@@ -1,0 +1,12 @@
+{
+
+   "clangd.fallbackFlags": [
+        "-I/Users/bruce/dev/light_switch/rp2040/c/lib/pico-sdk/src/common/pico_stdlib_headers",
+        "-I/Users/bruce/dev/light_switch/rp2040/c/lib/pico-sdk/src/common/pico_stdio_headers",
+        "-I/Users/bruce/dev/light_switch/rp2040/c/lib/pico-sdk/src/**", 
+        "-I/Users/bruce/dev/light_switch/rp2040/c/lib/FreeRTOS-Kernel/include", 
+        "-I/Users/bruce/dev/light_switch/rp2040/c/build", 
+        "-I/Users/bruce/dev/light_switch/rp2040/c/src", 
+        "-I/Users/bruce/dev/light_switch/rp2040/c/build/generated/pico_base/"    
+    ]
+}

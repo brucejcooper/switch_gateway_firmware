@@ -1,0 +1,56 @@
+.pio_version 0 
+
+
+.program buttongrid
+.side_set 1 opt
+
+    set y, 22                       ; Number of Columns - 2
+loop:
+    set pins, 1         side 0    ; clock out some data set data = 1
+    nop             [3] side 1    ; shift the 1 signal into the shift register's data register.  This will be output on output pins on the _next_ cycle,    
+    in pins, 8          side 0    ; Read in the pin values, and send the clock back down to 0
+    jmp y-- loop    [1]
+    set pins, 0         side 0    ; last iteration of our loop, shifting a 0 out as the next data bit
+    nop             [3] side 1    ; shift the data we just set out.  This will be output on the _next_ cycle, which will be the first output as this is the last iteration.
+    in pins, 8      [1] side 0    ; Read in the pin values, and send the clock back down to 0 - read in all 8 even though we actually have less, to pack it into a byte
+    
+ 
+
+
+% c-sdk {
+#include "hardware/clocks.h"
+
+static inline void buttongrid_init(PIO pio, uint sm, uint offset, uint ser_pin, uint clk_pin, uint col_base_pin) {
+    // Set ser_pin and clk_pin as outputs, with ser defaulting to 1 and clk 0
+    pio_sm_set_pins_with_mask64(pio, sm, 1ull << ser_pin, 1ull << ser_pin | 1ull << clk_pin);
+    pio_sm_set_pindirs_with_mask64(pio, sm, 1ull << ser_pin | 1ull << clk_pin, 1ull << ser_pin | 1ull << clk_pin);
+
+    // Set all the col pins as inputs.
+    pio_sm_set_consecutive_pindirs(pio, sm, col_base_pin, 8, false);
+
+    // Attach the PIO instance to all of the GPIO pins used
+    for (uint i = col_base_pin; i < col_base_pin + 8; ++i)
+        pio_gpio_init(pio, i);
+    pio_gpio_init(pio, ser_pin);
+    pio_gpio_init(pio, clk_pin);
+
+    // Configure the state machine.
+    pio_sm_config c = buttongrid_program_get_default_config(offset);
+    sm_config_set_set_pins(&c, ser_pin, 1);
+    sm_config_set_sideset_pins(&c, clk_pin);
+    sm_config_set_in_pin_base(&c, col_base_pin);
+    // Shift right, autopush, 32 bits.
+    sm_config_set_in_shift(&c, true, true, 32);
+    // Join the FIFOs so that we get an 8 word fifo
+    sm_config_set_fifo_join(&c, PIO_FIFO_JOIN_RX);
+
+    // Each fixture takes 8 cycles to scan. There are 24 fixtures, and we want to scan 200 times per second.
+    float div = (float)clock_get_hz(clk_sys) / (24*8*200);
+    sm_config_set_clkdiv(&c, div);
+
+    pio_sm_init(pio, sm, offset, &c);
+    // Start running!
+    pio_sm_set_enabled(pio, sm, true);
+}
+
+%}
