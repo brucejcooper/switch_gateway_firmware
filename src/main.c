@@ -5,7 +5,6 @@
 // #include "entity_status.h"
 // #include "dali_provision.h"
 #include <hardware/flash.h>
-#include <cJSON.h>
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>

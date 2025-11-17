@@ -24,15 +24,6 @@ add_executable(light_switch
     src/modbus.c
     src/button_actions.c
     src/lualoop.c
-    # src/entity_status.c
-    src/connection_tracking.c
-    # src/dali_provision.c
-    lib/cJSON/cJSON.c
-
-    # lib/littlefs/lfs.c
-    # lib/littlefs/lfs_util.c
-    # src/pico_lfs.c
-
 
     lib/lua-5.4.8/src/lapi.c 
     lib/lua-5.4.8/src/lcode.c 
@@ -71,7 +62,6 @@ add_subdirectory(lib/pico-vfs)
 
 target_include_directories(light_switch PRIVATE 
     ${CMAKE_CURRENT_LIST_DIR}/src 
-    ${CMAKE_CURRENT_LIST_DIR}/lib/cJSON
     ${CMAKE_CURRENT_LIST_DIR}/lib/lua-5.4.8/src
     ${CMAKE_CURRENT_LIST_DIR}/lib/littlefs
 )

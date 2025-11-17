@@ -5,7 +5,6 @@
 #include <string.h>
 #include "modbus.h"
 #include <hardware/flash.h>
-#include <cJSON.h>
 #include <lua.h>
 #include <lauxlib.h>
 #include <lualib.h>
