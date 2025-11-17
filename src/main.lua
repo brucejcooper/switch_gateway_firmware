@@ -188,9 +188,10 @@ function DaliLight:fade(direction)
         cmd = cmd | 0x108
     end
     self.gw:raw(cmd)
+    self:update(true)
 end
 
-function DaliLight:update()
+function DaliLight:update(onlybrightness)
     local status
     repeat
         local res = modbus_get_holding_registers(self.gw.modbus_address, self.address, 1)
@@ -323,11 +324,10 @@ function DaliGW:find_available_addresses()
     for addr=0,63 do 
         -- Query Control Gear Present for each address.
         local present = self:raw(0x0191 | (addr << 9))
-        print(string.format("Present response for %d is %s\n", addr, present));
-        -- if present == nil then
-        --     print("DALI Gateway is not responding.  Assuming it is missing");
-        --     return avail;
         if present == nil then
+             print("DALI Gateway is not responding.  Assuming it is missing");
+             return avail;
+        elseif present == -10 then
             table.insert(avail, addr)
             print(string.format("%d addresses available for assignment", #avail))
         else 
@@ -390,6 +390,7 @@ function DaliGW:provision(full)
         end
     end
     print(string.format("Provisioning Complete - found %d devices", devicesAdded))
+    coroutine.delay(100)
     -- Do a full scan of all devices again.
     self:update()
 end
@@ -583,7 +584,7 @@ setmetatable(buttons, {
     __newindex = function(self, key, val)
         if buttons[key] ~= val then
             buttons.pressed[key] = val
-            print(string.format("button[%d] = %s", key, val))
+            print(string.format("buttons[%d]=%s", key, val))
 
             local me, ismain = coroutine.running()
             if ismain then

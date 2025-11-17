@@ -193,10 +193,12 @@ static int l_modbus_set_coil(lua_State *L) {
 static void modbus_dali_complete(int res, uint8_t *buf, void *ctx) {
     lua_State *L = (lua_State *) ctx;
     if (L) {
-        if (res > 0) {
+        if (res >= 5) {
             lua_pushinteger(L, buf[2]);
+        } else if (res <= -5) {
+            // a negative response indicates an error - We return the negative value of the error code. 
+            lua_pushinteger(L, -buf[2]);
         } else {
-            // TODO differentiate between a NAK and an actual error.
             lua_pushnil(L);
         }
         scheduleResume(L, 1);
@@ -596,7 +598,7 @@ void lua_poll() {
     lua_State *L = mainThread;
 
     if (queue_try_remove(&btnChangeQueue, &btnChange)) {
-        sprintf(buf, "buttons[%d] = %s", btnChange.btnidx, btnChange.pressed  ? "true": "false");
+        sprintf(buf, "buttons[%d]=%s", btnChange.btnidx, btnChange.pressed  ? "true": "false");
         lua_schedule_cmd(buf);
     }
     
