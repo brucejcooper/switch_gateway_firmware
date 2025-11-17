@@ -20,7 +20,7 @@ loop:
 % c-sdk {
 #include "hardware/clocks.h"
 
-static inline void buttongrid_init(PIO pio, uint sm, uint offset, uint ser_pin, uint clk_pin, uint col_base_pin) {
+static inline void buttongrid_initpio(PIO pio, uint sm, uint offset, uint ser_pin, uint clk_pin, uint col_base_pin) {
     // Set ser_pin and clk_pin as outputs, with ser defaulting to 1 and clk 0
     pio_sm_set_pins_with_mask64(pio, sm, 1ull << ser_pin, 1ull << ser_pin | 1ull << clk_pin);
     pio_sm_set_pindirs_with_mask64(pio, sm, 1ull << ser_pin | 1ull << clk_pin, 1ull << ser_pin | 1ull << clk_pin);

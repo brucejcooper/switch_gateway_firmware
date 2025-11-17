@@ -1,19 +1,15 @@
 #include "hardware/uart.h"
 #include "hardware/gpio.h"
-#include <FreeRTOS.h>
 #include <pico/time.h>
-#include "projdefs.h"
 #include "stdio.h"
-#include <semphr.h>
+#include <pico/types.h>
 #include <sys/types.h>
-#include <task.h>
 #include <stdbool.h>
 #include "modbus.h"
-#include "entity_status.h"
+#include "pico/util/queue.h"
 
-static TaskHandle_t notificationTask;
 
-#define MODBUS_RESPONSE_TIMEOUT_TICKS pdMS_TO_TICKS(500)
+#define MODBUS_RESPONSE_TIMEOUT_MS 500
 
 #define RX_TASK_INDEX 1
 #define UART_ID uart1
@@ -21,12 +17,49 @@ static TaskHandle_t notificationTask;
 #define UART_TX_PIN 4
 #define UART_RX_PIN 5
 #define UART_DE_PIN 1
+
+
+
+typedef enum {
+  MODBUS_IDLE,
+  MODBUS_TRANSMITTING,
+  MODBUS_RECEIVING,
+  MODBUS_RECEIVED_RESPONSE,
+  MODBUS_DEADTIME,
+} modbus_bus_state_t;
+
+typedef enum {
+  ACTION_GET_COILS = 0x01,
+  ACTION_GET_HOLDING_REGISTERS = 0x03,
+  ACTION_SET_COIL = 0x05,
+  ACTION_SET_HOLDING_REGISTER = 0x06,
+  ACTION_DALI = 0x44,
+} modbus_action_type_t;
+
+
+typedef struct {
+  modbus_action_type_t action;
+  uint8_t device;
+  uint16_t address;
+  uint16_t arg;
+  modbus_action_cb_t callback;
+  void *ctx;
+} modbus_action_t;
+
+
+
 static volatile bool transmitting;
-static uint8_t *readbuf;
 static uint8_t *readptr;
 static size_t readbuf_sz;
 static size_t readbuf_max;
 static uint16_t readbuf_crc;
+static modbus_action_t currentAction;
+static absolute_time_t readTimeout;
+static uint8_t buf[256];
+static volatile modbus_bus_state_t bus_state = MODBUS_IDLE;
+static queue_t action_queue;
+static queue_t response_queue;
+
 
 static bool modbus_rx_valid() { return true; }
 
@@ -76,10 +109,16 @@ void append_crc16(uint8_t *buf, size_t sz) {
 
 void uart_irq() {
   uint8_t tmp;
+  int nread = 0;
 
   // This will go off every 4 characters, or when 32 bit periods of no data
-  // have occurred which corresponds to 3.33 ms @9600 baud
+  // have occurred which corresponds to 3.33 ms @9600 baud - this is longer than the required spec
   while (uart_is_readable(UART_ID)) {
+    // Once we read a character, we get a more urgent timeout delay, but we can't just use the 1.5 msec delay that
+    // the spec requires, because this ISR goes off at half read buffer full (4 characters).  That is longer than
+    // 1.5ms.  Instead, we give it at least 4 characters worth.
+    readTimeout = make_timeout_time_us(7500);
+
     uint8_t ch = uart_getc(UART_ID);
     if (readbuf_sz < readbuf_max) {
       *readptr++ = ch;
@@ -92,116 +131,41 @@ void uart_irq() {
     }
 
     if (readbuf_crc == 0 && modbus_rx_valid()) {
-      BaseType_t higherPriorityWoken = pdFALSE;
-      // Notify the calling task that we a valid response
-      vTaskNotifyGiveIndexedFromISR(notificationTask, RX_TASK_INDEX,
-                                    &higherPriorityWoken);
-      portYIELD_FROM_ISR(higherPriorityWoken);
+      bus_state = MODBUS_RECEIVED_RESPONSE;
+      // Todo turn of receive ISR, cos we got what we wanted. 
     }
+    nread++;
+  } 
+  if (nread == 0) {
+    printf("Read ISR has No data... timeout?");
   }
 }
 
-static QueueHandle_t action_queue;
-
-typedef enum {
-  ACTION_GET_COILS = 0x01,
-  ACTION_GET_HOLDING_REGISTERS = 0x03,
-  ACTION_SET_COIL = 0x05,
-  ACTION_SET_HOLDING_REGISTER = 0x06,
-  ACTION_DALI = 0x44,
-} modbus_action_type_t;
-
-
-typedef struct {
-  modbus_action_type_t action;
-  uint8_t device;
-  uint16_t address;
-  uint16_t arg;
-  modbus_action_cb_t callback;
-  action_ctx_t callbackarg;
-} modbus_action_t;
-
-
-
-
-/**
- * This must run on the same priority task as the idle task, otherwise whenever
- * it yeilds it will simply come back here.
- */
-int modbus_send(uint8_t *pkt, size_t max_sz, size_t sz, unsigned timeoutTicks) {
-  uint16_t crc = 0xFFFF;
-
-  append_crc16(pkt, sz);
-  sz += 2;
-
-  // Clear the RX buffer, in case some random stuff arrived
-  while (uart_is_readable(UART_ID)) {
-    uart_getc(UART_ID);
-  }
-
-  // Also clear any pending task notifications
-  xTaskNotifyStateClearIndexed(NULL, RX_TASK_INDEX);
-  notificationTask = xTaskGetCurrentTaskHandle();
-
-  // Set DE
-  gpio_put(UART_DE_PIN, 1);
-  transmitting = true;
-
-  uart_set_irqs_enabled(UART_ID, true, false);
-
-  // Transmit the outbound command
-  for (int i = 0; i < sz; i++) {
-    while (!uart_is_writable(UART_ID)) {
-      // In most cases the TX fifo will be able to completely contain our
-      // command, but just in case, give somebody else a chance while we wait
-      // for the queue to drain.
-      vPortYield();
-    }
-    // Send a character
-    uart_get_hw(UART_ID)->dr = pkt[i];
-  }
-  // There is no reliable way to get notified when the transmit buffer is
+int64_t release_de(alarm_id_t id, void *userdata) {
+    // There is no reliable way to get notified when the transmit buffer is
   // complete, other than to poll it. Instead, we we wait until its almost done,
   // then do some last minute polling.  This ain't pretty.
-  vTaskDelay(pdMS_TO_TICKS(10000 * sz / BAUD_RATE));
   // Do a busy wait loop waiting for the transmit to complete.  Hopefully it will be less than 1 tick.
   while (uart_get_hw(UART_ID)->fr & UART_UARTFR_BUSY_BITS) {
-    vPortYield();
+    ; // Hopefully this isn't for long...
   }
+  // Turn this back on for a sensible RS485 chip. 
   // gpio_put(UART_DE_PIN, 0);
+  bus_state = MODBUS_RECEIVING;
+  return 0;
+}
 
-  // Get ready to read results
-  readbuf = readptr = pkt;
-  readbuf_sz = 0;
-  readbuf_max = max_sz;
-  readbuf_crc = 0xFFFF;
-
-
-  // Wait for IRQ to tell us we have a valid packet, or we time out
-  if (ulTaskNotifyTakeIndexed(RX_TASK_INDEX, pdTRUE, timeoutTicks) == 0) {
-    // We timed out before we got a valid packet
-    readbuf_sz = 0;
-  }
-  uart_set_irqs_enabled(UART_ID, false, false);
-  if (readbuf[1] & 0x80) {
-    // Response was an error - return a negative response.
-    readbuf_sz = -readbuf_sz;
-  }
-
-  // Unlock
-  return readbuf_sz;
+static inline void blink() {
+   gpio_put(UART_DE_PIN, 0);
+   gpio_put(UART_DE_PIN, 1);
+    // gpio_put(PICO_DEFAULT_LED_PIN, GPIO_OUT);
 }
 
 
 
-void modbus_task(void *data) {
-  uint8_t buf[256];
-  size_t sz;
-  size_t bufoffset;
-  int ret;
-
-
-  action_queue = xQueueCreate(256, sizeof(modbus_action_t));
+void modbus_init() {
+  queue_init(&action_queue, sizeof(modbus_action_t), 256);
+  queue_init(&response_queue, sizeof(modbus_action_t), 20);
 
 
   gpio_init(UART_DE_PIN);
@@ -222,118 +186,185 @@ void modbus_task(void *data) {
   // And set up and enable the interrupt handlers
   irq_set_exclusive_handler(UART_IRQ, uart_irq);
   irq_set_enabled(UART_IRQ, true);
+}
 
-  while (true) {
-    modbus_action_t action;
+void modbus_poll() {
+  size_t sz;
 
-    if (xQueueReceive(action_queue, &action, portMAX_DELAY) == pdTRUE) {
-      bufoffset = 0;
-      buf[0] = action.device;
-      buf[1] = action.action;
-      buf[2] = action.address >> 8;
-      buf[3] = action.address;
-      if (action.action == ACTION_DALI) {
-        buf[4] = action.arg;
-        sz = 5;
-      } else {
-        buf[4] = action.arg >> 8;
-        buf[5] = action.arg;
-        sz = 6;
+  switch (bus_state) {
+    case MODBUS_IDLE:
+      if (queue_try_remove(&action_queue, &currentAction)) {
+        buf[0] = currentAction.device;
+        buf[1] = currentAction.action;
+        buf[2] = currentAction.address >> 8;
+        buf[3] = currentAction.address;
+        if (currentAction.action == ACTION_DALI) {
+          buf[4] = currentAction.arg; // This is the repeat.
+          sz = 5;
+        } else {
+          buf[4] = currentAction.arg >> 8;
+          buf[5] = currentAction.arg;
+          sz = 6;
+        }
+        // printf("sending %02x:%02x:%02x%02x:%02x%02x (%d bytes)\n", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], sz);
+        readTimeout = make_timeout_time_ms(500);
+        uint16_t crc = 0xFFFF;
+        append_crc16(buf, sz);
+        sz += 2;
+
+        // Clear the RX buffer, in case some random stuff arrived
+        while (uart_is_readable(UART_ID)) {
+          uart_getc(UART_ID);
+        }
+
+        // Set DE
+        gpio_put(UART_DE_PIN, 1);
+        transmitting = true;
+
+        // Transmit the outbound command.  This will alarm in something like the period after transmission completes. 
+        // Each byte takes 10 bit periods (1 start bit, 8 data bits, 1 stop bit) to transmit, which are 1/BAUD_RATE
+        alarm_pool_add_alarm_in_us(alarm_pool_get_default(), (10 * 1000000 * sz / BAUD_RATE), release_de, NULL, true);
+        for (int i = 0; i < sz; i++) {
+          // We shouldn't fill up the TX buffer, but just in case. 
+          while (!uart_is_writable(UART_ID)) {
+          }
+          
+          // Send a character
+          uart_get_hw(UART_ID)->dr = buf[i];
+        }
+
+        // Get ready to read results
+        readptr = buf;
+        readbuf_sz = 0;
+        readbuf_max = sizeof(buf);
+        readbuf_crc = 0xFFFF;
+        // IRQ on RX
+        uart_set_irqs_enabled(UART_ID, true, false);
+        bus_state = MODBUS_TRANSMITTING;
       }
-      // printf("sending %02x:%02x:%02x%02x:%02x%02x (%d bytes)\n", buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], sz);
-      ret = modbus_send(buf, sizeof(buf), sz, pdMS_TO_TICKS(500));
-      if (action.callback) {
-        action.callback(ret, buf, action.callbackarg);
+      break;
+    
+    case MODBUS_TRANSMITTING:
+      // We leave this state from the timer ISR.
+      break;
+
+    case MODBUS_RECEIVING:
+      // We leave this state from the ISR.
+      if (absolute_time_diff_us(readTimeout, get_absolute_time()) <= 0) {
+        // Not timed out yet....
+        break;
       }
-    }
-    // Minimum delay between receipt and transmission of new frame.
-    vTaskDelay(pdMS_TO_TICKS(2));
+      // Otherwise we have timed out.... Fall through to the RECEIVED_RESPONSE state.
+      blink();
+      readbuf_sz = 0;
+
+    case MODBUS_RECEIVED_RESPONSE:
+      // turn off both read and write IRQ
+      uart_set_irqs_enabled(UART_ID, false, false);
+
+      // Have a complete response. 
+      if (readbuf_sz >= 2 && buf[1] & 0x80) {
+        // Response was an error - return a negative response.
+        readbuf_sz = -readbuf_sz;
+      }
+      if (currentAction.callback) {
+        currentAction.callback(readbuf_sz, buf, currentAction.ctx);
+      }
+      bus_state = MODBUS_DEADTIME;
+      // Deadtime is 1.5 character times, which for 9600 baud is 1.5625 ms.
+      readTimeout = make_timeout_time_us(1563);
+      break;
+
+    case MODBUS_DEADTIME:
+      // There should be a dead time after any response 
+      if (absolute_time_diff_us(readTimeout, get_absolute_time()) > 0) {
+        bus_state = MODBUS_IDLE;
+      }
   }
-  vTaskDelete(NULL);
 }
 
 
-void modbus_get_coils(uint8_t device_id, uint16_t addr, uint16_t count, modbus_action_cb_t cb, action_ctx_t callbackarg) {
+void modbus_get_coils(uint8_t device_id, uint16_t addr, uint16_t count, modbus_action_cb_t cb, void *ctx) {
   modbus_action_t act = {
     .device = device_id,
     .action = ACTION_GET_COILS,
     .address = addr,
     .arg = count,
     .callback = cb,
-    .callbackarg = callbackarg
+    .ctx = ctx
   };
-  xQueueSend(action_queue, &act, portMAX_DELAY);
+  queue_try_add(&action_queue, &act);
 }
 
 
 
-void modbus_toggle(uint8_t device_id, uint16_t addr, modbus_action_cb_t cb, action_ctx_t callbackarg) {
+void modbus_toggle(uint8_t device_id, uint16_t addr, modbus_action_cb_t cb, void *ctx) {
   modbus_action_t act = {
     .device = device_id,
     .action = ACTION_SET_COIL,
     .address = addr,
     .arg = 0x5500,
     .callback = cb,
-    .callbackarg = callbackarg
+    .ctx = ctx
   };
-  xQueueSend(action_queue, &act, portMAX_DELAY);
+  queue_try_add(&action_queue, &act);
 }
 
-void modbus_set_coil(uint8_t device_id, uint16_t addr, bool is_on, modbus_action_cb_t cb, action_ctx_t callbackarg) {
+void modbus_set_coil(uint8_t device_id, uint16_t addr, bool is_on, modbus_action_cb_t cb, void *ctx) {
   modbus_action_t act = {
     .device = device_id,
     .action = ACTION_SET_COIL,
     .address = addr,
     .arg = is_on ? 0xFF00 : 0x0000,
     .callback = cb,
-    .callbackarg = callbackarg
+    .ctx = ctx
   };
-  xQueueSend(action_queue, &act, portMAX_DELAY);
+  queue_try_add(&action_queue, &act);
 }
 
 
-void modbus_get_holding_registers(uint8_t device_id, uint16_t addr, uint16_t count, modbus_action_cb_t cb, action_ctx_t callbackarg) {
+void modbus_get_holding_registers(uint8_t device_id, uint16_t addr, uint16_t count, modbus_action_cb_t cb, void *ctx) {
   modbus_action_t act = {
     .device = device_id,
     .action = ACTION_GET_HOLDING_REGISTERS,
     .address = addr,
     .arg = count,
     .callback = cb,
-    .callbackarg = callbackarg
+    .ctx = ctx
   };
   // printf("Fetching holding registers %d, %d, %d\n", act.device, act.address, act.arg);
-  xQueueSend(action_queue, &act, portMAX_DELAY);
+  queue_try_add(&action_queue, &act);
 }
 
-void modbus_set_holding_register(uint8_t device_id, uint16_t addr, uint16_t value, modbus_action_cb_t cb, action_ctx_t callbackarg) {
+void modbus_set_holding_register(uint8_t device_id, uint16_t addr, uint16_t value, modbus_action_cb_t cb, void *ctx) {
   modbus_action_t act = {
     .device = device_id,
     .action = ACTION_SET_HOLDING_REGISTER,
     .address = addr,
     .arg = value,
     .callback = cb,
-    .callbackarg = callbackarg
+    .ctx = ctx
   };
-  xQueueSend(action_queue, &act, portMAX_DELAY);
+  queue_try_add(&action_queue, &act);
 }
 
 
 
 
-void modbus_dali(uint8_t device_id, uint16_t cmd, uint8_t repeat, modbus_action_cb_t cb, action_ctx_t callbackarg) {
+void modbus_dali(uint8_t device_id, uint16_t cmd, uint8_t repeat, modbus_action_cb_t cb, void *ctx) {
   modbus_action_t act = {
     .device = device_id,
     .action = ACTION_DALI,
     .address = cmd,
     .arg = repeat,
     .callback = cb,
-    .callbackarg = callbackarg
+    .ctx = ctx
   };
-  xQueueSend(action_queue, &act, portMAX_DELAY);
+  queue_try_add(&action_queue, &act);
 }
 
 
 
-void modbus_fade(uint8_t device_id, uint16_t addr, int direction, modbus_action_cb_t cb, action_ctx_t callbackarg) {
-    return modbus_dali(device_id, (direction >= 0 ? 0x108 : 0x107) | (addr << 9), 1, cb, callbackarg);
+void modbus_fade(uint8_t device_id, uint16_t addr, int direction, modbus_action_cb_t cb, void *ctx) {
+    return modbus_dali(device_id, (direction >= 0 ? 0x108 : 0x107) | (addr << 9), 1, cb, ctx);
 }
