@@ -6,6 +6,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 
+typedef enum { MODBUS_DE_WHENTX, MODBUS_DE_ALWAYSON, MODBUS_DE_MAX } modbus_de_mode_t;
 
 typedef void (*modbus_action_cb_t)(int status, uint8_t buf[], void *ctx);
 
@@ -19,6 +20,7 @@ extern void modbus_get_holding_registers(uint8_t device_id, uint16_t addr, uint1
 extern void modbus_set_holding_register(uint8_t device_id, uint16_t addr, uint16_t value, modbus_action_cb_t cb, void *ctx);
 extern void modbus_dali(uint8_t device_id, uint16_t cmd, uint8_t repeat, modbus_action_cb_t cb, void *ctx);
 extern void modbus_fade(uint8_t device_id, uint16_t addr, int direction, modbus_action_cb_t cb, void *ctx);
+extern void set_modbus_de_mode(modbus_de_mode_t mode);
 
 
 

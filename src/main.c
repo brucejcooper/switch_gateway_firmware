@@ -1,24 +1,22 @@
-#include <pico/stdlib.h>
-#include <pico/stdio.h>
-#include <hardware/timer.h>
 #include "modbus.h"
+#include <hardware/timer.h>
+#include <pico/stdio.h>
+#include <pico/stdlib.h>
 // #include "entity_status.h"
 // #include "dali_provision.h"
-#include <hardware/flash.h>
-#include <lua.h>
-#include <lauxlib.h>
-#include <lualib.h>
-#include <sys/types.h>
-#include <dirent.h>
-#include <hardware/watchdog.h>
-#include "lualoop.h"
-#include "filesystem/vfs.h"
 #include "button_actions.h"
+#include "filesystem/vfs.h"
+#include "lualoop.h"
+#include <dirent.h>
+#include <hardware/flash.h>
+#include <hardware/watchdog.h>
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
 #include <pico/time.h>
-
+#include <sys/types.h>
 
 extern void buttongrid_task(void *data);
-
 
 // Perform initialisation
 int pico_led_init(void) {
@@ -29,7 +27,6 @@ int pico_led_init(void) {
     return PICO_OK;
 }
 
-
 #define MAX_LINE_LEN 256
 
 int main() {
@@ -39,18 +36,25 @@ int main() {
     int rc = pico_led_init();
     hard_assert(rc == PICO_OK);
 
-
-
-
     busy_wait_ms(2500);
 
-    modbus_init();      // Init script might call modbus, so it gets initialised first
-    lua_init();         // Then lua.  Anything that modbus depends on will be initialised before the init script gets called
-    buttongrid_init();  // Button grid goes last, as it injects commands into the lua state. 
+    if (watchdog_enable_caused_reboot()) {
+        printf("Rebooted by Watchdog or explicit reset!\n");
+    } else {
+        printf("Clean boot\n");
+    }
+
+    modbus_init();     // Init script might call modbus, so it gets initialised first
+    lua_init();        // Then lua.  Anything that modbus depends on will be initialised before the init script gets called
+    buttongrid_init(); // Button grid goes last, as it injects commands into the lua state.
+
+    watchdog_enable(5000, 1);
 
     while (true) {
         modbus_poll();
+        watchdog_update();
         lua_poll();
-    }    
+        watchdog_update();
+    }
     panic_unsupported();
 }

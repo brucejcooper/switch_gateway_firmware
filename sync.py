@@ -2,6 +2,7 @@
 import serial
 import sys
 import os
+import time
 
 print()
 
@@ -27,7 +28,7 @@ def escape_string(s):
 
 
 
-with serial.Serial('/dev/tty.usbmodem112101', 115200) as ser:
+with serial.Serial('/dev/tty.usbmodem11201', 115200) as ser:
     for file in sys.argv[1:]:
         filename = f"/lua/{os.path.basename(file)}"
         print(f"Writing {file} to {filename}")
@@ -44,11 +45,17 @@ with serial.Serial('/dev/tty.usbmodem112101', 115200) as ser:
                 res = ser.readline()
                 print(res.decode('ascii'), end="")
                 res = ser.readline()
+                # time.sleep(0.1)
+
+            ser.write(b"tmpf:flush()\n")
+            res = ser.readline()
                 
             ser.write(b"tmpf:close()\n")
             res = ser.readline()
             print(res.decode('ascii'))
             res = ser.readline()
+
+
                     
     ser.write(b"reboot()\n")
     res = ser.readline()

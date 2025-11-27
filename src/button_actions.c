@@ -37,11 +37,16 @@ static void sample_available() {
     while (!pio_sm_is_rx_fifo_empty(pio, sm)) {
         uint32_t reading = pio_sm_get(pio, sm);
         uint32_t changed = reading ^ values[index];
+        // printf(",%d = 0x%08x", index, reading);
+        // if (index == 5) {
+        //     printf("\n");
+        // }
+
         if (changed) {
             values[index] = reading;
             for (unsigned bit = 0; bit < 32; bit++) {
                 if (changed & 0x01) {
-                    lua_schedule_btn_change(index << 4 | bit, (reading & 0x01) == 0);
+                    lua_schedule_btn_change(index * 32 + bit, (reading & 0x01) == 0);
                 }
                 changed >>= 1;
                 reading >>= 1;

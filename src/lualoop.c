@@ -1,19 +1,19 @@
-#include <pico/stdlib.h>
-#include <pico/stdio.h>
+#include "modbus.h"
+#include "pico/util/queue.h"
+#include <dirent.h>
+#include <hardware/flash.h>
 #include <hardware/timer.h>
+#include <hardware/watchdog.h>
+#include <lauxlib.h>
+#include <lua.h>
+#include <lualib.h>
+#include <malloc.h>
+#include <pico/stdio.h>
+#include <pico/stdlib.h>
 #include <pico/time.h>
 #include <string.h>
-#include "modbus.h"
-#include <hardware/flash.h>
-#include <lua.h>
-#include <lauxlib.h>
-#include <lualib.h>
 #include <sys/types.h>
-#include <dirent.h>
-#include <hardware/watchdog.h>
-#include <malloc.h>
-#include "pico/util/queue.h"
-
+#include <unistd.h>
 
 #define MAX_LINE_LEN 256
 
@@ -22,58 +22,65 @@ static queue_t btnChangeQueue;
 
 static lua_State *mainThread;
 
-
 typedef struct {
     lua_State *thread;
     int nargs;
 } resume_args_t;
 
 typedef struct {
-    int btnidx:8;
-    bool pressed:1;
+    unsigned int btnidx : 16;
+    bool pressed : 1;
 } btn_change_t;
 
-
-void scheduleResume(lua_State *thread, int nargs) {
-    resume_args_t args = {
-        .thread = thread,
-        .nargs = nargs
-    };
-    if (!queue_try_add(&runnableTasksQueue, &args)) {
-        printf("Could not schedule coro for execution");
-    }
+static bool isdead(lua_State *thread) {
+    int status = lua_status(thread);
+    return status > LUA_YIELD || status == LUA_OK && lua_gettop(thread) == 0;
 }
 
+void scheduleResume(lua_State *thread, int nargs) {
+    resume_args_t args = {.thread = thread, .nargs = nargs};
+
+    int status = lua_status(thread);
+    // printf("Lua thread %p status %d\n", thread, status);
+
+    if (isdead(thread)) {
+        printf("not resuming dead thread %p\n", thread);
+    } else {
+        if (!queue_try_add(&runnableTasksQueue, &args)) {
+            printf("Could not schedule coro for execution");
+        }
+    }
+}
 
 /*
 ** Try to compile line on the stack as 'return <line>;'; on return, stack
 ** has either compiled chunk or original line (if compilation failed).
 */
-static int addreturn (lua_State *L, char *line) {
+static int addreturn(lua_State *L, char *line) {
     const char *retline = lua_pushfstring(L, "return %s;", line);
     int status = luaL_loadbuffer(L, retline, strlen(retline), "=stdin");
     if (status == LUA_OK) {
-        lua_remove(L,-2); // Remove the modified line
+        lua_remove(L, -2); // Remove the modified line
     } else {
-        lua_pop(L, 2);  /* pop result from 'luaL_loadbuffer' and modified line */
+        lua_pop(L, 2); /* pop result from 'luaL_loadbuffer' and modified line */
     }
     return status;
 }
 
 void dumpstack(lua_State *L, char *before) {
     printf("Stack %s\n", before);
-    int top=lua_gettop(L);
+    int top = lua_gettop(L);
     if (top == 0) {
         printf("Stack empty\n");
     }
-    for (int i=1; i <= top; i++) {
-        printf("%d\t%s\t", i, luaL_typename(L,i));
+    for (int i = 1; i <= top; i++) {
+        printf("%d\t%s\t", i, luaL_typename(L, i));
         switch (lua_type(L, i)) {
         case LUA_TNUMBER:
-            printf("%g\n",lua_tonumber(L,i));
+            printf("%g\n", lua_tonumber(L, i));
             break;
         case LUA_TSTRING:
-            printf("%s\n",lua_tostring(L,i));
+            printf("%s\n", lua_tostring(L, i));
             break;
         case LUA_TBOOLEAN:
             printf("%s\n", (lua_toboolean(L, i) ? "true" : "false"));
@@ -82,15 +89,15 @@ void dumpstack(lua_State *L, char *before) {
             printf("%s\n", "nil");
             break;
         default:
-            printf("%p\n",lua_topointer(L,i));
+            printf("%p\n", lua_topointer(L, i));
             break;
         }
     }
 }
 
-static int l_listdir (lua_State *L) {
-    const char *path = luaL_checkstring(L, 1); 
-    
+static int l_listdir(lua_State *L) {
+    const char *path = luaL_checkstring(L, 1);
+
     DIR *dir = opendir(path);
     if (dir == NULL) {
         luaL_error(L, "no such directory");
@@ -105,13 +112,11 @@ static int l_listdir (lua_State *L) {
     }
     printf("done\n");
     closedir(dir);
-    return 1;  
+    return 1;
 }
 
-
-
 static int l_catFile(lua_State *L) {
-    const char *path = luaL_checkstring(L, 1); 
+    const char *path = luaL_checkstring(L, 1);
 
     FILE *fp = fopen(path, "r");
     if (!fp) {
@@ -123,61 +128,115 @@ static int l_catFile(lua_State *L) {
     }
     fclose(fp);
     printf("--END--\n");
-    return 0;  
+    return 0;
 }
 
 static int l_reboot(lua_State *L) {
     // Enable watchdog with 100 ms timeout.  This will give the REPL
     // enough time to reply before it yanks the carpet out.
-    watchdog_enable(200, 0); 
-    return 0;  
+    watchdog_enable(200, 0);
+    while (true) {
+        ;
+    }
+    return 0;
+}
+
+static const char *modbus_error_codes[] = {
+    "Unknown 0x00",
+    "Illegal Function",
+    "Illegal Data Address",
+    "Illegal Data Value",
+    "Slave Device Failure",
+    "Acknowledge",
+    "Slave Device Busy",
+    "Negative Acknowledge",
+    "Memory Parity Error",
+    "Unknown 0x09",
+    "Gateway Path Unavailable",
+    "Gateway Target Failed to Respond",
+};
+
+
+static void pushModbusErr(lua_State *L, int res, uint8_t *buf) {
+    lua_pushboolean(L, false);
+    if (res == 0) {
+        lua_pushstring(L, "Timeout");
+    } else {
+        unsigned int err = buf[2];
+        if (err < sizeof(modbus_error_codes)/sizeof(char *)) {
+            lua_pushstring(L, modbus_error_codes[err]);
+        } else {
+            lua_pushfstring(L, "Modbus error %d", err);
+        }
+        
+    }
 }
 
 static void modbus_get_coils_complete(int res, uint8_t *buf, void *ctx) {
-    lua_State *L = (lua_State *) ctx;
-    if (L) {
+    lua_State *L = (lua_State *)ctx;
+    if (L && !isdead(L)) {
+
         if (res > 0) {
+            lua_pushboolean(L, true);
             // We assume they were requested in sets of 8 - we have no other way to tell.
-            int count = buf[2] * 8; 
-            uint8_t *dptr = buf + 3;
+            int count = buf[2] * 8;
+            uint8_t *dptr = buf + 2 + buf[2];
             lua_createtable(L, count, 0);
+            // Our stupid waveshare device gets the byte order wrong. 
+            int i = 1;
             while (count) {
-                lua_pushboolean(L, (*dptr) & 0x01);
-                lua_settable(L, -2);
+                lua_pushinteger(L, i++);
+                // printf("Bit %d = byte %d bit %d = %d\n", i, buf[2] + 2 - i/8, i%8, (buf[buf[2] + 2 - i/8] >> (i%8)) & 0x01);
+                lua_pushboolean(L, *dptr & 0x01);
+                lua_settable(L, -3);
+
                 if ((--count) % 8 == 0) {
-                    dptr++;
+                    dptr--;
                 } else {
                     *dptr >>= 1;
                 }
             }
         } else {
-            lua_pushnil(L);
+            pushModbusErr(L, res, buf);            
         }
-        scheduleResume(L, 1);
+        scheduleResume(L, 2);
     } else {
         // Ignore the response
         printf("Ignoring get coils response, as it was called from the main thread\n");
     }
 }
 
-
 static void modbus_set_coil_complete(int res, uint8_t *buf, void *ctx) {
-    lua_State *L = (lua_State *) ctx;
-    if (L) {
+    lua_State *L = (lua_State *)ctx;
+    if (L && !isdead(L)) {
         if (res > 0) {
             lua_pushboolean(L, true);
+            scheduleResume(L, 1);
         } else {
-            lua_pushboolean(L, false);
+            pushModbusErr(L, res, buf);            
+            scheduleResume(L, 2);
         }
-        scheduleResume(L, 1);
     }
 }
 
+static int l_unwrap_resume(lua_State *L, int status, lua_KContext ctx) {
+    // printf("Wrapped resume args %d %d\n", status, ctx);
+    // dumpstack(L, "");
+    bool success = lua_toboolean(L, 1);
+    lua_remove(L, 1);
+    if (success) {
+        // Return any additional values that were pushed by the callback.  This could be 0
+        return lua_gettop(L);
+    } else {
+        lua_error(L);
+    }
+    return 0;
+}
 
 static int l_modbus_set_coil(lua_State *L) {
-    const int modbus_device = luaL_checkinteger(L, 1); 
-    const int coil = luaL_checkinteger(L, 2); 
-    luaL_checktype(L, 3, LUA_TBOOLEAN); 
+    const int modbus_device = luaL_checkinteger(L, 1);
+    const int coil = luaL_checkinteger(L, 2);
+    luaL_checktype(L, 3, LUA_TBOOLEAN);
     const bool val = lua_toboolean(L, 3);
 
     if (L == mainThread) {
@@ -186,50 +245,51 @@ static int l_modbus_set_coil(lua_State *L) {
     }
 
     modbus_set_coil(modbus_device, coil, val, modbus_set_coil_complete, L);
-    return lua_yield(L, 0);
+    return lua_yieldk(L, 0, 1, l_unwrap_resume);
 }
 
-
 static void modbus_dali_complete(int res, uint8_t *buf, void *ctx) {
-    lua_State *L = (lua_State *) ctx;
-    if (L) {
+    lua_State *L = (lua_State *)ctx;
+    if (L && !isdead(L)) {
         if (res >= 5) {
+            lua_pushboolean(L, true);
             lua_pushinteger(L, buf[2]);
-        } else if (res <= -5) {
-            // a negative response indicates an error - We return the negative value of the error code. 
-            lua_pushinteger(L, -buf[2]);
-        } else {
+        } else if (res == -5 && (buf[2] == 10 || buf[2] == 11)) {
+            // Error code 0x0b means the DALI device did not respond.  Rather than treat this as an error, return nil
+            // We also allow 0x0a because of a historical bug.
+            lua_pushboolean(L, true);
             lua_pushnil(L);
+        } else {
+            pushModbusErr(L, res, buf);            
         }
-        scheduleResume(L, 1);
+        scheduleResume(L, 2);
     }
 }
 
 static int l_modbus_dali(lua_State *L) {
-    const int modbus_device = luaL_checkinteger(L, 1); 
-    const int cmd = luaL_checkinteger(L, 2); 
+    const int modbus_device = luaL_checkinteger(L, 1);
+    const int cmd = luaL_checkinteger(L, 2);
     const bool repeat = lua_toboolean(L, 3);
     if (L == mainThread) {
         luaL_error(L, "must call from coroutine");
         return 0;
     }
     modbus_dali(modbus_device, cmd, repeat ? 2 : 1, modbus_dali_complete, L);
-    return lua_yield(L, 0);
+    return lua_yieldk(L, 0, 2, l_unwrap_resume);
 }
 
-
-
 static int l_modbus_get_coils(lua_State *L) {
-    const int modbus_device = luaL_checkinteger(L, 1); 
-    const int start = luaL_checkinteger(L, 2); 
-    const int count = luaL_checkinteger(L, 3); 
+    const int modbus_device = luaL_checkinteger(L, 1);
+    const int start = luaL_checkinteger(L, 2);
+    const int count = luaL_checkinteger(L, 3);
+
 
     if (L == mainThread) {
         luaL_error(L, "Can not call modbus from non-coroutine");
         return 0;
     }
     modbus_get_coils(modbus_device, start, count, modbus_get_coils_complete, L);
-    return lua_yield(L, 0);
+    return lua_yieldk(L, 0, 3, l_unwrap_resume);
 }
 
 uint32_t getTotalHeap(void) {
@@ -244,62 +304,60 @@ static int l_heapsize(lua_State *L) {
 
 static int l_heapfree(lua_State *L) {
     struct mallinfo m = mallinfo();
-    lua_pushinteger(L,  getTotalHeap() - m.uordblks);
+    lua_pushinteger(L, getTotalHeap() - m.uordblks);
     return 1;
 }
 
-
 static void modbus_set_hr_complete(int res, uint8_t *buf, void *ctx) {
-    lua_State *L = (lua_State *) ctx;
-    if (L) {
+    lua_State *L = (lua_State *)ctx;
+    if (L && !isdead(L)) {
         if (res > 0) {
             int device = buf[0];
             int address = buf[2] << 8 | buf[3];
             // modbus_get_holding_registers(device, address, 1, modbus_get_hr_complete, ctx);
             lua_pushboolean(L, true);
+            scheduleResume(L, 1);
         } else {
-            lua_pushboolean(L, false);
+            pushModbusErr(L, res, buf);            
+            scheduleResume(L, 2);
         }
-        scheduleResume(L, 1);
     }
-
 }
 
 static void modbus_get_hrs_complete(int res, uint8_t *buf, void *ctx) {
-    lua_State *L = (lua_State *) ctx;
-    if (L) {
+    lua_State *L = (lua_State *)ctx;
+    if (L && !isdead(L)) {
         if (res > 0) {
+            lua_pushboolean(L, true);
             int bytecount = buf[2];
             lua_createtable(L, bytecount, 0);
-            for (int byteoffset = 3; byteoffset < 3+bytecount; byteoffset +=2) {
-                uint16_t val = (buf[byteoffset] << 8) | buf[byteoffset+1];
-                lua_pushinteger(L, byteoffset/2);
+            for (int byteoffset = 3; byteoffset < 3 + bytecount; byteoffset += 2) {
+                uint16_t val = (buf[byteoffset] << 8) | buf[byteoffset + 1];
+                lua_pushinteger(L, byteoffset / 2);
                 lua_pushinteger(L, val);
                 lua_settable(L, -3);
             }
         } else {
-            // Instead of pushing a table, we push an error message. 
-            lua_pushnil(L);
+            pushModbusErr(L, res, buf);            
         }
         // Resume the coroutine.
-        scheduleResume(L, 1);
+        scheduleResume(L, 2);
     }
 }
 
-
 static int l_modbus_set_holding_regsister(lua_State *L) {
-    const int modbus_device = luaL_checkinteger(L, 1); 
-    const int coil = luaL_checkinteger(L, 2); 
-    const int val = luaL_checkinteger(L, 3); 
+    const int modbus_device = luaL_checkinteger(L, 1);
+    const int coil = luaL_checkinteger(L, 2);
+    const int val = luaL_checkinteger(L, 3);
 
     modbus_set_holding_register(modbus_device, coil, val, modbus_set_hr_complete, L);
-    return lua_yield(L, 0);
+    return lua_yieldk(L, 0, 4, l_unwrap_resume);
 }
 
 static int l_modbus_get_holding_regsisters(lua_State *L) {
-    const int modbus_device = luaL_checkinteger(L, 1); 
-    const int start_addr = luaL_checkinteger(L, 2); 
-    const int count = luaL_checkinteger(L, 3); 
+    const int modbus_device = luaL_checkinteger(L, 1);
+    const int start_addr = luaL_checkinteger(L, 2);
+    const int count = luaL_checkinteger(L, 3);
 
     if (L == mainThread) {
         luaL_error(L, "Can not call modbus from non-coroutine");
@@ -307,30 +365,28 @@ static int l_modbus_get_holding_regsisters(lua_State *L) {
     }
 
     modbus_get_holding_registers(modbus_device, start_addr, count, modbus_get_hrs_complete, L);
-    return lua_yield(L, 0);
+    return lua_yieldk(L, 0, 5, l_unwrap_resume);
 }
 
-
 int64_t delay_cb(alarm_id_t id, void *data) {
-    lua_State *thread = (lua_State *) data;
-    scheduleResume(thread, 0);
+    lua_State *thread = (lua_State *)data;
+    if (thread && !isdead(thread)) {
+        lua_pushboolean(thread, true);
+        scheduleResume(thread, 1);
+    }
     return 0;
 }
 
 static int l_delay(lua_State *L) {
-    const int delayms = luaL_checkinteger(L, 1); 
-    if (add_alarm_in_ms(delayms, delay_cb, L, true)< 0) {
+    const int delayms = luaL_checkinteger(L, 1);
+    if (add_alarm_in_ms(delayms, delay_cb, L, true) < 0) {
         luaL_error(L, "Could not create alarm");
         return 0;
     }
-    return lua_yield(L, 0);
+    return lua_yieldk(L, 0, 6, l_unwrap_resume);
 }
 
-
-
-
-static int maybe_mkdir(const char* path, mode_t mode)
-{
+static int maybe_mkdir(const char *path, mode_t mode) {
     struct stat st;
     errno = 0;
 
@@ -356,11 +412,10 @@ static int maybe_mkdir(const char* path, mode_t mode)
     return 0;
 }
 
-int mkdir_p(const char *path)
-{
+int mkdir_p(const char *path) {
     /* Adapted from http://stackoverflow.com/a/2336245/119527 */
     char *_path = NULL;
-    char *p; 
+    char *p;
     int result = -1;
     mode_t mode = 0777;
 
@@ -382,7 +437,7 @@ int mkdir_p(const char *path)
 
             *p = '/';
         }
-    }   
+    }
 
     if (maybe_mkdir(_path, mode) != 0)
         goto out;
@@ -393,7 +448,6 @@ out:
     free(_path);
     return result;
 }
-
 
 void cleanup_thread(lua_State *L, lua_State *thread) {
     // do some cleanup on the main stack - first, find the thread in our tasks table.
@@ -406,12 +460,12 @@ void cleanup_thread(lua_State *L, lua_State *thread) {
     while ((found = lua_next(L, -2)) != 0) {
         lua_State *candidateThread = lua_tothread(L, -1);
         if (candidateThread == thread) {
-            lua_pop(L,1);                          // stack = table, removefn, tasks, idx
+            lua_pop(L, 1); // stack = table, removefn, tasks, idx
             lua_call(L, 2, 0);
             lua_closethread(thread, NULL);
             break;
         } else {
-            lua_pop(L,1); // Doesn't pop the index, because we use that as the argument for lua_next
+            lua_pop(L, 1); // Doesn't pop the index, because we use that as the argument for lua_next
         }
     }
     if (!found) {
@@ -425,10 +479,11 @@ static int l_panic(lua_State *L) {
     dumpstack(L, "PANIC");
     printf("PANIC: %s. resetting device\n", lua_tostring(L, -1));
     // Schedule a reboot after 200ms
-    watchdog_enable(200, 0); 
-    while (true) {
-        ;
-    }
+    // watchdog_enable(200, 0);
+    // watchdog_disable();
+    // while (true) {
+    //     ;
+    // }
     return 0;
 }
 
@@ -446,8 +501,7 @@ static void dump_table(lua_State *L, int idx) {
     printf(">]\n");
 }
 
-
-static void printResponse(lua_State *L, int idx, char prefix) {
+static void printResponse(lua_State *L, int idx) {
     // if (lua_istable(L, idx)) {
     //     // See if it has a custom tostring
     //     int type = luaL_getmetafield(L, idx, "__tostring");
@@ -458,12 +512,12 @@ static void printResponse(lua_State *L, int idx, char prefix) {
     //     //     dump_table(L,idx);
     //     //     return;
     //     // }
-    // } 
+    // }
     lua_getglobal(L, "tostring");
     lua_pushvalue(L, idx);
     int error = lua_pcall(L, 1, 1, 0);
-    printf("%c %s\n", prefix, lua_tostring(L, -1)); // It could be an error, or not, but we can print either way.
-    lua_pop(L, 1); // Get rid of the string at the top.
+    puts(lua_tostring(L, -1)); // It could be an error, or not, but we can print either way.
+    lua_pop(L, 1);             // Get rid of the string at the top.
 }
 
 static void addThread(lua_State *L, int idx) {
@@ -480,7 +534,7 @@ static int l_schedule(lua_State *L) {
     lua_State *thread = lua_tothread(L, 1);
     addThread(L, 1);
 
-    int nargs = lua_gettop(L) -1;
+    int nargs = lua_gettop(L) - 1;
     if (nargs > 0) {
         lua_xmove(L, thread, nargs);
     }
@@ -493,7 +547,7 @@ static void lua_schedule_cmd(char *cmd) {
     lua_settop(L, 0); // We want a clean stack for this.
     lua_State *thread = lua_newthread(L);
     addThread(L, 1);
-    lua_pop(L,1); // Take the thread off the stack
+    lua_pop(L, 1); // Take the thread off the stack
 
     // Create a function in the thread context to execute the command(s)
     int error = addreturn(thread, cmd);
@@ -526,7 +580,7 @@ void lua_init() {
 
     lua_pushcfunction(L, l_listdir);
     lua_setglobal(L, "listdir");
-    
+
     lua_pushcfunction(L, l_reboot);
     lua_setglobal(L, "reboot");
 
@@ -545,7 +599,6 @@ void lua_init() {
     lua_pushcfunction(L, l_modbus_dali);
     lua_setglobal(L, "modbus_dali");
 
-
     lua_pushcfunction(L, l_catFile);
     lua_setglobal(L, "catfile");
 
@@ -562,8 +615,7 @@ void lua_init() {
     lua_setfield(L, -2, "delay");
     lua_pop(L, 1);
 
-
-    // Create a tasks global to store references to tasks as they are scheduled. 
+    // Create a tasks global to store references to tasks as they are scheduled.
     lua_newtable(L);
     lua_setglobal(L, "tasks");
 
@@ -585,10 +637,10 @@ void lua_init() {
     printf("starting main LUA REPL\n");
 }
 
-
 void lua_poll() {
     static char buf[MAX_LINE_LEN];
     static char *ptr = buf;
+    static bool echoEnabled = true;
 
     int ch;
     int error;
@@ -598,48 +650,56 @@ void lua_poll() {
     lua_State *L = mainThread;
 
     if (queue_try_remove(&btnChangeQueue, &btnChange)) {
-        sprintf(buf, "buttons[%d]=%s", btnChange.btnidx, btnChange.pressed  ? "true": "false");
+        sprintf(buf, "buttons[%d]=%s", btnChange.btnidx, btnChange.pressed ? "true" : "false");
         lua_schedule_cmd(buf);
     }
-    
+
     if (queue_try_remove(&runnableTasksQueue, &resumeCmd)) {
         // absolute_time_t t1 = get_absolute_time();
         // We have a thread to run
         int nres;
-        // printf("Resuming %p with %d args\n", resumeCmd.thread, resumeCmd.nargs);
-        int status = lua_status(resumeCmd.thread);
-        // printf("Resuming thread %p, in status %d\n", resumeCmd.thread, status);
-        if (true || status != LUA_YIELD) {
+        if (!isdead(resumeCmd.thread)) {
             int error = lua_resume(resumeCmd.thread, NULL, resumeCmd.nargs, &nres);
-            // printf("Schedule response %d, with %d responses\n", error, nres);
+            // printf("Resuming %p returned %d, with %d responses\n", resumeCmd.thread, error, nres);
 
             // Print any responses, be they errors or normal
-            if (nres > 0) {
-                // printf("Moving %d items from %p (stack size %d) to the main thread\n", nres, resumeCmd.thread, lua_gettop(resumeCmd.thread));
-                lua_xmove(resumeCmd.thread, L, nres);
-                // dumpstack(L, "Responses to print");
-                char prefix = error == LUA_OK ? '>' : error == LUA_YIELD ? '.' : '!';
-                while (lua_gettop(L)) {
-                    printResponse(L, 1, prefix);
-                    lua_remove(L, 1);
+            switch (error) {
+            case LUA_OK:
+                if (nres > 0) {
+                    // printf("Moving %d items from %p (stack size %d) to the main thread\n", nres, resumeCmd.thread, lua_gettop(resumeCmd.thread));
+                    lua_xmove(resumeCmd.thread, L, nres);
+                    // dumpstack(L, "Responses to print");
+                    while (lua_gettop(L)) {
+                        printResponse(L, 1);
+                        lua_remove(L, 1);
+                    }
                 }
-            }
-
-            if (error != LUA_YIELD && resumeCmd.thread != mainThread ) {
                 cleanup_thread(L, resumeCmd.thread);
+                break;
+            case LUA_YIELD:
+                // We ignore all responses
+                lua_settop(resumeCmd.thread, 0);
+                break;
+            default:
+                printf("Error: %s\n", lua_tostring(resumeCmd.thread, -1));
+                cleanup_thread(L, resumeCmd.thread);
+                break;
             }
         } else {
-            printf("attempt to resume a thread in status %d\n", status);
+            printf("attempt to resume a dead thread\n");
         }
         lua_settop(L, 0);
         // absolute_time_t t2 = get_absolute_time();
         // printf("Run loop took %lld us\n", absolute_time_diff_us(t1,t2));
 
     } else if ((ch = stdio_getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
-        if (ch == 3) {
+        if (ch == 1) {
+            echoEnabled = false;
+        } else if (ch == 3) {
             printf("\r^C\n");
+            echoEnabled = true;
             ptr = buf;
-        } else if (ch == 8) {
+        } else if (ch == 8 && echoEnabled) {
             if (ptr > buf) {
                 putchar(ch);
                 putchar(' ');
@@ -647,14 +707,18 @@ void lua_poll() {
                 ptr--;
             }
         } else if (ch == '\n') {
-            putchar(ch);
+            if (echoEnabled) {
+                putchar(ch);
+            }
             *ptr = '\0';
             lua_schedule_cmd(buf);
             ptr = buf;
-        } else if (ptr-buf < MAX_LINE_LEN && ch != '\r') {
-            putchar(ch);
+            echoEnabled = true;
+        } else if (ptr - buf < MAX_LINE_LEN && ch != '\r') {
+            if (echoEnabled) {
+                putchar(ch);
+            }
             *ptr++ = ch;
         }
     }
 }
-
