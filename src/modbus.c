@@ -10,7 +10,7 @@
 #include <string.h>
 #include <sys/types.h>
 
-#define MODBUS_RESPONSE_TIMEOUT_MS 500
+#define MODBUS_RESPONSE_TIMEOUT_MS 700
 
 #define RX_TASK_INDEX 1
 #define UART_ID uart1

@@ -7,6 +7,20 @@ function dump(t)
 end
 
 
+function string.splitToNumbers (inputstr, sep)
+    if sep == nil then
+        sep = "%s"
+    end
+    local t={}
+    for str in string.gmatch(inputstr, "([^"..sep.."]+)") do
+        local v = tonumber(str)
+        if v ~= 0 then
+            table.insert(t, v)
+        end
+    end
+    return t
+end
+
 
 AddressDict={}
 function AddressDict:new(o)
@@ -35,11 +49,10 @@ end
 ModbusGW = { available = false }
 function ModbusGW:new(address)
     local relays = { }
-    for i = 0,32 do
+    for i = 0,31 do
         relays[i] = false
     end
-    local o = { modbus_address = address, relays=relays, num_relays=32, _available=false }
-    relays._gw = o
+    local o = { modbus_address = address, relays=relays, _available=false }
 
     setmetatable(o, self)
     return o
@@ -63,7 +76,7 @@ end
 
 function ModbusGW:__newindex(key, value)
     if type(key) == "number" then 
-        success, res = pcall(function()
+        local success, res = pcall(function()
             modbus_set_coil(self.modbus_address, key, value)
             self:update()
         end)
@@ -89,7 +102,7 @@ function ModbusGW:__tostring ()
         return "null"
     else
         local ret = "["
-        for addr = 0,self.num_relays do
+        for addr = 0,#self.relays do
             if addr ~= 0 then
                 ret = ret .. ","
             end
@@ -114,21 +127,29 @@ end
 
 
 
-local daliAttrMap = {}
-daliAttrMap[0] =   {"brightness", "status"}
-daliAttrMap[64] =  {"min", "max"}
-daliAttrMap[128] = {"faderate", "fadetime"}
-daliAttrMap[192] = {"poweron", "powerfail"}
-daliAttrMap[256] = {"groups"}
-daliAttrMap["brightness"] = 0
-daliAttrMap["status"]     = 0
-daliAttrMap["min"]        = 64
-daliAttrMap["max"]        = 64
-daliAttrMap["faderate"]   = 128
-daliAttrMap["fadetime"]   = 128
-daliAttrMap["poweron"]    = 192
-daliAttrMap["powerfail"]  = 192
-daliAttrMap["groups"]     = 256
+local daliGetter = {
+    brightness = 0x01a0,
+    status     = 0x0190,
+    min        = 0x01a2,
+    max        = 0x01a1,
+    faderate   = 0x01a5,
+    fadetime   = 0x01a8,
+    powerfail  = 0x01a4,
+    poweron    = 0x01a3,
+    groups    = 0x01c0,
+}
+
+
+local daliSetter = {
+    brightness = 0x0000,
+    min        = 0x012b,
+    max        = 0x012a,
+    faderate   = 0x012f,
+    fadetime   = 0x012e,
+    poweron    = 0x012d,
+    powerfail  = 0x012c
+}
+
 
 
 -- DALI
@@ -146,14 +167,14 @@ function DaliLight:new (gw, addr)
         _powerfail = 0, 
         _faderate = 0, 
         _fadetime = 0, 
-        _groups = 0 
+        _groups = 0, 
     }
     setmetatable(o, self)
     return o
 end
 
 function DaliLight:__index(key) 
-    if key == "available" or daliAttrMap[key] ~= nil then
+    if key == "available" or daliGetter[key] ~= nil then
         return self["_" .. key]
     end
     return getmetatable(self)[key]
@@ -164,46 +185,54 @@ function DaliLight:__newindex (key, val)
         self._available = val
         return
     end
+    if key == "brightness" then 
+        self.gw:raw(val | (self.address << 9))
+    elseif key == "groups" then
+        -- Groups is managed by a set of add/removes one for each bit. 
+        -- First make sure we have the up to date values.
+        self:update("groups")
 
-    -- Attributes are represented in pairs. 
-    local offset = daliAttrMap[key]
-
-
-    if offset == nil then
-         error(string.format("Unsupported attribute %s", key))
-    end
-
-    if string.match(key, "^_") then
-        error(string.format("Can not update private attribute %s", key))
-    end
-
-    local order = daliAttrMap[offset]
-    -- we use combined 16 bit values.  Attributes toggle between the high and low bits.
-    local regVal
-
-    if offset == 0 then
-        -- Special case for brightness, as the high order byte must be zero when setting
-        regVal = val
-    elseif #order == 1 then
-        regVal = val
-    elseif order[1] == key then
-        -- value is the low byte
-        regVal = val | (self["_"..order[2]] << 8)
+        local changed = self._groups ~ val
+        print(string.format("New groups are 0x%04x, changed 0x%04x", val, changed))
+        local shiftReg = val
+        for bit=0,15 do
+            if (changed & 0x01) ~= 0 then
+                local cmd
+                if (shiftReg & 0x01) ~= 0 then
+                    print("Adding light to group", bit)
+                    cmd = (0x0160 + bit) | (self.address << 9)
+                else
+                    print("Removing light from group", bit)
+                    cmd = (0x0170 + bit) | (self.address << 9)
+                end
+                self.gw:raw(cmd, true)
+            end
+            changed = changed >> 1
+            shiftReg = shiftReg >> 1
+        end
     else
-        -- value is the high byte
-        regVal = (val << 8) | self["_"..order[1]]
+        local code = daliSetter[key]
+        if code == nil then
+            error("Illegal attribute " .. key)
+        end
+        self.gw:raw(daliSetter[key] | (self.address << 9))
     end
-
-    if not modbus_set_holding_register(self.gw.modbus_address, offset + self.address, regVal) then
-        error("Setting modbus register failed")
-    end
-
-    self:update(offset, true)
+    self:update(key, true)
 end
 
 function DaliLight:toggle()
-    modbus_set_coil(self.gw.modbus_address, self.address, self.brightness == 0)
-    self:update(0)
+    -- local res = modbus_set_coil(self.gw.modbus_address, self.address, self.brightness == 0)
+    local cmd
+    if self.brightness == 0 then
+        -- Recall last level
+        cmd = (self.address << 9) | 0x10a
+    else
+        -- Turn off
+        cmd = (self.address << 9) | 0x100
+    end
+    local res = self.gw:raw(cmd)
+    print(string.format("Result of sending 0x%04x is %s", cmd, res))
+    self:update("brightness")
 end
 
 
@@ -215,62 +244,102 @@ function DaliLight:fade(direction)
     else
         cmd = cmd | 0x108
     end
-    success, res = pcall(function()
+    local success, res = pcall(function()
         self.gw:raw(cmd)
-        self:update(0)
+        self:update("brightness")
     end)
     if not success then
         print("Could not execute fade", res)
     end
 end
 
-function DaliLight:updateReg(regoffset, val, forcePrint)
-    local attrs = daliAttrMap[regoffset]
-    if attrs == nil then
-        error("Invalid register offset")
+-- function DaliLight:updateReg(regoffset, val, forcePrint)
+--     local attrs = daliGetter[regoffset]
+--     if attrs == nil then
+--         error("Invalid register offset")
+--     end
+
+--     if val ~= nil then
+--         -- A 255 brightness indicates no device is present at that index.
+--         if regoffset == 0 then
+--             local available = (val & 0xFF) ~= 0xFF
+--             self:updateAttr("available", available)
+--             if not available then
+--                 val = val & 0xFF00
+--             end
+--         end
+
+--         if #attrs == 1 then
+--             self:updateAttr(attrs[1], val, forcePrint)
+--         else
+--             self:updateAttr(attrs[1], val & 0xFF, forcePrint)
+--             self:updateAttr(attrs[2], val >> 8, forcePrint)
+--         end
+--     else
+--         self:updateAttr("available", false)
+--     end
+-- end
+
+
+function DaliLight:update(attr, forcePrint)
+    if attr == nil then
+        self:update("brightness")
+        self:update("status")
+        self:update("min")
+        self:update("max")
+        self:update("poweron")
+        self:update("powerfail")
+        self:update("faderate")
+        self:update("fadetime")
+        self:update("groups") 
+        return;
     end
 
-    if val ~= nil then
-        -- A 255 brightness indicates no device is present at that index.
-        if regoffset == 0 then
-            local available = (val & 0xFF) ~= 0xFF
-            self:updateAttr("available", available)
-            if not available then
-                val = val & 0xFF00
+    local cmd = daliGetter[attr]
+    if cmd == nil then
+        error(string.format("Invalid attribute %s", attr))
+    end
+    local fullCmd = cmd | (self.address << 9)
+    -- print(string.format("sending command 0x%04x", fullCmd))
+    local val = self.gw:raw(fullCmd)
+    -- print("Result is ", val)
+    if val == nil then
+        self.available = false
+    else
+        self.available = true
+
+        if attr == "groups" then
+            -- We also need groups 8-15
+            fullCmd = fullCmd + 1
+            local highByte = self.gw:raw(fullCmd)
+            if highByte ~= nil then
+                self:updateAttr(attr, val | (highByte << 8), forcePrint)
             end
-        end
-
-        if #attrs == 1 then
-            self:updateAttr(attrs[1], val, forcePrint)
         else
-            self:updateAttr(attrs[1], val & 0xFF, forcePrint)
-            self:updateAttr(attrs[2], val >> 8, forcePrint)
+            self:updateAttr(attr, val, forcePrint)
         end
-    else
-        self:updateAttr("available", false)
-    end
-end
-
-function DaliLight:update(regoffset, forcePrint)
-    if regoffset == nil then
-        self:update(0)
-        -- Don't bother getting the other registers if we failed to find the device
-        if self.available then 
-            self:update(64)
-            self:update(128)
-            self:update(192)
-            self:update(256)
-        end
-        return
     end
 
-    local addr = regoffset+self.address
-    local success, res = pcall(modbus_get_holding_registers, self.gw.modbus_address, addr, 1)
-    if success then 
-        self:updateReg(regoffset, res[1], forcePrint)
-    else
-        error(string.format("Timeout or other error while fetching holding register %d: %s", addr, res))
-    end
+
+    -- if regoffset == nil then
+    --     self:update(0)
+    --     -- Don't bother getting the other registers if we failed to find the device
+    --     if self.available then 
+    --         self:update(64)
+    --         self:update(128)
+    --         self:update(192)
+    --         self:update(256)
+    --     end
+    --     return
+    -- end
+
+    -- local addr = regoffset+self.address
+    -- local success, res = pcall(modbus_get_holding_registers, self.gw.modbus_address, addr, 1)
+    -- if success then 
+    --     self:updateReg(regoffset, res[1], forcePrint)
+    -- else
+    --     error(string.format("Timeout or other error while fetching holding register %d: %s", addr, res))
+    -- end
 end
 
 
@@ -288,30 +357,33 @@ function DaliLight:updateAttr(key, val, forcePrint)
 
     if shouldPrint then
         if key == "available" then
-            print(string.format("dali[%s][%d]=%s", self.gw.modbus_address, self.address, val))
+            print(string.format("dali[%s][%d]=%s", self.gw.modbus_address, self.address, self))
         else
             print(string.format("dali[%s][%d].%s=%s", self.gw.modbus_address, self.address, key, val))
         end
     end
 end
 
-
 function DaliLight:__tostring ()
     if not self._available then
         return "null"
     end
     return string.format("{\"brightness\": %d, \"status\": %d, \"min\": %d, \"max\": %d, \"poweron\": %d, \"powerfail\": %d, \"faderate\":%d, \"fadetime\":%d, \"groups\": %d }", 
-        self._brightness,
-        self._status,
-        self._min,
-        self._max,
-        self._poweron,
-        self._powerfail,
-        self._faderate,
-        self._fadetime,
-        self._groups
+        self._brightness or 0,
+        self._status or 0,
+        self._min or 0,
+        self._max or 0,
+        self._poweron or 0,
+        self._powerfail or 0,
+        self._faderate or 0,
+        self._fadetime or 0,
+        self._groups or 0
     )
 end
+
+
+
+
 
 DaliGW = { }
 function DaliGW:new(address)
@@ -353,6 +425,21 @@ function DaliGW:raw(cmd, sendtwice)
     return modbus_dali(self.modbus_address, cmd, sendtwice)
 end
 
+-- Sends a command and treats _any_ response, including a malformed one, as a Yes.
+function DaliGW:yesno(cmd) 
+    local success, res = pcall(modbus_dali, self.modbus_address, cmd, false)
+    if success then 
+        return res ~= nil
+    else
+        if res == "Malformed response" or res == "Slave Device Failure" or string.match(res, "Pulse") then
+            -- We treat a bus collision as a Yes
+            return true
+        end
+        error(res)
+    end
+end
+
+
 function DaliGW:anyDaliDevicesLessThanOrEqualTo(val)
     -- Set Search Address H
     self:raw(0xb100 | ((val >> 16) & 0xff))
@@ -361,7 +448,7 @@ function DaliGW:anyDaliDevicesLessThanOrEqualTo(val)
     -- Set Search Address L
     self:raw(0xb500 | (val & 0xff))
     -- Compare - Will return a value if true, or None/0xFF otherwise.
-    return self:raw(0xa900) == 0xFF
+    return self:yesno(0xa900)
 end 
 
 function DaliGW:findLowestRandomAddress(low, high)
@@ -402,25 +489,22 @@ function DaliGW:find_available_addresses()
     print("checking for available device IDs");
     for addr=0,63 do 
         -- Query Control Gear Present for each address.
-        local present = self:raw(0x0191 | (addr << 9))
-        if present == nil then
-             print("DALI Gateway is not responding.  Assuming it is missing");
-             return avail;
-        elseif present == -10 then
+        local present = self:yesno(0x0191 | (addr << 9))
+        if present then
+            print(string.format("Address %d is already used", addr))
+        else 
             table.insert(avail, addr)
             print(string.format("%d addresses available for assignment", #avail))
-        else 
-            print(string.format("Address %d is already used", addr))
         end
     end
     return avail
 end
 
-function DaliGW:provision(full)
-    if full == nil then
-        full = true
+function DaliGW:provision(address)
+    if address == nil then
+        address = true
     end
-    if full then
+    if address then
         self:clear_all_addresses()
     end
     local avail = self:find_available_addresses()
@@ -428,9 +512,22 @@ function DaliGW:provision(full)
     print("Termninating previous provision, if any")
     self:raw(0xa100)
 
-    -- Initialise - with either None (0xFF) if incremental, or Broadcast if full
-    print("Initialising")
-    self:raw(full and 0xa500 or 0xa5ff, true)
+    local initCmd;
+    if type(address) == "number" then
+        if address < 0 or address > 63 then
+            error("Invalid address")
+        end
+        -- Target a specific address
+        initCmd = 0xa501 | (address << 1)
+    elseif address == False then
+        -- Those devices that are not yet addressed
+        initCmd = 0xa5ff
+    else
+        -- Broadcast
+        initCmd = 0xa500
+    end
+    print(string.format("Initialising with command 0x%04x", initCmd))
+    self:raw(initCmd, true)
     
     print("Randomising long addresses")
     self:raw(0xa700, true);
@@ -457,7 +554,7 @@ function DaliGW:provision(full)
             self:raw(0xb701 | (deviceAddress << 1), true)
 
             -- Verify Short Address
-            if self:raw(0xb901 | (deviceAddress << 1), true) ~= 0xFF then
+            if not self:yesno(0xb901 | (deviceAddress << 1), true) then
                 print(string.format("Device %06x did not verify its address assignment of %d", lowestRandomDeviceIdFound, deviceAddress))
                 return
             end
@@ -475,20 +572,30 @@ function DaliGW:provision(full)
 end
 
 function DaliGW:update ()
-    for offset=0,256,64 do
-        local success, res = pcall(modbus_get_holding_registers, self.modbus_address, offset, 64)
+    for address=0,63 do
+        local light = self[address]
+        success, res = pcall(light.update, light)
+        self.available = success
 
-        if success then
-            self.available = true
-            for addr=0,63 do
-                self[addr]:updateReg(offset, res[addr+1])
-            end
-        else
-            print(string.format("Could not update DALI@%d: %s", self.modbus_address, res))
-            self.available = false
-            break;
+        if not success then
+            print("error updating dali device", address, res)
+            break
         end
     end
+    -- for offset=0,256,64 do
+    --     local success, res = pcall(modbus_get_holding_registers, self.modbus_address, offset, 64)
+
+    --     if success then
+    --         self.available = true
+    --         for addr=0,63 do
+    --             self[addr]:updateReg(offset, res[addr+1])
+    --         end
+    --     else
+    --         print(string.format("Could not update DALI@%d: %s", self.modbus_address, res))
+    --         self.available = false
+    --         break;
+    --     end
+    -- end
 end
 
 
@@ -516,14 +623,14 @@ bindings = {
         if fp == nil then
             print("No Bindings file... Using defaults")
             for i=0,24*8 do
-                bindings._real[i] = 0
+                bindings._real[i] = {}
             end
             return
         end
 
         btn = 0
         for line in fp:lines() do
-            bindings._real[btn] = tonumber(line)
+            bindings._real[btn] = string.splitToNumbers(line, ",")
             btn = btn + 1
         end
 
@@ -533,7 +640,7 @@ bindings = {
     write = function()
         local fp = io.open("/bindings.txt", "w")
         for addr=0,#bindings-1 do
-            fp:write(string.format("%d\n", bindings[addr] or 0))
+            fp:write(table.concat(bindings[addr] or {}, ",") .. "\n")
         end
         fp:close()
     end,
@@ -542,7 +649,7 @@ bindings = {
 setmetatable(bindings, { 
     __index = function (self, key)
         if type(key) == 'number' and key < (24*8) then
-            return bindings._real[key] or 0
+            return bindings._real[key] or {}
         end
         return nil
     end,
@@ -553,7 +660,7 @@ setmetatable(bindings, {
         end
         if val ~= bindings._real[key] then
             bindings._real[key] = val
-            print(string.format("bindings[%d]=%d", key, val or 0))
+            print(string.format("bindings[%d]=[%s]", key, table.concat(val, ",") or "[]"))
             bindings.write()
         end
     end,
@@ -568,8 +675,7 @@ setmetatable(bindings, {
             if i ~= 0 then
                 ret = ret .. ","
             end
-            binding = self[i]
-            ret = ret .. tostring(binding)
+            ret = string.format(ret .. "[" .. table.concat(self[i], ",") .. "]")
         end
         return ret .. "]"
     end,
@@ -586,13 +692,11 @@ buttons = {
     velocity = {},
 
     press_task = function (btnidx)        
-        local binding = bindings[btnidx]
-
-        -- Only Dali devices can be faded
-        if binding then 
+        for idx, binding in ipairs(bindings[btnidx]) do
             local device_id = binding >> 8
             local address = binding & 0xFF
             local gwdev = dali[device_id]
+            -- Only Dali devices can be faded
             if gwdev then 
                 coroutine.delay(800)
                 local vel = buttons.velocity[btnidx]
@@ -612,7 +716,8 @@ buttons = {
             else
                 gwdev = modbus[device_id]
                 if gwdev then
-                    coroutine.schedule(coroutine.create(function() gwdev[address]:toggle() end))
+                    -- Toggle the relay
+                    coroutine.schedule(coroutine.create(function() gwdev[address] = not gwdev[address] end))
                 end
             end
         end
@@ -621,19 +726,21 @@ buttons = {
     end,
 
     release_task = function (btnidx)
-        local binding = bindings[btnidx]
+        local buttonBindings = bindings[btnidx]
 
         if buttons.velocity[btnidx] then
             -- We were fading, so reset the velocity if they don't re-press for half a second
             coroutine.delay(333)
             buttons.velocity[btnidx] = nil
-        elseif binding ~= 0 then
-            local device = binding >> 8
-            local daligw = dali[device]
-            -- We only toggle dali devices on release.  Modbus are toggled on press.
-            if daligw then
-                -- Run the command in a separate corotine so it can't be interrupted, and it uses up to date values
-                coroutine.schedule(coroutine.create(function() daligw[binding & 0xFF]:toggle() end))
+        else
+            for idx, binding in ipairs(buttonBindings) do
+                local device = binding >> 8
+                local daligw = dali[device]
+                -- We only toggle dali devices on release.  Modbus are toggled on press.
+                if daligw then
+                    -- Run the command in a separate corotine so it can't be interrupted, and it uses up to date values
+                    coroutine.schedule(coroutine.create(function() daligw[binding & 0xFF]:toggle() end))
+                end
             end
         end
         -- We're done, so remove ourselves from the task table for cleanliness

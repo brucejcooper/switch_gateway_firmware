@@ -28,7 +28,7 @@ def escape_string(s):
 
 
 
-with serial.Serial('/dev/tty.usbmodem11201', 115200) as ser:
+with serial.Serial('/dev/ttyACM0', 115200) as ser:
     for file in sys.argv[1:]:
         filename = f"/lua/{os.path.basename(file)}"
         print(f"Writing {file} to {filename}")

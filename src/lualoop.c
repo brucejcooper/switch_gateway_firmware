@@ -142,7 +142,7 @@ static int l_reboot(lua_State *L) {
 }
 
 static const char *modbus_error_codes[] = {
-    "Unknown 0x00",
+    "Timeout waiting for response from gateway",
     "Illegal Function",
     "Illegal Data Address",
     "Illegal Data Value",
@@ -154,6 +154,46 @@ static const char *modbus_error_codes[] = {
     "Unknown 0x09",
     "Gateway Path Unavailable",
     "Gateway Target Failed to Respond",
+    NULL, // 0x0c
+    NULL, // 0x0d
+    NULL, // 0x0e
+    NULL, // 0x0f
+    NULL, // 0x10
+    NULL, // 0x11
+    NULL, // 0x12
+    NULL, // 0x13
+    NULL, // 0x14
+    NULL, // 0x15
+    NULL, // 0x16
+    NULL, // 0x17
+    NULL, // 0x18
+    NULL, // 0x19
+    NULL, // 0x1a
+    NULL, // 0x1b
+    NULL, // 0x1c
+    NULL, // 0x1d
+    NULL, // 0x1e
+    NULL, // 0x1f
+    "Responded with 0 bits - should have been reported as a NAK",
+    "Responded with 1 bits",
+    "Responded with 2 bits",
+    "Responded with 3 bits",
+    "Responded with 4 bits",
+    "Responded with 5 bits",
+    "Responded with 6 bits",
+    "Responded with 7 bits",
+    "Responded with 8 bits - Should have been reported as valid",
+    "Responded with 9 bits",
+    "Responded with 10 bits",
+    "Responded with 11 bits",
+    "Responded with 12 bits",
+    "Responded with 13 bits",
+    "Responded with 14 bits",
+    "Responded with 15 bits",
+    "Malformed response",
+    "Pulse Too Short",
+    "Pulse between short and long",
+    "Pulse Too long"
 };
 
 
@@ -163,7 +203,7 @@ static void pushModbusErr(lua_State *L, int res, uint8_t *buf) {
         lua_pushstring(L, "Timeout");
     } else {
         unsigned int err = buf[2];
-        if (err < sizeof(modbus_error_codes)/sizeof(char *)) {
+        if (err < sizeof(modbus_error_codes)/sizeof(char *) &&  modbus_error_codes[err]) {
             lua_pushstring(L, modbus_error_codes[err]);
         } else {
             lua_pushfstring(L, "Modbus error %d", err);
@@ -251,11 +291,16 @@ static int l_modbus_set_coil(lua_State *L) {
 static void modbus_dali_complete(int res, uint8_t *buf, void *ctx) {
     lua_State *L = (lua_State *)ctx;
     if (L && !isdead(L)) {
-        if (res >= 5) {
+        // TODO 4 is technically incorrect, but I just want it to work for now.
+        if (res ==4 || res == 5) {
+            if (res == 4) {
+                printf("Technically incorrect Dali response %d 0x%02x%02x%02x%02x%02x with thread %p\n", res, buf[0], buf[1], buf[2], buf[3], buf[4], L);
+            }
             lua_pushboolean(L, true);
             lua_pushinteger(L, buf[2]);
-        } else if (res == -5 && (buf[2] == 10 || buf[2] == 11)) {
-            // Error code 0x0b means the DALI device did not respond.  Rather than treat this as an error, return nil
+        } else if (res == -5 && (buf[2] == 0x0a || buf[2] == 0x0b)) {
+            // Error code 0x0b means the gateway sent the command, but the downstream DALI device did not respond.  
+            // Rather than treat this as an error, return nil.
             // We also allow 0x0a because of a historical bug.
             lua_pushboolean(L, true);
             lua_pushnil(L);
@@ -263,18 +308,22 @@ static void modbus_dali_complete(int res, uint8_t *buf, void *ctx) {
             pushModbusErr(L, res, buf);            
         }
         scheduleResume(L, 2);
+    } else {
+        printf("Thread is dead\n");
     }
 }
 
 static int l_modbus_dali(lua_State *L) {
     const int modbus_device = luaL_checkinteger(L, 1);
     const int cmd = luaL_checkinteger(L, 2);
-    const bool repeat = lua_toboolean(L, 3);
+    const int repeat = lua_toboolean(L, 3) ? 2 : 1;
     if (L == mainThread) {
         luaL_error(L, "must call from coroutine");
         return 0;
     }
-    modbus_dali(modbus_device, cmd, repeat ? 2 : 1, modbus_dali_complete, L);
+    // printf("Dali sending 0x%04x %d times\n", cmd, repeat);
+
+    modbus_dali(modbus_device, cmd, repeat, modbus_dali_complete, L);
     return lua_yieldk(L, 0, 2, l_unwrap_resume);
 }
 
