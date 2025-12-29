@@ -220,19 +220,26 @@ function DaliLight:__newindex (key, val)
     self:update(key, true)
 end
 
-function DaliLight:toggle()
-    -- local res = modbus_set_coil(self.gw.modbus_address, self.address, self.brightness == 0)
-    local cmd
-    if self.brightness == 0 then
-        -- Recall last level
-        cmd = (self.address << 9) | 0x10a
-    else
-        -- Turn off
-        cmd = (self.address << 9) | 0x100
-    end
-    local res = self.gw:raw(cmd)
-    print(string.format("Result of sending 0x%04x is %s", cmd, res))
+function DaliLight:on()
+    -- Recall last level
+    local res = self.gw:raw((self.address << 9) | 0x10a)
     self:update("brightness")
+
+end
+
+function DaliLight:off()
+    -- Off
+    local res = self.gw:raw((self.address << 9) | 0x100)
+    self:update("brightness")
+end
+
+
+function DaliLight:toggle()
+    if self.brightness == 0 then
+        self:on()
+    else
+        self:off()
+    end
 end
 
 
@@ -252,34 +259,6 @@ function DaliLight:fade(direction)
         print("Could not execute fade", res)
     end
 end
-
--- function DaliLight:updateReg(regoffset, val, forcePrint)
---     local attrs = daliGetter[regoffset]
---     if attrs == nil then
---         error("Invalid register offset")
---     end
-
---     if val ~= nil then
---         -- A 255 brightness indicates no device is present at that index.
---         if regoffset == 0 then
---             local available = (val & 0xFF) ~= 0xFF
---             self:updateAttr("available", available)
---             if not available then
---                 val = val & 0xFF00
---             end
---         end
-
---         if #attrs == 1 then
---             self:updateAttr(attrs[1], val, forcePrint)
---         else
---             self:updateAttr(attrs[1], val & 0xFF, forcePrint)
---             self:updateAttr(attrs[2], val >> 8, forcePrint)
---         end
---     else
---         self:updateAttr("available", false)
---     end
--- end
-
 
 function DaliLight:update(attr, forcePrint)
     if attr == nil then
@@ -319,27 +298,6 @@ function DaliLight:update(attr, forcePrint)
             self:updateAttr(attr, val, forcePrint)
         end
     end
-
-
-    -- if regoffset == nil then
-    --     self:update(0)
-    --     -- Don't bother getting the other registers if we failed to find the device
-    --     if self.available then 
-    --         self:update(64)
-    --         self:update(128)
-    --         self:update(192)
-    --         self:update(256)
-    --     end
-    --     return
-    -- end
-
-    -- local addr = regoffset+self.address
-    -- local success, res = pcall(modbus_get_holding_registers, self.gw.modbus_address, addr, 1)
-    -- if success then 
-    --     self:updateReg(regoffset, res[1], forcePrint)
-    -- else
-    --     error(string.format("Timeout or other error while fetching holding register %d: %s", addr, res))
-    -- end
 end
 
 
@@ -646,6 +604,29 @@ bindings = {
     end,
 }
 
+function is_on(device, address)
+    if device == 1 then
+        return modbus[device][address]
+    else
+        local level = dali[device]:raw(0x01a0 | (address << 9));
+        return level ~= nil and level > 0
+    end
+end
+
+function set_device(device, address, value)
+    if device == 1 then
+        modbus[device][address] = value
+    else
+        local l = dali[device][address]
+        if value then
+            l:on()
+        else
+            l:off()
+        end        
+    end
+end
+
+
 setmetatable(bindings, { 
     __index = function (self, key)
         if type(key) == 'number' and key < (24*8) then
@@ -691,34 +672,49 @@ buttons = {
     tasks = {},
     velocity = {},
 
-    press_task = function (btnidx)        
-        for idx, binding in ipairs(bindings[btnidx]) do
-            local device_id = binding >> 8
-            local address = binding & 0xFF
-            local gwdev = dali[device_id]
-            -- Only Dali devices can be faded
-            if gwdev then 
-                coroutine.delay(800)
-                local vel = buttons.velocity[btnidx]
-                if vel then
-                    vel = -vel
-                else 
-                    vel = -1
-                end
-                buttons.velocity[btnidx] = vel
-                
-                local light = gwdev[address]
-                light:fade(vel)
-                while true do
-                    coroutine.delay(300)
-                    light:fade(vel)
-                end
-            else
-                gwdev = modbus[device_id]
-                if gwdev then
-                    -- Toggle the relay
-                    coroutine.schedule(coroutine.create(function() gwdev[address] = not gwdev[address] end))
-                end
+    press_task = function (btnidx)
+        local btnbindings = bindings[btnidx]
+
+        if btnbindings and #btnbindings > 0 then
+            local first_binding = btnbindings[1]
+            local first_device_id = first_binding >> 8
+            local first_address = first_binding & 0xFF
+
+            local is_on = is_on(first_device_id, first_address)
+            print("Device ", first_device_id, first_address, "is", is_on)
+
+            for idx, binding in ipairs(bindings[btnidx]) do
+                local device_id = binding >> 8
+                local address = binding & 0xFF
+
+                print("Setting", device_id, address, "to", not is_on)
+
+                set_device(device_id, address, not is_on)
+                -- local gwdev = dali[device_id]
+                -- -- Only Dali devices can be faded
+                -- if gwdev then 
+                --     coroutine.delay(800)
+                --     local vel = buttons.velocity[btnidx]
+                --     if vel then
+                --         vel = -vel
+                --     else 
+                --         vel = -1
+                --     end
+                --     buttons.velocity[btnidx] = vel
+                    
+                --     local light = gwdev[address]
+                --     light:fade(vel)
+                --     while true do
+                --         coroutine.delay(300)
+                --         light:fade(vel)
+                --     end
+                -- else
+                --     gwdev = modbus[device_id]
+                --     if gwdev then
+                --         -- Toggle the relay
+                --         coroutine.schedule(coroutine.create(function() gwdev[address] = not gwdev[address] end))
+                --     end
+                -- end
             end
         end
         -- We're done, so remove ourselves from the task table for cleanliness
@@ -726,23 +722,23 @@ buttons = {
     end,
 
     release_task = function (btnidx)
-        local buttonBindings = bindings[btnidx]
+        -- local buttonBindings = bindings[btnidx]
 
-        if buttons.velocity[btnidx] then
-            -- We were fading, so reset the velocity if they don't re-press for half a second
-            coroutine.delay(333)
-            buttons.velocity[btnidx] = nil
-        else
-            for idx, binding in ipairs(buttonBindings) do
-                local device = binding >> 8
-                local daligw = dali[device]
-                -- We only toggle dali devices on release.  Modbus are toggled on press.
-                if daligw then
-                    -- Run the command in a separate corotine so it can't be interrupted, and it uses up to date values
-                    coroutine.schedule(coroutine.create(function() daligw[binding & 0xFF]:toggle() end))
-                end
-            end
-        end
+        -- if buttons.velocity[btnidx] then
+        --     -- We were fading, so reset the velocity if they don't re-press for half a second
+        --     coroutine.delay(333)
+        --     buttons.velocity[btnidx] = nil
+        -- else
+        --     for idx, binding in ipairs(buttonBindings) do
+        --         local device = binding >> 8
+        --         local daligw = dali[device]
+        --         -- We only toggle dali devices on release.  Modbus are toggled on press.
+        --         if daligw then
+        --             -- Run the command in a separate corotine so it can't be interrupted, and it uses up to date values
+        --             coroutine.schedule(coroutine.create(function() daligw[binding & 0xFF]:toggle() end))
+        --         end
+        --     end
+        -- end
         -- We're done, so remove ourselves from the task table for cleanliness
         buttons.tasks[btnidx] = nil
     end
@@ -761,9 +757,9 @@ setmetatable(buttons, {
             else
                 -- cancel any existing task that is happening for our button 
                 local t = buttons.tasks[key]
-                if t and coroutine.status(t) ~= "dead" then
-                    coroutine.close(t)
-                end
+                -- if t and coroutine.status(t) ~= "dead" then
+                --     coroutine.close(t)
+                -- end
                 buttons.tasks[key] = me
                 -- We are already running in a coroutine. process the potentially long running side effect of pressed/released,
                 -- with the understanding that we may be cancelled by a subsequent press/release
