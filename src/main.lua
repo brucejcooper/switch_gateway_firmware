@@ -75,7 +75,7 @@ function ModbusGW:updateAttr(key, value)
 end
 
 function ModbusGW:__newindex(key, value)
-    if type(key) == "number" then 
+    if type(key) == "number" then
         local success, res = pcall(function()
             modbus_set_coil(self.modbus_address, key, value)
             self:update()
@@ -91,7 +91,7 @@ end
 function ModbusGW:__index(key)
     if key == "available" then
         return self._available
-    elseif type(key) == "number" then 
+    elseif type(key) == "number" then
         return self.relays[key]
     end
     return getmetatable(self)[key]
@@ -155,40 +155,40 @@ local daliSetter = {
 -- DALI
 DaliLight={}
 function DaliLight:new (gw, addr)
-    local o = { 
-        gw=gw, 
-        address=addr, 
+    local o = {
+        gw=gw,
+        address=addr,
         _status = 0,
-        _available = false, 
-        _brightness = 0, 
-        _min = 0, 
-        _max = 0, 
-        _poweron = 0, 
-        _powerfail = 0, 
-        _faderate = 0, 
-        _fadetime = 0, 
-        _groups = 0, 
+        _available = false,
+        _brightness = 0,
+        _min = 0,
+        _max = 0,
+        _poweron = 0,
+        _powerfail = 0,
+        _faderate = 0,
+        _fadetime = 0,
+        _groups = 0,
     }
     setmetatable(o, self)
     return o
 end
 
-function DaliLight:__index(key) 
+function DaliLight:__index(key)
     if key == "available" or daliGetter[key] ~= nil then
         return self["_" .. key]
     end
     return getmetatable(self)[key]
 end
 
-function DaliLight:__newindex (key, val) 
+function DaliLight:__newindex (key, val)
     if key == "available" then
         self._available = val
         return
     end
-    if key == "brightness" then 
+    if key == "brightness" then
         self.gw:raw(val | (self.address << 9))
     elseif key == "groups" then
-        -- Groups is managed by a set of add/removes one for each bit. 
+        -- Groups is managed by a set of add/removes one for each bit.
         -- First make sure we have the up to date values.
         self:update("groups")
 
@@ -270,7 +270,7 @@ function DaliLight:update(attr, forcePrint)
         self:update("powerfail")
         self:update("faderate")
         self:update("fadetime")
-        self:update("groups") 
+        self:update("groups")
         return;
     end
 
@@ -326,7 +326,7 @@ function DaliLight:__tostring ()
     if not self._available then
         return "null"
     end
-    return string.format("{\"brightness\": %d, \"status\": %d, \"min\": %d, \"max\": %d, \"poweron\": %d, \"powerfail\": %d, \"faderate\":%d, \"fadetime\":%d, \"groups\": %d }", 
+    return string.format("{\"brightness\": %d, \"status\": %d, \"min\": %d, \"max\": %d, \"poweron\": %d, \"powerfail\": %d, \"faderate\":%d, \"fadetime\":%d, \"groups\": %d }",
         self._brightness or 0,
         self._status or 0,
         self._min or 0,
@@ -359,7 +359,7 @@ function DaliGW:__index(key)
     if key == 'available' then
         return self._available
     end
-    if type(key) == 'number' and key >= 0 and key < 64 then 
+    if type(key) == 'number' and key >= 0 and key < 64 then
         -- if not self._available then
         --     error("attempt to fetch light from unavailable gateway")
         -- end
@@ -368,7 +368,7 @@ function DaliGW:__index(key)
     return getmetatable(self)[key]
 end
 
-function DaliGW:__newindex(key, val) 
+function DaliGW:__newindex(key, val)
     if key == 'available' then
         if val ~= self._available then
             self._available = val
@@ -379,14 +379,14 @@ function DaliGW:__newindex(key, val)
     end
 end
 
-function DaliGW:raw(cmd, sendtwice) 
+function DaliGW:raw(cmd, sendtwice)
     return modbus_dali(self.modbus_address, cmd, sendtwice)
 end
 
 -- Sends a command and treats _any_ response, including a malformed one, as a Yes.
-function DaliGW:yesno(cmd) 
+function DaliGW:yesno(cmd)
     local success, res = pcall(modbus_dali, self.modbus_address, cmd, false)
-    if success then 
+    if success then
         return res ~= nil
     else
         if res == "Malformed response" or res == "Slave Device Failure" or string.match(res, "Pulse") then
@@ -407,7 +407,7 @@ function DaliGW:anyDaliDevicesLessThanOrEqualTo(val)
     self:raw(0xb500 | (val & 0xff))
     -- Compare - Will return a value if true, or None/0xFF otherwise.
     return self:yesno(0xa900)
-end 
+end
 
 function DaliGW:findLowestRandomAddress(low, high)
     -- As a sanity check, make sure there's at least one device in initialisation mode, otherwise we'll be looking for ages.
@@ -424,7 +424,7 @@ function DaliGW:findLowestRandomAddress(low, high)
                 return low
             end
             high = testPoint
-        else 
+        else
             -- It must be above the middle value
             low = testPoint + 1
         end
@@ -441,16 +441,16 @@ function DaliGW:clear_all_addresses()
     self:raw(0xff80, true)
 end
 
-function DaliGW:find_available_addresses() 
-    avail = {} 
+function DaliGW:find_available_addresses()
+    avail = {}
 
     print("checking for available device IDs");
-    for addr=0,63 do 
+    for addr=0,63 do
         -- Query Control Gear Present for each address.
         local present = self:yesno(0x0191 | (addr << 9))
         if present then
             print(string.format("Address %d is already used", addr))
-        else 
+        else
             table.insert(avail, addr)
             print(string.format("%d addresses available for assignment", #avail))
         end
@@ -486,14 +486,14 @@ function DaliGW:provision(address)
     end
     print(string.format("Initialising with command 0x%04x", initCmd))
     self:raw(initCmd, true)
-    
+
     print("Randomising long addresses")
     self:raw(0xa700, true);
 
     -- Give the devices a moment to randomise...
     coroutine.delay(100)
 
-    
+
     local lowestRandomDeviceIdFound = -1
     local addressIdx = 0
     local devicesAdded = 0
@@ -561,7 +561,7 @@ function DaliGW:__tostring ()
     if not self._available then
         return "null"
     end
-    local res = "[" 
+    local res = "["
     for addr=0,63 do
         if addr ~= 0 then
             res = res .. ","
@@ -574,7 +574,7 @@ end
 
 
 
-bindings = { 
+bindings = {
     _real = {},
     read = function()
         local fp = io.open("/bindings.txt", "r")
@@ -622,12 +622,12 @@ function set_device(device, address, value)
             l:on()
         else
             l:off()
-        end        
+        end
     end
 end
 
 
-setmetatable(bindings, { 
+setmetatable(bindings, {
     __index = function (self, key)
         if type(key) == 'number' and key < (24*8) then
             return bindings._real[key] or {}
@@ -667,8 +667,8 @@ bindings.read()
 
 
 
-buttons = { 
-    pressed = {}, 
+buttons = {
+    pressed = {},
     tasks = {},
     velocity = {},
 
@@ -692,16 +692,16 @@ buttons = {
                 set_device(device_id, address, not is_on)
                 -- local gwdev = dali[device_id]
                 -- -- Only Dali devices can be faded
-                -- if gwdev then 
+                -- if gwdev then
                 --     coroutine.delay(800)
                 --     local vel = buttons.velocity[btnidx]
                 --     if vel then
                 --         vel = -vel
-                --     else 
+                --     else
                 --         vel = -1
                 --     end
                 --     buttons.velocity[btnidx] = vel
-                    
+
                 --     local light = gwdev[address]
                 --     light:fade(vel)
                 --     while true do
@@ -755,7 +755,7 @@ setmetatable(buttons, {
             if ismain then
                 print("Button being changed from main, which should never happen")
             else
-                -- cancel any existing task that is happening for our button 
+                -- cancel any existing task that is happening for our button
                 local t = buttons.tasks[key]
                 -- if t and coroutine.status(t) ~= "dead" then
                 --     coroutine.close(t)
@@ -824,5 +824,5 @@ devices = AddressDict:new{
     modbus = modbus,
 }
 
--- Perform an initial scan of the devices, but do it in a co-routine so that this file can be directly run. 
+-- Perform an initial scan of the devices, but do it in a co-routine so that this file can be directly run.
 coroutine.schedule(coroutine.create(function() return update() end ))
