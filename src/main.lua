@@ -477,7 +477,7 @@ function DaliGW:provision(address)
         end
         -- Target a specific address
         initCmd = 0xa501 | (address << 1)
-    elseif address == False then
+    elseif address == false then
         -- Those devices that are not yet addressed
         initCmd = 0xa5ff
     else
