@@ -573,6 +573,28 @@ end
 
 
 
+function is_on(device, address)
+    if device == 1 then
+        return modbus[device][address]
+    else
+        local level = dali[device]:raw(0x01a0 | (address << 9));
+        return level ~= nil and level > 0
+    end
+end
+
+function set_device(device, address, value)
+    if device == 1 then
+        modbus[device][address] = value
+    else
+        local l = dali[device][address]
+        if value then
+            l:on()
+        else
+            l:off()
+        end
+    end
+end
+
 
 bindings = {
     _real = {},
@@ -602,30 +624,17 @@ bindings = {
         end
         fp:close()
     end,
-}
 
-function is_on(device, address)
-    if device == 1 then
-        return modbus[device][address]
-    else
-        local level = dali[device]:raw(0x01a0 | (address << 9));
-        return level ~= nil and level > 0
-    end
-end
-
-function set_device(device, address, value)
-    if device == 1 then
-        modbus[device][address] = value
-    else
-        local l = dali[device][address]
-        if value then
-            l:on()
-        else
-            l:off()
+    clear = function()
+        for addr=0,#bindings-1 do
+            bindings._real[addr] = {}
         end
     end
-end
 
+    add = function(button, target) do
+        table.insert(bindings._real[button], target)
+    end
+}
 
 setmetatable(bindings, {
     __index = function (self, key)
