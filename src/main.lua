@@ -477,7 +477,7 @@ function DaliGW:provision(address)
         end
         -- Target a specific address
         initCmd = 0xa501 | (address << 1)
-    elseif address == false then
+    elseif address == False then
         -- Those devices that are not yet addressed
         initCmd = 0xa5ff
     else
@@ -628,11 +628,12 @@ bindings = {
     clear = function()
         for addr=0,#bindings-1 do
             bindings._real[addr] = {}
-        end
+        endx
     end
 
-    add = function(button, target) do
-        table.insert(bindings._real[button], target)
+    add = function(fixture, button, device, address) do
+        local idx = 
+        table.insert(bindings._real[fixture*8+button], device*8+address)
     end
 }
 
