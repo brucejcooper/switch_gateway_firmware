@@ -628,11 +628,10 @@ bindings = {
     clear = function()
         for addr=0,#bindings-1 do
             bindings._real[addr] = {}
-        endx
+        end
     end
 
     add = function(fixture, button, device, address)
-        local idx = 
         table.insert(bindings._real[fixture*8+button], device*8+address)
     end
 }
