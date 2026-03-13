@@ -631,7 +631,7 @@ bindings = {
         endx
     end
 
-    add = function(fixture, button, device, address) do
+    add = function(fixture, button, device, address)
         local idx = 
         table.insert(bindings._real[fixture*8+button], device*8+address)
     end
