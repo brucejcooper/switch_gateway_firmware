@@ -458,40 +458,71 @@ function DaliGW:find_available_addresses()
     return avail
 end
 
-function DaliGW:provision(address)
-    if address == nil then
-        address = true
-    end
-    if address then
-        self:clear_all_addresses()
-    end
-    local avail = self:find_available_addresses()
-    -- Terminate any existing provisioning processes.
-    print("Termninating previous provision, if any")
-    self:raw(0xa100)
-
+function DaliGW:initialise(address)
     local initCmd;
     if type(address) == "number" then
         if address < 0 or address > 63 then
             error("Invalid address")
         end
+        print("Targetting address", address)
         -- Target a specific address
         initCmd = 0xa501 | (address << 1)
-    elseif address == False then
+    elseif address == true then
+        print("Targeting all devices (Broadcast)");
+        -- Broadcast
+        initCmd = 0xa500
+    elseif address == false or address == nil then
+        print("Targeting unaddressed devices");
         -- Those devices that are not yet addressed
         initCmd = 0xa5ff
     else
-        -- Broadcast
-        initCmd = 0xa500
+        error("Illegal address argument")
     end
-    print(string.format("Initialising with command 0x%04x", initCmd))
+    print(string.format("setting devices into initialise mode with command 0x%04x", initCmd))
     self:raw(initCmd, true)
+end
 
+function DaliGW:terminate()
+    print("Termninating previous provision, if any")
+    self:raw(0xa100)
+end
+
+function DaliGW:randomise() 
     print("Randomising long addresses")
     self:raw(0xa700, true);
-
-    -- Give the devices a moment to randomise...
     coroutine.delay(100)
+end
+
+function DaliGW:programShortAddress(addr)
+    self:raw(0xb701 | (addr << 1), true)
+end
+
+function DaliGW:verifyShortAddress(addr)
+    return self:yesno(0xb901 | (addr << 1), true)
+end
+
+function DaliGW:withdraw()
+    -- Withdraw the device we just assigned
+    self:raw(0xab00)
+end
+
+
+function DaliGW:provision(address, dryrun)
+    if address == nil then
+        error("Address parameter (#1) must be boolean or a number between 0 and 63 inclusive")
+    end
+    if address == true then
+        if dryrun then
+            print("Not clearing addresses, because of dryrun")
+        else
+            print("Clearing all previous addresses")
+            self:clear_all_addresses()
+        end 
+    end
+    local avail = self:find_available_addresses()
+    self:terminate()
+    self:initialise(address)
+    self:randomise()
 
 
     local lowestRandomDeviceIdFound = -1
@@ -502,22 +533,20 @@ function DaliGW:provision(address)
 
         if lowestRandomDeviceIdFound ~= nil then
             if #avail == 0 then
-                print(string.format("Ran out of available addresses after %d items", addressIdx))
-                return
+                error(string.format("Ran out of available addresses after %d items", addressIdx))
             end
             local deviceAddress = table.remove(avail, 1)
             print(string.format("Found device at random address %06x. Assigning address %d", lowestRandomDeviceIdFound, deviceAddress))
 
-            -- Program Short Address
-            self:raw(0xb701 | (deviceAddress << 1), true)
-
-            -- Verify Short Address
-            if not self:yesno(0xb901 | (deviceAddress << 1), true) then
-                print(string.format("Device %06x did not verify its address assignment of %d", lowestRandomDeviceIdFound, deviceAddress))
-                return
+            if dryrun then
+                print("Not assigning address as we are performing a dry run")
+            else
+                self:programShortAddress(deviceAddress)
+                if not self:verifyShortAddress(deviceAddress) then
+                    error(string.format("Device %06x did not verify its address assignment of %d", lowestRandomDeviceIdFound, deviceAddress))
+                end
             end
-            -- Withdraw the device we just assigned
-            self:raw(0xab00)
+            self:withdraw()
             devicesAdded = devicesAdded + 1
         else
             print("No more devices found")
