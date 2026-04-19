@@ -152,6 +152,7 @@ local daliSetter = {
 
 
 
+
 -- DALI
 DaliLight={}
 function DaliLight:new (gw, addr)
@@ -215,7 +216,8 @@ function DaliLight:__newindex (key, val)
         if code == nil then
             error("Illegal attribute " .. key)
         end
-        self.gw:raw(daliSetter[key] | (self.address << 9))
+        self.gw:set_dtr0(val)
+        self.gw:raw(daliSetter[key] | (self.address << 9), true)
     end
     self:update(key, true)
 end
@@ -432,11 +434,14 @@ function DaliGW:findLowestRandomAddress(low, high)
     return nil
 end
 
+function DaliGW:set_dtr0(val) 
+    self:raw(0xa3 | (val & 0xff))
+end
 
 function DaliGW:clear_all_addresses()
     print("Clearing all existing Short IDs")
     -- Set DTR0 to 255
-    self:raw(0xa3ff)
+    self:set_dtr0(0xff)
     -- Broadcast clear Short address
     self:raw(0xff80, true)
 end
