@@ -1,0 +1,11 @@
+{
+  "domain": "lighting_modbus",
+  "name": "Lighting Modbus",
+  "version": "2.0.0",
+  "documentation": "https://git.8bitcloud.com/bruce/switch_gateway_firmware",
+  "requirements": ["pymodbus==3.7.4"],
+  "dependencies": [],
+  "codeowners": [],
+  "config_flow": true,
+  "iot_class": "local_polling"
+}
