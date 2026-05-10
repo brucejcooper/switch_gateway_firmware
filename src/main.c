@@ -1,60 +1,136 @@
+/*
+ * main.c — switch gateway firmware, v2.
+ *
+ * Retains from original:
+ *   - pico_enable_filesystem (pico-vfs / littlefs via fopen())
+ *   - modbus_init() + modbus_poll() ISR-driven poll loop
+ *   - buttongrid_init() + PIO button scanner
+ *   - alarm_pool_init_default()
+ *   - watchdog
+ *   - LED heartbeat
+ *
+ * Replaces:
+ *   - lua_init() / lua_poll()  → serial_protocol_init() / serial_poll()
+ *   - Lua coroutine scheduler  → button_fsm_tick() + callback model
+ *   - DALI coroutine bindings  → lighting_actions + dirty_poll_tick()
+ */
+
 #include "modbus.h"
+#include "button_actions.h"
+#include "button_fsm.h"
+#include "state_cache.h"
+#include "config.h"
+#include "mapping.h"
+#include "lighting_actions.h"
+#include "dirty_poll.h"
+#include "serial_protocol.h"
+#include "dali_provision.h"
+
 #include <hardware/timer.h>
+#include <hardware/watchdog.h>
 #include <pico/stdio.h>
 #include <pico/stdlib.h>
-// #include "entity_status.h"
-// #include "dali_provision.h"
-#include "button_actions.h"
-#include "filesystem/vfs.h"
-#include "lualoop.h"
-#include <dirent.h>
-#include <hardware/flash.h>
-#include <hardware/watchdog.h>
-#include <lauxlib.h>
-#include <lua.h>
-#include <lualib.h>
 #include <pico/time.h>
-#include <sys/types.h>
 
-extern void buttongrid_task(void *data);
-
-// Perform initialisation
-int pico_led_init(void) {
-    // A device like Pico that uses a GPIO for the LED will define PICO_DEFAULT_LED_PIN
-    // so we can use normal GPIO functionality to turn the led on and off
+static int pico_led_init(void) {
     gpio_init(PICO_DEFAULT_LED_PIN);
     gpio_set_dir(PICO_DEFAULT_LED_PIN, GPIO_OUT);
     return PICO_OK;
 }
 
-#define MAX_LINE_LEN 256
+/* Blocking relay read using the sync_read pattern from dirty_poll.c */
+typedef struct { volatile bool done; volatile bool ok;
+                 uint8_t *bits; } relay_sync_ctx_t;
 
-int main() {
+static void relay_read_cb(int res, uint8_t *buf, void *ctx) {
+    relay_sync_ctx_t *c = (relay_sync_ctx_t *)ctx;
+    if (res >= 7) { /* addr+FC+bytecount+4bytes+CRC... actually buf has raw frame */
+        /* buf[2] = byte count, buf[3..] = coil bytes, each bit = one coil */
+        uint8_t byte_count = buf[2];
+        for (int i = 0; i < byte_count && i < 4; i++) {
+            c->bits[i] = buf[3 + i];
+        }
+        c->ok = true;
+    }
+    c->done = true;
+}
+
+int main(void) {
     stdio_init_all();
     fs_init();
     alarm_pool_init_default();
+
     int rc = pico_led_init();
     hard_assert(rc == PICO_OK);
 
-    busy_wait_ms(2500);
+    busy_wait_ms(2500); /* USB enumeration settling time */
 
     if (watchdog_enable_caused_reboot()) {
-        printf("Rebooted by Watchdog or explicit reset!\n");
+        printf("Rebooted by Watchdog\n");
     } else {
         printf("Clean boot\n");
     }
 
-    modbus_init();     // Init script might call modbus, so it gets initialised first
-    lua_init();        // Then lua.  Anything that modbus depends on will be initialised before the init script gets called
-    buttongrid_init(); // Button grid goes last, as it injects commands into the lua state.
+    /* Load persistent config and mappings */
+    config_load();
+    mapping_load();
+    state_cache_init();
+
+    /* Modbus must init first (may be called during scan) */
+    modbus_init();
+
+    /* Dirty poll init before full scan */
+    dirty_poll_init();
+    dali_provision_init();
+
+    /* Full scan of each DALI slave — blocking, establishes ground truth */
+    for (int i = 0; i < g_config.dali_slave_count; i++) {
+        dirty_poll_full_scan(g_config.dali_slave_ids[i]);
+    }
+
+    /* Read all relay coils to sync cache */
+    {
+        static relay_sync_ctx_t ctx;
+        static uint8_t coil_bits[4] = {0};
+        ctx = (relay_sync_ctx_t){ false, false, coil_bits };
+        modbus_get_coils(g_config.relay_slave_id, 0, 32, relay_read_cb, &ctx);
+        absolute_time_t dl = make_timeout_time_ms(1000);
+        while (!ctx.done && absolute_time_diff_us(get_absolute_time(), dl) > 0) {
+            modbus_poll();
+        }
+        if (ctx.ok) {
+            for (int ch = 0; ch < 32; ch++) {
+                bool on = (coil_bits[ch / 8] >> (ch % 8)) & 1;
+                state_cache_set_relay((uint8_t)ch, on);
+                lighting_emit_relay_state((uint8_t)ch, on);
+            }
+        }
+    }
+
+    /* Button grid — goes last as in original, injects events once loop starts */
+    button_fsm_init();
+    buttongrid_init();
+
+    serial_protocol_init();
 
     watchdog_enable(5000, 1);
 
+    /* Announce over USB */
+    sleep_ms(100);
+    serial_tx_hello();
+
+    /* ── Main loop ────────────────────────────────────────────────────── */
     while (true) {
         modbus_poll();
         watchdog_update();
-        lua_poll();
+
+        button_fsm_tick();
+        dirty_poll_tick();
+        dali_provision_tick();
+        serial_poll();
+
         watchdog_update();
     }
+
     panic_unsupported();
 }
