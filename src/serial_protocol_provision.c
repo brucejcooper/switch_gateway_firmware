@@ -15,6 +15,7 @@
 #include "serial_protocol.h"
 #include "dali_provision.h"
 #include "config.h"
+#include "log.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -141,6 +142,8 @@ void serial_handle_provision_start(const char *line, unsigned cmd_id) {
         return;
     }
 
+    LOG_INFO("prov", "dispatch start slave=%u mode=%s target=%u",
+             (unsigned)slave, mode_str, (unsigned)target);
     bool started = dali_provision_start((uint8_t)slave, mode, (uint8_t)target);
     serial_tx_ack(cmd_id, started, started ? NULL : "start_failed");
 }

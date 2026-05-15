@@ -38,5 +38,16 @@ void state_cache_set_dali_present(uint8_t slave_idx, uint8_t addr, bool present)
 /* Returns slave index for a given slave_id, or -1 if unknown */
 int  state_cache_slave_idx(uint8_t slave_id);
 
+/* Per-slave DALI group membership cache, populated by dirty_poll_full_scan.
+ * group_members[g] is a 64-bit mask of ballasts in group g. */
+void     state_cache_set_dali_group(uint8_t slave_idx, uint8_t group, uint64_t mask);
+uint64_t state_cache_get_dali_group(uint8_t slave_idx, uint8_t group);
+
+/* True if any present ballast in this group has arc_level > 0. */
+bool     state_cache_dali_group_any_on(uint8_t slave_idx, uint8_t group);
+
+/* Max arc level across present members; 0 if no member is on. */
+uint8_t  state_cache_dali_group_max_bri(uint8_t slave_idx, uint8_t group);
+
 /* Returns true if any light mapped to (fixture,button) is currently on */
 bool state_cache_any_on(uint8_t fixture, uint8_t button);

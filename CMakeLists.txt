@@ -20,10 +20,12 @@ add_executable(light_switch
     src/mapping.c
     src/lighting_actions.c
     src/dirty_poll.c
+    src/bus_discovery.c
     src/serial_protocol.c
     src/serial_protocol_provision.c
     src/dali_provision.c
     src/button_fsm_emit.c
+    src/log.c
 )
 
 add_subdirectory(lib/pico-vfs)

@@ -53,3 +53,8 @@ void modbus_get_input_registers(uint8_t device_id, uint16_t addr,
  * Persisted to /modbus_baud.txt. Default 38400 to match TinyModbus config. */
 void modbus_set_baud(uint32_t baud);
 uint32_t modbus_get_baud(void);
+
+/* Switch the master UART baud rate at runtime without touching the
+ * persisted config file. Only safe when no Modbus action is in flight —
+ * intended for boot-time discovery. */
+void modbus_uart_set_baud_runtime(uint32_t baud);

@@ -19,12 +19,15 @@ void dirty_poll_background_check(uint8_t slave_id);
 #define DIRTY_ZERO_SETTLE_COUNT  2u
 #define BACKGROUND_CHECK_MS      60000u
 
-/* TinyModbus FC04 register addresses */
-#define DALI_BLOCK0_START     0x0000u
-#define DALI_BLOCK1_START     0x0040u
-#define DALI_BLOCK2_START     0x0080u
-#define DALI_BLOCK3_START     0x00C0u
-#define DALI_PRESENT_START    0x0151u
-#define DALI_DIRTY_START      0x0159u
+/* TinyModbus register addresses (post task-1-flag-driven refactor).
+ * Per-ballast banks (BLOCK0..BLOCK3) are FC03 holding registers; the
+ * presence and dirty bitmasks are FC04 input registers. */
+#define DALI_BLOCK0_START     0x0000u  /* FC03 holding */
+#define DALI_BLOCK1_START     0x0040u  /* FC03 holding */
+#define DALI_BLOCK2_START     0x0080u  /* FC03 holding */
+#define DALI_BLOCK3_START     0x00C0u  /* FC03 holding */
+#define DALI_PRESENT_START    0x0100u  /* FC04 input, 4 regs */
+#define DALI_DIRTY_START      0x0104u  /* FC04 input, 4 regs, read-clears */
+#define DALI_GROUP_MASK_START 0x0110u  /* FC03 holding, 4 regs/group * 16 groups = 64 regs */
 #define DALI_SCAN_TRIGGER_REG 0x1010u
 #define DALI_MAX_CHUNK        16u

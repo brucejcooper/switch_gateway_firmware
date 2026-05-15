@@ -5,10 +5,12 @@
 
 static bool                  s_relay[RELAY_COUNT];
 static dali_ballast_state_t  s_dali[MAX_DALI_SLAVES][DALI_ADDR_COUNT];
+static uint64_t              s_dali_groups[MAX_DALI_SLAVES][16];
 
 void state_cache_init(void) {
-    memset(s_relay, 0, sizeof(s_relay));
-    memset(s_dali,  0, sizeof(s_dali));
+    memset(s_relay,        0, sizeof(s_relay));
+    memset(s_dali,         0, sizeof(s_dali));
+    memset(s_dali_groups,  0, sizeof(s_dali_groups));
 }
 
 void state_cache_set_relay(uint8_t ch, bool on) {
@@ -58,6 +60,43 @@ void state_cache_set_dali_present(uint8_t slave_idx, uint8_t addr, bool present)
     s_dali[slave_idx][addr].present = present;
 }
 
+void state_cache_set_dali_group(uint8_t slave_idx, uint8_t group, uint64_t mask) {
+    if (slave_idx >= MAX_DALI_SLAVES || group >= 16) return;
+    s_dali_groups[slave_idx][group] = mask;
+}
+
+uint64_t state_cache_get_dali_group(uint8_t slave_idx, uint8_t group) {
+    if (slave_idx >= MAX_DALI_SLAVES || group >= 16) return 0;
+    return s_dali_groups[slave_idx][group];
+}
+
+bool state_cache_dali_group_any_on(uint8_t slave_idx, uint8_t group) {
+    if (slave_idx >= MAX_DALI_SLAVES || group >= 16) return false;
+    uint64_t mask = s_dali_groups[slave_idx][group];
+    while (mask) {
+        uint8_t a = (uint8_t)__builtin_ctzll(mask);
+        mask &= mask - 1;
+        if (a >= DALI_ADDR_COUNT) continue;
+        dali_ballast_state_t *b = &s_dali[slave_idx][a];
+        if (b->present && b->arc_level > 0) return true;
+    }
+    return false;
+}
+
+uint8_t state_cache_dali_group_max_bri(uint8_t slave_idx, uint8_t group) {
+    if (slave_idx >= MAX_DALI_SLAVES || group >= 16) return 0;
+    uint64_t mask = s_dali_groups[slave_idx][group];
+    uint8_t  max  = 0;
+    while (mask) {
+        uint8_t a = (uint8_t)__builtin_ctzll(mask);
+        mask &= mask - 1;
+        if (a >= DALI_ADDR_COUNT) continue;
+        dali_ballast_state_t *b = &s_dali[slave_idx][a];
+        if (b->present && b->arc_level > max) max = b->arc_level;
+    }
+    return max;
+}
+
 bool state_cache_any_on(uint8_t fixture, uint8_t button) {
     const mapping_record_t *rec = mapping_lookup(fixture, button);
     if (!rec) return false;
@@ -69,8 +108,15 @@ bool state_cache_any_on(uint8_t fixture, uint8_t button) {
         } else {
             int idx = state_cache_slave_idx(slave);
             if (idx < 0) continue;
-            dali_ballast_state_t *b = state_cache_get_dali((uint8_t)idx, addr);
-            if (b && b->arc_level > 0) return true;
+            if (TARGET_IS_GROUP(rec->targets[i])) {
+                if (state_cache_dali_group_any_on((uint8_t)idx,
+                                                   TARGET_GROUP_NUM(rec->targets[i])))
+                    return true;
+            } else {
+                dali_ballast_state_t *b = state_cache_get_dali(
+                    (uint8_t)idx, TARGET_BALLAST_ADDR(rec->targets[i]));
+                if (b && b->arc_level > 0) return true;
+            }
         }
     }
     return false;

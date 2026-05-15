@@ -12,6 +12,7 @@
 #include "mapping.h"            /* fix #2: SLAVE_RELAY, MAX_FIXTURES, MAX_BUTTONS */
 #include "state_cache.h"
 #include "config.h"
+#include "log.h"
 #include "pico/time.h"
 #include <string.h>
 
@@ -54,7 +55,15 @@ static void do_toggle(uint8_t fixture, uint8_t button) {
     if (!rec) return;
     bool any_on = state_cache_any_on(fixture, button);
     for (int i = 0; i < rec->target_count; i++) {
-        lighting_set_on_off(rec->targets[i].slave, rec->targets[i].addr, !any_on);
+        if (TARGET_IS_GROUP(rec->targets[i])) {
+            lighting_group_set_on_off(rec->targets[i].slave,
+                                       TARGET_GROUP_NUM(rec->targets[i]),
+                                       !any_on);
+        } else {
+            lighting_set_on_off(rec->targets[i].slave,
+                                 TARGET_BALLAST_ADDR(rec->targets[i]),
+                                 !any_on);
+        }
     }
 }
 
@@ -63,8 +72,15 @@ static void do_dim_step(uint8_t fixture, uint8_t button, dim_dir_t dir) {
     if (!rec) return;
     for (int i = 0; i < rec->target_count; i++) {
         if (rec->targets[i].slave == SLAVE_RELAY) continue; /* relays don't dim */
-        lighting_dali_step(rec->targets[i].slave, rec->targets[i].addr,
-                           dir == DIM_UP);
+        if (TARGET_IS_GROUP(rec->targets[i])) {
+            lighting_group_step(rec->targets[i].slave,
+                                 TARGET_GROUP_NUM(rec->targets[i]),
+                                 dir == DIM_UP);
+        } else {
+            lighting_dali_step(rec->targets[i].slave,
+                                TARGET_BALLAST_ADDR(rec->targets[i]),
+                                dir == DIM_UP);
+        }
     }
 }
 
@@ -75,6 +91,7 @@ static void process_raw(uint8_t fixture, uint8_t button,
     switch (fsm->state) {
     case BTN_STATE_IDLE:
         if (raw == BTN_RAW_PRESS) {
+            LOG_INFO("btn", "F%u.B%u press", fixture, button);
             fsm->press_time_ms = now_ms;
             fsm->dir_locked    = false;
             fsm->state         = BTN_STATE_PRESSED;
@@ -91,6 +108,9 @@ static void process_raw(uint8_t fixture, uint8_t button,
 
     case BTN_STATE_HOLDING:
         if (raw == BTN_RAW_RELEASE) {
+            uint32_t held = now_ms - fsm->press_time_ms;
+            LOG_INFO("btn", "F%u.B%u release held=%lu ms",
+                     fixture, button, (unsigned long)held);
             emit_button_event(fixture, button, "release");
             fsm->release_time_ms = now_ms;
             fsm->state           = BTN_STATE_RELEASED_AFTER_HOLD;
@@ -105,11 +125,15 @@ static void process_raw(uint8_t fixture, uint8_t button,
                 fsm->last_dir      = (fsm->last_dir == DIM_DOWN) ? DIM_UP : DIM_DOWN;
                 fsm->dir_locked    = true;
                 fsm->press_time_ms = now_ms;
+                LOG_INFO("btn", "F%u.B%u long_press_start dir=%s",
+                         fixture, button,
+                         fsm->last_dir == DIM_UP ? "up" : "down");
                 emit_button_event(fixture, button, "long_press_start");
                 do_dim_step(fixture, button, fsm->last_dir);
                 fsm->last_repeat_ms = now_ms;
                 fsm->state          = BTN_STATE_HOLDING;
             } else {
+                LOG_INFO("btn", "F%u.B%u press", fixture, button);
                 fsm->press_time_ms = now_ms;
                 fsm->dir_locked    = false;
                 fsm->state         = BTN_STATE_PRESSED;
@@ -143,6 +167,9 @@ void button_fsm_tick(void) {
                         fsm->last_dir  = initial_dir(f, b);
                         fsm->dir_locked = true;
                     }
+                    LOG_INFO("btn", "F%u.B%u long_press_start dir=%s",
+                             (unsigned)f, (unsigned)b,
+                             fsm->last_dir == DIM_UP ? "up" : "down");
                     emit_button_event(f, b, "long_press_start");
                     do_dim_step(f, b, fsm->last_dir);
                     fsm->last_repeat_ms = now_ms;
@@ -152,6 +179,7 @@ void button_fsm_tick(void) {
             }
             case BTN_STATE_HOLDING: {
                 if (now_ms - fsm->last_repeat_ms >= g_config.dim_repeat_ms) {
+                    LOG_DBG("btn", "F%u.B%u repeat", (unsigned)f, (unsigned)b);
                     emit_button_event(f, b, "long_press_repeat");
                     do_dim_step(f, b, fsm->last_dir);
                     fsm->last_repeat_ms = now_ms;

@@ -25,6 +25,8 @@
 #include "dirty_poll.h"
 #include "serial_protocol.h"
 #include "dali_provision.h"
+#include "bus_discovery.h"
+#include "log.h"
 
 #include <hardware/timer.h>
 #include <hardware/watchdog.h>
@@ -66,18 +68,31 @@ int main(void) {
     busy_wait_ms(2500); /* USB enumeration settling time */
 
     if (watchdog_enable_caused_reboot()) {
-        printf("Rebooted by Watchdog\n");
+        LOG_INFO("boot", "Rebooted by Watchdog");
     } else {
-        printf("Clean boot\n");
+        LOG_INFO("boot", "Clean boot");
     }
 
     /* Load persistent config and mappings */
     config_load();
     mapping_load();
     state_cache_init();
+    LOG_INFO("boot", "config loaded relay_slave=%u dali_slaves=%u",
+             g_config.relay_slave_id, g_config.dali_slave_count);
 
     /* Modbus must init first (may be called during scan) */
     modbus_init();
+    LOG_INFO("boot", "modbus init baud=%lu", (unsigned long)modbus_get_baud());
+
+    /* Bus discovery: probe each configured slave at the canonical baud,
+     * recovering factory-default 9600-baud slaves to 38400 if needed.
+     * Runs before watchdog_enable and before any DALI/relay scan. */
+    LOG_INFO("boot", "bus discovery: relay=%u dali_count=%u",
+             g_config.relay_slave_id, g_config.dali_slave_count);
+    bus_discover_slave(g_config.relay_slave_id, SLAVE_KIND_WAVESHARE_RELAY);
+    for (int i = 0; i < g_config.dali_slave_count; i++) {
+        bus_discover_slave(g_config.dali_slave_ids[i], SLAVE_KIND_TINYMODBUS_DALI);
+    }
 
     /* Dirty poll init before full scan */
     dirty_poll_init();
@@ -85,6 +100,7 @@ int main(void) {
 
     /* Full scan of each DALI slave — blocking, establishes ground truth */
     for (int i = 0; i < g_config.dali_slave_count; i++) {
+        LOG_INFO("boot", "scanning slave %u", g_config.dali_slave_ids[i]);
         dirty_poll_full_scan(g_config.dali_slave_ids[i]);
     }
 
@@ -104,6 +120,9 @@ int main(void) {
                 state_cache_set_relay((uint8_t)ch, on);
                 lighting_emit_relay_state((uint8_t)ch, on);
             }
+            LOG_INFO("boot", "relay sync: 32 channels read");
+        } else {
+            LOG_WARN("boot", "relay sync: read failed");
         }
     }
 
@@ -118,6 +137,8 @@ int main(void) {
     /* Announce over USB */
     sleep_ms(100);
     serial_tx_hello();
+
+    LOG_INFO("boot", "main loop entering, watchdog=5000 ms");
 
     /* ── Main loop ────────────────────────────────────────────────────── */
     while (true) {

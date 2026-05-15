@@ -15,6 +15,7 @@
 #include "lighting_actions.h"
 #include "config.h"
 #include "dali_provision.h"
+#include "log.h"
 #include "pico/time.h"
 #include <string.h>
 #include <stdio.h>
@@ -73,7 +74,7 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
 
     /* fix #5: FC04 4-register frame = slave+FC+bytecount+8data+CRC = 13 bytes */
     if (res < 13) {
-        printf("dirty bitmask read failed slave %u (%d)\n", slave_id, res);
+        LOG_WARN("dirty", "bitmask read failed slave %u (%d)", slave_id, res);
         return;
     }
 
@@ -82,6 +83,11 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
                     ((uint64_t)((p[2]<<8)|p[3]) << 16)  |
                     ((uint64_t)((p[4]<<8)|p[5]) << 32)  |
                     ((uint64_t)((p[6]<<8)|p[7]) << 48);
+
+    if (mask != 0) {
+        LOG_INFO("dirty", "slave=%u dirty_mask=0x%016llx",
+                 slave_id, (unsigned long long)mask);
+    }
 
     if (mask == 0) {
         dp->zero_count++;
@@ -95,9 +101,10 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             if (mask & ((uint64_t)1 << a)) {
                 dp->state = DPOLL_AWAITING_BALLAST;
-                modbus_get_input_registers(slave_id,
-                                           DALI_BLOCK0_START + (uint16_t)a, 1,
-                                           ballast_read_cb, &s_bctx[idx][a]);
+                /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
+                modbus_get_holding_registers(slave_id,
+                                             DALI_BLOCK0_START + (uint16_t)a, 1,
+                                             ballast_read_cb, &s_bctx[idx][a]);
                 break;
             }
         }
@@ -120,6 +127,8 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
         uint8_t status = buf[3];
         uint8_t arc    = buf[4];
         lighting_emit_dali_state(slave, addr, arc, status);
+        LOG_INFO("dirty", "ballast %u.%u arc=%u status=0x%02x",
+                 slave, addr, arc, status);
         if ((status & 0x02) || (status & 0x80)) {
             lighting_emit_fault(slave, addr,
                                 (status & 0x02) != 0,
@@ -131,9 +140,10 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
     for (int a = addr + 1; a < DALI_ADDR_COUNT; a++) {
         if (dp->pending_dirty & ((uint64_t)1 << a)) {
             dp->state = DPOLL_AWAITING_BALLAST;
-            modbus_get_input_registers(slave,
-                                       DALI_BLOCK0_START + (uint16_t)a, 1,
-                                       ballast_read_cb, &s_bctx[idx][a]);
+            /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
+            modbus_get_holding_registers(slave,
+                                         DALI_BLOCK0_START + (uint16_t)a, 1,
+                                         ballast_read_cb, &s_bctx[idx][a]);
             return;
         }
     }
@@ -206,13 +216,65 @@ static bool sync_read(uint8_t slave, uint16_t addr, uint16_t count,
     return ctx.ok;
 }
 
+/* FC03 holding-register variant — used for the per-ballast banks (BLOCK0..3)
+ * which moved from FC04 input regs to FC03 holding regs in the refactor. */
+static bool sync_read_holding(uint8_t slave, uint16_t addr, uint16_t count,
+                              uint16_t *out) {
+    static sync_ctx_t ctx;
+    ctx.done  = false;
+    ctx.ok    = false;
+    ctx.out   = out;
+    ctx.count = count;
+    modbus_get_holding_registers(slave, addr, count, sync_read_cb, &ctx);
+    absolute_time_t deadline = make_timeout_time_ms(1000);
+    while (!ctx.done && absolute_time_diff_us(get_absolute_time(), deadline) > 0)
+        modbus_poll();
+    return ctx.ok;
+}
+
+/* ── Group-mask read (used by full_scan and background_check) ────────────── */
+/* Group g lives at FC03 holding regs DALI_GROUP_MASK_START + 4*g .. +4*g+3.
+ * TinyModbus stores each group's 8-byte member bitmap as group_mask[g][0..7]
+ * where byte 0 covers ballasts 0-7 (LSB=ballast 0), byte 1 ballasts 8-15, …,
+ * byte 7 ballasts 56-63 (see TinyModbus/src/registers.c:376-387).
+ * The register read path packs each pair as (group_mask[g][2r] << 8) |
+ * group_mask[g][2r+1] (registers.c:159-163). So in the 16-bit register value
+ * received here, the HIGH byte holds the lower-numbered ballasts and the LOW
+ * byte holds the higher-numbered ones. Byte-swap each register so that bit N
+ * in the assembled 64-bit mask corresponds to ballast short address N. */
+static void read_all_group_masks(uint8_t slave_id, uint8_t idx) {
+    uint16_t regs[64];  /* 16 groups * 4 regs */
+    for (uint16_t chunk = 0; chunk < 4; chunk++) {
+        uint16_t off = chunk * DALI_MAX_CHUNK;  /* 4 groups per 16-reg chunk */
+        if (!sync_read_holding(slave_id,
+                                DALI_GROUP_MASK_START + off,
+                                DALI_MAX_CHUNK, regs + off)) {
+            LOG_WARN("dirty", "group mask chunk %u failed slave %u",
+                     chunk, slave_id);
+            return;
+        }
+    }
+    for (uint8_t g = 0; g < 16; g++) {
+        uint16_t *r = regs + 4 * g;
+        uint64_t mask = 0;
+        for (int word = 0; word < 4; word++) {
+            uint16_t v = r[word];
+            /* Swap bytes: high byte = lower-numbered ballasts (bits N..N+7),
+             * low byte = higher-numbered ballasts (bits N+8..N+15). */
+            uint16_t le = (uint16_t)((v >> 8) | ((v & 0xFFu) << 8));
+            mask |= (uint64_t)le << (word * 16);
+        }
+        state_cache_set_dali_group(idx, g, mask);
+    }
+}
+
 /* ── Blocking startup full scan ──────────────────────────────────────────── */
 
 void dirty_poll_full_scan(uint8_t slave_id) {
     int idx = state_cache_slave_idx(slave_id);
     if (idx < 0) return;
 
-    printf("Full scan: slave %u\n", slave_id);
+    LOG_INFO("dirty", "Full scan: slave %u", slave_id);
 
     /* Trigger firmware scan */
     {
@@ -237,12 +299,12 @@ void dirty_poll_full_scan(uint8_t slave_id) {
         ((uint64_t)present_regs[3] << 48);
     s_dp[idx].last_present = present_mask;
 
-    /* Block 0 in 16-register chunks */
+    /* Block 0 in 16-register chunks (FC03 holding regs post refactor). */
     uint16_t regs[DALI_ADDR_COUNT];
     for (uint16_t chunk = 0; chunk < 4; chunk++) {
         uint16_t off = chunk * DALI_MAX_CHUNK;
-        if (!sync_read(slave_id, DALI_BLOCK0_START + off, DALI_MAX_CHUNK, regs + off))
-            printf("block0 chunk %u failed\n", chunk);
+        if (!sync_read_holding(slave_id, DALI_BLOCK0_START + off, DALI_MAX_CHUNK, regs + off))
+            LOG_WARN("dirty", "block0 chunk %u failed", chunk);
     }
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         bool present = (present_mask & ((uint64_t)1 << a)) != 0;
@@ -253,12 +315,13 @@ void dirty_poll_full_scan(uint8_t slave_id) {
                                   (regs[a] >> 8) & 0xFF);
     }
 
+    /* BLOCK1..3 are FC03 holding regs post refactor. */
     uint16_t b1[DALI_ADDR_COUNT], b2[DALI_ADDR_COUNT], b3[DALI_ADDR_COUNT];
     for (uint16_t chunk = 0; chunk < 4; chunk++) {
         uint16_t off = chunk * DALI_MAX_CHUNK;
-        sync_read(slave_id, DALI_BLOCK1_START + off, DALI_MAX_CHUNK, b1 + off);
-        sync_read(slave_id, DALI_BLOCK2_START + off, DALI_MAX_CHUNK, b2 + off);
-        sync_read(slave_id, DALI_BLOCK3_START + off, DALI_MAX_CHUNK, b3 + off);
+        sync_read_holding(slave_id, DALI_BLOCK1_START + off, DALI_MAX_CHUNK, b1 + off);
+        sync_read_holding(slave_id, DALI_BLOCK2_START + off, DALI_MAX_CHUNK, b2 + off);
+        sync_read_holding(slave_id, DALI_BLOCK3_START + off, DALI_MAX_CHUNK, b3 + off);
     }
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         if (!(present_mask & ((uint64_t)1 << a))) continue;
@@ -268,11 +331,27 @@ void dirty_poll_full_scan(uint8_t slave_id) {
                                     (b3[a] >> 8) & 0xFF, b3[a] & 0xFF);
     }
 
+    /* Group membership masks (FC03 0x0110-0x014F). Must be read before the
+     * per-ballast emit loop below so that lighting_emit_dali_state's group
+     * derivation sees populated membership masks. */
+    read_all_group_masks(slave_id, (uint8_t)idx);
+
+    /* Emit per-ballast state events for every present ballast so the bridge
+     * gets initial state without having to wait for the first dirty bit.
+     * This also drives Layer-2 group-state derivation since membership masks
+     * are now loaded. */
+    for (int a = 0; a < DALI_ADDR_COUNT; a++) {
+        if (!(present_mask & ((uint64_t)1 << a))) continue;
+        uint8_t arc    = regs[a] & 0xFF;
+        uint8_t status = (regs[a] >> 8) & 0xFF;
+        lighting_emit_dali_state(slave_id, (uint8_t)a, arc, status);
+    }
+
     /* fix #6: emit scan_complete — bridge uses this to set per-ballast availability */
     lighting_emit_scan_complete(slave_id, present_mask);
 
-    printf("Full scan slave %u complete — present=0x%016llX\n",
-           slave_id, (unsigned long long)present_mask);
+    LOG_INFO("dirty", "Full scan slave %u complete — present=0x%016llX",
+             slave_id, (unsigned long long)present_mask);
 }
 
 void dirty_poll_background_check(uint8_t slave_id) {
@@ -288,11 +367,19 @@ void dirty_poll_background_check(uint8_t slave_id) {
         ((uint64_t)present_regs[2] << 32) |
         ((uint64_t)present_regs[3] << 48);
 
+    LOG_INFO("dirty", "background check slave=%u present=0x%016llx",
+             slave_id, (unsigned long long)present_mask);
+
     uint64_t prev        = s_dp[idx].last_present;
     uint64_t appeared    = present_mask & ~prev;
     uint64_t disappeared = prev & ~present_mask;
 
     if (appeared || disappeared) {
+        LOG_INFO("dirty",
+                 "presence change slave=%u appeared=0x%016llx disappeared=0x%016llx",
+                 slave_id,
+                 (unsigned long long)appeared,
+                 (unsigned long long)disappeared);
         s_dp[idx].last_present = present_mask;
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             state_cache_set_dali_present((uint8_t)idx, (uint8_t)a,
@@ -301,10 +388,15 @@ void dirty_poll_background_check(uint8_t slave_id) {
         lighting_emit_presence(slave_id, appeared, disappeared);
     }
 
+    /* Re-read group membership masks so memberships set via Modbus by an
+     * external master are picked up (and to recover from any drift). */
+    read_all_group_masks(slave_id, (uint8_t)idx);
+
+    /* BLOCK0 is FC03 holding regs post refactor. */
     uint16_t b0[DALI_ADDR_COUNT];
     for (uint16_t c = 0; c < 4; c++) {
-        sync_read(slave_id, DALI_BLOCK0_START + c * DALI_MAX_CHUNK,
-                  DALI_MAX_CHUNK, b0 + c * DALI_MAX_CHUNK);
+        sync_read_holding(slave_id, DALI_BLOCK0_START + c * DALI_MAX_CHUNK,
+                          DALI_MAX_CHUNK, b0 + c * DALI_MAX_CHUNK);
     }
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         if (!(present_mask & ((uint64_t)1 << a))) continue;

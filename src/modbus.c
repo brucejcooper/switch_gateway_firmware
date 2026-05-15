@@ -10,6 +10,7 @@
  */
 
 #include "modbus.h"
+#include "log.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
 #include "pico/util/queue.h"
@@ -141,9 +142,10 @@ static void uart_irq(void) {
         }
         nread++;
     }
-    if (nread == 0) {
-        printf("Read ISR has No data... timeout?\n");
-    }
+    /* Note: do NOT call LOG_* from ISR context.  If nread==0 the next
+     * MODBUS_RECEIVING tick will time out and emit a warn from the poll
+     * loop instead. */
+    (void)nread;
 }
 
 /* ── DE release alarm (identical to original) ────────────────────────────── */
@@ -173,7 +175,7 @@ static modbus_de_mode_t parseDeMode(const char *str) {
     for (modbus_de_mode_t mode = 0; mode < MODBUS_DE_MAX; mode++) {
         if (strcmp(str, modbus_de_mode_str[mode]) == 0) return mode;
     }
-    printf("unknown modbus DE mode '%s' — assuming tx\n", str);
+    LOG_WARN("modbus", "unknown DE mode '%s' — assuming tx", str);
     return MODBUS_DE_WHENTX;
 }
 
@@ -196,6 +198,12 @@ void modbus_set_baud(uint32_t baud) {
 }
 
 uint32_t modbus_get_baud(void) { return s_baud; }
+
+void modbus_uart_set_baud_runtime(uint32_t baud) {
+    LOG_INFO("modbus", "uart baud -> %lu", (unsigned long)baud);
+    s_baud = baud;
+    uart_set_baudrate(UART_ID, baud);
+}
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 void modbus_init(void) {
@@ -225,8 +233,8 @@ void modbus_init(void) {
         s_baud = DEFAULT_BAUD_RATE;
     }
 
-    printf("Modbus DE mode=%s baud=%lu\n",
-           modbus_de_mode_str[de_mode], (unsigned long)s_baud);
+    LOG_INFO("modbus", "init de_mode=%s baud=%lu",
+             modbus_de_mode_str[de_mode], (unsigned long)s_baud);
 
     gpio_init(UART_DE_PIN);
     gpio_put(UART_DE_PIN, 0);
@@ -249,6 +257,13 @@ void modbus_poll(void) {
 
     case MODBUS_IDLE:
         if (queue_try_remove(&action_queue, &currentAction)) {
+            LOG_INFO("modbus",
+                     "tx slave=%u fc=0x%02x addr=0x%04x arg=0x%04x sz=%u",
+                     currentAction.device,
+                     (unsigned)currentAction.action,
+                     (unsigned)currentAction.address,
+                     (unsigned)currentAction.arg,
+                     6u);
             buf[0] = currentAction.device;
             buf[1] = currentAction.action;
             buf[2] = currentAction.address >> 8;
@@ -291,13 +306,26 @@ void modbus_poll(void) {
         if (absolute_time_diff_us(readTimeout, get_absolute_time()) <= 0) {
             break;
         }
+        LOG_WARN("modbus", "rx timeout slave=%u fc=0x%02x",
+                 currentAction.device, (unsigned)currentAction.action);
         readbuf_sz = 0;
         /* fall through */
 
     case MODBUS_RECEIVED_RESPONSE:
         uart_set_irqs_enabled(UART_ID, false, false);
         if (readbuf_sz >= 2 && buf[1] & 0x80) {
+            uint8_t exc = (readbuf_sz >= 3) ? buf[2] : 0xFFu;
+            LOG_WARN("modbus",
+                     "rx exception slave=%u fc=0x%02x code=0x%02x",
+                     currentAction.device,
+                     (unsigned)currentAction.action,
+                     (unsigned)exc);
             readbuf_sz = -(int)readbuf_sz;
+        } else if (readbuf_sz > 0) {
+            LOG_INFO("modbus", "rx ok slave=%u fc=0x%02x bytes=%d",
+                     currentAction.device,
+                     (unsigned)currentAction.action,
+                     (int)readbuf_sz);
         }
         if (currentAction.callback) {
             currentAction.callback((int)readbuf_sz, buf, currentAction.ctx);
@@ -324,7 +352,7 @@ void modbus_poll(void) {
 /* ── Action enqueuers ────────────────────────────────────────────────────── */
 static inline void enqueue(modbus_action_t *act) {
     if (!queue_try_add(&action_queue, act)) {
-        printf("modbus: action queue full — dropped\n");
+        LOG_WARN("modbus", "queue full — dropped action");
     }
 }
 

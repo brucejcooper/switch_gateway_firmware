@@ -68,10 +68,18 @@ int mapping_serialise_all(char *buf, int buf_len) {
             char targets[256];
             int  tp = snprintf(targets, sizeof(targets), "[");
             for (int t = 0; t < r->target_count; t++) {
-                tp += snprintf(targets + tp, sizeof(targets) - tp,
-                               "%s{\"slave\":%u,\"addr\":%u}",
-                               t > 0 ? "," : "",
-                               r->targets[t].slave, r->targets[t].addr);
+                if (TARGET_IS_GROUP(r->targets[t])) {
+                    tp += snprintf(targets + tp, sizeof(targets) - tp,
+                                   "%s{\"slave\":%u,\"group\":%u}",
+                                   t > 0 ? "," : "",
+                                   r->targets[t].slave,
+                                   TARGET_GROUP_NUM(r->targets[t]));
+                } else {
+                    tp += snprintf(targets + tp, sizeof(targets) - tp,
+                                   "%s{\"slave\":%u,\"addr\":%u}",
+                                   t > 0 ? "," : "",
+                                   r->targets[t].slave, r->targets[t].addr);
+                }
             }
             tp += snprintf(targets + tp, sizeof(targets) - tp, "]");
 

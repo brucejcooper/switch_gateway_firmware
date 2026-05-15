@@ -10,24 +10,25 @@ to button presses, and exposes the entire system to Home Assistant via MQTT.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  RS-485 bus @ 38400 baud                                        │
-│                                                                  │
-│  Pico 2 (Modbus master, single source of truth)                │
-│  ├── Waveshare 32CH Relay Board (slave 1)   — 32 relay coils   │
-│  ├── TinyModbus DALI Gateway (slave 2)      — up to 64 ballasts│
-│  └── TinyModbus DALI Gateway (slave 3)      — up to 64 ballasts│
-│                                                                  │
+│  RS-485 bus @ 38400 baud  (canonical; firmware auto-recovers    │
+│                            slaves stuck at the factory 9600)    │
+│                                                                 │
+│  Pico 2 (Modbus master, single source of truth)                 │
+│  ├── Waveshare 32CH Relay Board (slave 1)   — 32 relay coils    │
+│  ├── TinyModbus DALI Gateway (slave 2)      — up to 64 ballasts │
+│  └── TinyModbus DALI Gateway (slave 3)      — up to 64 ballasts │
+│                                                                 │
 │  Pico 2 also scans                                              │
-│  └── 24 switch fixtures × up to 7 buttons each (PIO matrix)    │
+│  └── 24 switch fixtures × up to 7 buttons each (PIO matrix)     │
 └─────────────────────┬───────────────────────────────────────────┘
-                       │ USB CDC serial, 115200 baud
-                       │ Line-delimited JSON
-                       ▼
+                      │ USB CDC serial, 115200 baud
+                      │ Line-delimited JSON
+                      ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │  Linux host (Docker)                                            │
-│  ├── mqtt_bridge.py  — serial ↔ MQTT translation               │
+│  ├── mqtt_bridge.py  — serial ↔ MQTT translation                │
 │  ├── Mosquitto       — MQTT broker                              │
-│  └── Home Assistant  — dashboards, automations, scenes         │
+│  └── Home Assistant  — dashboards, automations, scenes          │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -56,6 +57,9 @@ names and room assignments are done in HA's device registry UI.
 | TinyModbus ATtiny1604 DALI Gateway #2 | DALI bus B — up to 64 ballasts | 3 |
 | Raspberry Pi Pico 2 | Main controller, button scanner, Modbus master | — |
 
+Function-code mappings and register addresses for the Waveshare board:
+<https://www.waveshare.com/wiki/Modbus_RTU_Relay_32CH>.
+
 ### Pin assignments (Pico 2)
 
 | Function | GPIO |
@@ -67,23 +71,32 @@ names and room assignments are done in HA's device registry UI.
 | Button matrix CLK | 7 |
 | Button matrix COL base | 8 |
 
-### Baud rate setup (one-time)
+### Baud rate setup
 
-All three Modbus devices must be configured to 38400 baud before first use.
-They default to 9600 from the factory.
+The firmware auto-recovers slaves stuck at the factory-default 9600 baud:
+on boot it pings each slave at 38400 first, falls back to 9600 on timeout,
+sends the per-device "set baud to 38400" command, and verifies the slave
+came back at 38400 — all logged under the `disc` module tag.
 
-**TinyModbus gateway** (repeat for slave 2 and slave 3):
-```
-FC06 write to register 0x1013, value 0x0002  → set baud to 38400
-FC06 write to register 0x1012, value 0x0002  → set slave address to 2
-(or value 0x0003 for slave 3)
-```
+| Slave kind | Set-baud register | Value |
+|---|---|---|
+| Waveshare 32CH Relay | FC06 `0x2000` | `0x0003` |
+| TinyModbus DALI gateway | FC06 `0x1013` | `0x0002` |
 
-**Waveshare relay board** (broadcast FC06 at current baud):
-```
-FC06 to address 0x00, register 0x2000, value 0x0003  → set baud to 38400
-FC06 to address 0x00, register 0x4000, value 0x0001  → set slave address to 1
-```
+The set-baud writes are persisted on the slaves, so the fallback path only
+fires once per device. After the first successful boot, subsequent boots
+take <100 ms total for all three slaves.
+
+If a slave is unreachable at *both* 38400 and 9600, the discovery logs
+`E disc: slave N (...) unreachable at both bauds` and boot continues
+without that slave — the relay sync / DALI scan will see it as missing.
+Most commonly this means the slave is unplugged, has a different baud
+rate (some devices ship at 19200), or is at a different slave address than
+configured. Manual recovery via a USB-485 dongle and the per-device
+commands above will get it back online. The slave-address writes for
+factory-fresh devices (TinyModbus FC06 `0x1012` value `0x0002` or `0x0003`;
+Waveshare FC06 `0x4000` value `0x0001`) are also one-time and must be done
+manually before the first boot.
 
 ---
 
@@ -101,23 +114,47 @@ make -j$(nproc)
 
 Flash `light_switch.uf2` by holding BOOTSEL on the Pico while connecting USB.
 
+### Boot Sequence
+
+Each boot, before the main loop starts, the firmware runs:
+
+1. **Filesystem + alarm pool init** — pico-vfs mount, hardware timers.
+2. **Config + mapping load** — `/config.json` and `/mappings.bin`. Defaults
+   if absent.
+3. **State cache init** — zeros the in-memory entity state.
+4. **Modbus init** — UART at the persisted baud rate (38400 default).
+5. **Bus discovery** — for each configured slave, ping at 38400, fall back
+   to 9600, auto-reconfigure if needed (see "Baud rate setup" above).
+6. **DALI full scan** — for each TinyModbus gateway, blocking read of every
+   ballast bank + group masks, populate state cache, emit per-ballast
+   `state_dali` events and a `scan_complete`.
+7. **Relay full sync** — read all 32 coils on the Waveshare board into the
+   state cache, emit `state_relay` events.
+8. **Button + serial init** — PIO scanner, USB CDC parser.
+9. **Watchdog enabled** — 5 s timeout; only after this point are stalls
+   fatal. Discovery and scans run unwatchdog'd because they can take
+   seconds in failure paths.
+10. **Hello emitted** — first JSON event the bridge sees.
+
 ### Source file overview
 
 | File | Purpose |
 |------|---------|
 | `main.c` | Startup, init sequence, main loop |
 | `modbus.c/h` | Modbus RTU master — ISR-driven, non-blocking |
+| `bus_discovery.c/h` | Boot-time slave ping + auto baud recovery |
 | `button_actions.c/h` | PIO button matrix scanner |
 | `button_fsm.c/h` | Per-button state machine (toggle/dim/reversal) |
-| `button_fsm_emit.c` | Button event serial emission |
+| `button_fsm_emit.c` | JSON `button` event emission |
 | `config.c/h` | Global config, persisted to `/config.json` |
 | `mapping.c/h` | Button-to-light mappings, persisted to `/mappings.bin` |
-| `state_cache.c/h` | Canonical lighting state (relay + DALI) |
+| `state_cache.c/h` | In-memory cache of relay + DALI ballast + group state |
 | `lighting_actions.c/h` | Modbus command dispatch, state event queue |
 | `dirty_poll.c/h` | TinyModbus dirty-bit polling, background scans |
 | `serial_protocol.c/h` | JSON line protocol over USB CDC |
 | `dali_provision.c/h` | DALI commissioning state machine |
 | `serial_protocol_provision.c` | Provision message handling |
+| `log.c/h` | Logging facility (LOG_INFO/WARN/ERR/DBG macros) emitting to USB CDC |
 
 ### Main loop
 
@@ -192,15 +229,16 @@ cache with the hardware's actual state (handles Pico restarts while power was on
 ### DALI ballasts — dirty-bit polling
 
 DALI ballasts go through TinyModbus, which maintains a dirty bitmask (FC04
-registers 0x0159–0x015C, one bit per ballast). A bit is set whenever a
-ballast's block-0 register (status byte | arc level) changes, and cleared
-when read.
+registers 0x0104–0x0107, one bit per ballast). A bit is set whenever a
+ballast's block-0 cache (status byte | arc level) changes, and cleared when
+read.
 
 The Pico's polling loop:
 
 1. Every **100 ms** when a command is in flight: read the 4-register dirty
    bitmask (one RTU frame). For each dirty bit, read that ballast's single
-   block-0 register and emit a `state_dali` event.
+   block-0 register via FC03 at `0x0000 + addr` and emit a `state_dali`
+   event.
 2. Every **60 s** (background): read the present bitmask and all block-0
    status bytes. Emit `presence` events for any changes. Emit `fault` events
    for ballasts with lamp-failure or power-cycle bits set.
@@ -212,6 +250,37 @@ waits for the dirty bit and reads the hardware. This correctly handles:
 - DALI min/max level clamping (commanded 10, got 20 → reports 20)
 - Real-time fade tracking (arc level changes on each dirty-bit read during fade)
 - Power-cycle events (ballast restarted → new arc level read immediately)
+
+#### TinyModbus register contract
+
+The `task-1-flag-driven` refactor of the TinyModbus firmware moved the
+per-ballast cache from input registers to holding registers and retired
+several action / DTR-setter registers. The Pico's master code follows the
+new contract:
+
+- **Per-ballast cache (FC03 read, FC06/FC10 write) at `0x0000–0x00FF`.**
+  Block 0 (status | brightness) is `0x0000–0x003F`; min/max, power-on/
+  sys-fail, and fade rate/time follow at `0x0040–0x00FF`. Writing the
+  brightness register's low byte (DAPC level 0–254) is how the Pico drives
+  ballast level changes — the firmware caches predictively and dispatches
+  the DAPC asynchronously.
+- **Raw DALI commands (FC06) at `0x1000` (single send) or `0x1001` (sent
+  twice, for SET / INITIALISE / RANDOMISE).** The Pico uses these for
+  GOTO_LAST_ACTIVE, UP, DOWN, group, broadcast, and commissioning frames.
+  The asynchronous result is polled at FC04 `0x0108` (terminal-state read
+  clears it).
+- **Presence + dirty bitmaps (FC04) at `0x0100–0x0107`** — one 8-register
+  read fetches both. The dirty range is read-clears.
+- **Removed in the refactor — do not write.** The action holding registers
+  `0x1002–0x100A` (DAPC, GOTO_LAST_ACTIVE, OFF/UP/DOWN/STEP/RECALL) and the
+  DTR-setter registers `0x100B–0x100D` (SET_DTR0/1/2) all return
+  `ILLEGAL_ADDRESS`. DAPC goes through the brightness register; everything
+  else goes through the raw command channel.
+
+The canonical specification for the gateway is
+[`../TinyModbus/README.md`](../TinyModbus/README.md) — sections "FC04 —
+Input Register Map", "FC03/FC06/FC10 — Holding Register Map", and
+"Behavioural Changes".
 
 ### State event flow to HA
 
@@ -232,6 +301,12 @@ Hardware change
 
 ## Serial Protocol
 
+The CDC port carries three multiplexed line types: JSON events
+(machine-readable, leading `{`), logs (human-readable, leading `# `), and text
+command output (human-readable, anything else). The bridge only consumes lines
+starting with `{` — see the [Manual Testing via CDC](#manual-testing-via-cdc)
+section for everything else.
+
 All communication between the Pico and the MQTT bridge uses line-delimited
 JSON over USB CDC at 115200 baud. One message per line, `\n` terminated.
 
@@ -251,9 +326,13 @@ Commands from HA also carry `"id": N` which is echoed in the `ack` response.
 ### Pico → Bridge (outbound)
 
 #### `hello`
-Sent at boot. Bridge uses this to publish discovery payloads and subscribe.
+Sent **once** at firmware boot. Bridge uses this to publish discovery payloads
+and subscribe. If the bridge starts (or restarts) after the firmware boots it
+will miss this message — it can re-request the full snapshot at any time via
+[`resync`](#resync), which re-emits `hello` followed by every cached
+state event and mapping.
 ```json
-{"t":"hello","ts":0,"d":{
+{"t":"hello","id":0,"ts":0,"d":{
   "fw_version":"2.0.0",
   "relay_slave":1,
   "dali_slaves":[2,3],
@@ -281,6 +360,24 @@ Emitted when a ballast's block-0 changes (dirty-bit poll).
 reports fade-running in its status byte. Both fields update on every dirty-bit
 read, giving real-time fade tracking to HA.
 
+#### `state_group`
+Emitted when a group's derived state changes. Computed from the cached group
+membership bitmap (read from TinyModbus FC03 `0x0110–0x014F` at boot and on
+every background presence check) and the per-member arc levels.
+```json
+{"t":"state_group","ts":12345,
+ "d":{"slave":2,"group":5},
+ "v":{"on":true,"bri":180}}
+```
+- `on` — true if any present member of the group has `arc_level > 0`.
+- `bri` — max `arc_level` across present members (0 if none on).
+
+Triggered after every per-member `state_dali` whose ballast belongs to the
+group, by recomputing the aggregate. The event is only emitted when `on` or
+`bri` actually changes (debounced against the last value sent for that group).
+Per-member `state_dali` events are still emitted as before — `state_group` is
+in addition, not instead.
+
 #### `button`
 Emitted at every classified button event.
 ```json
@@ -292,12 +389,17 @@ Emitted at every classified button event.
 
 #### `scan_complete`
 Emitted after `dirty_poll_full_scan()` — at boot and after commissioning.
-The bridge uses `present` to set per-ballast MQTT availability.
+The bridge uses `present` to set per-ballast MQTT availability and `groups`
+to publish per-group entity state and member lists.
 ```json
 {"t":"scan_complete","ts":12345,
  "d":{"slave":2},
- "v":{"present":[0,1,2,5,7,8]}}
+ "v":{"present":[0,1,2,5,7,8],
+      "groups":{"5":[0,5,7],"12":[1,2]}}}
 ```
+`groups` is an object keyed by stringified group number (0–15); each value is
+the array of present member short addresses. Empty groups are omitted, so the
+object is `{}` on a freshly-commissioned bus with no group memberships set.
 
 #### `presence`
 Emitted during the 60 s background check when a ballast appears or disappears.
@@ -320,10 +422,11 @@ Emitted on every state transition during a commissioning run.
 ```json
 {"t":"provision_status","ts":12345,
  "d":{"slave":2},
- "v":{"state":"searching","msg":"Found device at 0x3A21F0 → address 0","devices_found":1}}
+ "v":{"state":"assigning","msg":"Found device at 0x3A21F0 → address 0","devices_found":1}}
 ```
 `state` is one of: `idle`, `clearing`, `scanning`, `terminating`, `initialising`,
-`randomising`, `searching`, `assigning`, `complete`, `error`.
+`randomising`, `searching`, `assigning`, `verifying`, `withdrawing`, `complete`,
+`error`.
 
 #### `config_mapping`
 Emitted after `set_mapping` or `del_mapping` to confirm the change.
@@ -341,6 +444,23 @@ Response to any command carrying an `id` field.
 {"t":"ack","id":43,"d":{"ok":false,"err":"invalid_slave"}}
 ```
 
+When `ok` is `false`, `err` is one of the following short tokens:
+
+| Reason | Meaning |
+|--------|---------|
+| `invalid_slave` | Slave ID not 0 (relay), 2, or 3 (DALI) |
+| `out_of_range` | Numeric argument outside its valid range |
+| `invalid_group` | Group number not 0–15 |
+| `invalid_baud` | Baud value not in the supported set |
+| `invalid_target` | Provision target address not 0–63 |
+| `invalid_mode` | Provision mode string not recognised |
+| `start_failed` | Provisioning could not be started (lower-layer failure) |
+| `busy` | Operation rejected because another is in flight |
+| `save_failed` | Persistent write to flash failed |
+
+The `set_baud` ack additionally carries `"note":"reboot required for baud change"`
+in its `d` object on success.
+
 ### Bridge → Pico (inbound)
 
 #### `cmd_relay`
@@ -355,6 +475,28 @@ Control a DALI ballast. Include `bri` (0–254) for dimming, or `on` for toggle.
 {"t":"cmd_dali","id":2,"d":{"slave":2,"addr":5,"on":true}}
 {"t":"cmd_dali","id":3,"d":{"slave":2,"addr":5,"bri":128}}
 ```
+
+#### `cmd_dali_group`
+Control a DALI group. Same shape as `cmd_dali` but addresses a group (0–15)
+instead of a short address. The Pico sends a single DALI group frame via
+raw command register `0x1000` — `addr_byte` is derived from `group`, the
+caller does not encode it.
+```json
+{"t":"cmd_dali_group","id":4,"d":{"slave":2,"group":5},"v":{"on":true}}
+{"t":"cmd_dali_group","id":5,"d":{"slave":2,"group":5},"v":{"bri":128}}
+```
+
+Wire format written to gateway register `0x1000` (high byte | low byte):
+
+| Action | High byte | Low byte |
+|--------|-----------|----------|
+| `bri` (DAPC, level 0–254) | `0x80 \| (group << 1)` | bri value |
+| `on: true` (GOTO_LAST_ACTIVE) | `0x81 \| (group << 1)` | `0x0A` |
+| `on: false` (OFF) | `0x81 \| (group << 1)` | `0x00` |
+
+Per-member `state_dali` events follow once the affected ballasts mark their
+dirty bits; the aggregate `state_group` event is emitted after the last of
+those (see `state_group` above).
 
 #### `cmd_dali_broadcast`
 Send a command to a raw DALI address byte (for groups or broadcast).
@@ -393,7 +535,8 @@ Update timing parameters. All fields optional — omit to leave unchanged.
 ```
 
 #### `set_baud`
-Change the Modbus bus baud rate. Takes effect after reboot.
+Change the Modbus bus baud rate. Takes effect after reboot. The `ack` for
+this command carries `"note":"reboot required for baud change"` in `d`.
 ```json
 {"t":"set_baud","id":9,"baud":38400}
 ```
@@ -411,6 +554,231 @@ Abort a running commission.
 ```json
 {"t":"provision_abort","id":11}
 ```
+
+#### `resync`
+Re-emit the full snapshot — `hello`, every cached relay/DALI/group state,
+`scan_complete` per slave, and every mapping. Use on bridge startup or
+reconnect to recover from any boot-timing race. Idempotent. No Modbus or
+DALI activity.
+```json
+{"t":"resync","id":42}
+```
+
+---
+
+## Manual Testing via CDC
+
+The same USB CDC port the bridge uses also accepts human-typed text commands
+and emits a stream of human-readable log lines. This makes it possible to drive
+the system, inspect state, and watch internal events from any serial terminal,
+with or without the bridge running.
+
+### Connecting
+
+The Pico exposes a single USB CDC ACM device — typically `/dev/ttyACM0` on
+Linux (or use the stable `/dev/serial/by-id/usb-Raspberry_Pi_Pico_2-if00`
+symlink). The line is 115200 baud, 8N1, line-oriented (`\n` terminated). Any
+serial terminal works:
+
+```bash
+screen /dev/ttyACM0 115200
+picocom -b 115200 /dev/ttyACM0
+cu -l /dev/ttyACM0 -s 115200
+```
+
+The firmware never echoes typed characters — enable local echo in your
+terminal if you want to see what you are typing.
+
+### Mixed line types
+
+The firmware emits four kinds of line on the CDC port. They are all
+distinguishable by their first character:
+
+| Line type | Leading | Consumer | Description |
+|-----------|---------|----------|-------------|
+| JSON event | `{` | Bridge | Machine-readable state, ack, button, etc. (see Serial Protocol) |
+| Log | `# ` | Human | Narration of internal state changes — see format below |
+| Command output | (other) | Human | Reply to a typed text command |
+| Command echo | — | Local terminal | Firmware never echoes; enable local echo if needed |
+
+The bridge only parses lines starting with `{`, so logs and text-command
+output are safe to mix with the JSON event stream — the bridge ignores them.
+
+### Filtering
+
+Useful one-liners for picking one line type out of a live capture:
+
+```bash
+grep '^#'         </dev/ttyACM0   # just logs
+grep '^{' | jq .  </dev/ttyACM0   # just JSON events, pretty-printed
+grep -v '^[#{]'   </dev/ttyACM0   # just text-command output
+```
+
+### Log line format
+
+```
+# <ts_ms> <level> <module>: <message>
+```
+
+Example:
+
+```
+# 12345 I dirty: ballast 2.5 arc=128 status=0x80
+```
+
+- `ts_ms` — Pico uptime in milliseconds (matches the `ts` field in JSON events)
+- `level` — single character: `I` info, `W` warn, `E` err, `D` debug
+- `module` — short lowercase tag, see [Module tags](#module-tags)
+- `message` — free-form, but uses key=value style where it carries data
+
+#### Module tags
+
+| Tag | Description |
+|-----|-------------|
+| `boot` | Startup, init sequence, watchdog reboot cause |
+| `disc` | Boot-time bus discovery and baud recovery |
+| `modbus` | RS-485 Modbus master — frames, timeouts, retries |
+| `dirty` | TinyModbus dirty-bit poller — state cache updates |
+| `light` | Lighting command dispatch — relay coil and DALI writes |
+| `btn` | Button matrix — gestures, classified events |
+| `prov` | DALI commissioning state machine |
+| `serial` | USB CDC line I/O — JSON parse, command receipt |
+| `cli` | Text command interface — parsed commands and replies |
+
+#### Log levels
+
+| Level | Meaning |
+|-------|---------|
+| `I` | Normal operational events |
+| `W` | Recoverable problems (timeouts, retries, ignored input) |
+| `E` | Errors that left the system in a degraded state |
+| `D` | Debug detail; off at the default verbosity |
+
+Verbosity is set at runtime via the `log <level>` text command. Levels in
+order of increasing detail: `off`, `err`, `warn`, `info` (default), `dbg`.
+Each level emits its own output plus everything from less-verbose levels —
+e.g. `log warn` emits `W` and `E` lines but suppresses `I` and `D`. Numeric
+form `0`..`4` is also accepted (`log 4` is equivalent to `log dbg`).
+
+The current level is shown by `show log`. Verbosity is **not persisted** —
+boots default to `info`. Set `log dbg` after a reboot if you want to see
+debug-level events.
+
+### Text command grammar
+
+Anything received on the CDC port that does not start with `{` is parsed as a
+text command. One command per line. Tokens are whitespace-separated; keywords
+are case-insensitive. Output is plain text and never starts with `{`, so the
+bridge ignores it.
+
+| Command | Description |
+|---------|-------------|
+| `help` | Show this list |
+| `show config` | Current config (long_press_ms, baud, slave IDs, ...) |
+| `show mappings` | All non-empty button → light mappings |
+| `show mapping <fix> <btn>` | One mapping |
+| `show relay [<ch>]` | One or all 32 relay states |
+| `show dali [<slave> [<addr>]]` | All gateways / one slave / one ballast |
+| `show group <slave> [<group>]` | Groups on slave (members + on/bri) |
+| `show present <slave>` | List present ballast addresses on a DALI slave |
+| `show provision` | Current provisioning state |
+| `relay <ch> {on\|off\|toggle}` | Set relay coil |
+| `dali <slave> <addr> {on\|off\|toggle\|<bri>}` | Individual DALI ballast |
+| `dali <slave> g<group> {on\|off\|<bri>}` | DALI group (toggle not supported) |
+| `dim <slave> <addr> {up\|down}` | One DALI step on individual |
+| `dim <slave> g<group> {up\|down}` | One DALI step on group |
+| `provision <slave> {all\|new\|<addr>}` | Start commissioning |
+| `provision abort` | Abort a running commission |
+| `scan <slave>` | Full read of one slave (blocking) |
+| `map set <fix> <btn> <s>:<a>[,<s>:<a>...]` | Set mapping; `<a>` may be 0-63 or `G<n>` |
+| `map del <fix> <btn>` | Delete mapping |
+| `log <level>` | Set verbosity (`off`, `err`, `warn`, `info`, `dbg`; or numeric `0`..`4`) |
+| `show log` | Current verbosity |
+| `reboot` | Watchdog reboot |
+| `resync` | Re-emit hello + all state + mappings |
+
+### Output conventions
+
+Successful commands that have no other output reply with `ok`. Errors reply
+with `err: <reason>` where `<reason>` is a short token. The reasons in this
+table apply to the **text command channel only**; the JSON `ack` event uses a
+separate set of reasons (see the `ack` event section above).
+
+| Reason | Meaning |
+|--------|---------|
+| `unknown_command` | First token did not match any command |
+| `bad_arg` | Wrong number of arguments or unparseable token |
+| `invalid_slave` | Slave ID is not 0 (relay), 2, or 3 (DALI) |
+| `out_of_range` | Numeric argument outside its valid range |
+| `provision_busy` | Commissioning is already running on that slave |
+| `bad_arg group_toggle_unsupported` | `toggle` is not valid on a `dali ... g<n>` command (compound form: `err: bad_arg group_toggle_unsupported`) |
+
+`show` commands emit terse `key=value` lines, one entity per line:
+
+```
+relay 3: on
+dali 2.5: present=true on=true bri=128 status=0x80 fading=false min=1 max=254 poweron=128 sysfail=128 fade_rate=7 fade_time=0
+group 2.G5: members=[3,7,12] on=true bri=180
+present 2: 0 1 2 5 7 8
+map F3.B1 -> 2:5,2:G7,0:12
+provision: state=searching slave=2 devices_found=4 msg="Found device at 0x3A21F0..."
+```
+
+### Examples
+
+```text
+> relay 3 on
+ok
+
+> dali 2 5 127           # ballast 5 on slave 2 to ~50%
+ok
+
+> dali 2 g5 on           # group 5 on slave 2 — last active level
+ok
+
+> dim 2 5 down           # one DALI Down step on ballast 2.5
+ok
+
+> show dali 2 5
+dali 2.5: present=true on=true bri=127 status=0x80 fading=false min=1 max=254 poweron=128 sysfail=128 fade_rate=7 fade_time=0
+
+> show group 2
+group 2.G5: members=[3,7,12] on=true bri=180
+group 2.G7: members=[1,4] on=false bri=0
+
+> map set 3 1 2:G5,2:G7   # bind fixture 3, button 1 to two groups
+ok
+
+> provision 2 all         # full commissioning of slave 2
+ok
+
+> show provision
+provision: state=searching slave=2 devices_found=4 msg="Found device at 0x3A21F0..."
+
+> log dbg                  # raise verbosity to see DBG-level events
+log: dbg
+
+> show log
+log: dbg
+```
+
+Watching live while pressing a button (default `info` verbosity):
+
+```
+# 12345 I btn: F3.B1 press
+# 12346 I light: dali 2.5 on
+# 12348 I dirty: ballast 2.5 arc=128 status=0x80
+```
+
+After `log dbg`, the same press also surfaces debug-level activity:
+
+```
+# 12345 D btn: F3.B1 repeat
+# 12348 D light: emit dali 2.5 arc=128 status=0x80
+```
+
+The same press produces JSON `button` and `state_dali` events on the same
+line stream — see [Serial Protocol](#serial-protocol).
 
 ---
 
@@ -454,6 +822,10 @@ All topics live under the prefix (default `lighting`).
 | `lighting/dali/<slave>/<addr>/state` | Bridge → HA | Yes | `{"on":true,"bri":180,...}` |
 | `lighting/dali/<slave>/<addr>/set` | HA → Bridge | No | `{"brightness":128}` or `{"state":"ON"}` |
 | `lighting/dali/<slave>/<addr>/availability` | Bridge → HA | Yes | `online` / `offline` (per ballast) |
+| `lighting/dali/<slave>/group/<g>/state` | Bridge → HA | Yes | `{"on":..,"bri":..}` (one per non-empty group) |
+| `lighting/dali/<slave>/group/<g>/set` | HA → Bridge | No | `{"state":"ON"}` or `{"brightness":N}` |
+| `lighting/dali/<slave>/group/<g>/availability` | Bridge → HA | Yes | `online` if group has ≥1 present member, else `offline` |
+| `lighting/dali/<slave>/group/<g>/members` | Bridge → HA | Yes | JSON array of present member addresses |
 | `lighting/button/<fixture>/<button>` | Bridge → HA | No | `{"event_type":"press"}` |
 | `lighting/mapping/<fixture>/<button>` | Bridge → HA | Yes | Current mapping state |
 | `lighting/mapping/<fixture>/<button>/set` | HA → Bridge | No | JSON targets array |
@@ -482,6 +854,14 @@ DALI light discovery payloads use `"availability_mode": "all"` with both the
 system topic and the per-ballast topic. A ballast is only shown as available
 in HA when both are `online`.
 
+**Per-group availability** (`lighting/dali/<slave>/group/<g>/availability`):
+derived from the group's member list (see `scan_complete` extension above).
+The bridge publishes `online` whenever the group has at least one present
+member (after `scan_complete` or any `presence` delta that affects membership)
+and `offline` when the last present member of the group disappears. The
+companion `.../members` topic publishes the present member-address array on
+the same trigger so HA can show which ballasts a group covers.
+
 Relay channels and switch plates use only the system availability topic.
 
 ### Discovery
@@ -491,6 +871,10 @@ No manual HA configuration is needed. Payloads include:
 
 - **Switch** entity for each relay channel (user can override to light/fan in HA UI)
 - **Light** entity for each DALI ballast (dimmable, brightness 0–254)
+- **Light** entity for each non-empty DALI group, published on `scan_complete`
+  with names like `DALI 2.G05` (`DALI <slave>.G<NN>`) — numeric, user can
+  rename in HA. See the `scan_complete` extension above for how the bridge
+  learns which groups exist.
 - **Event** entity for each button (7 per switch plate, 24 plates = 168 entities)
 - **Sensor** entities for provision state, status message, devices found
 - **Button** entities for Commission All, Commission New Devices, Commission Address, Abort
@@ -547,11 +931,43 @@ without waiting for the 60 s background check.
 |-------|------|
 | Clearing all addresses (PROV_ALL) | ~1.5 s (broadcast + gap) |
 | Scanning used addresses (PROV_UNADDRESSED) | ~1 s for 64 queries |
-| Per device: binary search | ~600 ms (24 steps × 25 ms) |
+| Per device: binary search | ~2.4 s (24 steps × 4 frames × ~25 ms) |
 | Per device: programme + verify + withdraw | ~100 ms |
 | Post-commission rescan wait | 300 ms + ~10 s for full scan |
 
-A full bus with 64 ballasts takes roughly 45–60 seconds.
+A full bus with 64 ballasts takes roughly 2.5–3 minutes, dominated by the
+per-device binary search (~2.5 s × 64 ballasts ≈ 160 s) plus the ~10 s
+post-commission rescan.
+
+### Group membership management (future)
+
+The current firmware **reads** group memberships at boot and on every
+background presence check, but does not **change** them. Memberships are
+typically configured once at commissioning via a separate DALI tool or
+vendor app, and the gateway just reflects the result.
+
+Adding HA-driven membership management would need:
+
+- A new inbound command, e.g. `cmd_dali_group_membership` with
+  `{"slave":S,"group":G,"members":[...]}`.
+- The Pico computes the diff against its cached current bitmap for that
+  group and writes the new 64-bit bitmap to TinyModbus FC06 register
+  `0x0110 + 4*G` (4 consecutive registers covering bits 0–63).
+- TinyModbus internally diffs against its own cached bitmap and dispatches
+  the per-bit `ADD_TO_GROUP` / `REMOVE_FROM_GROUP` DALI commands
+  automatically — see the FC03/FC06/FC10 holding-register entry for
+  `0x0110–0x014F` in `../TinyModbus/README.md` for the gateway-side
+  bitmap-write semantics.
+- The Pico re-reads the bitmap afterward to confirm and emit a fresh
+  `scan_complete` so HA group membership/availability updates.
+
+Worst-case dispatch time for a fully-changed group is ~800 ms (16 bits ×
+2 commands × 25 ms per spec), then the Pico re-reads to confirm.
+
+Why deferred: most installations set group membership once at commissioning
+and never touch it again. Exposing this surface to HA without a clear UI
+need (e.g. drag-and-drop reassignment) creates more confusion than utility.
+Revisit when there's a concrete use case.
 
 ---
 
@@ -587,7 +1003,11 @@ DALI Gateway 2 (TinyModbus ATtiny1604)
 ├── Commission Address (config button)
 ├── Target Address     (config number, 0–63)
 ├── Abort Commission   (config button)
-└── via_device ← DALI 2.00, DALI 2.01, ... (dimmable light entities)
+├── via_device ← DALI 2.00, DALI 2.01, ... (dimmable light entities, one per ballast)
+└── via_device ← DALI 2.G05    (group light entity, one per non-empty group)
+                  DALI 2.G07
+                  DALI 2.G12
+                  ...
 
 DALI Gateway 3 (same structure)
 
@@ -599,6 +1019,12 @@ Switch Plate 01 (fixture 0)
 
 Switch Plate 02 ... Switch Plate 24 (same structure)
 ```
+
+Group entities (`DALI <slave>.G<g>`) are separate HA lights from the per-ballast
+entities, not a replacement: the same physical ballast can be a member of
+several groups, so changing one ballast's level updates the per-ballast light
+plus every group light it belongs to. The group light's `on` and `bri` are
+the aggregate over its present members (see the `state_group` event spec).
 
 All device names are numbered. After HA discovery, rename devices and assign
 them to rooms using HA's Settings → Devices & Services UI. These names and
@@ -614,26 +1040,35 @@ in `/mappings.bin` and are configurable from HA without firmware changes.
 
 ### Reading current mappings
 
-Publish any payload to `lighting/provision/<slave>/start/all` — no, wait,
-that starts commissioning. To read mappings, publish to:
-
-```
-lighting/mapping/<fixture>/<button>/set
-```
-
-Or send `get_config` via the serial protocol directly. The Pico emits a
-`config_mapping` message for each mapped button.
+The bridge retains the current mapping on `lighting/mapping/<fixture>/<button>`
+— subscribe to read it. Or send `get_config` via the serial protocol directly;
+the Pico emits a `config_mapping` message for each mapped button.
 
 ### Setting a mapping
 
 Publish a JSON array of targets to `lighting/mapping/<fixture>/<button>/set`:
 
 ```json
-[{"slave":2,"addr":5},{"slave":2,"addr":6},{"slave":0,"addr":12}]
+[{"slave":2,"addr":5},{"slave":2,"group":5},{"slave":0,"addr":12}]
 ```
 
-- `slave: 0` = relay board (addr = coil number 0–31)
-- `slave: 2` or `3` = DALI gateway (addr = short address 0–63)
+Each target is one of two forms:
+
+- `{"slave":2,"addr":5}` — DALI ballast 5 on slave 2 (addr 0–63)
+- `{"slave":2,"group":5}` — DALI group 5 on slave 2 (group 0–15)
+
+Slave rules:
+
+- `slave: 0` = relay board (addr = coil number 0–31; groups not supported)
+- `slave: 2` or `3` = DALI gateway (addr = short address 0–63, or group 0–15)
+
+A group target sends a single DALI group frame at button-press time rather than
+N per-ballast commands, so it is both faster on the wire and atomic on the bus.
+
+On disk in `/mappings.bin` the two forms share one byte: bit 7 of the addr
+byte flags "this is a group" (`0x80 | (group_num & 0x0F)`). Existing `mappings.bin`
+files written by older firmware load unchanged — all stored bytes have bit 7
+clear and decode as ballast targets.
 
 Up to 8 targets per button. All targets are controlled together — one
 button press toggles all of them in unison.
@@ -649,7 +1084,11 @@ Publish any payload to `lighting/mapping/<fixture>/<button>/delete`.
 ### Serial monitor
 
 Connect to the Pico's USB CDC port with any serial terminal at 115200 baud.
-Messages flow as readable JSON lines in both directions.
+The port carries both JSON event/command lines and human-readable logs and
+text-command output — see [Manual Testing via CDC](#manual-testing-via-cdc)
+for the line-type breakdown, log format, and full text-command grammar.
+
+JSON commands (the same shape the bridge sends):
 
 ```bash
 # Simple monitor
@@ -663,6 +1102,16 @@ echo '{"t":"cmd_relay","id":2,"d":{"ch":3,"on":true}}' > /dev/ttyACM0
 
 # Dim DALI address 5 on slave 2 to 50%
 echo '{"t":"cmd_dali","id":3,"d":{"slave":2,"addr":5,"bri":127}}' > /dev/ttyACM0
+```
+
+Equivalent text commands (typeable from any terminal — easier for ad-hoc
+testing, no JSON quoting required):
+
+```bash
+echo 'relay 3 on'        > /dev/ttyACM0
+echo 'dali 2 5 127'      > /dev/ttyACM0
+echo 'show dali 2 5'     > /dev/ttyACM0
+echo 'show mappings'     > /dev/ttyACM0
 ```
 
 ### Bridge debug mode
@@ -738,10 +1187,14 @@ from the repository, so `git revert` works cleanly if needed.
   DALI gateway were ever added, incrementing `MAX_DALI_SLAVES` and extending
   the config file format would be the only changes required.
 
-- **DALI group control.** The firmware does not expose DALI group commands
-  through the mapping system. Group-level control (single DALI broadcast to
-  all members of a group) is available via `cmd_dali_broadcast` from HA but
-  is not assignable to buttons.
+- **DALI group membership management.** Group-level control (button mappings
+  to a group, per-group HA Light entities, `cmd_dali_group`, `state_group`)
+  is fully supported — see the mapping format and `state_group` /
+  `cmd_dali_group` sections above. What's not implemented is **changing**
+  which ballasts belong to which group from HA; the firmware only reads the
+  memberships configured by an external DALI commissioning tool. See
+  "Group membership management (future)" under DALI Commissioning for the
+  rationale and the implementation sketch.
 
 - **Provisioning is single-slave.** Only one DALI slave can be provisioned at
   a time. The other slave and the relay board remain fully operational during
