@@ -257,13 +257,6 @@ void modbus_poll(void) {
 
     case MODBUS_IDLE:
         if (queue_try_remove(&action_queue, &currentAction)) {
-            LOG_INFO("modbus",
-                     "tx slave=%u fc=0x%02x addr=0x%04x arg=0x%04x sz=%u",
-                     currentAction.device,
-                     (unsigned)currentAction.action,
-                     (unsigned)currentAction.address,
-                     (unsigned)currentAction.arg,
-                     6u);
             buf[0] = currentAction.device;
             buf[1] = currentAction.action;
             buf[2] = currentAction.address >> 8;
@@ -275,6 +268,14 @@ void modbus_poll(void) {
             readTimeout = make_timeout_time_ms(MODBUS_RESPONSE_TIMEOUT_MS);
             append_crc16(buf, sz);
             sz += 2;
+
+            char hex[3 * 16 + 1];
+            int hp = 0;
+            for (size_t i = 0; i < sz && hp + 3 < (int)sizeof(hex); i++) {
+                hp += snprintf(hex + hp, sizeof(hex) - hp,
+                               "%s%02X", i ? " " : "", buf[i]);
+            }
+            LOG_INFO("modbus", "tx [%s]", hex);
 
             while (uart_is_readable(UART_ID)) uart_getc(UART_ID);
 

@@ -12,6 +12,7 @@
 #include "config.h"
 #include "state_cache.h"
 #include "dirty_poll.h"
+#include "bus_discovery.h"
 #include "modbus.h"
 #include "log.h"
 #include <stdio.h>
@@ -21,6 +22,8 @@
 #include <hardware/watchdog.h>
 #include <pico/stdio.h>
 #include <pico/time.h>
+#include <sys/stat.h>
+#include <dirent.h>
 
 /* Consume levt_t events from lighting_actions */
 extern bool lighting_evt_try_pop(void *out);  /* defined in lighting_actions.c */
@@ -733,6 +736,10 @@ static void cmd_help(void) {
     printf("provision <slave> {all|new|<addr>}         start commissioning\n");
     printf("provision abort                            stop commissioning\n");
     printf("scan <slave>                               blocking full scan\n");
+    printf("discover                                   re-probe all configured slaves (blocking)\n");
+    printf("baud [<rate> [save]]                       show / set UART baud (live; 'save' persists)\n");
+    printf("ls [<path>]                                list files in path (default /)\n");
+    printf("cat <path>                                 dump file contents to console\n");
     printf("map set <fix> <btn> <s>:<a>[,<s>:<a>...]   set mapping (a may be N or GN)\n");
     printf("map del <fix> <btn>                        delete mapping\n");
     printf("log <level>                                set verbosity (off|err|warn|info|dbg)\n");
@@ -1126,6 +1133,115 @@ static void cmd_scan(char **saveptr) {
     printf("scan complete: %d ballasts present\n", present);
 }
 
+/* ── discover ──────────────────────────────────────────────────────────── */
+/* Re-runs bus_discover_slave() across every configured slave. Blocking —
+ * worst case ~4 s per slave (three 1 s pings + a set-baud + settle). We
+ * pet the watchdog between slaves so each gets a fresh 5 s window. */
+static void cmd_discover(char **saveptr) {
+    (void)saveptr;
+    int ok = 0, fail = 0;
+    LOG_INFO("cli", "discover: relay_count=%u dali_count=%u",
+             g_config.relay_slave_count, g_config.dali_slave_count);
+    printf("discovering %u relay + %u dali slaves...\n",
+           g_config.relay_slave_count, g_config.dali_slave_count);
+
+    for (int i = 0; i < g_config.relay_slave_count; i++) {
+        watchdog_update();
+        uint8_t id = g_config.relay_slave_ids[i];
+        bool r = bus_discover_slave(id, SLAVE_KIND_RELAY);
+        printf("  slave %u relay: %s\n", id, r ? "ok" : "fail");
+        if (r) ok++; else fail++;
+    }
+    for (int i = 0; i < g_config.dali_slave_count; i++) {
+        watchdog_update();
+        uint8_t id = g_config.dali_slave_ids[i];
+        bool r = bus_discover_slave(id, SLAVE_KIND_DALI);
+        printf("  slave %u dali: %s\n", id, r ? "ok" : "fail");
+        if (r) ok++; else fail++;
+    }
+    watchdog_update();
+    printf("discover complete: %d ok, %d fail\n", ok, fail);
+}
+
+/* ── baud ──────────────────────────────────────────────────────────────── */
+static void cmd_baud(char **saveptr) {
+    char *bs = strtok_r(NULL, " \t", saveptr);
+    if (!bs) {
+        printf("baud: %lu\n", (unsigned long)modbus_get_baud());
+        return;
+    }
+    long baud = 0;
+    if (!parse_int_range_auto(bs, 300, 921600, &baud)) {
+        txt_err("invalid_baud");
+        return;
+    }
+    char *sv = strtok_r(NULL, " \t", saveptr);
+    bool persist = sv && strcasecmp(sv, "save") == 0;
+
+    LOG_INFO("cli", "baud %ld%s", baud, persist ? " save" : "");
+    modbus_uart_set_baud_runtime((uint32_t)baud);
+    if (persist) modbus_set_baud((uint32_t)baud);
+    printf("baud: %lu%s\n", (unsigned long)modbus_get_baud(),
+           persist ? " (saved)" : " (live only)");
+}
+
+/* ── ls / cat (pico-vfs littlefs) ──────────────────────────────────────── */
+static void cmd_ls(char **saveptr) {
+    const char *path = strtok_r(NULL, " \t", saveptr);
+    if (!path) path = "/";
+
+    DIR *d = opendir(path);
+    if (!d) { txt_err("opendir_failed"); return; }
+
+    int count = 0;
+    struct dirent *e;
+    while ((e = readdir(d)) != NULL) {
+        if (e->d_name[0] == '\0') break;
+        if (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0) continue;
+
+        if (e->d_type == DT_DIR) {
+            printf("  %s/\n", e->d_name);
+        } else {
+            /* d_type doesn't carry size — stat the full path */
+            char full[320];
+            int plen = strlen(path);
+            bool need_slash = plen > 0 && path[plen - 1] != '/';
+            snprintf(full, sizeof(full), "%s%s%s",
+                     path, need_slash ? "/" : "", e->d_name);
+            struct stat st;
+            if (stat(full, &st) == 0) {
+                printf("  %-32s %lu\n", e->d_name, (unsigned long)st.st_size);
+            } else {
+                printf("  %-32s ?\n", e->d_name);
+            }
+        }
+        count++;
+    }
+    closedir(d);
+    if (count == 0) printf("(empty)\n");
+}
+
+static void cmd_cat(char **saveptr) {
+    const char *path = strtok_r(NULL, " \t", saveptr);
+    if (!path) { txt_err("bad_arg"); return; }
+
+    FILE *fp = fopen(path, "rb");
+    if (!fp) { txt_err("fopen_failed"); return; }
+
+    char buf[128];
+    size_t total = 0;
+    char last = 0;
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        fwrite(buf, 1, n, stdout);
+        last = buf[n - 1];
+        total += n;
+        watchdog_update();
+    }
+    fclose(fp);
+    if (total == 0 || last != '\n') putchar('\n');
+}
+
 /* ── map set / map del ─────────────────────────────────────────────────── */
 static void cmd_map(char **saveptr) {
     char *sub = strtok_r(NULL, " \t", saveptr);
@@ -1230,6 +1346,22 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "scan") == 0) {
         cmd_scan(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "discover") == 0) {
+        cmd_discover(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "baud") == 0) {
+        cmd_baud(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "ls") == 0) {
+        cmd_ls(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "cat") == 0) {
+        cmd_cat(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "map") == 0) {
