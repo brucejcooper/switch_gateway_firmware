@@ -457,6 +457,8 @@ When `ok` is `false`, `err` is one of the following short tokens:
 | `start_failed` | Provisioning could not be started (lower-layer failure) |
 | `busy` | Operation rejected because another is in flight |
 | `save_failed` | Persistent write to flash failed |
+| `no_txn` | `replace_mapping_add` or `replace_mappings_commit` arrived without a prior `replace_mappings_begin` |
+| `txn_invalid` | `replace_mappings_commit` refused because an earlier `replace_mapping_add` failed validation |
 
 The `set_baud` ack additionally carries `"note":"reboot required for baud change"`
 in its `d` object on success.
@@ -519,6 +521,39 @@ Remove a button mapping.
 ```json
 {"t":"del_mapping","id":6,"d":{"fixture":3,"button":1}}
 ```
+
+#### `replace_mappings_begin` / `replace_mapping_add` / `replace_mappings_commit` / `replace_mappings_abort`
+Atomic wipe-and-replace transaction for the full button mapping set. Used by
+`bridge/sync_bindings.py` to push a spreadsheet's worth of bindings in one
+go. The transaction lives in RAM until commit; mid-transaction reboots leave
+the live mappings untouched.
+
+```json
+{"t":"replace_mappings_begin","id":1}
+
+{"t":"replace_mapping_add","id":2,
+ "d":{"fixture":3,"button":1},
+ "v":{"targets":[{"slave":2,"addr":5},{"slave":0,"addr":12}]}}
+
+{"t":"replace_mappings_commit","id":99}
+
+{"t":"replace_mappings_abort","id":100}
+```
+
+`replace_mapping_add` payload matches `set_mapping`. `commit` swaps the
+scratch into `g_mappings`, writes `mappings.bin`, and emits a
+`config_mapping` event for every (fixture, button) whose targets differ
+(including ones cleared to empty), so a connected bridge stays in sync.
+
+| Reason on `ack` | Meaning |
+|---|---|
+| `no_txn` | `add` or `commit` arrived without a prior `begin` |
+| `out_of_range` | `add` rejected (bad fixture/button or too many targets); sticky — commit will fail |
+| `txn_invalid` | `commit` refused because an earlier `add` errored |
+| `save_failed` | swap succeeded but flash write failed |
+
+Begin is idempotent (re-issuing it discards the current scratch and starts
+over). Abort is also idempotent.
 
 #### `get_config`
 Request a dump of all current button mappings (returns a series of
@@ -1077,6 +1112,24 @@ button press toggles all of them in unison.
 
 Publish any payload to `lighting/mapping/<fixture>/<button>/delete`.
 
+### Bulk sync from a spreadsheet
+
+`bridge/sync_bindings.py` reads `Switch wiring.xlsx` and replaces the
+firmware's entire binding set in one atomic transaction over USB CDC. The
+`Switch Positions` tab provides the physical button remap (per switch
+plate, including plates that share a fixture ID), the `Lights` tab provides
+the per-light bindings. Dry-run by default; pass `--apply` to actually send.
+
+```bash
+python3 bridge/sync_bindings.py \
+    --workbook "Switch wiring.xlsx" \
+    --serial /dev/serial/by-id/usb-Raspberry_Pi_Pico_2-if00 \
+    --apply
+```
+
+The MQTT bridge must be stopped while running this tool — it would consume
+the same acks. Requires `openpyxl` and `pyserial`.
+
 ---
 
 ## Development & Debugging
@@ -1144,29 +1197,6 @@ cause is printed on the next serial connection:
 ```
 Rebooted by Watchdog or explicit reset!
 ```
-
----
-
-## Applying the Patch
-
-The firmware changes are delivered as `0001-complete.patch`, a unified diff
-against the base `switch_gateway_firmware` repository.
-
-```bash
-git clone https://git.8bitcloud.com/bruce/switch_gateway_firmware
-cd switch_gateway_firmware
-git checkout -b c-firmware
-patch -p1 < 0001-complete.patch
-git add -A
-git commit -m "Replace Lua/REPL with C firmware"
-```
-
-Verify the patch applies cleanly before committing — it should apply with no
-rejected hunks or fuzz against the unmodified base repository.
-
-The Lua files (`src/lualoop.c`, `src/lualoop.h`, `src/main.lua`,
-`src/json.lua`, `lib/lua-5.4.8/`) are removed from the build but not deleted
-from the repository, so `git revert` works cleanly if needed.
 
 ---
 

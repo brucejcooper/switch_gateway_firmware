@@ -1,10 +1,11 @@
 #pragma once
 
+#include <stdbool.h>
+
 /* Initialise serial protocol (nothing to do — stdio_usb handles CDC init) */
 void serial_protocol_init(void);
 
-/* Call from main loop — reads USB CDC input, emits pending state events.
- * Replaces lua_poll() from the original firmware. */
+/* Call from main loop — reads USB CDC input, emits pending state events. */
 void serial_poll(void);
 
 /* Emit hello message after boot */

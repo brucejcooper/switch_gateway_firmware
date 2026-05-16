@@ -1,53 +1,33 @@
 /*
- * dali_provision.c — DALI commissioning state machine.
+ * dali_provision.c — driver for TinyModbus's native commissioning channel.
  *
- * All DALI system commands are issued via TinyModbus holding registers:
- *   0x1000 RAW_CMD       — single send, expects backward frame (for queries)
- *   0x1001 RAW_CMD_TWICE — sends twice, no backward frame (for set commands)
+ * TinyModbus implements IEC 62386-102 control-gear commissioning natively
+ * via MBREG_COMMISSION (FC03/FC06 0x1014):
  *
- * The dedicated DTR0-setter holding register was removed in TinyModbus
- * subtask 9 — load DTR0 by issuing the special command 0xA3 via RAW_CMD
- * instead (write 0xA3VV to 0x1000 to load DTR0 with VV).
+ *   FC06 write 0x0001        start full commissioning (wipe + reassign 0..N-1)
+ *   FC06 write 0x0002        start incremental commissioning (only fresh gear)
+ *   FC06 write 0x0000        abort (latches; firmware terminates at next boundary)
  *
- * Query results are polled from FC04 input register 0x0108. The TinyModbus
- * firmware atomically clears the result back to 0x0000 when the master reads
- * a terminal value, so no follow-up clear write is required.
+ *   FC03 read returns the live status word with read-clears on terminal:
+ *     0x0000      idle
+ *     0x01nn      running, nn = ballasts addressed so far this run
+ *     0x02nn      complete, nn = total programmed (read-clears)
+ *     0x03nn      error / aborted (read-clears). Subtype in low byte:
+ *                 0x01 aborted by master, 0x02 no ballasts found,
+ *                 0x03 >3 verify failures, 0x04 short-address pool exhausted,
+ *                 0x05 bus shorted >200 TE.
  *
- *   0xFFnn — pending (high byte 0xFF; low byte = sends remaining at arming:
- *            0x02 right after RAW_CMD_TWICE, 0x01 right after RAW_CMD;
- *            does NOT decrement mid-twice-send)
- *   0x0000 — idle (no command in progress / previous result already consumed)
- *   0x01nn — NAK (no response within the 22 Te response window)
- *   0x02xx — OK, response byte = xx
- *   0x03xx — bus error (low byte = subtype)
+ * This file is a thin polling state machine: arm the channel, then poll
+ * status every ~500 ms until terminal, then trigger a local
+ * dirty_poll_full_scan to repopulate the controller's state cache from the
+ * freshly-addressed bus.
  *
- * Match the high byte for the pending check (`(value & 0xFF00) == 0xFF00`):
- * the only visible mid-pending value is `0xFF02`, but treating any `0xFFxx`
- * as pending is the safe rule.
- *
- * The state machine is driven by dali_provision_tick() called from main loop.
- * Each tick either:
- *   a) Issues the next Modbus write (non-blocking, enqueued via modbus.c), or
- *   b) Polls 0x0108 for a query result and advances state on receipt, or
- *   c) Waits for a minimum inter-command gap (enforced by timestamp).
- *
- * DALI system command encoding:
- *   RAW_CMD / RAW_CMD_TWICE value = (addr_byte << 8) | cmd_byte
- *   For system commands (no short address), addr_byte is the command's
- *   own high byte (e.g. 0xA1 for Terminate, 0xA9 for Compare).
- *
- * Binary search:
- *   Search range [low, high] (24-bit). We maintain low and high as the
- *   unexamined range. Each iteration:
- *     1. Set Search Address = midpoint
- *     2. Compare — if YES: high = midpoint (something at or below mid)
- *                  if NO:  low  = midpoint + 1 (nothing at or below mid)
- *     3. When low == high: that IS the device's random address.
+ * PROV_ADDRESS mode (re-init one specific short address) has no equivalent
+ * in the TinyModbus commissioning channel and is rejected.
  */
 
 #include "dali_provision.h"
 #include "modbus.h"
-#include "config.h"
 #include "dirty_poll.h"
 #include "serial_protocol.h"
 #include "log.h"
@@ -55,288 +35,101 @@
 #include <stdio.h>
 #include <string.h>
 
-/* ── TinyModbus register addresses ───────────────────────────────────────── */
-#define REG_RAW_CMD        0x1000u
-#define REG_RAW_CMD_TWICE  0x1001u
-#define REG_RAW_RESULT     0x0108u   /* FC04 input register; read-clears on terminal */
+#define MBREG_COMMISSION  0x1014u
 
-/* DALI special command for loading DTR0 (replaces the retired DTR0-setter
- * register removed in TinyModbus subtask 9). High byte 0xA3 = SET_DTR0
- * special command, low byte = the value to load. */
-#define DALI_SET_DTR0_CMD(v)  (0xA300u | ((v) & 0xFF))
+#define POLL_INTERVAL_MS  500u
+#define POST_SCAN_WAIT_MS 200u
 
-/* RAW_RESULT values */
-#define RAW_RESULT_IDLE    0x0000u
-#define RAW_RESULT_PENDING 0xFF00u
-#define RAW_RESULT_NAK     0x0100u
-#define RAW_RESULT_OK      0x0200u   /* low byte = response */
-#define RAW_RESULT_ERROR   0x0300u
-
-/* ── DALI system command bytes ────────────────────────────────────────────── */
-/* Each encoded as (high_byte << 8) | low_byte for RAW_CMD / RAW_CMD_TWICE   */
-#define DALI_TERMINATE          0xA100u
-#define DALI_RANDOMISE          0xA700u
-#define DALI_COMPARE            0xA900u
-#define DALI_WITHDRAW           0xAB00u
-#define DALI_INITIALISE_ALL     0xA500u   /* put ALL devices into init mode */
-#define DALI_INITIALISE_NEW     0xA5FFu   /* put UNADDRESSED devices only   */
-#define DALI_CLEAR_SHORT_ADDR   0xFF80u   /* broadcast: delete short address */
-/* SET_SEARCH_ADDR_{H,M,L}: high byte is cmd, low byte is address fragment  */
-#define DALI_SET_SEARCH_H(b)    (0xB100u | ((b) & 0xFF))
-#define DALI_SET_SEARCH_M(b)    (0xB300u | ((b) & 0xFF))
-#define DALI_SET_SEARCH_L(b)    (0xB500u | ((b) & 0xFF))
-/* PROGRAM_SHORT_ADDRESS: sends short_addr in form (addr<<1)|1              */
-#define DALI_PROG_SHORT(a)      (0xB700u | (((a) & 0x3F) << 1) | 0x01u)
-/* VERIFY_SHORT_ADDRESS: query — expects YES response                        */
-#define DALI_VERIFY_SHORT(a)    (0xB900u | (((a) & 0x3F) << 1) | 0x01u)
-/* INITIALISE for a specific short address already present                   */
-#define DALI_INITIALISE_ADDR(a) (0xA501u | (((a) & 0x3F) << 1))
-/* QUERY_CONTROL_GEAR_PRESENT for addr: check if a short addr is occupied   */
-#define DALI_QUERY_PRESENT(a)   ((((a) & 0x3F) << 1 | 0x01u) << 8 | 0x91u)
-
-/* Minimum gap between DALI system commands (ms) — 22 Te ≈ 9.2 ms, use 12  */
-#define DALI_CMD_GAP_MS  12u
-/* Extra delay after RANDOMISE — devices need time to generate random addr   */
-#define DALI_RANDOMISE_DELAY_MS 120u
-
-/* ── Internal sub-states ─────────────────────────────────────────────────── */
+/* ── Internal sub-state ─────────────────────────────────────────────────── */
 typedef enum {
-    /* Idle */
     SS_IDLE,
-
-    /* Clearing existing addresses */
-    SS_CLEAR_DTR0,          /* write SET_DTR0 = 0xFF */
-    SS_CLEAR_BROADCAST,     /* write RAW_CMD_TWICE = 0xFF80 */
-    SS_CLEAR_DONE,
-
-    /* Scanning which addresses are already used */
-    SS_SCAN_QUERY,          /* query CONTROL_GEAR_PRESENT for current addr */
-    SS_SCAN_WAIT,           /* wait for 0x0108 result */
-    SS_SCAN_DONE,
-
-    /* Terminate → Initialise → Randomise */
-    SS_TERMINATE,
-    SS_INITIALISE,
-    SS_RANDOMISE,
-    SS_RANDOMISE_WAIT,      /* extra delay for RNG to settle */
-
-    /* Binary search loop */
-    SS_SEARCH_SET_H,        /* write Search Address H */
-    SS_SEARCH_SET_M,        /* write Search Address M */
-    SS_SEARCH_SET_L,        /* write Search Address L */
-    SS_SEARCH_COMPARE,      /* write RAW_CMD = Compare */
-    SS_SEARCH_COMPARE_WAIT, /* poll 0x0108 */
-
-    /* Assign address to found device */
-    SS_ASSIGN_PROG,         /* write RAW_CMD_TWICE = PROGRAM_SHORT_ADDRESS */
-    SS_ASSIGN_VERIFY,       /* write RAW_CMD = VERIFY_SHORT_ADDRESS */
-    SS_ASSIGN_VERIFY_WAIT,  /* poll 0x0108 */
-    SS_ASSIGN_WITHDRAW,     /* write RAW_CMD_TWICE = WITHDRAW */
-
-    /* Final terminate + scan trigger + wait + Pico rescan */
-    SS_FINAL_TERMINATE,
-    SS_FINAL_SCAN,
-    SS_FINAL_WAIT,       /* wait for TinyModbus scan to complete (~200 ms) */
+    SS_ARMING,         /* FC06 start write enqueued; awaiting ACK         */
+    SS_POLLING,        /* periodic FC03 read of 0x1014 until terminal      */
+    SS_ABORTING,       /* FC06 abort write enqueued / polling for terminal */
+    SS_POST_SCAN_WAIT, /* settle delay before dirty_poll_full_scan         */
     SS_DONE,
-    SS_ABORTED,
 } sub_state_t;
 
-/* ── Module state ─────────────────────────────────────────────────────────── */
 prov_status_t g_prov_status = { .run_state = PROV_STATE_IDLE };
 
 static struct {
     bool        active;
     uint8_t     slave_id;
-    prov_mode_t mode;
-    uint8_t     target_addr;   /* PROV_ADDRESS only */
-
     sub_state_t sub;
-
-    /* Available address pool: which short addresses are free to assign */
-    bool        used[64];      /* true = already occupied */
-    uint8_t     avail[64];     /* ordered list of free addresses */
-    uint8_t     avail_count;
-    uint8_t     avail_idx;     /* next index into avail[] to assign */
-
-    /* Scan state */
-    uint8_t     scan_addr;     /* current address being scanned (0–63) */
-
-    /* Binary search state */
-    uint32_t    search_low;
-    uint32_t    search_high;
-    uint32_t    search_mid;
-
-    /* Timing */
-    uint32_t    last_cmd_ms;   /* time of last Modbus write */
-    uint32_t    wait_until_ms; /* for delay states */
-
-    /* Query result polling */
-    volatile bool     result_ready;
-    volatile uint16_t result_val;
-    bool              poll_pending;  /* P4: true while poll_result() in flight */
+    uint32_t    next_poll_ms;
+    uint32_t    wait_until_ms;
+    bool        poll_pending;      /* a FC03 read is in flight              */
+    volatile bool     status_ready;
+    volatile uint16_t status_val;
 } s;
 
-/* ── Helpers ──────────────────────────────────────────────────────────────── */
-
-static const char *prov_state_name(prov_run_state_t s) {
-    switch (s) {
-    case PROV_STATE_IDLE:          return "idle";
-    case PROV_STATE_CLEARING:      return "clearing";
-    case PROV_STATE_SCANNING_USED: return "scanning_used";
-    case PROV_STATE_TERMINATING:   return "terminating";
-    case PROV_STATE_INITIALISING:  return "initialising";
-    case PROV_STATE_RANDOMISING:   return "randomising";
-    case PROV_STATE_SEARCHING:     return "searching";
-    case PROV_STATE_ASSIGNING:     return "assigning";
-    case PROV_STATE_VERIFYING:     return "verifying";
-    case PROV_STATE_WITHDRAWING:   return "withdrawing";
-    case PROV_STATE_COMPLETE:      return "complete";
-    case PROV_STATE_ERROR:         return "error";
-    default:                       return "unknown";
-    }
-}
-
-static void set_status(prov_run_state_t run_state, const char *msg) {
-    g_prov_status.run_state = run_state;
-    strncpy(g_prov_status.msg, msg, PROV_STATUS_MSG_MAX - 1);
-    g_prov_status.msg[PROV_STATUS_MSG_MAX - 1] = '\0';
-    LOG_INFO("prov", "state -> %s", prov_state_name(run_state));
-    if (run_state == PROV_STATE_COMPLETE) {
-        LOG_INFO("prov", "complete devices=%u", g_prov_status.devices_found);
-    }
-    /* serial_protocol will see this on next serial_poll() tick */
-    serial_provision_status_changed();
-}
+/* ── Helpers ────────────────────────────────────────────────────────────── */
 
 static uint32_t now_ms(void) {
     return to_ms_since_boot(get_absolute_time());
 }
 
-static bool gap_elapsed(void) {
-    return (now_ms() - s.last_cmd_ms) >= DALI_CMD_GAP_MS;
+static void set_status(prov_run_state_t state, const char *msg) {
+    g_prov_status.run_state = state;
+    strncpy(g_prov_status.msg, msg, PROV_STATUS_MSG_MAX - 1);
+    g_prov_status.msg[PROV_STATUS_MSG_MAX - 1] = '\0';
+    LOG_INFO("prov", "state=%d msg=\"%s\"", (int)state, msg);
+    serial_provision_status_changed();
 }
 
-/* Non-query command callback — just records the time */
-static void cmd_cb(int res, uint8_t *buf, void *ctx) {
-    s.last_cmd_ms = now_ms();
-    (void)res; (void)buf; (void)ctx;
+static const char *err_subtype_msg(uint8_t sub) {
+    switch (sub) {
+    case 0x01: return "aborted by master";
+    case 0x02: return "no ballasts found";
+    case 0x03: return "consecutive verify failures";
+    case 0x04: return "short-address pool exhausted";
+    case 0x05: return "bus stuck";
+    default:   return "unknown error";
+    }
 }
 
-/* Discard callback — used for the pre-read in write_raw_query that flushes
- * any terminal value parked in 0x0108 by a prior raw write. We don't care
- * about the result; the read itself does the work via the firmware's
- * read-clears-on-terminal semantics. */
-static void discard_cb(int res, uint8_t *buf, void *ctx) {
-    (void)res; (void)buf; (void)ctx;
+/* ── Modbus callbacks ──────────────────────────────────────────────────── */
+
+static void arm_cb(int res, uint8_t *buf, void *ctx) {
+    (void)buf; (void)ctx;
+    if (res <= 0) {
+        /* DEVICE_BUSY (commissioning already running) or other failure.
+         * Either way we are not driving a run — bail. */
+        set_status(PROV_STATE_ERROR, "Failed to arm commissioning");
+        s.active = false;
+        s.sub    = SS_DONE;
+        return;
+    }
+    s.next_poll_ms = now_ms() + POLL_INTERVAL_MS;
+    s.sub          = SS_POLLING;
 }
 
-/* Query result callback — reads FC04 0x0108 (RAW_RESULT).
- *
- * The TinyModbus encoding is:
- *   0xFFnn — pending (high byte 0xFF, low byte = sends remaining at arming)
- *   0x0000 — idle (no command in progress / previous result already consumed)
- *   0x01nn — NAK
- *   0x02xx — OK (low byte = response byte)
- *   0x03xx — error
- *
- * Only set result_ready on a TERMINAL value (high byte 0x00 / 0x01 / 0x02 /
- * 0x03). Pending (0xFFnn) just clears poll_pending so the next tick re-polls.
- * Treating idle (0x0000) as terminal too keeps the state machine from
- * hanging in the unlikely case it shows up mid-query (e.g. if a prior poll
- * already consumed the terminal value via the read-clears semantics).
- */
-static void query_result_cb(int res, uint8_t *buf, void *ctx) {
-    s.last_cmd_ms  = now_ms();
-    s.poll_pending = false;   /* P4: clear pending flag */
+static void abort_cb(int res, uint8_t *buf, void *ctx) {
+    (void)buf; (void)ctx;
+    if (res <= 0) {
+        LOG_WARN("prov", "abort write failed (%d) — still polling for terminal", res);
+    }
+    s.next_poll_ms = now_ms() + POLL_INTERVAL_MS;
+    s.sub          = SS_ABORTING;
+}
+
+static void poll_cb(int res, uint8_t *buf, void *ctx) {
     (void)ctx;
-
-    /* P2: FC04 1-register frame = slave+FC+bytecount+2data+CRC = 7 bytes.
-     * Short / failed frame = treat as no-update; let the next tick re-poll.
-     * (Don't synthesize NAK here — that would prematurely advance the FSM.) */
-    if (res < 7) {
-        return;
-    }
-
-    uint16_t val = ((uint16_t)buf[3] << 8) | buf[4];
-    uint8_t  hi  = (uint8_t)(val >> 8);
-
-    if (hi == 0xFF) {
-        /* Pending (0xFFnn). Don't latch — next tick will poll again. */
-        return;
-    }
-
-    /* Terminal value (0x00 idle / 0x01 NAK / 0x02 OK / 0x03 error). */
-    s.result_val   = val;
-    s.result_ready = true;
+    s.poll_pending = false;
+    /* FC03 1-register frame: addr+FC+bytecount+2data+CRC = 7 bytes */
+    if (res < 7) return;
+    s.status_val   = ((uint16_t)buf[3] << 8) | buf[4];
+    s.status_ready = true;
 }
 
-static void write_raw(uint16_t cmd) {
-    /* Pre-flush 0x0108 so the gateway accepts this write (otherwise it
-     * returns DEVICE_BUSY because every prior raw write parks a terminal
-     * NAK there). cmd_cb is preserved — its only job is updating last_cmd_ms. */
-    modbus_get_input_registers(s.slave_id, REG_RAW_RESULT, 1, discard_cb, NULL);
-    modbus_set_holding_register(s.slave_id, REG_RAW_CMD_TWICE,
-                                cmd, cmd_cb, NULL);
-}
-
-static void write_raw_query(uint16_t cmd) {
-    s.result_ready = false;
-    s.result_val   = RAW_RESULT_PENDING;
-    /* Pre-read 0x0108 to clear any terminal value parked there by a prior
-     * raw write — without this, RAW_CMD returns SLAVE_DEVICE_BUSY (which
-     * cmd_cb silently swallows) and the next poll_result() reads the stale
-     * value as the new query's response.
-     *
-     * Every raw write — including non-query writes like SET_SEARCH_H/M/L,
-     * TERMINATE, RANDOMISE, WITHDRAW, PROGRAM_SHORT — parks a terminal
-     * value (typically NAK) in 0x0108 when it completes, and that value
-     * sits there until the master reads it. So between e.g. SS_SEARCH_SET_L
-     * and SS_SEARCH_COMPARE, or SS_ASSIGN_PROG and SS_ASSIGN_VERIFY, the
-     * register holds a stale NAK from the preceding non-query write.
-     *
-     * The "reading clears terminal value" atomic at TinyModbus README
-     * line 389 is what makes this pre-read safe and cheap: one extra
-     * input-register read flushes the stale terminal back to 0x0000 so
-     * the subsequent RAW_CMD write is accepted (no SLAVE_DEVICE_BUSY) and
-     * the next poll_result() can only see this query's own result. */
-    modbus_get_input_registers(s.slave_id, REG_RAW_RESULT, 1,
-                               discard_cb, NULL);
-    modbus_set_holding_register(s.slave_id, REG_RAW_CMD,
-                                cmd, cmd_cb, NULL);
-    /* Result will arrive asynchronously; poll_result() reads it */
-}
-
-static void poll_result(void) {
-    if (s.poll_pending) return;   /* P4: only one read in flight at a time */
+static void start_poll(void) {
+    if (s.poll_pending) return;
     s.poll_pending = true;
-    modbus_get_input_registers(s.slave_id, REG_RAW_RESULT, 1,
-                               query_result_cb, NULL);
+    s.status_ready = false;
+    modbus_get_holding_registers(s.slave_id, MBREG_COMMISSION, 1, poll_cb, NULL);
 }
 
-static void build_avail_list(void) {
-    s.avail_count = 0;
-    for (int a = 0; a < 64; a++) {
-        if (!s.used[a]) {
-            s.avail[s.avail_count++] = (uint8_t)a;
-        }
-    }
-}
-
-static void advance(sub_state_t next) {
-    s.sub = next;
-}
-
-static void fail(const char *reason) {
-    char msg[PROV_STATUS_MSG_MAX];
-    snprintf(msg, sizeof(msg), "Error: %s", reason);
-    set_status(PROV_STATE_ERROR, msg);
-    /* Send terminate to clean up the DALI bus */
-    write_raw(DALI_TERMINATE);
-    s.active = false;
-    s.sub    = SS_DONE;
-}
-
-/* ── Public API ───────────────────────────────────────────────────────────── */
+/* ── Public API ────────────────────────────────────────────────────────── */
 
 void dali_provision_init(void) {
     memset(&s, 0, sizeof(s));
@@ -351,66 +144,44 @@ bool dali_provision_busy_slave(uint8_t slave_id) {
 
 bool dali_provision_start(uint8_t slave_id, prov_mode_t mode,
                            uint8_t target_addr) {
+    (void)target_addr;
     if (s.active) return false;
+    if (mode == PROV_ADDRESS) {
+        LOG_WARN("prov", "PROV_ADDRESS not supported by TinyModbus commissioning");
+        return false;
+    }
+
+    uint16_t cmd = (mode == PROV_UNADDRESSED) ? 0x0002u : 0x0001u;
 
     memset(&s, 0, sizeof(s));
-    s.active      = true;
-    s.slave_id    = slave_id;
-    s.mode        = mode;
-    s.target_addr = target_addr;
-    s.search_low  = 0;
-    s.search_high = 0xFFFFFF;
-    s.last_cmd_ms = now_ms();
+    s.active   = true;
+    s.slave_id = slave_id;
+    s.sub      = SS_ARMING;
 
     g_prov_status.slave_id      = slave_id;
     g_prov_status.devices_found = 0;
 
-    {
-        const char *mode_str =
-            mode == PROV_ALL         ? "all"     :
-            mode == PROV_UNADDRESSED ? "new"     :
-            mode == PROV_ADDRESS     ? "address" : "?";
-        if (mode == PROV_ADDRESS) {
-            LOG_INFO("prov", "start slave=%u mode=%s target=%u",
-                     slave_id, mode_str, target_addr);
-        } else {
-            LOG_INFO("prov", "start slave=%u mode=%s", slave_id, mode_str);
-        }
-    }
+    LOG_INFO("prov", "start slave=%u mode=%s",
+             slave_id, mode == PROV_UNADDRESSED ? "incremental" : "full");
+    set_status(PROV_STATE_INITIALISING,
+               mode == PROV_UNADDRESSED ?
+               "Starting incremental commissioning..." :
+               "Starting full commissioning...");
 
-    /* Choose entry sub-state based on mode */
-    switch (mode) {
-    case PROV_ALL:
-        set_status(PROV_STATE_CLEARING, "Clearing existing addresses...");
-        s.sub = SS_CLEAR_DTR0;
-        break;
-    case PROV_UNADDRESSED:
-        set_status(PROV_STATE_SCANNING_USED,
-                   "Scanning for used addresses... (0/64)");
-        s.scan_addr = 0;
-        s.sub = SS_SCAN_QUERY;
-        break;
-    case PROV_ADDRESS:
-        set_status(PROV_STATE_TERMINATING, "Terminating previous session...");
-        /* Mark everything except target as "used" so only target addr is free */
-        for (int a = 0; a < 64; a++) s.used[a] = (a != target_addr);
-        build_avail_list();
-        s.sub = SS_TERMINATE;
-        break;
-    }
+    modbus_set_holding_register(slave_id, MBREG_COMMISSION, cmd, arm_cb, NULL);
     return true;
 }
 
 void dali_provision_abort(void) {
     if (!s.active) return;
-    LOG_INFO("prov", "abort");
-    write_raw(DALI_TERMINATE);
-    s.active = false;
-    s.sub    = SS_ABORTED;
-    set_status(PROV_STATE_IDLE, "Aborted");
+    if (s.sub == SS_DONE || s.sub == SS_POST_SCAN_WAIT) return;
+    LOG_INFO("prov", "abort requested");
+    set_status(PROV_STATE_TERMINATING, "Aborting commissioning...");
+    modbus_set_holding_register(s.slave_id, MBREG_COMMISSION,
+                                0x0000u, abort_cb, NULL);
 }
 
-/* ── Main tick ────────────────────────────────────────────────────────────── */
+/* ── Tick ──────────────────────────────────────────────────────────────── */
 
 void dali_provision_tick(void) {
     if (!s.active) return;
@@ -419,298 +190,72 @@ void dali_provision_tick(void) {
 
     switch (s.sub) {
 
-    /* ── Clearing ────────────────────────────────────────────────────────── */
-
-    case SS_CLEAR_DTR0:
-        if (!gap_elapsed()) break;
-        /* Load DTR0 = 0xFF via the raw command channel — the dedicated
-         * DTR0-setter register was retired in TinyModbus subtask 9.
-         * 0xA3 is the SET_DTR0 special command; single send, no backward
-         * frame expected. Use cmd_cb (no result polling).
-         *
-         * Pre-flush 0x0108 just like write_raw — any prior raw write (e.g.
-         * a stray TERMINATE from an aborted prior session) would otherwise
-         * leave a parked terminal that makes the gateway reject this. */
-        modbus_get_input_registers(s.slave_id, REG_RAW_RESULT, 1,
-                                   discard_cb, NULL);
-        modbus_set_holding_register(s.slave_id, REG_RAW_CMD,
-                                    DALI_SET_DTR0_CMD(0xFF), cmd_cb, NULL);
-        advance(SS_CLEAR_BROADCAST);
+    case SS_IDLE:
+    case SS_ARMING:
+    case SS_DONE:
+        /* Waiting for callback or nothing to do */
         break;
 
-    case SS_CLEAR_BROADCAST:
-        if (!gap_elapsed()) break;
-        write_raw(DALI_CLEAR_SHORT_ADDR);
-        advance(SS_CLEAR_DONE);
-        break;
+    case SS_POLLING:
+    case SS_ABORTING:
+        if (s.status_ready) {
+            uint16_t val = s.status_val;
+            uint8_t  hi  = (uint8_t)(val >> 8);
+            uint8_t  lo  = (uint8_t)val;
+            s.status_ready = false;
 
-    case SS_CLEAR_DONE:
-        if (!gap_elapsed()) break;
-        /* All addresses cleared — nothing is "used" */
-        memset(s.used, 0, sizeof(s.used));
-        build_avail_list();
-        set_status(PROV_STATE_TERMINATING, "Terminating previous session...");
-        s.sub = SS_TERMINATE;
-        break;
-
-    /* ── Scanning used addresses ─────────────────────────────────────────── */
-
-    case SS_SCAN_QUERY:
-        if (!gap_elapsed()) break;
-        /* Query CONTROL_GEAR_PRESENT for s.scan_addr */
-        write_raw_query(DALI_QUERY_PRESENT(s.scan_addr));
-        advance(SS_SCAN_WAIT);
-        break;
-
-    case SS_SCAN_WAIT:
-        if (!gap_elapsed()) break;
-        poll_result();
-        if (!s.result_ready) break;
-
-        /* 0x02xx = response received = address is occupied */
-        if ((s.result_val & 0xFF00) == RAW_RESULT_OK) {
-            s.used[s.scan_addr] = true;
-        }
-        s.scan_addr++;
-        if (s.scan_addr < 64) {
-            snprintf(msg, sizeof(msg),
-                     "Scanning for used addresses... (%u/64)", s.scan_addr);
-            set_status(PROV_STATE_SCANNING_USED, msg);
-            s.sub = SS_SCAN_QUERY;
-        } else {
-            build_avail_list();
-            snprintf(msg, sizeof(msg),
-                     "%u addresses available for assignment", s.avail_count);
-            set_status(PROV_STATE_TERMINATING, msg);
-            s.sub = SS_TERMINATE;
-        }
-        break;
-
-    case SS_SCAN_DONE:
-        /* Unused — fall through handled in SS_SCAN_WAIT */
-        break;
-
-    /* ── Terminate → Initialise → Randomise ─────────────────────────────── */
-
-    case SS_TERMINATE:
-        if (!gap_elapsed()) break;
-        write_raw(DALI_TERMINATE);
-        advance(SS_INITIALISE);
-        break;
-
-    case SS_INITIALISE:
-        if (!gap_elapsed()) break;
-        {
-            uint16_t init_cmd;
-            switch (s.mode) {
-            case PROV_ALL:
-                set_status(PROV_STATE_INITIALISING, "Initialising all devices...");
-                init_cmd = DALI_INITIALISE_ALL;
-                break;
-            case PROV_UNADDRESSED:
-                set_status(PROV_STATE_INITIALISING, "Initialising unaddressed devices...");
-                init_cmd = DALI_INITIALISE_NEW;
-                break;
-            case PROV_ADDRESS:
-                snprintf(msg, sizeof(msg),
-                         "Initialising address %u...", s.target_addr);
-                set_status(PROV_STATE_INITIALISING, msg);
-                init_cmd = DALI_INITIALISE_ADDR(s.target_addr);
-                break;
-            default:
-                fail("invalid mode");
-                return;
-            }
-            write_raw(init_cmd);
-            advance(SS_RANDOMISE);
-        }
-        break;
-
-    case SS_RANDOMISE:
-        if (!gap_elapsed()) break;
-        set_status(PROV_STATE_RANDOMISING, "Randomising device addresses...");
-        write_raw(DALI_RANDOMISE);
-        s.wait_until_ms = now_ms() + DALI_RANDOMISE_DELAY_MS;
-        advance(SS_RANDOMISE_WAIT);
-        break;
-
-    case SS_RANDOMISE_WAIT:
-        /* Give devices time to generate their random addresses */
-        if (now_ms() < s.wait_until_ms) break;
-        /* Start binary search from scratch */
-        s.search_low  = 0;
-        s.search_high = 0xFFFFFF;
-        set_status(PROV_STATE_SEARCHING,
-                   "Searching for devices...");
-        s.sub = SS_SEARCH_SET_H;
-        break;
-
-    /* ── Binary search ───────────────────────────────────────────────────── */
-
-    case SS_SEARCH_SET_H:
-        if (!gap_elapsed()) break;
-        if (s.search_low > 0xFFFFFF) {
-            /* No more devices */
-            s.sub = SS_FINAL_TERMINATE;
-            break;
-        }
-        s.search_mid = (s.search_low + s.search_high) / 2;
-        /* Set Search Address H, M, L — three writes, all non-query */
-        write_raw(DALI_SET_SEARCH_H((s.search_mid >> 16) & 0xFF));
-        advance(SS_SEARCH_SET_M);
-        break;
-
-    case SS_SEARCH_SET_M:
-        if (!gap_elapsed()) break;
-        write_raw(DALI_SET_SEARCH_M((s.search_mid >> 8) & 0xFF));
-        advance(SS_SEARCH_SET_L);
-        break;
-
-    case SS_SEARCH_SET_L:
-        if (!gap_elapsed()) break;
-        write_raw(DALI_SET_SEARCH_L(s.search_mid & 0xFF));
-        advance(SS_SEARCH_COMPARE);
-        break;
-
-    case SS_SEARCH_COMPARE:
-        if (!gap_elapsed()) break;
-        write_raw_query(DALI_COMPARE);
-        advance(SS_SEARCH_COMPARE_WAIT);
-        break;
-
-    case SS_SEARCH_COMPARE_WAIT:
-        if (!gap_elapsed()) break;
-        poll_result();
-        if (!s.result_ready) break;
-
-        {
-            bool yes = (s.result_val & 0xFF00) == RAW_RESULT_OK
-                       || (s.result_val & 0xFF00) == RAW_RESULT_ERROR;
-            /* Note: bus collision (0x03xx) counts as YES per DALI spec and
-             * original Lua: any response at all = at least one device present */
-
-            if (yes) {
-                if (s.search_low == s.search_mid) {
-                    /* Found it — search_mid IS the random address */
-                    snprintf(msg, sizeof(msg),
-                             "Found device at 0x%06lX",
-                             (unsigned long)s.search_mid);
-                    set_status(PROV_STATE_SEARCHING, msg);
-
-                    if (s.avail_count == 0 || s.avail_idx >= s.avail_count) {
-                        LOG_WARN("prov", "no free addresses");
-                        fail("no free short addresses remaining");
-                        return;
-                    }
-                    s.sub = SS_ASSIGN_PROG;
+            switch (hi) {
+            case 0x00:
+                /* Idle — saw a terminal-clear during this poll, or the
+                 * abort completed. Either way, the run is done. */
+                if (s.sub == SS_ABORTING) {
+                    set_status(PROV_STATE_ERROR, "Aborted by master");
                 } else {
-                    s.search_high = s.search_mid;
-                    s.sub = SS_SEARCH_SET_H;
+                    set_status(PROV_STATE_ERROR,
+                               "Status returned to idle unexpectedly");
                 }
-            } else {
-                /* Nothing at or below mid — search above it */
-                if (s.search_mid == 0xFFFFFF) {
-                    /* Nothing found in entire remaining range */
-                    s.sub = SS_FINAL_TERMINATE;
-                } else {
-                    s.search_low = s.search_mid + 1;
-                    s.sub = SS_SEARCH_SET_H;
-                }
-            }
-        }
-        break;
+                s.active = false;
+                s.sub    = SS_DONE;
+                break;
 
-    /* ── Assign short address to found device ────────────────────────────── */
-
-    case SS_ASSIGN_PROG:
-        if (!gap_elapsed()) break;
-        {
-            uint8_t short_addr = s.avail[s.avail_idx];
-            snprintf(msg, sizeof(msg),
-                     "Assigning address %u to device at 0x%06lX...",
-                     short_addr, (unsigned long)s.search_mid);
-            set_status(PROV_STATE_ASSIGNING, msg);
-            write_raw(DALI_PROG_SHORT(short_addr));
-            advance(SS_ASSIGN_VERIFY);
-        }
-        break;
-
-    case SS_ASSIGN_VERIFY:
-        if (!gap_elapsed()) break;
-        write_raw_query(DALI_VERIFY_SHORT(s.avail[s.avail_idx]));
-        advance(SS_ASSIGN_VERIFY_WAIT);
-        break;
-
-    case SS_ASSIGN_VERIFY_WAIT:
-        if (!gap_elapsed()) break;
-        poll_result();
-        if (!s.result_ready) break;
-
-        {
-            bool ok = (s.result_val & 0xFF00) == RAW_RESULT_OK;
-            uint8_t short_addr = s.avail[s.avail_idx];
-            if (!ok) {
-                LOG_ERR("prov", "verify failed addr=%u random=0x%06lX",
-                        short_addr, (unsigned long)s.search_mid);
+            case 0x01:
+                g_prov_status.devices_found = lo;
                 snprintf(msg, sizeof(msg),
-                         "Verify failed for address %u at device 0x%06lX",
-                         short_addr, (unsigned long)s.search_mid);
-                fail(msg);
-                return;
+                         s.sub == SS_ABORTING ?
+                         "Aborting... %u device%s addressed so far" :
+                         "Commissioning... %u device%s addressed",
+                         lo, lo == 1 ? "" : "s");
+                set_status(PROV_STATE_SEARCHING, msg);
+                s.next_poll_ms = now_ms() + POLL_INTERVAL_MS;
+                break;
+
+            case 0x02:
+                g_prov_status.devices_found = lo;
+                snprintf(msg, sizeof(msg),
+                         "Commissioning finished: %u device%s — re-syncing...",
+                         lo, lo == 1 ? "" : "s");
+                set_status(PROV_STATE_SEARCHING, msg);
+                s.wait_until_ms = now_ms() + POST_SCAN_WAIT_MS;
+                s.sub = SS_POST_SCAN_WAIT;
+                break;
+
+            case 0x03:
+                snprintf(msg, sizeof(msg), "Error: %s", err_subtype_msg(lo));
+                set_status(PROV_STATE_ERROR, msg);
+                s.active = false;
+                s.sub    = SS_DONE;
+                break;
             }
-            LOG_INFO("prov", "device found random=0x%06lX assigned=%u",
-                     (unsigned long)s.search_mid, short_addr);
-            snprintf(msg, sizeof(msg),
-                     "Address %u assigned — %u device%s found so far",
-                     short_addr,
-                     g_prov_status.devices_found + 1,
-                     g_prov_status.devices_found + 1 == 1 ? "" : "s");
-            set_status(PROV_STATE_ASSIGNING, msg);
-            g_prov_status.devices_found++;
-            s.avail_idx++;
-            s.sub = SS_ASSIGN_WITHDRAW;
+        } else if ((int32_t)(now_ms() - s.next_poll_ms) >= 0) {
+            start_poll();
         }
         break;
 
-    case SS_ASSIGN_WITHDRAW:
-        if (!gap_elapsed()) break;
-        write_raw(DALI_WITHDRAW);
-        /* Next search starts from one above the address we just found */
-        s.search_low  = s.search_mid + 1;
-        s.search_high = 0xFFFFFF;
-        if (s.search_low > 0xFFFFFF) {
-            s.sub = SS_FINAL_TERMINATE;
-        } else {
-            s.sub = SS_SEARCH_SET_H;
-        }
-        break;
-
-    /* ── Wrap up ─────────────────────────────────────────────────────────── */
-
-    case SS_FINAL_TERMINATE:
-        if (!gap_elapsed()) break;
-        write_raw(DALI_TERMINATE);
-        advance(SS_FINAL_SCAN);
-        break;
-
-    case SS_FINAL_SCAN:
-        if (!gap_elapsed()) break;
-        /* Trigger TinyModbus firmware bus scan */
-        modbus_set_holding_register(s.slave_id, 0x1010u, 0x0001u,
-                                    cmd_cb, NULL);
-        set_status(PROV_STATE_SEARCHING, "Waiting for bus rescan...");
-        /* P3: wait ~300 ms for firmware scan to populate registers */
-        s.wait_until_ms = now_ms() + 300u;
-        advance(SS_FINAL_WAIT);
-        break;
-
-    case SS_FINAL_WAIT:
-        if (now_ms() < s.wait_until_ms) break;
-        /* P3: full blocking scan updates state_cache and emits scan_complete,
-         * which the bridge uses to update per-ballast MQTT availability.
-         * This is the same scan done at boot — after provisioning the Pico
-         * must re-discover which addresses are now populated. */
-        s.active = false;   /* release lock before blocking scan */
+    case SS_POST_SCAN_WAIT:
+        if ((int32_t)(now_ms() - s.wait_until_ms) < 0) break;
+        /* Release the lock before the blocking scan so any other
+         * subsystem that asks "are you busy?" gets the right answer. */
+        s.active = false;
         dirty_poll_full_scan(s.slave_id);
         snprintf(msg, sizeof(msg),
                  "Complete: %u device%s commissioned",
@@ -718,11 +263,6 @@ void dali_provision_tick(void) {
                  g_prov_status.devices_found == 1 ? "" : "s");
         set_status(PROV_STATE_COMPLETE, msg);
         s.sub = SS_DONE;
-        break;
-
-    case SS_DONE:
-    case SS_ABORTED:
-    case SS_IDLE:
         break;
     }
 }

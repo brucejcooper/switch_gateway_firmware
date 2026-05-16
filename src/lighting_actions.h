@@ -16,11 +16,10 @@
 void lighting_set_relay(uint8_t channel, bool on);
 
 /* Issue a raw DALI command via TinyModbus's RAW_CMD (or RAW_CMD_TWICE if
- * `twice` is true). Always pre-flushes the result register at FC04 0x0108
- * — TinyModbus rejects new raw writes with SLAVE_DEVICE_BUSY whenever a
- * stale terminal value is parked there, and *every* successful raw write
- * parks one. This helper is the only correct way for any caller to issue
- * a raw DALI command; never write FC06 0x1000/0x1001 directly. */
+ * `twice` is true). TinyModbus rejects new raw writes only while the
+ * previous command is still in flight (raw_cmd_result high byte == 0xFF —
+ * PENDING); a terminal IDLE/NAK/OK/ERR is silently overwritten by the new
+ * write. The slave returns MB_ERR_DEVICE_BUSY on the PENDING case. */
 void dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice);
 
 /* DALI: on (goto last active) / off */

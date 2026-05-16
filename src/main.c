@@ -33,6 +33,7 @@
 #include <pico/stdio.h>
 #include <pico/stdlib.h>
 #include <pico/time.h>
+#include <filesystem/vfs.h>
 
 static int pico_led_init(void) {
     gpio_init(PICO_DEFAULT_LED_PIN);

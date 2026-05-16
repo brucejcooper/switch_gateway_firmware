@@ -1,11 +1,8 @@
 /*
  * serial_protocol.c — JSON line protocol over USB CDC.
  *
- * Replaces lualoop.c.  Uses stdio_getchar_timeout_us(0) to non-blockingly
- * read USB CDC input — exactly as lua_poll() did in the original firmware.
- * Outbound messages use printf() — same as the original.
- *
- * All parsing is single-core; no multicore synchronisation needed.
+ * Uses stdio_getchar_timeout_us(0) to non-blockingly read USB CDC input;
+ * outbound messages use printf(). Single-core; no multicore sync needed.
  */
 
 #include "serial_protocol.h"
@@ -22,6 +19,7 @@
 #include <strings.h>
 #include <stdlib.h>
 #include <hardware/watchdog.h>
+#include <pico/stdio.h>
 #include <pico/time.h>
 
 /* Consume levt_t events from lighting_actions */
@@ -59,6 +57,78 @@ static bool json_bool(const char *j, const char *k, bool *out) {
     if (!json_str(j, k, buf, sizeof(buf))) return false;
     *out = strcmp(buf, "true") == 0 || strcmp(buf, "1") == 0;
     return true;
+}
+
+/* Parse `"targets":[{...},{...}]` out of `line`, populating `out` with up
+ * to `max` valid entries. Invalid target objects are skipped (matching the
+ * legacy set_mapping behaviour). Returns the count of accepted targets. */
+static uint8_t parse_targets(const char *line, mapping_target_t *out, uint8_t max) {
+    uint8_t count = 0;
+    const char *tp = strstr(line, "\"targets\"");
+    if (!tp) return 0;
+    const char *p = tp;
+    while (count < max && (p = strchr(p, '{')) != NULL) {
+        const char *end = strchr(p, '}');
+        if (!end) break;
+        char obj[64];
+        size_t len = (size_t)(end - p + 1);
+        if (len < sizeof(obj)) {
+            memcpy(obj, p, len);
+            obj[len] = '\0';
+            int slave = 0, addr = 0, group = 0;
+            bool has_slave = json_int(obj, "slave", &slave);
+            bool has_addr  = json_int(obj, "addr",  &addr);
+            bool has_group = json_int(obj, "group", &group);
+            if (has_slave && (has_addr || has_group)) {
+                out[count].slave = (uint8_t)slave;
+                if (has_group && (uint8_t)slave != SLAVE_RELAY) {
+                    if (group >= 0 && group <= 15) {
+                        out[count].addr = TARGET_MAKE_GROUP((uint8_t)group);
+                        count++;
+                    }
+                } else if (has_addr) {
+                    out[count].addr = (uint8_t)addr;
+                    count++;
+                }
+            }
+        }
+        p = end + 1;
+    }
+    return count;
+}
+
+/* Emit a config_mapping line for one (fixture, button). Empty `targets`
+ * (count == 0) clears the bridge's retained MQTT entry for that button. */
+static void emit_config_mapping(uint8_t fixture, uint8_t button,
+                                const mapping_target_t *targets, uint8_t count) {
+    char mbuf[256];
+    int n = snprintf(mbuf, sizeof(mbuf),
+                     "{\"t\":\"config_mapping\","
+                     "\"d\":{\"fixture\":%u,\"button\":%u},"
+                     "\"v\":{\"targets\":[",
+                     fixture, button);
+    for (int i = 0; i < count; i++) {
+        if (TARGET_IS_GROUP(targets[i])) {
+            n += snprintf(mbuf + n, sizeof(mbuf) - n,
+                          "%s{\"slave\":%u,\"group\":%u}",
+                          i > 0 ? "," : "",
+                          targets[i].slave, TARGET_GROUP_NUM(targets[i]));
+        } else {
+            n += snprintf(mbuf + n, sizeof(mbuf) - n,
+                          "%s{\"slave\":%u,\"addr\":%u}",
+                          i > 0 ? "," : "",
+                          targets[i].slave, targets[i].addr);
+        }
+    }
+    n += snprintf(mbuf + n, sizeof(mbuf) - n, "]}}\n");
+    printf("%s", mbuf);
+}
+
+static void diff_emit_cb(uint8_t fixture, uint8_t button,
+                         const mapping_target_t *new_targets,
+                         uint8_t new_count, void *user) {
+    (void)user;
+    emit_config_mapping(fixture, button, new_targets, new_count);
 }
 
 /* ── Process one inbound JSON line ──────────────────────────────────────── */
@@ -180,69 +250,11 @@ static void handle_json_line(const char *line) {
         int fixture = 0, button = 0;
         json_int(line, "fixture", &fixture);
         json_int(line, "button",  &button);
-
         mapping_target_t targets[MAX_TARGETS_PER_BTN];
-        uint8_t count = 0;
-        const char *tp = strstr(line, "\"targets\"");
-        if (tp) {
-            const char *p = tp;
-            while (count < MAX_TARGETS_PER_BTN && (p = strchr(p, '{')) != NULL) {
-                const char *end = strchr(p, '}');
-                if (!end) break;
-                char obj[64];
-                size_t len = (size_t)(end - p + 1);
-                if (len < sizeof(obj)) {
-                    memcpy(obj, p, len);
-                    obj[len] = '\0';
-                    int slave = 0, addr = 0, group = 0;
-                    bool has_slave = json_int(obj, "slave", &slave);
-                    bool has_addr  = json_int(obj, "addr",  &addr);
-                    bool has_group = json_int(obj, "group", &group);
-                    if (has_slave && (has_addr || has_group)) {
-                        targets[count].slave = (uint8_t)slave;
-                        if (has_group && (uint8_t)slave != SLAVE_RELAY) {
-                            /* group wins over addr if both supplied; range check */
-                            if (group < 0 || group > 15) {
-                                /* drop this target object, don't fail the whole call */
-                            } else {
-                                targets[count].addr =
-                                    TARGET_MAKE_GROUP((uint8_t)group);
-                                count++;
-                            }
-                        } else if (has_addr) {
-                            targets[count].addr = (uint8_t)addr;
-                            count++;
-                        }
-                    }
-                }
-                p = end + 1;
-            }
-        }
+        uint8_t count = parse_targets(line, targets, MAX_TARGETS_PER_BTN);
         bool ok = mapping_set((uint8_t)fixture, (uint8_t)button, targets, count);
-        /* Echo mapping update back so bridge can refresh retained MQTT topic */
         if (ok) {
-            char mbuf[256];
-            int n = snprintf(mbuf, sizeof(mbuf),
-                             "{\"t\":\"config_mapping\","
-                             "\"d\":{\"fixture\":%d,\"button\":%d},"
-                             "\"v\":{\"targets\":[",
-                             fixture, button);
-            for (int i = 0; i < count; i++) {
-                if (TARGET_IS_GROUP(targets[i])) {
-                    n += snprintf(mbuf + n, sizeof(mbuf) - n,
-                                  "%s{\"slave\":%u,\"group\":%u}",
-                                  i > 0 ? "," : "",
-                                  targets[i].slave,
-                                  TARGET_GROUP_NUM(targets[i]));
-                } else {
-                    n += snprintf(mbuf + n, sizeof(mbuf) - n,
-                                  "%s{\"slave\":%u,\"addr\":%u}",
-                                  i > 0 ? "," : "",
-                                  targets[i].slave, targets[i].addr);
-                }
-            }
-            n += snprintf(mbuf + n, sizeof(mbuf) - n, "]}}\n");
-            printf("%s", mbuf);
+            emit_config_mapping((uint8_t)fixture, (uint8_t)button, targets, count);
         }
         serial_tx_ack(cmd_id, ok, ok ? NULL : "save_failed");
         return;
@@ -255,11 +267,66 @@ static void handle_json_line(const char *line) {
         json_int(line, "button",  &button);
         bool ok = mapping_delete((uint8_t)fixture, (uint8_t)button);
         if (ok) {
-            printf("{\"t\":\"config_mapping\","
-                   "\"d\":{\"fixture\":%d,\"button\":%d},"
-                   "\"v\":{\"targets\":[]}}\n", fixture, button);
+            emit_config_mapping((uint8_t)fixture, (uint8_t)button, NULL, 0);
         }
         serial_tx_ack(cmd_id, ok, ok ? NULL : "save_failed");
+        return;
+    }
+
+    /* ── replace_mappings_begin ─────────────────────────────────────────
+     * Wipe-and-replace transaction. Sequence: begin → add* → commit (or
+     * abort). The 256-byte serial line cap means we can't send all 24×8
+     * possible mappings in one message, so the txn buffers everything in
+     * RAM and only swaps live + saves to flash on commit. */
+    if (strcmp(t, "replace_mappings_begin") == 0) {
+        mapping_txn_begin();
+        serial_tx_ack(cmd_id, true, NULL);
+        return;
+    }
+
+    /* ── replace_mapping_add ─────────────────────────────────────────────
+     * Same payload as set_mapping, but stages into the txn scratch buffer.
+     * Bad ranges latch a sticky error so the eventual commit refuses. */
+    if (strcmp(t, "replace_mapping_add") == 0) {
+        if (!mapping_txn_active()) {
+            serial_tx_ack(cmd_id, false, "no_txn");
+            return;
+        }
+        int fixture = 0, button = 0;
+        json_int(line, "fixture", &fixture);
+        json_int(line, "button",  &button);
+        mapping_target_t targets[MAX_TARGETS_PER_BTN];
+        uint8_t count = parse_targets(line, targets, MAX_TARGETS_PER_BTN);
+        bool ok = mapping_txn_add((uint8_t)fixture, (uint8_t)button,
+                                  targets, count);
+        serial_tx_ack(cmd_id, ok, ok ? NULL : "out_of_range");
+        return;
+    }
+
+    /* ── replace_mappings_commit ─────────────────────────────────────────
+     * Atomically swap the scratch in, save to flash, and emit
+     * config_mapping for every (fixture, button) whose targets changed. */
+    if (strcmp(t, "replace_mappings_commit") == 0) {
+        if (!mapping_txn_active()) {
+            serial_tx_ack(cmd_id, false, "no_txn");
+            return;
+        }
+        if (mapping_txn_errored()) {
+            mapping_txn_abort();
+            serial_tx_ack(cmd_id, false, "txn_invalid");
+            return;
+        }
+        /* Walk diffs BEFORE the swap so we can compare scratch vs live. */
+        mapping_txn_for_each_change(diff_emit_cb, NULL);
+        bool ok = mapping_txn_commit();
+        serial_tx_ack(cmd_id, ok, ok ? NULL : "save_failed");
+        return;
+    }
+
+    /* ── replace_mappings_abort ─────────────────────────────────────────── */
+    if (strcmp(t, "replace_mappings_abort") == 0) {
+        mapping_txn_abort();
+        serial_tx_ack(cmd_id, true, NULL);
         return;
     }
 

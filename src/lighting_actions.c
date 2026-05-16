@@ -3,9 +3,7 @@
 #include "modbus.h"
 #include "state_cache.h"
 #include "config.h"
-#include "serial_protocol.h"
 #include "log.h"
-#include <stdio.h>
 
 /* TinyModbus holding register addresses (post-refactor):
  *   0x0000 + addr  per-ballast brightness bank (FC06 low byte = DAPC level,
@@ -109,20 +107,7 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
     }
 }
 
-/* Discard callback for the pre-read flush. We don't care about the result;
- * the read itself does the work via TinyModbus's atomic
- * read-clears-on-terminal semantics (README line 389). */
-static void dali_raw_arm_discard_cb(int res, uint8_t *buf, void *ctx) {
-    (void)res; (void)buf; (void)ctx;
-}
-
 void dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice) {
-    /* Flush any stale terminal in 0x0108. Atomic read-clears-on-terminal
-     * (TinyModbus README line 389) means the next raw write sees IDLE and
-     * is accepted. The two enqueues below execute in FIFO order on the
-     * same Modbus action queue, so no other action can interleave. */
-    modbus_get_input_registers(slave_id, 0x0108u, 1,
-                               dali_raw_arm_discard_cb, NULL);
     modbus_set_holding_register(slave_id,
                                 twice ? 0x1001u : 0x1000u,
                                 value, dali_write_cb, NULL);

@@ -2,6 +2,7 @@ cmake_minimum_required(VERSION 3.13)
 
 set(PICO_PLATFORM "rp2350")
 set(PICO_SDK_PATH "lib/pico-sdk")
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 include(${PICO_SDK_PATH}/pico_sdk_init.cmake)
 

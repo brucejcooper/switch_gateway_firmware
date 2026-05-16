@@ -46,3 +46,35 @@ bool mapping_delete(uint8_t fixture, uint8_t button);
 /* Serialise all non-empty mappings as JSON lines into buf.
  * Returns bytes written, or -1 if buffer too small. */
 int mapping_serialise_all(char *buf, int buf_len);
+
+/* ── Batch replace transaction ─────────────────────────────────────────────
+ * Used by the spreadsheet sync tool to wipe and replace every binding
+ * atomically. Sequence is begin → add* → commit (or abort).
+ *
+ *   begin   — clears scratch, starts a new transaction (idempotent).
+ *   add     — stages one (fixture, button) entry into the scratch buffer.
+ *             Validates ranges; on failure latches a sticky error flag so
+ *             commit will refuse. Returns true if the entry was accepted.
+ *   commit  — if no error latched, swaps scratch into g_mappings, saves to
+ *             flash, ends the transaction. Returns false if no txn was
+ *             active or an add had failed.
+ *   abort   — discards scratch + clears error flag. Idempotent.
+ *
+ * Transaction state is RAM-only: a reboot mid-transaction leaves the live
+ * mappings untouched. */
+void mapping_txn_begin(void);
+bool mapping_txn_add(uint8_t fixture, uint8_t button,
+                     const mapping_target_t *targets, uint8_t count);
+bool mapping_txn_commit(void);
+void mapping_txn_abort(void);
+bool mapping_txn_active(void);
+bool mapping_txn_errored(void);
+
+/* During commit, walk every (fixture, button) whose targets differ between
+ * the old live mapping and the newly-committed one — caller emits the
+ * required config_mapping events. Must be called inside commit (after the
+ * swap) for the diff to reflect what changed. */
+typedef void (*mapping_diff_cb_t)(uint8_t fixture, uint8_t button,
+                                  const mapping_target_t *new_targets,
+                                  uint8_t new_count, void *user);
+void mapping_txn_for_each_change(mapping_diff_cb_t cb, void *user);
