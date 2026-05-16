@@ -1,16 +1,17 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include "pico/time.h"
 #include "pico/util/queue.h"
 #include "mapping.h"
 
 typedef enum { BTN_RAW_PRESS, BTN_RAW_RELEASE } btn_raw_type_t;
 
 typedef struct {
-    btn_raw_type_t type;
-    uint8_t        fixture;
-    uint8_t        button;
-    uint32_t       time_ms;
+    btn_raw_type_t  type;
+    uint8_t         fixture;
+    uint8_t         button;
+    absolute_time_t time;
 } btn_raw_event_t;
 
 /* Written by PIO ISR in button_actions.c, read by button_fsm_tick() */

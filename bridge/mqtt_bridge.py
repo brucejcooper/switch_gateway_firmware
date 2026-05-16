@@ -417,9 +417,15 @@ class Bridge:
     def _pico_hello(self, msg: dict) -> None:
         d = msg.get("d", {})
         dali_slaves = d.get("dali_slaves", [])
+        # Accept the new "relay_slaves":[...] array, falling back to the legacy
+        # scalar "relay_slave":N for older firmware builds.
+        relay_slaves = d.get("relay_slaves")
+        if relay_slaves is None:
+            legacy = d.get("relay_slave")
+            relay_slaves = [legacy] if legacy is not None else []
         log.info(
-            "Pico hello: relay_slave=%s dali_slaves=%s fw=%s",
-            d.get("relay_slave"), dali_slaves, d.get("fw_version", "?"),
+            "Pico hello: relay_slaves=%s dali_slaves=%s fw=%s",
+            relay_slaves, dali_slaves, d.get("fw_version", "?"),
         )
 
         # Clear session state so reconnect publishes fresh discovery

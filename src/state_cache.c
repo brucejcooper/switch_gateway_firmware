@@ -103,11 +103,13 @@ bool state_cache_any_on(uint8_t fixture, uint8_t button) {
     for (int i = 0; i < rec->target_count; i++) {
         uint8_t slave = rec->targets[i].slave;
         uint8_t addr  = rec->targets[i].addr;
-        if (slave == SLAVE_RELAY) {
+        switch (slave_kind(slave)) {
+        case SLAVE_KIND_RELAY:
             if (state_cache_get_relay_on(addr)) return true;
-        } else {
+            break;
+        case SLAVE_KIND_DALI: {
             int idx = state_cache_slave_idx(slave);
-            if (idx < 0) continue;
+            if (idx < 0) break;
             if (TARGET_IS_GROUP(rec->targets[i])) {
                 if (state_cache_dali_group_any_on((uint8_t)idx,
                                                    TARGET_GROUP_NUM(rec->targets[i])))
@@ -117,6 +119,10 @@ bool state_cache_any_on(uint8_t fixture, uint8_t button) {
                     (uint8_t)idx, TARGET_BALLAST_ADDR(rec->targets[i]));
                 if (b && b->arc_level > 0) return true;
             }
+            break;
+        }
+        default:
+            break;
         }
     }
     return false;

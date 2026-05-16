@@ -31,12 +31,6 @@ MAX_FIXTURES        = 24
 MAX_BUTTONS         = 8       # 7 physical + 1 spare
 MAX_TARGETS_PER_BTN = 8
 
-# Spreadsheet `Device` → firmware `slave` for the mapping format.
-# Device 1 (Modbus slave 1, the relay board) is exposed as `slave 0` in the
-# mapping JSON; DALI gateways pass through unchanged.
-DEVICE_TO_SLAVE = {1: 0, 2: 2, 3: 3}
-
-
 @dataclass
 class Target:
     slave: int
@@ -154,22 +148,14 @@ def load_bindings(wb, remap: dict) -> tuple[dict, list[str]]:
         if device is None or address is None:
             continue
 
-        if device not in DEVICE_TO_SLAVE:
+        if not isinstance(device, int) or not (1 <= device <= 247):
             errors.append(f"Lights row {row_idx} ({light_name!r}): "
                           f"invalid Device {device!r}")
             continue
-        slave = DEVICE_TO_SLAVE[device]
-        if not isinstance(address, int):
+        slave = device
+        if not isinstance(address, int) or not (0 <= address < 64):
             errors.append(f"Lights row {row_idx} ({light_name!r}): "
-                          f"non-integer Address {address!r}")
-            continue
-        if device == 1 and not (0 <= address < 32):
-            errors.append(f"Lights row {row_idx} ({light_name!r}): "
-                          f"relay address {address} out of range 0..31")
-            continue
-        if device in (2, 3) and not (0 <= address < 64):
-            errors.append(f"Lights row {row_idx} ({light_name!r}): "
-                          f"DALI address {address} out of range 0..63")
+                          f"invalid Address {address!r} (must be 0..63)")
             continue
 
         for triplet_idx, base in enumerate((4, 6, 8)):

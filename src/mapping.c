@@ -20,6 +20,27 @@ bool mapping_load(void) {
         }
     }
     fclose(fp);
+
+    /* Legacy files stored relay targets as slave=0 (the SLAVE_RELAY sentinel).
+     * Rewrite those to the first configured relay slave id and re-save so the
+     * on-disk file matches the new convention on the next boot. */
+    if (g_config.relay_slave_count > 0) {
+        uint8_t real_relay = g_config.relay_slave_ids[0];
+        bool changed = false;
+        for (int f = 0; f < MAX_FIXTURES; f++) {
+            for (int b = 0; b < MAX_BUTTONS; b++) {
+                mapping_record_t *r = &g_mappings[f][b];
+                for (int t = 0; t < r->target_count; t++) {
+                    if (r->targets[t].slave == 0) {
+                        r->targets[t].slave = real_relay;
+                        changed = true;
+                    }
+                }
+            }
+        }
+        if (changed) mapping_save();
+    }
+
     return true;
 }
 

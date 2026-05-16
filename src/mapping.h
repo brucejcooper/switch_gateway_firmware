@@ -7,17 +7,15 @@
 #define MAX_BUTTONS          8    /* 7 physical + 1 spare, keep byte-aligned */
 #define MAX_TARGETS_PER_BTN  8
 
-#define SLAVE_RELAY 0u
-
 typedef struct {
-    uint8_t slave;   /* SLAVE_RELAY or DALI slave ID; 0xFF = empty */
+    uint8_t slave;   /* real Modbus slave id; 0 (broadcast) means unset/legacy */
     uint8_t addr;
 } mapping_target_t;
 
 /* Group encoding: when bit 7 of `addr` is set, the low nibble (0-15) is a DALI
  * group number; otherwise `addr` is a short ballast address (0-63). Layout is
  * byte-compatible with previous mappings.bin files (all old `addr` values had
- * bit 7 clear). Relay bindings (slave == SLAVE_RELAY) never set the group bit. */
+ * bit 7 clear). Relay bindings never set the group bit. */
 #define TARGET_GROUP_BIT       0x80u
 #define TARGET_IS_GROUP(t)     (((t).addr & TARGET_GROUP_BIT) != 0)
 #define TARGET_GROUP_NUM(t)    ((t).addr & 0x0Fu)

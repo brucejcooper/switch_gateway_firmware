@@ -79,9 +79,11 @@ static uint8_t parse_targets(const char *line, mapping_target_t *out, uint8_t ma
             bool has_slave = json_int(obj, "slave", &slave);
             bool has_addr  = json_int(obj, "addr",  &addr);
             bool has_group = json_int(obj, "group", &group);
-            if (has_slave && (has_addr || has_group)) {
+            if (has_slave && slave > 0 && slave <= 247 &&
+                (has_addr || has_group)) {
                 out[count].slave = (uint8_t)slave;
-                if (has_group && (uint8_t)slave != SLAVE_RELAY) {
+                bool is_relay = slave_kind((uint8_t)slave) == SLAVE_KIND_RELAY;
+                if (has_group && !is_relay) {
                     if (group >= 0 && group <= 15) {
                         out[count].addr = TARGET_MAKE_GROUP((uint8_t)group);
                         count++;
@@ -424,6 +426,17 @@ static bool parse_int_range(const char *s, int lo, int hi, int *out) {
     return true;
 }
 
+/* Parse int in [lo, hi], accepting decimal or 0x-prefixed hex (base 0). */
+static bool parse_int_range_auto(const char *s, long lo, long hi, long *out) {
+    if (!s || !*s) return false;
+    char *end = NULL;
+    long v = strtol(s, &end, 0);
+    if (end == s || *end != '\0') return false;
+    if (v < lo || v > hi) return false;
+    *out = v;
+    return true;
+}
+
 /* Print one ballast in long form */
 static void print_dali_long(uint8_t slave_id, uint8_t addr) {
     int idx = state_cache_slave_idx(slave_id);
@@ -519,14 +532,14 @@ static bool parse_target_pair(const char *s, mapping_target_t *out) {
     memcpy(slave_buf, s, slen);
     slave_buf[slen] = '\0';
     int slave = 0;
-    if (!parse_int_range(slave_buf, 0, 247, &slave)) return false;
+    if (!parse_int_range(slave_buf, 1, 247, &slave)) return false;
     out->slave = (uint8_t)slave;
 
     const char *addr_s = colon + 1;
     if (addr_s[0] == 'G' || addr_s[0] == 'g') {
         int group = 0;
         if (!parse_int_range(addr_s + 1, 0, 15, &group)) return false;
-        if ((uint8_t)slave == SLAVE_RELAY) return false;
+        if (slave_kind((uint8_t)slave) == SLAVE_KIND_RELAY) return false;
         out->addr = TARGET_MAKE_GROUP((uint8_t)group);
     } else {
         int addr = 0;
@@ -534,6 +547,171 @@ static bool parse_target_pair(const char *s, mapping_target_t *out) {
         out->addr = (uint8_t)addr;
     }
     return true;
+}
+
+/* ── Raw Modbus CLI helpers ─────────────────────────────────────────────── */
+
+typedef struct {
+    volatile bool done;
+    int           res;          /* raw result: >0 ok, 0 timeout, <0 exception */
+    uint8_t       frame[256];
+    int           frame_len;
+} cli_mb_ctx_t;
+
+static void cli_mb_cb(int res, uint8_t *buf, void *ctx) {
+    cli_mb_ctx_t *c = (cli_mb_ctx_t *)ctx;
+    c->res = res;
+    int n = res > 0 ? res : (res < 0 ? -res : 0);
+    if (n > (int)sizeof(c->frame)) n = (int)sizeof(c->frame);
+    if (n > 0) memcpy(c->frame, buf, n);
+    c->frame_len = n;
+    c->done = true;
+}
+
+static void cli_mb_wait(cli_mb_ctx_t *c) {
+    absolute_time_t deadline = make_timeout_time_ms(1500);
+    while (!c->done && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+        modbus_poll();
+    }
+}
+
+/* Report a transport-level failure; returns true if reported (caller should
+ * return without printing further). */
+static bool cli_mb_report_fail(const cli_mb_ctx_t *c) {
+    if (!c->done) { txt_err("internal"); return true; }
+    if (c->res == 0) { txt_err("timeout"); return true; }
+    if (c->res < 0) {
+        uint8_t code = c->frame_len >= 3 ? c->frame[2] : 0xFFu;
+        printf("err: exception 0x%02X\n", code);
+        return true;
+    }
+    return false;
+}
+
+static void print_reg_table(const cli_mb_ctx_t *c, uint16_t base, uint16_t count) {
+    int expected = 5 + count * 2;
+    if (c->res < expected) { txt_err("short_response"); return; }
+    if (c->frame[2] != count * 2) { txt_err("bad_bytecount"); return; }
+    printf("  reg    dec       hex\n");
+    for (uint16_t i = 0; i < count; i++) {
+        uint16_t v = ((uint16_t)c->frame[3 + 2*i] << 8) | c->frame[3 + 2*i + 1];
+        printf("%5u  %5u    0x%04X\n", (unsigned)(base + i), v, v);
+    }
+}
+
+static void print_coil_table(const cli_mb_ctx_t *c, uint16_t base, uint16_t count) {
+    int byte_count = (count + 7) / 8;
+    int expected   = 5 + byte_count;
+    if (c->res < expected) { txt_err("short_response"); return; }
+    if (c->frame[2] != byte_count) { txt_err("bad_bytecount"); return; }
+    printf(" coil  state\n");
+    for (uint16_t i = 0; i < count; i++) {
+        bool on = (c->frame[3 + i/8] >> (i % 8)) & 1u;
+        printf("%5u  %s\n", (unsigned)(base + i), on ? "on" : "off");
+    }
+}
+
+/* Common parser for the read-style commands: <slave> <reg> [count]. */
+static bool parse_read_args(char **saveptr, long lo_count, long hi_count,
+                            long *slave, long *reg, long *count) {
+    char *as = strtok_r(NULL, " \t", saveptr);
+    char *rs = strtok_r(NULL, " \t", saveptr);
+    char *cs = strtok_r(NULL, " \t", saveptr);
+    if (!parse_int_range_auto(as, 0, 247, slave)) { txt_err("invalid_slave"); return false; }
+    if (!parse_int_range_auto(rs, 0, 65535, reg)) { txt_err("bad_arg"); return false; }
+    *count = 1;
+    if (cs && !parse_int_range_auto(cs, lo_count, hi_count, count)) {
+        txt_err("bad_arg"); return false;
+    }
+    return true;
+}
+
+/* ── get_input <slave> <reg> [count] ────────────────────────────────────── */
+static void cmd_get_input(char **saveptr) {
+    long slave, reg, count;
+    if (!parse_read_args(saveptr, 1, 64, &slave, &reg, &count)) return;
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    LOG_INFO("cli", "get_input slave=%ld reg=%ld count=%ld", slave, reg, count);
+    modbus_get_input_registers((uint8_t)slave, (uint16_t)reg, (uint16_t)count,
+                               cli_mb_cb, &ctx);
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return;
+    print_reg_table(&ctx, (uint16_t)reg, (uint16_t)count);
+}
+
+/* ── get_holding <slave> <reg> [count] ──────────────────────────────────── */
+static void cmd_get_holding(char **saveptr) {
+    long slave, reg, count;
+    if (!parse_read_args(saveptr, 1, 64, &slave, &reg, &count)) return;
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    LOG_INFO("cli", "get_holding slave=%ld reg=%ld count=%ld", slave, reg, count);
+    modbus_get_holding_registers((uint8_t)slave, (uint16_t)reg, (uint16_t)count,
+                                  cli_mb_cb, &ctx);
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return;
+    print_reg_table(&ctx, (uint16_t)reg, (uint16_t)count);
+}
+
+/* ── set_holding <slave> <reg> <value> ──────────────────────────────────── */
+static void cmd_set_holding(char **saveptr) {
+    char *as = strtok_r(NULL, " \t", saveptr);
+    char *rs = strtok_r(NULL, " \t", saveptr);
+    char *vs = strtok_r(NULL, " \t", saveptr);
+    long slave, reg, val;
+    if (!parse_int_range_auto(as, 0, 247, &slave))   { txt_err("invalid_slave"); return; }
+    if (!parse_int_range_auto(rs, 0, 65535, &reg))   { txt_err("bad_arg"); return; }
+    if (!parse_int_range_auto(vs, 0, 65535, &val))   { txt_err("bad_arg"); return; }
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    LOG_INFO("cli", "set_holding slave=%ld reg=%ld val=%ld", slave, reg, val);
+    modbus_set_holding_register((uint8_t)slave, (uint16_t)reg, (uint16_t)val,
+                                 cli_mb_cb, &ctx);
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return;
+    txt_ok();
+}
+
+/* ── get_coils <slave> <reg> [count] ────────────────────────────────────── */
+static void cmd_get_coils(char **saveptr) {
+    long slave, reg, count;
+    if (!parse_read_args(saveptr, 1, 128, &slave, &reg, &count)) return;
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    LOG_INFO("cli", "get_coils slave=%ld reg=%ld count=%ld", slave, reg, count);
+    modbus_get_coils((uint8_t)slave, (uint16_t)reg, (uint16_t)count,
+                     cli_mb_cb, &ctx);
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return;
+    print_coil_table(&ctx, (uint16_t)reg, (uint16_t)count);
+}
+
+/* ── set_coil <slave> <reg> {true|false|toggle} ─────────────────────────── */
+static void cmd_set_coil(char **saveptr) {
+    char *as = strtok_r(NULL, " \t", saveptr);
+    char *rs = strtok_r(NULL, " \t", saveptr);
+    char *vs = strtok_r(NULL, " \t", saveptr);
+    long slave, reg;
+    if (!parse_int_range_auto(as, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    if (!parse_int_range_auto(rs, 0, 65535, &reg)) { txt_err("bad_arg"); return; }
+    if (!vs) { txt_err("bad_arg"); return; }
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    LOG_INFO("cli", "set_coil slave=%ld reg=%ld v=%s", slave, reg, vs);
+    if (strcasecmp(vs, "true") == 0) {
+        modbus_set_coil((uint8_t)slave, (uint16_t)reg, true, cli_mb_cb, &ctx);
+    } else if (strcasecmp(vs, "false") == 0) {
+        modbus_set_coil((uint8_t)slave, (uint16_t)reg, false, cli_mb_cb, &ctx);
+    } else if (strcasecmp(vs, "toggle") == 0) {
+        modbus_toggle((uint8_t)slave, (uint16_t)reg, cli_mb_cb, &ctx);
+    } else {
+        txt_err("bad_arg");
+        return;
+    }
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return;
+    txt_ok();
 }
 
 /* ── help ───────────────────────────────────────────────────────────────── */
@@ -559,6 +737,12 @@ static void cmd_help(void) {
     printf("map del <fix> <btn>                        delete mapping\n");
     printf("log <level>                                set verbosity (off|err|warn|info|dbg)\n");
     printf("show log                                   current verbosity\n");
+    printf("get_input <slave> <reg> [count]            raw FC04 read input registers\n");
+    printf("get_holding <slave> <reg> [count]          raw FC03 read holding registers\n");
+    printf("set_holding <slave> <reg> <value>          raw FC06 write holding register\n");
+    printf("get_coils <slave> <reg> [count]            raw FC01 read coils\n");
+    printf("set_coil <slave> <reg> {true|false|toggle} raw FC05 write coil\n");
+    printf("  (reg/value accept decimal or 0x-prefixed hex)\n");
     printf("reboot                                     watchdog reset\n");
     printf("resync                                     re-emit hello + all state + mappings\n");
 }
@@ -570,11 +754,14 @@ static void cmd_show(char **saveptr) {
 
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
-               "baud=%lu relay_slave=%u dali_slaves=",
+               "baud=%lu relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
-               (unsigned long)modbus_get_baud(),
-               g_config.relay_slave_id);
+               (unsigned long)modbus_get_baud());
+        for (int i = 0; i < g_config.relay_slave_count; i++) {
+            printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
+        }
+        printf(" dali_slaves=");
         for (int i = 0; i < g_config.dali_slave_count; i++) {
             printf("%s%u", i > 0 ? "," : "", g_config.dali_slave_ids[i]);
         }
@@ -1053,6 +1240,26 @@ static void handle_text_line(const char *original_line) {
         cmd_log(&saveptr);
         return;
     }
+    if (strcasecmp(cmd, "get_input") == 0) {
+        cmd_get_input(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "get_holding") == 0) {
+        cmd_get_holding(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "set_holding") == 0) {
+        cmd_set_holding(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "get_coils") == 0) {
+        cmd_get_coils(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "set_coil") == 0) {
+        cmd_set_coil(&saveptr);
+        return;
+    }
     if (strcasecmp(cmd, "reboot") == 0) {
         cmd_reboot();
         return;
@@ -1091,14 +1298,17 @@ static void emit_event(const levt_t *e) {
     uint32_t ts = to_ms_since_boot(get_absolute_time());
 
     switch (e->type) {
-    case LEVT_RELAY:
+    case LEVT_RELAY: {
+        uint8_t rsid = g_config.relay_slave_count > 0
+                       ? g_config.relay_slave_ids[0] : 0;
         printf("{\"t\":\"state_relay\",\"ts\":%lu,"
                "\"d\":{\"ch\":%u},\"v\":{\"on\":%s}}\n",
                (unsigned long)ts, e->relay.ch,
                e->relay.on ? "true" : "false");
         LOG_DBG("serial", "evt state_relay slave=%u addr=%u",
-                g_config.relay_slave_id, e->relay.ch);
+                rsid, e->relay.ch);
         break;
+    }
 
     case LEVT_DALI: {
         bool fading    = (e->dali.status & 0x10) != 0;
@@ -1260,8 +1470,11 @@ void serial_protocol_init(void) {
 void serial_tx_hello(void) {
     printf("{\"t\":\"hello\",\"id\":0,\"ts\":0,"
            "\"d\":{\"fw_version\":\"2.0.0\","
-           "\"relay_slave\":%u,\"dali_slaves\":[",
-           g_config.relay_slave_id);
+           "\"relay_slaves\":[");
+    for (int i = 0; i < g_config.relay_slave_count; i++) {
+        printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
+    }
+    printf("],\"dali_slaves\":[");
     for (int i = 0; i < g_config.dali_slave_count; i++) {
         printf("%s%u", i > 0 ? "," : "", g_config.dali_slave_ids[i]);
     }

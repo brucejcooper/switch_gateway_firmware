@@ -78,8 +78,8 @@ int main(void) {
     config_load();
     mapping_load();
     state_cache_init();
-    LOG_INFO("boot", "config loaded relay_slave=%u dali_slaves=%u",
-             g_config.relay_slave_id, g_config.dali_slave_count);
+    LOG_INFO("boot", "config loaded relay_slaves=%u dali_slaves=%u",
+             g_config.relay_slave_count, g_config.dali_slave_count);
 
     /* Modbus must init first (may be called during scan) */
     modbus_init();
@@ -88,11 +88,13 @@ int main(void) {
     /* Bus discovery: probe each configured slave at the canonical baud,
      * recovering factory-default 9600-baud slaves to 38400 if needed.
      * Runs before watchdog_enable and before any DALI/relay scan. */
-    LOG_INFO("boot", "bus discovery: relay=%u dali_count=%u",
-             g_config.relay_slave_id, g_config.dali_slave_count);
-    bus_discover_slave(g_config.relay_slave_id, SLAVE_KIND_WAVESHARE_RELAY);
+    LOG_INFO("boot", "bus discovery: relay_count=%u dali_count=%u",
+             g_config.relay_slave_count, g_config.dali_slave_count);
+    for (int i = 0; i < g_config.relay_slave_count; i++) {
+        bus_discover_slave(g_config.relay_slave_ids[i], SLAVE_KIND_RELAY);
+    }
     for (int i = 0; i < g_config.dali_slave_count; i++) {
-        bus_discover_slave(g_config.dali_slave_ids[i], SLAVE_KIND_TINYMODBUS_DALI);
+        bus_discover_slave(g_config.dali_slave_ids[i], SLAVE_KIND_DALI);
     }
 
     /* Dirty poll init before full scan */
@@ -106,11 +108,11 @@ int main(void) {
     }
 
     /* Read all relay coils to sync cache */
-    {
+    if (g_config.relay_slave_count > 0) {
         static relay_sync_ctx_t ctx;
         static uint8_t coil_bits[4] = {0};
         ctx = (relay_sync_ctx_t){ false, false, coil_bits };
-        modbus_get_coils(g_config.relay_slave_id, 0, 32, relay_read_cb, &ctx);
+        modbus_get_coils(g_config.relay_slave_ids[0], 0, 32, relay_read_cb, &ctx);
         absolute_time_t dl = make_timeout_time_ms(1000);
         while (!ctx.done && absolute_time_diff_us(get_absolute_time(), dl) > 0) {
             modbus_poll();

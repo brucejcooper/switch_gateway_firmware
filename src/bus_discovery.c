@@ -58,7 +58,7 @@ static bool ping_dali(uint8_t slave_id) {
 }
 
 static bool ping(uint8_t slave_id, slave_kind_t kind) {
-    return (kind == SLAVE_KIND_WAVESHARE_RELAY)
+    return (kind == SLAVE_KIND_RELAY)
             ? ping_relay(slave_id)
             : ping_dali(slave_id);
 }
@@ -66,14 +66,14 @@ static bool ping(uint8_t slave_id, slave_kind_t kind) {
 /* FC06 set the baud index/value to switch the slave to 38400. */
 static bool set_slave_baud_38400(uint8_t slave_id, slave_kind_t kind) {
     disc_ctx_t ctx = { false, false, 0 };
-    uint16_t reg = (kind == SLAVE_KIND_WAVESHARE_RELAY) ? 0x2000 : 0x1013;
-    uint16_t val = (kind == SLAVE_KIND_WAVESHARE_RELAY) ? 0x0003 : 0x0002;
+    uint16_t reg = (kind == SLAVE_KIND_RELAY) ? 0x2000 : 0x1013;
+    uint16_t val = (kind == SLAVE_KIND_RELAY) ? 0x0003 : 0x0002;
     modbus_set_holding_register(slave_id, reg, val, disc_cb, &ctx);
     return wait_done(&ctx);
 }
 
 bool bus_discover_slave(uint8_t slave_id, slave_kind_t kind) {
-    const char *kind_s = (kind == SLAVE_KIND_WAVESHARE_RELAY) ? "relay" : "dali";
+    const char *kind_s = (kind == SLAVE_KIND_RELAY) ? "relay" : "dali";
 
     if (ping(slave_id, kind)) {
         LOG_INFO("disc", "slave %u (%s) ok at %u", slave_id, kind_s, BAUD_FAST);

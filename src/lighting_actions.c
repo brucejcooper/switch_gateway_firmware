@@ -90,10 +90,14 @@ static void relay_write_cb(int res, uint8_t *buf, void *ctx) {
 }
 
 void lighting_set_relay(uint8_t channel, bool on) {
+    if (g_config.relay_slave_count == 0) {
+        LOG_WARN("light", "relay write dropped — no relay slave configured");
+        return;
+    }
     relay_ctx_t *c = &s_relay_ctx[s_relay_ctx_idx++ % RELAY_COUNT];
     c->channel = channel;
     c->on      = on;
-    modbus_set_coil(g_config.relay_slave_id, channel, on, relay_write_cb, c);
+    modbus_set_coil(g_config.relay_slave_ids[0], channel, on, relay_write_cb, c);
     LOG_INFO("light", "relay ch=%u %s", channel, on ? "on" : "off");
 }
 

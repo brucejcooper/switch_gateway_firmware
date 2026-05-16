@@ -60,7 +60,7 @@ static void sample_available(void) {
                             .type    = pressed ? BTN_RAW_PRESS : BTN_RAW_RELEASE,
                             .fixture = fixture,
                             .button  = button,
-                            .time_ms = to_ms_since_boot(get_absolute_time()),
+                            .time    = get_absolute_time(),
                         };
                         /* Non-blocking push — drop if queue full.
                          * The FSM queue is deep enough (64 slots) that this
