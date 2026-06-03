@@ -2,9 +2,10 @@
  * bus_discovery.c — boot-time bus probe + auto baud recovery.
  *
  * Slaves shipped from the factory default to 9600 baud; the controller's
- * canonical bus speed is 38400. At boot, for each configured slave, try
- * 38400 first; on timeout, drop to 9600 and re-ping; if it responds, send
- * the per-device set-baud command, snap back to 38400, and verify.
+ * canonical bus speed is 19200 (the reliable rate for the TinyModbus slaves'
+ * internal-RC oscillator — 38400 is marginal). At boot, for each configured
+ * slave, try 19200 first; on timeout, drop to 9600 and re-ping; if it responds,
+ * send the per-device set-baud command, snap back to 19200, and verify.
  *
  * Blocking by design — must be called from main() before the watchdog is
  * enabled and before the main poll loop starts. Worst case ~10 s per slave.
@@ -17,7 +18,7 @@
 #include <string.h>
 
 #define DISC_TIMEOUT_MS 1000
-#define BAUD_FAST  38400u
+#define BAUD_FAST  19200u
 #define BAUD_FALLBACK 9600u
 #define POST_RECONFIG_SETTLE_MS 100
 
@@ -63,11 +64,40 @@ static bool ping(uint8_t slave_id, slave_kind_t kind) {
             : ping_dali(slave_id);
 }
 
-/* FC06 set the baud index/value to switch the slave to 38400. */
-static bool set_slave_baud_38400(uint8_t slave_id, slave_kind_t kind) {
+bool bus_ping_slave(uint8_t slave_id, slave_kind_t kind) {
+    return ping(slave_id, kind);
+}
+
+/* Map a target baud to the slave's baud register + register value. The register
+ * and the encoding differ by kind:
+ *   relay (Waveshare 0x2000): 9600=0x0001, 19200=0x0002, 38400=0x0003
+ *   dali  (TinyModbus BAUD_INDEX 0x1013): 9600=0x0000, 19200=0x0001, 38400=0x0002
+ * Returns false for an unsupported baud. */
+static bool baud_reg_value(slave_kind_t kind, uint32_t baud,
+                           uint16_t *reg, uint16_t *val) {
+    if (kind == SLAVE_KIND_RELAY) {
+        *reg = 0x2000;
+        switch (baud) {
+            case 9600u:  *val = 0x0001; return true;
+            case 19200u: *val = 0x0002; return true;
+            case 38400u: *val = 0x0003; return true;
+        }
+    } else {
+        *reg = 0x1013;
+        switch (baud) {
+            case 9600u:  *val = 0x0000; return true;
+            case 19200u: *val = 0x0001; return true;
+            case 38400u: *val = 0x0002; return true;
+        }
+    }
+    return false;
+}
+
+/* FC06 write the slave's baud register to switch its UART to `baud`. */
+bool bus_set_slave_baud(uint8_t slave_id, slave_kind_t kind, uint32_t baud) {
+    uint16_t reg, val;
+    if (!baud_reg_value(kind, baud, &reg, &val)) return false;
     disc_ctx_t ctx = { false, false, 0 };
-    uint16_t reg = (kind == SLAVE_KIND_RELAY) ? 0x2000 : 0x1013;
-    uint16_t val = (kind == SLAVE_KIND_RELAY) ? 0x0003 : 0x0002;
     modbus_set_holding_register(slave_id, reg, val, disc_cb, &ctx);
     return wait_done(&ctx);
 }
@@ -93,7 +123,7 @@ bool bus_discover_slave(uint8_t slave_id, slave_kind_t kind) {
 
     LOG_INFO("disc", "slave %u (%s) found at %u, reconfiguring to %u",
              slave_id, kind_s, BAUD_FALLBACK, BAUD_FAST);
-    if (!set_slave_baud_38400(slave_id, kind)) {
+    if (!bus_set_slave_baud(slave_id, kind, BAUD_FAST)) {
         LOG_ERR("disc", "slave %u (%s) set-baud command failed",
                 slave_id, kind_s);
         modbus_uart_set_baud_runtime(BAUD_FAST);

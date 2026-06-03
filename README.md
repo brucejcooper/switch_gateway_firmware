@@ -10,7 +10,7 @@ to button presses, and exposes the entire system to Home Assistant via MQTT.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│  RS-485 bus @ 38400 baud  (canonical; firmware auto-recovers    │
+│  RS-485 bus @ 19200 baud  (canonical; firmware auto-recovers    │
 │                            slaves stuck at the factory 9600)    │
 │                                                                 │
 │  Pico 2 (Modbus master, single source of truth)                 │
@@ -73,26 +73,28 @@ Function-code mappings and register addresses for the Waveshare board:
 
 ### Baud rate setup
 
+The canonical bus speed is **19200** — the reliable rate for the TinyModbus
+slaves' internal-RC oscillator (38400 is marginal and drops occasional frames).
 The firmware auto-recovers slaves stuck at the factory-default 9600 baud:
-on boot it pings each slave at 38400 first, falls back to 9600 on timeout,
-sends the per-device "set baud to 38400" command, and verifies the slave
-came back at 38400 — all logged under the `disc` module tag.
+on boot it pings each slave at 19200 first, falls back to 9600 on timeout,
+sends the per-device "set baud to 19200" command, and verifies the slave
+came back at 19200 — all logged under the `disc` module tag.
 
 | Slave kind | Set-baud register | Value |
 |---|---|---|
-| Waveshare 32CH Relay | FC06 `0x2000` | `0x0003` |
-| TinyModbus DALI gateway | FC06 `0x1013` | `0x0002` |
+| Waveshare 32CH Relay | FC06 `0x2000` | `0x0002` |
+| TinyModbus DALI gateway | FC06 `0x1013` | `0x0001` |
 
 The set-baud writes are persisted on the slaves, so the fallback path only
 fires once per device. After the first successful boot, subsequent boots
 take <100 ms total for all three slaves.
 
-If a slave is unreachable at *both* 38400 and 9600, the discovery logs
+If a slave is unreachable at *both* 19200 and 9600, the discovery logs
 `E disc: slave N (...) unreachable at both bauds` and boot continues
 without that slave — the relay sync / DALI scan will see it as missing.
 Most commonly this means the slave is unplugged, has a different baud
-rate (some devices ship at 19200), or is at a different slave address than
-configured. Manual recovery via a USB-485 dongle and the per-device
+rate (e.g. left at 38400 from an earlier config), or is at a different slave
+address than configured. Manual recovery via a USB-485 dongle and the per-device
 commands above will get it back online. The slave-address writes for
 factory-fresh devices (TinyModbus FC06 `0x1012` value `0x0002` or `0x0003`;
 Waveshare FC06 `0x4000` value `0x0001`) are also one-time and must be done
@@ -112,7 +114,11 @@ cmake ..
 make -j$(nproc)
 ```
 
-Flash `light_switch.uf2` by holding BOOTSEL on the Pico while connecting USB.
+Flash `light_switch.uf2` by using the picotool command.  For example
+
+```bash
+build % make && picotool load -f -x light_switch.uf2 && sleep 2 && pyserial-miniterm /dev/tty.usbmodem111201
+```
 
 ### Boot Sequence
 
@@ -122,8 +128,8 @@ Each boot, before the main loop starts, the firmware runs:
 2. **Config + mapping load** — `/config.json` and `/mappings.bin`. Defaults
    if absent.
 3. **State cache init** — zeros the in-memory entity state.
-4. **Modbus init** — UART at the persisted baud rate (38400 default).
-5. **Bus discovery** — for each configured slave, ping at 38400, fall back
+4. **Modbus init** — UART at the persisted baud rate (19200 default).
+5. **Bus discovery** — for each configured slave, ping at 19200, fall back
    to 9600, auto-reconfigure if needed (see "Baud rate setup" above).
 6. **DALI full scan** — for each TinyModbus gateway, blocking read of every
    ballast bank + group masks, populate state cache, emit per-ballast
@@ -339,7 +345,7 @@ state event and mapping.
   "long_press_ms":500,
   "dim_repeat_ms":200,
   "reversal_window_ms":400,
-  "baud":38400
+  "baud":19200
 }}
 ```
 
@@ -573,7 +579,7 @@ Update timing parameters. All fields optional — omit to leave unchanged.
 Change the Modbus bus baud rate. Takes effect after reboot. The `ack` for
 this command carries `"note":"reboot required for baud change"` in `d`.
 ```json
-{"t":"set_baud","id":9,"baud":38400}
+{"t":"set_baud","id":9,"baud":19200}
 ```
 
 #### `provision_start`

@@ -86,7 +86,7 @@ int main(void) {
     LOG_INFO("boot", "modbus init baud=%lu", (unsigned long)modbus_get_baud());
 
     /* Bus discovery: probe each configured slave at the canonical baud,
-     * recovering factory-default 9600-baud slaves to 38400 if needed.
+     * recovering factory-default 9600-baud slaves to 19200 if needed.
      * Runs before watchdog_enable and before any DALI/relay scan. */
     LOG_INFO("boot", "bus discovery: relay_count=%u dali_count=%u",
              g_config.relay_slave_count, g_config.dali_slave_count);

@@ -5,7 +5,7 @@
  * for DE release timing, non-blocking poll loop.  Changes from original:
  *   - ACTION_DALI (0x44) removed; TinyModbus uses standard FC04/FC06
  *   - FC04 Read Input Registers added (ACTION_GET_INPUT_REGISTERS)
- *   - Baud rate is configurable, defaulting to 38400
+ *   - Baud rate is configurable, defaulting to 19200
  *   - Baud rate and DE mode are both persisted to flash filesystem
  */
 
@@ -22,14 +22,21 @@
 #include <string.h>
 #include <sys/types.h>
 
-#define MODBUS_RESPONSE_TIMEOUT_MS 700
+/* A present slave starts replying within ~10 ms (even at 19200), so 50 ms is
+ * ample to detect "no answer" without falsely firing on a slow reply.  A bare
+ * timeout (no valid frame) is retried up to MODBUS_MAX_RETRIES times before the
+ * failure is delivered to the caller, transparently recovering the occasional
+ * dropped frame.  A CRC-valid reply — including a Modbus exception — is a real
+ * answer and is never retried. */
+#define MODBUS_RESPONSE_TIMEOUT_MS 50
+#define MODBUS_MAX_RETRIES         2
 
 #define UART_ID      uart1
 #define UART_TX_PIN  4
 #define UART_RX_PIN  5
 #define UART_DE_PIN  1
 
-#define DEFAULT_BAUD_RATE 38400u
+#define DEFAULT_BAUD_RATE 19200u
 
 typedef enum {
     MODBUS_IDLE,
@@ -70,9 +77,46 @@ static volatile modbus_bus_state_t bus_state = MODBUS_IDLE;
 static queue_t               action_queue;
 static queue_t               response_queue;
 
+/* Retry bookkeeping for the in-flight action: attempts remaining and whether a
+ * re-transmit is pending once the post-timeout gap elapses. */
+static uint8_t               s_attempts_left;
+static bool                  s_retry_pending;
+
 static bool modbus_rx_valid(void) { return true; }
 
 static const char *modbus_de_mode_str[MODBUS_DE_MAX] = { "tx", "always" };
+
+/* Emit the *intent* of an action at INFO level (what we're asking the slave
+ * to do), separate from the raw tx byte dump which lives at DEBUG. */
+static void log_action_intent(const modbus_action_t *a) {
+    switch (a->action) {
+    case ACTION_GET_COILS:
+        LOG_INFO("modbus", "read coils slave=%u addr=%u count=%u",
+                 a->device, a->address, a->arg);
+        break;
+    case ACTION_GET_HOLDING_REGISTERS:
+        LOG_INFO("modbus", "read holding registers slave=%u addr=%u count=%u",
+                 a->device, a->address, a->arg);
+        break;
+    case ACTION_GET_INPUT_REGISTERS:
+        LOG_INFO("modbus", "read input registers slave=%u addr=%u count=%u",
+                 a->device, a->address, a->arg);
+        break;
+    case ACTION_SET_COIL:
+        LOG_INFO("modbus", "set coil slave=%u addr=%u -> %s",
+                 a->device, a->address,
+                 a->arg == 0x5500u ? "toggle" : (a->arg ? "on" : "off"));
+        break;
+    case ACTION_SET_HOLDING_REGISTER:
+        LOG_INFO("modbus", "set holding register slave=%u addr=%u value=%u",
+                 a->device, a->address, a->arg);
+        break;
+    default:
+        LOG_INFO("modbus", "action 0x%02x slave=%u addr=%u arg=%u",
+                 (unsigned)a->action, a->device, a->address, a->arg);
+        break;
+    }
+}
 
 /* ── CRC-16 table (identical to original) ────────────────────────────────── */
 static const uint16_t crcTable[] = {
@@ -188,6 +232,13 @@ void set_modbus_de_mode(modbus_de_mode_t mode) {
     }
 }
 
+modbus_de_mode_t modbus_get_de_mode(void) { return de_mode; }
+
+const char *modbus_de_mode_to_str(modbus_de_mode_t mode) {
+    if (mode >= MODBUS_DE_MAX) return "?";
+    return modbus_de_mode_str[mode];
+}
+
 void modbus_set_baud(uint32_t baud) {
     s_baud   = baud;
     FILE *fp = fopen("/modbus_baud.txt", "w");
@@ -249,54 +300,62 @@ void modbus_init(void) {
     irq_set_enabled(UART_IRQ, true);
 }
 
-/* ── Poll loop (identical structure to original) ─────────────────────────── */
-void modbus_poll(void) {
-    size_t sz;
+/* Build the request frame for currentAction into buf and start transmitting it.
+ * Called both for a fresh action (from MODBUS_IDLE) and for a retransmit (from
+ * MODBUS_DEADTIME).  Leaves the bus in MODBUS_TRANSMITTING. */
+static void start_action_tx(void) {
+    buf[0] = currentAction.device;
+    buf[1] = currentAction.action;
+    buf[2] = currentAction.address >> 8;
+    buf[3] = currentAction.address & 0xFF;
+    buf[4] = currentAction.arg >> 8;
+    buf[5] = currentAction.arg & 0xFF;
+    size_t sz = 6;
 
+    readTimeout = make_timeout_time_ms(MODBUS_RESPONSE_TIMEOUT_MS);
+    append_crc16(buf, sz);
+    sz += 2;
+
+    char hex[3 * 16 + 1];
+    int hp = 0;
+    for (size_t i = 0; i < sz && hp + 3 < (int)sizeof(hex); i++) {
+        hp += snprintf(hex + hp, sizeof(hex) - hp,
+                       "%s%02X", i ? " " : "", buf[i]);
+    }
+    LOG_DBG("modbus", "tx [%s]", hex);
+
+    while (uart_is_readable(UART_ID)) uart_getc(UART_ID);
+
+    gpio_put(UART_DE_PIN, 1);
+    transmitting = true;
+
+    /* Schedule DE release after all bytes transmitted */
+    alarm_pool_add_alarm_in_us(alarm_pool_get_default(),
+                               (10ULL * 1000000ULL * sz / s_baud),
+                               release_de, NULL, true);
+    for (size_t i = 0; i < sz; i++) {
+        while (!uart_is_writable(UART_ID)) {}
+        uart_get_hw(UART_ID)->dr = buf[i];
+    }
+
+    readptr     = buf;
+    readbuf_sz  = 0;
+    readbuf_max = sizeof(buf);
+    readbuf_crc = 0xFFFF;
+    uart_set_irqs_enabled(UART_ID, true, false);
+    bus_state = MODBUS_TRANSMITTING;
+}
+
+/* ── Poll loop ───────────────────────────────────────────────────────────── */
+void modbus_poll(void) {
     switch (bus_state) {
 
     case MODBUS_IDLE:
         if (queue_try_remove(&action_queue, &currentAction)) {
-            buf[0] = currentAction.device;
-            buf[1] = currentAction.action;
-            buf[2] = currentAction.address >> 8;
-            buf[3] = currentAction.address & 0xFF;
-            buf[4] = currentAction.arg >> 8;
-            buf[5] = currentAction.arg & 0xFF;
-            sz = 6;
-
-            readTimeout = make_timeout_time_ms(MODBUS_RESPONSE_TIMEOUT_MS);
-            append_crc16(buf, sz);
-            sz += 2;
-
-            char hex[3 * 16 + 1];
-            int hp = 0;
-            for (size_t i = 0; i < sz && hp + 3 < (int)sizeof(hex); i++) {
-                hp += snprintf(hex + hp, sizeof(hex) - hp,
-                               "%s%02X", i ? " " : "", buf[i]);
-            }
-            LOG_INFO("modbus", "tx [%s]", hex);
-
-            while (uart_is_readable(UART_ID)) uart_getc(UART_ID);
-
-            gpio_put(UART_DE_PIN, 1);
-            transmitting = true;
-
-            /* Schedule DE release after all bytes transmitted */
-            alarm_pool_add_alarm_in_us(alarm_pool_get_default(),
-                                       (10ULL * 1000000ULL * sz / s_baud),
-                                       release_de, NULL, true);
-            for (size_t i = 0; i < sz; i++) {
-                while (!uart_is_writable(UART_ID)) {}
-                uart_get_hw(UART_ID)->dr = buf[i];
-            }
-
-            readptr     = buf;
-            readbuf_sz  = 0;
-            readbuf_max = sizeof(buf);
-            readbuf_crc = 0xFFFF;
-            uart_set_irqs_enabled(UART_ID, true, false);
-            bus_state = MODBUS_TRANSMITTING;
+            s_attempts_left = MODBUS_MAX_RETRIES;
+            s_retry_pending = false;
+            log_action_intent(&currentAction);
+            start_action_tx();
         }
         break;
 
@@ -307,44 +366,66 @@ void modbus_poll(void) {
         if (absolute_time_diff_us(readTimeout, get_absolute_time()) <= 0) {
             break;
         }
-        LOG_WARN("modbus", "rx timeout slave=%u fc=0x%02x",
-                 currentAction.device, (unsigned)currentAction.action);
-        readbuf_sz = 0;
+        readbuf_sz = 0;   /* timed out with no valid frame */
         /* fall through */
 
-    case MODBUS_RECEIVED_RESPONSE:
+    case MODBUS_RECEIVED_RESPONSE: {
         uart_set_irqs_enabled(UART_ID, false, false);
-        if (readbuf_sz >= 2 && buf[1] & 0x80) {
+
+        bool retry = false;
+        if (readbuf_sz == 0) {
+            /* No valid reply.  Retry the same request if attempts remain,
+             * otherwise deliver the failure (length 0) to the caller. */
+            if (s_attempts_left > 0) {
+                s_attempts_left--;
+                retry = true;
+                LOG_WARN("modbus",
+                         "rx timeout slave=%u fc=0x%02x — retrying (%u left)",
+                         currentAction.device, (unsigned)currentAction.action,
+                         (unsigned)s_attempts_left);
+            } else {
+                LOG_WARN("modbus", "rx timeout slave=%u fc=0x%02x (gave up)",
+                         currentAction.device, (unsigned)currentAction.action);
+                if (currentAction.callback)
+                    currentAction.callback(0, buf, currentAction.ctx);
+            }
+        } else if (readbuf_sz >= 2 && (buf[1] & 0x80)) {
             uint8_t exc = (readbuf_sz >= 3) ? buf[2] : 0xFFu;
-            LOG_WARN("modbus",
-                     "rx exception slave=%u fc=0x%02x code=0x%02x",
-                     currentAction.device,
-                     (unsigned)currentAction.action,
+            LOG_WARN("modbus", "rx exception slave=%u fc=0x%02x code=0x%02x",
+                     currentAction.device, (unsigned)currentAction.action,
                      (unsigned)exc);
-            readbuf_sz = -(int)readbuf_sz;
-        } else if (readbuf_sz > 0) {
+            if (currentAction.callback)
+                currentAction.callback(-(int)readbuf_sz, buf, currentAction.ctx);
+        } else {
             LOG_INFO("modbus", "rx ok slave=%u fc=0x%02x bytes=%d",
-                     currentAction.device,
-                     (unsigned)currentAction.action,
+                     currentAction.device, (unsigned)currentAction.action,
                      (int)readbuf_sz);
+            if (currentAction.callback)
+                currentAction.callback((int)readbuf_sz, buf, currentAction.ctx);
         }
-        if (currentAction.callback) {
-            currentAction.callback((int)readbuf_sz, buf, currentAction.ctx);
-        }
+
+        s_retry_pending = retry;
         bus_state = MODBUS_DEADTIME;
-        /* fix #8: deadtime = 1.5 char times at current baud rate.
-         * One char = 10 bits; 1.5 chars = 15 bit-periods = 15000000/baud us.
-         * Minimum 750 us per Modbus spec. */
+        /* fix #8: normal deadtime = 1.5 char times (min 750 us).  Before a
+         * retry, wait the full 3.5-char inter-frame silence (min 2 ms) so the
+         * slave's receiver resets any partial frame from the failed attempt. */
         {
-            uint32_t dt = 15000000u / s_baud;
-            if (dt < 750u) dt = 750u;
+            uint32_t dt    = retry ? (35000000u / s_baud) : (15000000u / s_baud);
+            uint32_t floor = retry ? 2000u : 750u;
+            if (dt < floor) dt = floor;
             readTimeout = make_timeout_time_us((uint64_t)dt);
         }
         break;
+    }
 
     case MODBUS_DEADTIME:
         if (absolute_time_diff_us(readTimeout, get_absolute_time()) > 0) {
-            bus_state = MODBUS_IDLE;
+            if (s_retry_pending) {
+                s_retry_pending = false;
+                start_action_tx();   /* re-send the same request */
+            } else {
+                bus_state = MODBUS_IDLE;
+            }
         }
         break;
     }

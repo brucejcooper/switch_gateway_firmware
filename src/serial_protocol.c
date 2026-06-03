@@ -28,6 +28,12 @@
 /* Consume levt_t events from lighting_actions */
 extern bool lighting_evt_try_pop(void *out);  /* defined in lighting_actions.c */
 
+/* When true, serial_poll() echoes received characters back to the terminal
+ * and honours backspace for line editing.  Off by default; toggled with the
+ * "echo on" / "echo off" command.  Useful when driving the CLI from a dumb
+ * terminal (e.g. miniterm) that does not echo locally. */
+static bool echo_on = false;
+
 /* ── Minimal JSON key extraction (identical to pico_lighting design) ─────── */
 static bool json_str(const char *json, const char *key, char *out, int out_len) {
     char needle[64];
@@ -737,7 +743,10 @@ static void cmd_help(void) {
     printf("provision abort                            stop commissioning\n");
     printf("scan <slave>                               blocking full scan\n");
     printf("discover                                   re-probe all configured slaves (blocking)\n");
+    printf("ping <slave> [relay|dali]                  one ping at current master baud (kind inferred if omitted)\n");
+    printf("set_slave_baud <slave> {9600|19200|38400} [relay|dali]  tell slave to switch its UART baud\n");
     printf("baud [<rate> [save]]                       show / set UART baud (live; 'save' persists)\n");
+    printf("rs485 [{tx|always}]                         show / set RS485 DE mode (saved; tx=DE while transmitting)\n");
     printf("ls [<path>]                                list files in path (default /)\n");
     printf("cat <path>                                 dump file contents to console\n");
     printf("map set <fix> <btn> <s>:<a>[,<s>:<a>...]   set mapping (a may be N or GN)\n");
@@ -750,6 +759,7 @@ static void cmd_help(void) {
     printf("get_coils <slave> <reg> [count]            raw FC01 read coils\n");
     printf("set_coil <slave> <reg> {true|false|toggle} raw FC05 write coil\n");
     printf("  (reg/value accept decimal or 0x-prefixed hex)\n");
+    printf("echo {on|off}                              echo input + backspace editing (or show state)\n");
     printf("reboot                                     watchdog reset\n");
     printf("resync                                     re-emit hello + all state + mappings\n");
 }
@@ -761,10 +771,11 @@ static void cmd_show(char **saveptr) {
 
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
-               "baud=%lu relay_slaves=",
+               "baud=%lu rs485=%s relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
-               (unsigned long)modbus_get_baud());
+               (unsigned long)modbus_get_baud(),
+               modbus_de_mode_to_str(modbus_get_de_mode()));
         for (int i = 0; i < g_config.relay_slave_count; i++) {
             printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
         }
@@ -1163,6 +1174,63 @@ static void cmd_discover(char **saveptr) {
     printf("discover complete: %d ok, %d fail\n", ok, fail);
 }
 
+/* ── ping / set_slave_baud (bus diagnostics) ───────────────────────────── */
+/* Resolve an optional "relay"|"dali" token (NULL → infer from the configured
+ * slave lists). On failure prints the err: line and returns false. */
+static bool resolve_kind(const char *tok, uint8_t slave, slave_kind_t *out) {
+    if (tok) {
+        if      (strcasecmp(tok, "relay") == 0) *out = SLAVE_KIND_RELAY;
+        else if (strcasecmp(tok, "dali")  == 0) *out = SLAVE_KIND_DALI;
+        else { txt_err("bad_arg"); return false; }
+        return true;
+    }
+    *out = slave_kind(slave);
+    if (*out == SLAVE_KIND_UNKNOWN) { txt_err("unknown_kind"); return false; }
+    return true;
+}
+
+/* ping <slave> [relay|dali] — single ping at the current master baud. */
+static void cmd_ping(char **saveptr) {
+    char *ss = strtok_r(NULL, " \t", saveptr);
+    int slave = 0;
+    if (!parse_int_range(ss, 1, 247, &slave)) { txt_err("invalid_slave"); return; }
+
+    slave_kind_t kind;
+    if (!resolve_kind(strtok_r(NULL, " \t", saveptr), (uint8_t)slave, &kind)) return;
+
+    const char *ks = (kind == SLAVE_KIND_RELAY) ? "relay" : "dali";
+    unsigned long baud = (unsigned long)modbus_get_baud();
+    LOG_INFO("cli", "ping slave %d (%s) at %lu", slave, ks, baud);
+    bool ok = bus_ping_slave((uint8_t)slave, kind);
+    printf("ping slave %d (%s) at %lu: %s\n", slave, ks, baud,
+           ok ? "ok" : "no_response");
+}
+
+/* set_slave_baud <slave> {9600|19200|38400} [relay|dali] — tell a slave to switch
+ * its own UART baud. The master UART is left as-is; use 'baud' to match afterwards. */
+static void cmd_set_slave_baud(char **saveptr) {
+    char *ss = strtok_r(NULL, " \t", saveptr);
+    char *bs = strtok_r(NULL, " \t", saveptr);
+    int  slave = 0;
+    long baud  = 0;
+    if (!parse_int_range(ss, 1, 247, &slave)) { txt_err("invalid_slave"); return; }
+    if (!parse_int_range_auto(bs, 300, 921600, &baud)) { txt_err("invalid_baud"); return; }
+    if (baud != 9600 && baud != 19200 && baud != 38400) { txt_err("unsupported_baud"); return; }
+
+    slave_kind_t kind;
+    if (!resolve_kind(strtok_r(NULL, " \t", saveptr), (uint8_t)slave, &kind)) return;
+
+    const char *ks = (kind == SLAVE_KIND_RELAY) ? "relay" : "dali";
+    LOG_INFO("cli", "set_slave_baud slave %d (%s) -> %ld", slave, ks, baud);
+    bool ok = bus_set_slave_baud((uint8_t)slave, kind, (uint32_t)baud);
+    printf("set_slave_baud slave %d (%s) -> %ld: %s\n", slave, ks, baud,
+           ok ? "ok" : "fail");
+    if (ok) {
+        printf("  slave now at %ld; master still at %lu — run 'baud %ld' to match\n",
+               baud, (unsigned long)modbus_get_baud(), baud);
+    }
+}
+
 /* ── baud ──────────────────────────────────────────────────────────────── */
 static void cmd_baud(char **saveptr) {
     char *bs = strtok_r(NULL, " \t", saveptr);
@@ -1183,6 +1251,24 @@ static void cmd_baud(char **saveptr) {
     if (persist) modbus_set_baud((uint32_t)baud);
     printf("baud: %lu%s\n", (unsigned long)modbus_get_baud(),
            persist ? " (saved)" : " (live only)");
+}
+
+/* ── rs485 transmit (DE) mode ──────────────────────────────────────────── */
+static void cmd_rs485(char **saveptr) {
+    char *arg = strtok_r(NULL, " \t", saveptr);
+    if (!arg) {
+        printf("rs485: %s\n", modbus_de_mode_to_str(modbus_get_de_mode()));
+        return;
+    }
+    for (modbus_de_mode_t m = 0; m < MODBUS_DE_MAX; m++) {
+        if (strcasecmp(arg, modbus_de_mode_to_str(m)) == 0) {
+            LOG_INFO("cli", "rs485 %s", modbus_de_mode_to_str(m));
+            set_modbus_de_mode(m);  /* applies live + persists */
+            printf("rs485: %s (saved)\n", modbus_de_mode_to_str(m));
+            return;
+        }
+    }
+    txt_err("bad_arg");
 }
 
 /* ── ls / cat (pico-vfs littlefs) ──────────────────────────────────────── */
@@ -1306,6 +1392,20 @@ static void cmd_reboot(void) {
     while (1) { ; }
 }
 
+/* ── echo ──────────────────────────────────────────────────────────────── */
+static void cmd_echo(char **saveptr) {
+    char *arg = strtok_r(NULL, " \t", saveptr);
+    if (!arg) {
+        printf("echo %s\n", echo_on ? "on" : "off");
+        return;
+    }
+    int v = parse_on_off_toggle(arg);
+    if (v < 0 || v == 2) { txt_err("bad_arg"); return; }
+    echo_on = (v == 1);
+    LOG_INFO("cli", "echo %s", echo_on ? "on" : "off");
+    txt_ok();
+}
+
 /* ── Top-level text dispatcher ─────────────────────────────────────────── */
 static void handle_text_line(const char *original_line) {
     LOG_INFO("cli", "rx: %s", original_line);
@@ -1352,8 +1452,20 @@ static void handle_text_line(const char *original_line) {
         cmd_discover(&saveptr);
         return;
     }
+    if (strcasecmp(cmd, "ping") == 0) {
+        cmd_ping(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "set_slave_baud") == 0) {
+        cmd_set_slave_baud(&saveptr);
+        return;
+    }
     if (strcasecmp(cmd, "baud") == 0) {
         cmd_baud(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "rs485") == 0) {
+        cmd_rs485(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "ls") == 0) {
@@ -1390,6 +1502,10 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "set_coil") == 0) {
         cmd_set_coil(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "echo") == 0) {
+        cmd_echo(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "reboot") == 0) {
@@ -1642,16 +1758,29 @@ void serial_poll(void) {
     int ch;
     while ((ch = stdio_getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
         if (ch == '\n' || ch == '\r') {
+            if (echo_on) { putchar('\r'); putchar('\n'); }
             if (line_pos > 0) {
                 line_buf[line_pos] = '\0';
                 handle_line(line_buf);
                 line_pos = 0;
             }
+        } else if (echo_on && (ch == 0x08 || ch == 0x7f)) {
+            /* backspace / delete: erase the last buffered character and rub it
+             * out on the terminal (cursor back, overwrite with space, back
+             * again).  Only active while echo is on. */
+            if (line_pos > 0) {
+                line_pos--;
+                fputs("\b \b", stdout);
+            }
         } else if (line_pos < SERIAL_LINE_MAX - 1) {
             line_buf[line_pos++] = (char)ch;
+            if (echo_on) putchar((char)ch);
         } else {
             line_pos = 0; /* overflow — discard */
         }
+        /* Push echoed characters (incl. the "\b \b" erase) out immediately so
+         * the terminal updates on each keypress rather than at line end. */
+        if (echo_on) fflush(stdout);
     }
 
     /* Drain outbound state events */
