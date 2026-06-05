@@ -17,6 +17,11 @@ void set_modbus_de_mode(modbus_de_mode_t mode);
 modbus_de_mode_t modbus_get_de_mode(void);
 const char *modbus_de_mode_to_str(modbus_de_mode_t mode);
 
+/* Decode a Modbus exception code (the byte after the OR'd-0x80 function code
+ * in an error response) into a short human-readable string. Returns "unknown"
+ * for codes not in the standard table. */
+const char *modbus_exception_str(uint8_t code);
+
 /* ── Callback type ───────────────────────────────────────────────────────── */
 /* res > 0: bytes received; res == 0: timeout; res < 0: Modbus exception.
  * buf contains the raw response frame (addr, fc, payload, crc).

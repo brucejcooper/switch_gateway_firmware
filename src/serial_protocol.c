@@ -591,7 +591,7 @@ static bool cli_mb_report_fail(const cli_mb_ctx_t *c) {
     if (c->res == 0) { txt_err("timeout"); return true; }
     if (c->res < 0) {
         uint8_t code = c->frame_len >= 3 ? c->frame[2] : 0xFFu;
-        printf("err: exception 0x%02X\n", code);
+        printf("err: exception 0x%02X (%s)\n", code, modbus_exception_str(code));
         return true;
     }
     return false;
@@ -737,6 +737,8 @@ static void cmd_help(void) {
     printf("relay <ch> {on|off|toggle}                 set one relay\n");
     printf("dali <slave> <addr> {on|off|toggle|<bri>}  set one ballast\n");
     printf("dali <slave> g<group> {on|off|<bri>}       set one group (no toggle)\n");
+    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame\n");
+    printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
     printf("provision <slave> {all|new|<addr>}         start commissioning\n");
@@ -1035,6 +1037,66 @@ static void cmd_dali(char **saveptr) {
         lighting_dali_set_level((uint8_t)slave, (uint8_t)addr, (uint8_t)bri);
     }
     dirty_poll_mark_active((uint8_t)slave);
+    txt_ok();
+}
+
+/* ── dali_raw <slave> <cmd16> [twice] ──────────────────────────────────────
+ * Send an arbitrary 16-bit DALI forward frame to a gateway. cmd16 is the full
+ * frame — address/selector byte in the high 8 bits, opcode/data in the low 8
+ * bits — and accepts decimal or 0x-hex. It is written to the gateway RAW_CMD
+ * holding register (0x1000 single send, 0x1001 send-twice). Append "twice" (or
+ * "2x") for config commands that DALI requires be repeated within 100 ms (e.g.
+ * STORE_DTR_AS_*, SET_SCENE). Reports the Modbus-level ack/exception, not the
+ * DALI backward frame. */
+static void cmd_dali_raw(char **saveptr) {
+    char *ss = strtok_r(NULL, " \t", saveptr);
+    char *cs = strtok_r(NULL, " \t", saveptr);
+    char *ts = strtok_r(NULL, " \t", saveptr);
+    long slave, cmd16;
+    if (!parse_int_range_auto(ss, 0, 247, &slave))   { txt_err("invalid_slave"); return; }
+    if (!parse_int_range_auto(cs, 0, 65535, &cmd16)) { txt_err("bad_arg"); return; }
+    bool twice = false;
+    if (ts) {
+        if (strcasecmp(ts, "twice") == 0 || strcasecmp(ts, "2x") == 0) {
+            twice = true;
+        } else {
+            txt_err("bad_arg"); return;
+        }
+    }
+
+    /* TinyModbus RAW_CMD registers (see lighting_actions.c). */
+    uint16_t reg   = twice ? 0x1001u : 0x1000u;
+    uint16_t value = (uint16_t)cmd16;
+
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    LOG_INFO("cli", "dali_raw slave=%ld frame=0x%04x%s",
+             slave, value, twice ? " twice" : "");
+    modbus_set_holding_register((uint8_t)slave, reg, value, cli_mb_cb, &ctx);
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return;
+    /* Let dirty-poll pick up any resulting ballast state change. */
+    dirty_poll_mark_active((uint8_t)slave);
+    txt_ok();
+}
+
+/* ── gw_reboot <slave> ─────────────────────────────────────────────────────
+ * Force a TinyModbus gateway to perform a software reset by writing the magic
+ * value 0xA5A5 to its SYSTEM_RESET register (0x1015). Recovery hatch for a
+ * gateway wedged in a stuck-busy DALI state (raw channel returning exception
+ * 0x06 for every command). The gateway ACKs, then reboots and is unresponsive
+ * for ~1 s before it re-runs its own bus scan. */
+static void cmd_gw_reboot(char **saveptr) {
+    char *ss = strtok_r(NULL, " \t", saveptr);
+    long slave;
+    if (!parse_int_range_auto(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    LOG_INFO("cli", "gw_reboot slave=%ld", slave);
+    /* TinyModbus MBREG_SYSTEM_RESET / MBREG_SYSTEM_RESET_MAGIC (registers.h). */
+    modbus_set_holding_register((uint8_t)slave, 0x1015u, 0xA5A5u, cli_mb_cb, &ctx);
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return;
     txt_ok();
 }
 
@@ -1434,6 +1496,14 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "dali") == 0) {
         cmd_dali(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "dali_raw") == 0) {
+        cmd_dali_raw(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "gw_reboot") == 0) {
+        cmd_gw_reboot(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "dim") == 0) {

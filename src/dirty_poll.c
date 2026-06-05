@@ -101,6 +101,9 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             if (mask & ((uint64_t)1 << a)) {
                 dp->state = DPOLL_AWAITING_BALLAST;
+                LOG_INFO("dirty",
+                         "slave=%u: ballast %d flagged dirty — reading BLOCK0 holding reg %u for fresh arc/status",
+                         slave_id, a, (unsigned)(DALI_BLOCK0_START + a));
                 /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
                 modbus_get_holding_registers(slave_id,
                                              DALI_BLOCK0_START + (uint16_t)a, 1,
@@ -140,6 +143,9 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
     for (int a = addr + 1; a < DALI_ADDR_COUNT; a++) {
         if (dp->pending_dirty & ((uint64_t)1 << a)) {
             dp->state = DPOLL_AWAITING_BALLAST;
+            LOG_INFO("dirty",
+                     "slave=%u: ballast %d also dirty — reading next BLOCK0 holding reg %u",
+                     slave, a, (unsigned)(DALI_BLOCK0_START + a));
             /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
             modbus_get_holding_registers(slave,
                                          DALI_BLOCK0_START + (uint16_t)a, 1,
@@ -244,6 +250,10 @@ static bool sync_read_holding(uint8_t slave, uint16_t addr, uint16_t count,
  * in the assembled 64-bit mask corresponds to ballast short address N. */
 static void read_all_group_masks(uint8_t slave_id, uint8_t idx) {
     uint16_t regs[64];  /* 16 groups * 4 regs */
+    LOG_DBG("dirty",
+            "slave=%u: reading 16 DALI group membership masks (holding regs %u..%u) to refresh group state",
+            slave_id, (unsigned)DALI_GROUP_MASK_START,
+            (unsigned)(DALI_GROUP_MASK_START + 64 - 1));
     for (uint16_t chunk = 0; chunk < 4; chunk++) {
         uint16_t off = chunk * DALI_MAX_CHUNK;  /* 4 groups per 16-reg chunk */
         if (!sync_read_holding(slave_id,
@@ -300,6 +310,10 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     s_dp[idx].last_present = present_mask;
 
     /* Block 0 in 16-register chunks (FC03 holding regs post refactor). */
+    LOG_INFO("dirty",
+             "slave=%u: full scan reading BLOCK0 arc/status for all %d ballasts (holding regs %u..%u)",
+             slave_id, DALI_ADDR_COUNT, (unsigned)DALI_BLOCK0_START,
+             (unsigned)(DALI_BLOCK0_START + DALI_ADDR_COUNT - 1));
     uint16_t regs[DALI_ADDR_COUNT];
     for (uint16_t chunk = 0; chunk < 4; chunk++) {
         uint16_t off = chunk * DALI_MAX_CHUNK;
@@ -316,6 +330,10 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     }
 
     /* BLOCK1..3 are FC03 holding regs post refactor. */
+    LOG_INFO("dirty",
+             "slave=%u: full scan reading BLOCK1-3 config (holding regs %u..%u) for all ballasts",
+             slave_id, (unsigned)DALI_BLOCK1_START,
+             (unsigned)(DALI_BLOCK3_START + DALI_ADDR_COUNT - 1));
     uint16_t b1[DALI_ADDR_COUNT], b2[DALI_ADDR_COUNT], b3[DALI_ADDR_COUNT];
     for (uint16_t chunk = 0; chunk < 4; chunk++) {
         uint16_t off = chunk * DALI_MAX_CHUNK;
@@ -393,6 +411,10 @@ void dirty_poll_background_check(uint8_t slave_id) {
     read_all_group_masks(slave_id, (uint8_t)idx);
 
     /* BLOCK0 is FC03 holding regs post refactor. */
+    LOG_DBG("dirty",
+            "slave=%u: background check reading BLOCK0 arc/status (holding regs %u..%u) to detect faults",
+            slave_id, (unsigned)DALI_BLOCK0_START,
+            (unsigned)(DALI_BLOCK0_START + DALI_ADDR_COUNT - 1));
     uint16_t b0[DALI_ADDR_COUNT];
     for (uint16_t c = 0; c < 4; c++) {
         sync_read_holding(slave_id, DALI_BLOCK0_START + c * DALI_MAX_CHUNK,

@@ -5,7 +5,7 @@
  * for DE release timing, non-blocking poll loop.  Changes from original:
  *   - ACTION_DALI (0x44) removed; TinyModbus uses standard FC04/FC06
  *   - FC04 Read Input Registers added (ACTION_GET_INPUT_REGISTERS)
- *   - Baud rate is configurable, defaulting to 19200
+ *   - Baud rate is configurable, defaulting to 38400
  *   - Baud rate and DE mode are both persisted to flash filesystem
  */
 
@@ -36,7 +36,7 @@
 #define UART_RX_PIN  5
 #define UART_DE_PIN  1
 
-#define DEFAULT_BAUD_RATE 19200u
+#define DEFAULT_BAUD_RATE 38400u
 
 typedef enum {
     MODBUS_IDLE,
@@ -86,34 +86,53 @@ static bool modbus_rx_valid(void) { return true; }
 
 static const char *modbus_de_mode_str[MODBUS_DE_MAX] = { "tx", "always" };
 
-/* Emit the *intent* of an action at INFO level (what we're asking the slave
- * to do), separate from the raw tx byte dump which lives at DEBUG. */
+/* Standard Modbus exception codes (MODBUS Application Protocol v1.1b3 §7). */
+const char *modbus_exception_str(uint8_t code) {
+    switch (code) {
+    case 0x01: return "illegal function";
+    case 0x02: return "illegal data address";
+    case 0x03: return "illegal data value";
+    case 0x04: return "device failure";
+    case 0x05: return "acknowledge";
+    case 0x06: return "device busy";
+    case 0x07: return "negative acknowledge";
+    case 0x08: return "memory parity error";
+    case 0x0A: return "gateway path unavailable";
+    case 0x0B: return "gateway target no response";
+    default:   return "unknown";
+    }
+}
+
+/* Emit the *intent* of an action at DEBUG level (what we're asking the slave
+ * to do), separate from the raw tx byte dump which also lives at DEBUG. The
+ * higher-level *why* (which subsystem requested the read and for what reason)
+ * is logged by the callers, e.g. dirty_poll.c. */
 static void log_action_intent(const modbus_action_t *a) {
     switch (a->action) {
     case ACTION_GET_COILS:
-        LOG_INFO("modbus", "read coils slave=%u addr=%u count=%u",
-                 a->device, a->address, a->arg);
+        LOG_DBG("modbus", "read coils slave=%u addr=%u count=%u",
+                a->device, a->address, a->arg);
         break;
     case ACTION_GET_HOLDING_REGISTERS:
-        LOG_INFO("modbus", "read holding registers slave=%u addr=%u count=%u",
-                 a->device, a->address, a->arg);
+        LOG_DBG("modbus", "read holding registers slave=%u addr=%u count=%u",
+                a->device, a->address, a->arg);
         break;
     case ACTION_GET_INPUT_REGISTERS:
-        LOG_INFO("modbus", "read input registers slave=%u addr=%u count=%u",
-                 a->device, a->address, a->arg);
+        LOG_DBG("modbus", "read input registers slave=%u addr=%u count=%u",
+                a->device, a->address, a->arg);
         break;
     case ACTION_SET_COIL:
-        LOG_INFO("modbus", "set coil slave=%u addr=%u -> %s",
-                 a->device, a->address,
-                 a->arg == 0x5500u ? "toggle" : (a->arg ? "on" : "off"));
+        LOG_DBG("modbus", "set coil slave=%u addr=%u -> %s",
+                a->device, a->address,
+                a->arg == 0x5500u ? "toggle" : (a->arg ? "on" : "off"));
         break;
     case ACTION_SET_HOLDING_REGISTER:
-        LOG_INFO("modbus", "set holding register slave=%u addr=%u value=%u",
-                 a->device, a->address, a->arg);
+        LOG_DBG("modbus", "set holding register slave=%u addr=%u value=%u",
+                a->device, a->address, a->arg);
         break;
     default:
-        LOG_INFO("modbus", "action 0x%02x slave=%u addr=%u arg=%u",
-                 (unsigned)a->action, a->device, a->address, a->arg);
+        LOG_DBG("modbus", "action 0x%02x slave=%u addr=%u arg=%u",
+                (unsigned)a->action, a->device, a->address, a->arg);
         break;
     }
 }
@@ -391,15 +410,15 @@ void modbus_poll(void) {
             }
         } else if (readbuf_sz >= 2 && (buf[1] & 0x80)) {
             uint8_t exc = (readbuf_sz >= 3) ? buf[2] : 0xFFu;
-            LOG_WARN("modbus", "rx exception slave=%u fc=0x%02x code=0x%02x",
+            LOG_WARN("modbus", "rx exception slave=%u fc=0x%02x code=0x%02x (%s)",
                      currentAction.device, (unsigned)currentAction.action,
-                     (unsigned)exc);
+                     (unsigned)exc, modbus_exception_str(exc));
             if (currentAction.callback)
                 currentAction.callback(-(int)readbuf_sz, buf, currentAction.ctx);
         } else {
-            LOG_INFO("modbus", "rx ok slave=%u fc=0x%02x bytes=%d",
-                     currentAction.device, (unsigned)currentAction.action,
-                     (int)readbuf_sz);
+            LOG_DBG("modbus", "rx ok slave=%u fc=0x%02x bytes=%d",
+                    currentAction.device, (unsigned)currentAction.action,
+                    (int)readbuf_sz);
             if (currentAction.callback)
                 currentAction.callback((int)readbuf_sz, buf, currentAction.ctx);
         }
