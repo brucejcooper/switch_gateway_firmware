@@ -829,6 +829,7 @@ static void cmd_help(void) {
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
     printf("identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n");
+    printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
@@ -1221,6 +1222,30 @@ static void cmd_identify(char **saveptr) {
     printf(" serial=");
     for (int i = 0; i < 8; i++) printf("%02X", serial[i]);
     printf("\n");
+}
+
+/* ── blink <slave> <addr> ──────────────────────────────────────────────────
+ * Flash one ballast (DAPC full/off, ~8 toggles) so it can be located
+ * physically — DALI control gear has no IDENTIFY command, so we just pulse its
+ * level.  Leaves the light on at full. */
+static void cmd_blink(char **saveptr) {
+    char *as = strtok_r(NULL, " \t", saveptr);
+    char *ds = strtok_r(NULL, " \t", saveptr);
+    long slave, addr;
+    if (!parse_int_range_auto(as, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    if (!parse_int_range_auto(ds, 0, 63,  &addr))  { txt_err("bad_arg"); return; }
+    uint16_t r;
+    // DAPC (direct arc power): address byte = (addr<<1) with bit0=0, data = level.
+    uint16_t dapc = (uint16_t)((uint16_t)((addr << 1) & 0x7Eu) << 8);
+    LOG_INFO("cli", "blink slave=%ld addr=%ld", slave, addr);
+    for (int i = 0; i < 8; i++) {
+        uint8_t level = (i & 1) ? 0x00u : 0xFEu;
+        if (!dali_raw_result((uint8_t)slave, (uint16_t)(dapc | level), false, &r)) return;
+        sleep_ms(300);
+    }
+    dali_raw_result((uint8_t)slave, (uint16_t)(dapc | 0xFEu), false, &r);  // leave on
+    dirty_poll_mark_active((uint8_t)slave);
+    txt_ok();
 }
 
 /* ── gw_reboot <slave> ─────────────────────────────────────────────────────
@@ -1651,6 +1676,10 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "identify") == 0) {
         cmd_identify(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "blink") == 0) {
+        cmd_blink(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "gw_reboot") == 0) {
