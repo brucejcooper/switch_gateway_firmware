@@ -36,9 +36,28 @@ dali_ballast_state_t *state_cache_get_dali(uint8_t slave_idx, uint8_t addr) {
 void state_cache_set_dali_arc(uint8_t slave_idx, uint8_t addr,
                                uint8_t arc, uint8_t status) {
     if (slave_idx >= MAX_DALI_SLAVES || addr >= DALI_ADDR_COUNT) return;
+    bool fading = (status & 0x10) != 0;
     s_dali[slave_idx][addr].arc_level   = arc;
     s_dali[slave_idx][addr].status_byte = status;
-    s_dali[slave_idx][addr].fading      = (status & 0x10) != 0;
+    s_dali[slave_idx][addr].fading      = fading;
+    /* Re-sync the on/off intent from a stable read (catches external changes) —
+     * but only once the command settle window has elapsed.  Within the window
+     * the just-commanded intent is authoritative, so a stale read (taken between
+     * command-send and fade-start) or a mid-fade read can't clobber a rapid
+     * in-flight toggle.  Rapid tapping keeps extending cmd_time, so the intent
+     * stays command-driven until the user stops. */
+    #define DALI_CMD_SETTLE_US 700000  /* 0.7 s */
+    if (!fading &&
+        absolute_time_diff_us(s_dali[slave_idx][addr].cmd_time, get_absolute_time())
+            > DALI_CMD_SETTLE_US) {
+        s_dali[slave_idx][addr].commanded_on = (arc > 0);
+    }
+}
+
+void state_cache_set_dali_commanded_on(uint8_t slave_idx, uint8_t addr, bool on) {
+    if (slave_idx >= MAX_DALI_SLAVES || addr >= DALI_ADDR_COUNT) return;
+    s_dali[slave_idx][addr].commanded_on = on;
+    s_dali[slave_idx][addr].cmd_time     = get_absolute_time();
 }
 
 void state_cache_set_dali_config(uint8_t slave_idx, uint8_t addr,
@@ -78,7 +97,7 @@ bool state_cache_dali_group_any_on(uint8_t slave_idx, uint8_t group) {
         mask &= mask - 1;
         if (a >= DALI_ADDR_COUNT) continue;
         dali_ballast_state_t *b = &s_dali[slave_idx][a];
-        if (b->present && b->arc_level > 0) return true;
+        if (b->present && b->commanded_on) return true;
     }
     return false;
 }
@@ -117,7 +136,7 @@ bool state_cache_any_on(uint8_t fixture, uint8_t button) {
             } else {
                 dali_ballast_state_t *b = state_cache_get_dali(
                     (uint8_t)idx, TARGET_BALLAST_ADDR(rec->targets[i]));
-                if (b && b->arc_level > 0) return true;
+                if (b && b->commanded_on) return true;
             }
             break;
         }

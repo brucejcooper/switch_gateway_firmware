@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include "pico/time.h"
 #include "config.h"
 
 #define RELAY_COUNT     32
@@ -17,6 +18,11 @@ typedef struct {
     uint8_t fade_time;
     bool    present;
     bool    fading;
+    bool    commanded_on;   /* on/off intent — drives toggle/any_on.  Set by every
+                             * command; re-synced from a stable read only after the
+                             * settle window below, so a stale/mid-fade read during
+                             * a (rapid) toggle can't clobber the in-flight intent. */
+    absolute_time_t cmd_time;  /* when commanded_on was last set by a command */
 } dali_ballast_state_t;
 
 void state_cache_init(void);
@@ -34,6 +40,10 @@ void state_cache_set_dali_config(uint8_t slave_idx, uint8_t addr,
                                   uint8_t power_on, uint8_t sys_fail,
                                   uint8_t fade_rate, uint8_t fade_time);
 void state_cache_set_dali_present(uint8_t slave_idx, uint8_t addr, bool present);
+
+/* Set the on/off intent synchronously (called by lighting commands so a
+ * follow-up toggle reads the commanded state without waiting for dirty-poll). */
+void state_cache_set_dali_commanded_on(uint8_t slave_idx, uint8_t addr, bool on);
 
 /* Returns slave index for a given slave_id, or -1 if unknown */
 int  state_cache_slave_idx(uint8_t slave_id);

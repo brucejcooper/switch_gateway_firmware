@@ -2,6 +2,7 @@
 #include "dali_provision.h"
 #include "modbus.h"
 #include "state_cache.h"
+#include "dirty_poll.h"
 #include "config.h"
 #include "log.h"
 
@@ -117,6 +118,26 @@ void dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice) {
                                 value, dali_write_cb, NULL);
 }
 
+/* Synchronously record the on/off intent so a follow-up toggle (e.g. a rapid
+ * button press) reads the commanded state immediately, before — and regardless
+ * of — the async dirty-poll refresh.  The dirty-poll re-syncs the intent from
+ * the next *stable* read, so mid-fade reads can't clobber an in-flight toggle. */
+static void cache_predict_dali(uint8_t slave_id, uint8_t dali_addr, bool on) {
+    int idx = state_cache_slave_idx(slave_id);
+    if (idx >= 0) state_cache_set_dali_commanded_on((uint8_t)idx, dali_addr, on);
+}
+
+static void cache_predict_group(uint8_t slave_id, uint8_t group, bool on) {
+    int idx = state_cache_slave_idx(slave_id);
+    if (idx < 0) return;
+    uint64_t mask = state_cache_get_dali_group((uint8_t)idx, group);
+    while (mask) {
+        uint8_t a = (uint8_t)__builtin_ctzll(mask);
+        mask &= mask - 1;
+        state_cache_set_dali_commanded_on((uint8_t)idx, a, on);
+    }
+}
+
 void lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
     if (dali_provision_busy_slave(slave_id)) return;
     if (on) {
@@ -134,6 +155,12 @@ void lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
     }
     LOG_INFO("light", "dali %u.%u %s",
              slave_id, dali_addr, on ? "on" : "off");
+    /* Reflect the change in the cache immediately so a rapid follow-up toggle
+     * reads the new state, then mark the slave active so dirty-poll confirms the
+     * exact level.  Without this only the CLI (which marks active itself) stayed
+     * in sync; button presses went stale and stuck after the first toggle. */
+    cache_predict_dali(slave_id, dali_addr, on);
+    dirty_poll_mark_active(slave_id);
 }
 
 void lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
@@ -144,6 +171,7 @@ void lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
     dali_raw_arm(slave_id, value, false);
     LOG_INFO("light", "dali %u.%u step %s",
              slave_id, dali_addr, up ? "up" : "down");
+    dirty_poll_mark_active(slave_id);
 }
 
 void lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
@@ -154,6 +182,8 @@ void lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
     modbus_set_holding_register(slave_id, reg,
                                 (uint16_t)arc, dali_write_cb, NULL);
     LOG_INFO("light", "dali %u.%u bri=%u", slave_id, dali_addr, arc);
+    cache_predict_dali(slave_id, dali_addr, arc > 0);
+    dirty_poll_mark_active(slave_id);
 }
 
 /* ── DALI group helpers ──────────────────────────────────────────────────── */
@@ -167,6 +197,8 @@ void lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
     uint16_t value     = ((uint16_t)addr_byte << 8) | arc;
     dali_raw_arm(slave_id, value, false);
     LOG_INFO("light", "group %u.G%u bri=%u", slave_id, group, arc);
+    cache_predict_group(slave_id, group, arc > 0);
+    dirty_poll_mark_active(slave_id);
 }
 
 void lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
@@ -177,6 +209,8 @@ void lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
     dali_raw_arm(slave_id, value, false);
     LOG_INFO("light", "group %u.G%u %s",
              slave_id, group, on ? "on" : "off");
+    cache_predict_group(slave_id, group, on);
+    dirty_poll_mark_active(slave_id);
 }
 
 void lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {
@@ -186,6 +220,7 @@ void lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {
     dali_raw_arm(slave_id, value, false);
     LOG_INFO("light", "group %u.G%u step %s",
              slave_id, group, up ? "up" : "down");
+    dirty_poll_mark_active(slave_id);
 }
 
 /* ── Emit helpers (called by dirty_poll) ─────────────────────────────────── */
