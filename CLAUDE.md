@@ -202,3 +202,30 @@ device) · `0x13-0x14` hw ver. Verified on the rig's ballasts.
 2. `provision <slave> <addr>` per collided address → split onto free addresses.
 3. `blink`/`identify` the new addresses, update the spreadsheet — or run
    `dali_xlsx_sync.py remap` if serials were `populate`d beforehand.
+
+## DALI per-ballast config — min/max/power-on/sys-fail/fade (2026-06-06)
+
+For Home Assistant. The controller already fetched this config (full scan reads
+gateway BLOCK1-3) but didn't expose it; now it does.
+
+- **`state_dali` emit** carries the full config on every update:
+  `min max power_on sys_fail fade_rate fade_time` (alongside `on/bri/fading/lamp_fail`).
+- **Get (CLI):** `show dali <slave> <addr>` prints it. **Get (JSON):**
+  `{"t":"get_dali_config","slave":S,"addr":A}` re-emits the ballast's `state_dali`.
+- **Set (CLI):** `set_dali_config <slave> <addr> <field> <value>`,
+  field ∈ `min|max|power_on|sys_fail|fade_rate|fade_time`. **Set (JSON):**
+  `{"t":"set_dali_config","slave":S,"addr":A, ...any subset of those fields...}`.
+- Fields map to gateway holding-register **pairs** (high byte first):
+  `0x0040+addr=(min<<8)|max`, `0x0080+addr=(power_on<<8)|sys_fail`,
+  `0x00C0+addr=(fade_rate<<8)|fade_time`. A register write arms the gateway's DALI
+  `STORE DTR AS …` sequence. Set is read-modify-write (preserves the pair's other
+  field from cache) + a predictive cache update + re-emit.
+- **Gotcha:** the ballast clamps out-of-range values — notably `min` to its
+  **physical minimum** (`QUERY PHYSICAL MINIMUM` 0x9A; the rig's is 99), so
+  `set min` below that is silently floored. A rescan reflects the actual stored
+  value (the predictive emit shows the requested value until then).
+- **Opcode fix:** `TinyModbus dali.h` had `QUERY MIN/MAX` **swapped** vs IEC 62386-102
+  (`0xA1`=QUERY MAX, `0xA2`=QUERY MIN). The scan-store + controller-read swaps
+  cancelled so reads looked right, but it left read and write byte-orders opposite.
+  Corrected the opcodes and flipped the controller's BLOCK1 read (dirty_poll) to
+  match, so read and write are now consistent at `(min<<8)|max`.

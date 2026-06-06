@@ -343,8 +343,10 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     }
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         if (!(present_mask & ((uint64_t)1 << a))) continue;
+        /* BLOCK1 wire order is (min<<8)|max (high byte = min, low = max); the
+         * cfg args are (max_l, min_l).  BLOCK2/3 high byte = power_on/fade_rate. */
         state_cache_set_dali_config((uint8_t)idx, (uint8_t)a,
-                                    (b1[a] >> 8) & 0xFF, b1[a] & 0xFF,
+                                    b1[a] & 0xFF, (b1[a] >> 8) & 0xFF,
                                     (b2[a] >> 8) & 0xFF, b2[a] & 0xFF,
                                     (b3[a] >> 8) & 0xFF, b3[a] & 0xFF);
     }

@@ -56,6 +56,9 @@ static bool json_str(const char *json, const char *key, char *out, int out_len) 
     out[i] = '\0';
     return i > 0;
 }
+/* Forward decl — defined alongside the other DALI helpers further down. */
+static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t value);
+
 static bool json_int(const char *j, const char *k, int *out) {
     char buf[16];
     if (!json_str(j, k, buf, sizeof(buf))) return false;
@@ -353,6 +356,43 @@ static void handle_json_line(const char *line) {
             g_config.reversal_window_ms = (uint16_t)v;
         config_save();
         serial_tx_ack(cmd_id, true, NULL);
+        return;
+    }
+
+    /* ── set_dali_config ───────────────────────────────────────────────────
+     * {"t":"set_dali_config","slave":S,"addr":A,"min":..,"max":..,...}
+     * Any subset of min/max/power_on/sys_fail/fade_rate/fade_time. */
+    if (strcmp(t, "set_dali_config") == 0) {
+        int slave = 0, addr = 0;
+        json_int(line, "slave", &slave);
+        json_int(line, "addr",  &addr);
+        static const char *fields[] = { "min", "max", "power_on",
+                                        "sys_fail", "fade_rate", "fade_time" };
+        bool any = false, ok = true;
+        for (unsigned i = 0; i < 6; i++) {
+            int v;
+            if (json_int(line, fields[i], &v)) {
+                any = true;
+                if (dali_cfg_set((uint8_t)slave, (uint8_t)addr, fields[i],
+                                 (uint8_t)v) != 1)
+                    ok = false;
+            }
+        }
+        serial_tx_ack(cmd_id, any && ok, !any ? "no_fields" : (ok ? NULL : "set_failed"));
+        return;
+    }
+
+    /* ── get_dali_config ─── re-emit state_dali (which carries config) ────── */
+    if (strcmp(t, "get_dali_config") == 0) {
+        int slave = 0, addr = 0;
+        json_int(line, "slave", &slave);
+        json_int(line, "addr",  &addr);
+        int idx = state_cache_slave_idx((uint8_t)slave);
+        dali_ballast_state_t *b =
+            idx >= 0 ? state_cache_get_dali((uint8_t)idx, (uint8_t)addr) : NULL;
+        if (b) lighting_emit_dali_state((uint8_t)slave, (uint8_t)addr,
+                                        b->arc_level, b->status_byte);
+        serial_tx_ack(cmd_id, b != NULL, b ? NULL : "not_present");
         return;
     }
 
@@ -827,6 +867,7 @@ static void cmd_help(void) {
     printf("relay <ch> {on|off|toggle}                 set one relay\n");
     printf("dali <slave> <addr> {on|off|toggle|<bri>}  set one ballast\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
+    printf("set_dali_config <slave> <addr> <field> <val> field: min|max|power_on|sys_fail|fade_rate|fade_time\n");
     printf("dali <slave> g<group> {on|off|<bri>}       set one group (no toggle)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
@@ -1155,6 +1196,67 @@ static void cmd_btn(char **saveptr) {
     } else { txt_err("bad_arg"); return; }
     LOG_INFO("cli", "btn F%d.B%d %s (synthesized)", fix, btn, act);
     txt_ok();
+}
+
+/* ── DALI config get/set ───────────────────────────────────────────────────
+ * Fields map to gateway holding-register pairs (high byte first):
+ *   BLOCK1 0x0040+addr = (min<<8)|max
+ *   BLOCK2 0x0080+addr = (power_on<<8)|sys_fail
+ *   BLOCK3 0x00C0+addr = (fade_rate<<8)|fade_time
+ * Writing a register arms the gateway's DALI "STORE DTR AS ..." sequence.  The
+ * ballast may clamp a value (e.g. min to its physical minimum); a rescan then
+ * reflects the actual stored value. */
+static bool dali_cfg_field(const char *name, uint16_t *base, bool *high) {
+    if (strcasecmp(name, "min")       == 0) { *base = 0x0040u; *high = true;  return true; }
+    if (strcasecmp(name, "max")       == 0) { *base = 0x0040u; *high = false; return true; }
+    if (strcasecmp(name, "power_on")  == 0) { *base = 0x0080u; *high = true;  return true; }
+    if (strcasecmp(name, "sys_fail")  == 0) { *base = 0x0080u; *high = false; return true; }
+    if (strcasecmp(name, "fade_rate") == 0) { *base = 0x00C0u; *high = true;  return true; }
+    if (strcasecmp(name, "fade_time") == 0) { *base = 0x00C0u; *high = false; return true; }
+    return false;
+}
+
+/* Returns 1 ok, 0 bad field, -1 not present, -2 transport error (printed). */
+static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t value) {
+    uint16_t base; bool high;
+    if (!dali_cfg_field(field, &base, &high)) return 0;
+    int idx = state_cache_slave_idx(slave);
+    dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
+    if (!b) return -1;
+    uint8_t mn = b->min_level, mx = b->max_level, po = b->power_on_level,
+            sf = b->sys_fail_level, fr = b->fade_rate, ft = b->fade_time;
+    if      (base == 0x0040u) { if (high) mn = value; else mx = value; }
+    else if (base == 0x0080u) { if (high) po = value; else sf = value; }
+    else                      { if (high) fr = value; else ft = value; }
+    uint16_t regval = base == 0x0040u ? (uint16_t)(((uint16_t)mn << 8) | mx)
+                    : base == 0x0080u ? (uint16_t)(((uint16_t)po << 8) | sf)
+                    :                   (uint16_t)(((uint16_t)fr << 8) | ft);
+    static cli_mb_ctx_t ctx;
+    memset(&ctx, 0, sizeof ctx);
+    modbus_set_holding_register(slave, (uint16_t)(base + addr), regval, cli_mb_cb, &ctx);
+    cli_mb_wait(&ctx);
+    if (cli_mb_report_fail(&ctx)) return -2;
+    /* Predictive cache update + re-emit so HA sees the change immediately. */
+    state_cache_set_dali_config((uint8_t)idx, addr, mx, mn, po, sf, fr, ft);
+    lighting_emit_dali_state(slave, addr, b->arc_level, b->status_byte);
+    return 1;
+}
+
+/* set_dali_config <slave> <addr> <field> <value> */
+static void cmd_set_dali_config(char **saveptr) {
+    char *ss = strtok_r(NULL, " \t", saveptr), *as = strtok_r(NULL, " \t", saveptr);
+    char *fs = strtok_r(NULL, " \t", saveptr), *vs = strtok_r(NULL, " \t", saveptr);
+    int slave, addr, value;
+    if (!parse_int_range(ss, 0, 247, &slave)) { txt_err("bad_slave"); return; }
+    if (!parse_int_range(as, 0, 63,  &addr))  { txt_err("bad_addr");  return; }
+    if (!fs)                                  { txt_err("bad_field"); return; }
+    if (!parse_int_range(vs, 0, 255, &value)) { txt_err("bad_value"); return; }
+    switch (dali_cfg_set((uint8_t)slave, (uint8_t)addr, fs, (uint8_t)value)) {
+        case 1:  txt_ok();               break;
+        case 0:  txt_err("bad_field");   break;
+        case -1: txt_err("not_present"); break;
+        default: /* -2: error already printed */ break;
+    }
 }
 
 /* ── dali_raw <slave> <cmd16> [twice] ──────────────────────────────────────
@@ -1691,6 +1793,10 @@ static void handle_text_line(const char *original_line) {
         cmd_btn(&saveptr);
         return;
     }
+    if (strcasecmp(cmd, "set_dali_config") == 0) {
+        cmd_set_dali_config(&saveptr);
+        return;
+    }
     if (strcasecmp(cmd, "dali") == 0) {
         cmd_dali(&saveptr);
         return;
@@ -1840,16 +1946,25 @@ static void emit_event(const levt_t *e) {
     case LEVT_DALI: {
         bool fading    = (e->dali.status & 0x10) != 0;
         bool lamp_fail = (e->dali.status & 0x02) != 0;
+        /* Include the cached ballast config so Home Assistant gets min/max/fade
+         * with every state update (the values come from the full scan). */
+        int didx = state_cache_slave_idx(e->dali.slave_id);
+        dali_ballast_state_t *b =
+            didx >= 0 ? state_cache_get_dali((uint8_t)didx, e->dali.addr) : NULL;
         printf("{\"t\":\"state_dali\",\"ts\":%lu,"
                "\"d\":{\"slave\":%u,\"addr\":%u},"
-               "\"v\":{\"on\":%s,\"bri\":%u,\"fading\":%s,"
-               "\"lamp_fail\":%s}}\n",
+               "\"v\":{\"on\":%s,\"bri\":%u,\"fading\":%s,\"lamp_fail\":%s,"
+               "\"min\":%u,\"max\":%u,\"power_on\":%u,\"sys_fail\":%u,"
+               "\"fade_rate\":%u,\"fade_time\":%u}}\n",
                (unsigned long)ts,
                e->dali.slave_id, e->dali.addr,
                e->dali.arc > 0 ? "true" : "false",
                e->dali.arc,
                fading    ? "true" : "false",
-               lamp_fail ? "true" : "false");
+               lamp_fail ? "true" : "false",
+               b ? b->min_level : 0, b ? b->max_level : 0,
+               b ? b->power_on_level : 0, b ? b->sys_fail_level : 0,
+               b ? b->fade_rate : 0, b ? b->fade_time : 0);
         LOG_DBG("serial", "evt state_dali slave=%u addr=%u",
                 e->dali.slave_id, e->dali.addr);
         break;
