@@ -5,7 +5,8 @@
  * for DE release timing, non-blocking poll loop.  Changes from original:
  *   - ACTION_DALI (0x44) removed; TinyModbus uses standard FC04/FC06
  *   - FC04 Read Input Registers added (ACTION_GET_INPUT_REGISTERS)
- *   - Baud rate is configurable, defaulting to 38400
+ *   - Baud rate is configurable, defaulting to 19200 (38400 is marginal
+ *     against the TinyModbus ATtiny's internal-RC-oscillator RX sampling)
  *   - Baud rate and DE mode are both persisted to flash filesystem
  */
 
@@ -36,7 +37,7 @@
 #define UART_RX_PIN  5
 #define UART_DE_PIN  1
 
-#define DEFAULT_BAUD_RATE 38400u
+#define DEFAULT_BAUD_RATE 19200u
 
 typedef enum {
     MODBUS_IDLE,

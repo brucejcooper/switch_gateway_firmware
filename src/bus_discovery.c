@@ -2,12 +2,15 @@
  * bus_discovery.c — boot-time bus probe + auto baud recovery.
  *
  * Slaves shipped from the factory default to 9600 baud; the controller's
- * canonical bus speed is 38400.  (38400 was previously thought "marginal
- * against the internal-RC oscillator", but that was actually a TinyModbus RX
- * interrupt-starvation bug dropping bytes — now fixed — so 38400 runs clean.)
- * At boot, for each configured slave, try 38400 first; on timeout, drop to 9600
+ * canonical bus speed is 19200.  (38400 was tried, but the TinyModbus ATtiny's
+ * internal-RC-oscillator RX sampling is marginal at 38400 — confirmed on the
+ * Saleae: clean frames on the wire, but the gateway mis-frames bytes and fails
+ * CRC under load.  19200 doubles the bit-time and the errors vanish, so 19200
+ * is canonical.  Separately, a TinyModbus RX interrupt-starvation bug — now
+ * fixed — used to drop bytes; that was a different fault.)
+ * At boot, for each configured slave, try 19200 first; on timeout, drop to 9600
  * and re-ping; if it responds, send the per-device set-baud command, snap back
- * to 38400, and verify.
+ * to 19200, and verify.
  *
  * Blocking by design — must be called from main() before the watchdog is
  * enabled and before the main poll loop starts. Worst case ~10 s per slave.
@@ -20,7 +23,7 @@
 #include <string.h>
 
 #define DISC_TIMEOUT_MS 1000
-#define BAUD_FAST  38400u
+#define BAUD_FAST  19200u
 #define BAUD_FALLBACK 9600u
 #define POST_RECONFIG_SETTLE_MS 100
 
