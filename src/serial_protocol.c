@@ -9,6 +9,7 @@
 #include "dali_provision.h"
 #include "lighting_actions.h"
 #include "mapping.h"
+#include "button_fsm.h"
 #include "config.h"
 #include "state_cache.h"
 #include "dirty_poll.h"
@@ -825,6 +826,7 @@ static void cmd_help(void) {
     printf("show provision                             provisioning status\n");
     printf("relay <ch> {on|off|toggle}                 set one relay\n");
     printf("dali <slave> <addr> {on|off|toggle|<bri>}  set one ballast\n");
+    printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
     printf("dali <slave> g<group> {on|off|<bri>}       set one group (no toggle)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
@@ -1129,6 +1131,29 @@ static void cmd_dali(char **saveptr) {
         lighting_dali_set_level((uint8_t)slave, (uint8_t)addr, (uint8_t)bri);
     }
     dirty_poll_mark_active((uint8_t)slave);
+    txt_ok();
+}
+
+/* ── btn <fixture> <button> [tap|press|release] ────────────────────────────
+ * Synthesize a button event (test hook).  Default `tap` = press+release, which
+ * runs the same FSM path as a real short press. */
+static void cmd_btn(char **saveptr) {
+    char *fs = strtok_r(NULL, " \t", saveptr);
+    char *bs = strtok_r(NULL, " \t", saveptr);
+    char *as = strtok_r(NULL, " \t", saveptr);
+    int fix, btn;
+    if (!parse_int_range(fs, 0, MAX_FIXTURES - 1, &fix)) { txt_err("bad_fixture"); return; }
+    if (!parse_int_range(bs, 0, MAX_BUTTONS - 1, &btn))  { txt_err("bad_button"); return; }
+    const char *act = as ? as : "tap";
+    if (strcasecmp(act, "press") == 0) {
+        button_fsm_inject((uint8_t)fix, (uint8_t)btn, BTN_RAW_PRESS);
+    } else if (strcasecmp(act, "release") == 0) {
+        button_fsm_inject((uint8_t)fix, (uint8_t)btn, BTN_RAW_RELEASE);
+    } else if (strcasecmp(act, "tap") == 0) {
+        button_fsm_inject((uint8_t)fix, (uint8_t)btn, BTN_RAW_PRESS);
+        button_fsm_inject((uint8_t)fix, (uint8_t)btn, BTN_RAW_RELEASE);
+    } else { txt_err("bad_arg"); return; }
+    LOG_INFO("cli", "btn F%d.B%d %s (synthesized)", fix, btn, act);
     txt_ok();
 }
 
@@ -1660,6 +1685,10 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "relay") == 0) {
         cmd_relay(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "btn") == 0) {
+        cmd_btn(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "dali") == 0) {

@@ -51,10 +51,18 @@ static dim_dir_t initial_dir(uint8_t fixture, uint8_t button) {
     return state_cache_any_on(fixture, button) ? DIM_DOWN : DIM_UP;
 }
 
+void button_fsm_inject(uint8_t fixture, uint8_t button, btn_raw_type_t type) {
+    btn_raw_event_t e = { .type = type, .fixture = fixture, .button = button,
+                          .time = get_absolute_time() };
+    queue_try_add(&g_btn_raw_queue, &e);
+}
+
 static void do_toggle(uint8_t fixture, uint8_t button) {
     const mapping_record_t *rec = mapping_lookup(fixture, button);
     if (!rec) return;
     bool any_on = state_cache_any_on(fixture, button);
+    LOG_INFO("btn", "toggle F%u.B%u cached_any_on=%d -> %s",
+             fixture, button, any_on, any_on ? "off" : "on");
     for (int i = 0; i < rec->target_count; i++) {
         if (TARGET_IS_GROUP(rec->targets[i])) {
             lighting_group_set_on_off(rec->targets[i].slave,

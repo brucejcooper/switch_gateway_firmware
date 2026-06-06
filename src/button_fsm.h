@@ -20,6 +20,10 @@ extern queue_t g_btn_raw_queue;
 
 void button_fsm_init(void);
 
+/* Synthesize a raw button event (for testing without physical hardware):
+ * queues it just like the PIO ISR would.  A tap = PRESS then RELEASE. */
+void button_fsm_inject(uint8_t fixture, uint8_t button, btn_raw_type_t type);
+
 /* Call from main loop — drains raw queue, advances all FSMs,
  * pushes lighting commands into the modbus action queue indirectly
  * by calling the lighting command functions directly. */
