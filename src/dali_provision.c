@@ -144,14 +144,16 @@ bool dali_provision_busy_slave(uint8_t slave_id) {
 
 bool dali_provision_start(uint8_t slave_id, prov_mode_t mode,
                            uint8_t target_addr) {
-    (void)target_addr;
     if (s.active) return false;
-    if (mode == PROV_ADDRESS) {
-        LOG_WARN("prov", "PROV_ADDRESS not supported by TinyModbus commissioning");
-        return false;
-    }
+    if (mode == PROV_ADDRESS && target_addr >= 64u) return false;
 
-    uint16_t cmd = (mode == PROV_UNADDRESSED) ? 0x0002u : 0x0001u;
+    // MBREG_COMMISSION command word: 0x0001 full, 0x0002 incremental,
+    // 0x03YY re-provision the gear at short address YY (fixes a collision).
+    uint16_t cmd;
+    const char *what;
+    if (mode == PROV_ADDRESS)        { cmd = 0x0300u | target_addr; what = "re-provision addr"; }
+    else if (mode == PROV_UNADDRESSED) { cmd = 0x0002u;             what = "incremental"; }
+    else                             { cmd = 0x0001u;               what = "full"; }
 
     memset(&s, 0, sizeof(s));
     s.active   = true;
@@ -161,12 +163,18 @@ bool dali_provision_start(uint8_t slave_id, prov_mode_t mode,
     g_prov_status.slave_id      = slave_id;
     g_prov_status.devices_found = 0;
 
-    LOG_INFO("prov", "start slave=%u mode=%s",
-             slave_id, mode == PROV_UNADDRESSED ? "incremental" : "full");
-    set_status(PROV_STATE_INITIALISING,
-               mode == PROV_UNADDRESSED ?
-               "Starting incremental commissioning..." :
-               "Starting full commissioning...");
+    LOG_INFO("prov", "start slave=%u mode=%s%s", slave_id, what,
+             mode == PROV_ADDRESS ? "" : "");
+    if (mode == PROV_ADDRESS) {
+        char msg[PROV_STATUS_MSG_MAX];
+        snprintf(msg, sizeof msg, "Re-provisioning address %u...", target_addr);
+        set_status(PROV_STATE_INITIALISING, msg);
+    } else {
+        set_status(PROV_STATE_INITIALISING,
+                   mode == PROV_UNADDRESSED ?
+                   "Starting incremental commissioning..." :
+                   "Starting full commissioning...");
+    }
 
     modbus_set_holding_register(slave_id, MBREG_COMMISSION, cmd, arm_cb, NULL);
     return true;

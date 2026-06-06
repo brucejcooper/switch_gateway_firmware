@@ -597,6 +597,95 @@ static bool cli_mb_report_fail(const cli_mb_ctx_t *c) {
     return false;
 }
 
+/* ── Raw DALI command + async result helpers (FC06 0x1000/0x1001 -> FC04 0x0108) ── */
+
+/* Decode a raw_cmd_result word (FC04 0x0108) into a short label. */
+static const char *dali_result_str(uint16_t r) {
+    switch (r >> 8) {
+        case 0x00: return "ok";
+        case 0x01: return "nak";
+        case 0xFF: return "pending";
+        case 0x02:
+            switch (r & 0xFFu) {
+                case 1:  return "malformed";    /* garbled backward frame = collision */
+                case 2:  return "pulse_short";
+                case 3:  return "pulse_mid";
+                case 4:  return "pulse_long";
+                default: return "err";
+            }
+        default: return "err";
+    }
+}
+
+/* Send a raw DALI frame (single, or twice when `twice`) and poll FC04 0x0108
+ * for the asynchronous outcome.  Retries the write on DEVICE_BUSY (0x06).  On
+ * success sets *result to the raw_cmd_result word and returns true; on a
+ * Modbus transport failure prints the error and returns false. */
+static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
+                            uint16_t *result) {
+    static cli_mb_ctx_t ctx;
+    uint16_t reg = twice ? 0x1001u : 0x1000u;
+
+    bool acked = false;
+    for (int attempt = 0; attempt < 6 && !acked; attempt++) {
+        memset(&ctx, 0, sizeof(ctx));
+        modbus_set_holding_register(slave, reg, frame, cli_mb_cb, &ctx);
+        cli_mb_wait(&ctx);
+        if (!ctx.done) { txt_err("internal"); return false; }
+        if (ctx.res > 0) { acked = true; break; }
+        if (ctx.res < 0) {
+            uint8_t code = ctx.frame_len >= 3 ? ctx.frame[2] : 0xFFu;
+            if (code == 0x06) { sleep_ms(15); continue; }   /* busy: retry */
+            printf("err: exception 0x%02X (%s)\n", code, modbus_exception_str(code));
+            return false;
+        }
+        txt_err("timeout"); return false;
+    }
+    if (!acked) { txt_err("device_busy"); return false; }
+
+    /* A single DALI command completes in ~25 ms; poll until it leaves PENDING. */
+    absolute_time_t deadline = make_timeout_time_ms(300);
+    uint16_t r = 0xFF00u;
+    do {
+        memset(&ctx, 0, sizeof(ctx));
+        modbus_get_input_registers(slave, 0x0108u, 1, cli_mb_cb, &ctx);
+        cli_mb_wait(&ctx);
+        if (cli_mb_report_fail(&ctx)) return false;
+        if (ctx.res >= 5) r = ((uint16_t)ctx.frame[3] << 8) | ctx.frame[4];
+    } while ((r >> 8) == 0xFFu &&
+             absolute_time_diff_us(get_absolute_time(), deadline) > 0);
+    *result = r;
+    return true;
+}
+
+/* Read `count` bytes from DALI memory `bank` starting at `offset`, from the
+ * gear at short address `addr`.  Sequence: SET DTR1=bank, SET DTR0=offset, then
+ * `count` READ MEMORY LOCATION (opcode 0xC5) — the gear auto-increments DTR0.
+ * Sets *collision if any read garbles (two+ gear answering differently) and
+ * *absent if a read NAKs (no gear there).  Returns false on transport failure. */
+static bool dali_read_mem(uint8_t slave, uint8_t addr, uint8_t bank,
+                          uint8_t offset, uint8_t count, uint8_t *out,
+                          bool *collision, bool *absent) {
+    uint16_t r;
+    *collision = false;
+    *absent    = false;
+    if (!dali_raw_result(slave, (uint16_t)(0xC300u | bank), false, &r)) return false; /* SET DTR1 */
+    uint8_t addr_byte = (uint8_t)((addr << 1) | 0x01u);   /* short-address command form */
+    for (uint8_t i = 0; i < count; i++) {
+        /* Re-set DTR0 before every read: not all gear auto-increment, and some
+         * have unreadable holes (e.g. bank-0 offset 0x01) that desync a run. */
+        if (!dali_raw_result(slave, (uint16_t)(0xA300u | (uint8_t)(offset + i)), false, &r))
+            return false;
+        uint16_t frame = (uint16_t)(((uint16_t)addr_byte << 8) | 0xC5u); /* READ MEMORY LOCATION */
+        if (!dali_raw_result(slave, frame, false, &r)) return false;
+        if      ((r >> 8) == 0x00u) out[i] = (uint8_t)(r & 0xFFu);   /* byte read */
+        else if ((r >> 8) == 0x02u) { *collision = true; out[i] = 0xFFu; }  /* garbled = 2+ gear */
+        else if (r == 0x0100u)      { if (i == 0) *absent = true; out[i] = 0xFFu; } /* NAK: no gear / hole */
+        else                        out[i] = 0xFFu;
+    }
+    return true;
+}
+
 static void print_reg_table(const cli_mb_ctx_t *c, uint16_t base, uint16_t count) {
     int expected = 5 + count * 2;
     if (c->res < expected) { txt_err("short_response"); return; }
@@ -737,11 +826,13 @@ static void cmd_help(void) {
     printf("relay <ch> {on|off|toggle}                 set one relay\n");
     printf("dali <slave> <addr> {on|off|toggle|<bri>}  set one ballast\n");
     printf("dali <slave> g<group> {on|off|<bri>}       set one group (no toggle)\n");
-    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame\n");
+    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
+    printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
+    printf("identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n");
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
-    printf("provision <slave> {all|new|<addr>}         start commissioning\n");
+    printf("provision <slave> {all|new|<addr>}         commission: all / incremental / re-provision collided <addr>\n");
     printf("provision abort                            stop commissioning\n");
     printf("scan <slave>                               blocking full scan\n");
     printf("discover                                   re-probe all configured slaves (blocking)\n");
@@ -1064,20 +1155,72 @@ static void cmd_dali_raw(char **saveptr) {
         }
     }
 
-    /* TinyModbus RAW_CMD registers (see lighting_actions.c). */
-    uint16_t reg   = twice ? 0x1001u : 0x1000u;
     uint16_t value = (uint16_t)cmd16;
-
-    static cli_mb_ctx_t ctx;
-    memset(&ctx, 0, sizeof(ctx));
+    uint16_t result;
     LOG_INFO("cli", "dali_raw slave=%ld frame=0x%04x%s",
              slave, value, twice ? " twice" : "");
-    modbus_set_holding_register((uint8_t)slave, reg, value, cli_mb_cb, &ctx);
-    cli_mb_wait(&ctx);
-    if (cli_mb_report_fail(&ctx)) return;
+    if (!dali_raw_result((uint8_t)slave, value, twice, &result)) return;
     /* Let dirty-poll pick up any resulting ballast state change. */
     dirty_poll_mark_active((uint8_t)slave);
-    txt_ok();
+    if ((result >> 8) == 0x00u)
+        printf("ok: result 0x%04X (response byte 0x%02X)\n", result, result & 0xFFu);
+    else
+        printf("ok: result 0x%04X (%s)\n", result, dali_result_str(result));
+}
+
+/* ── read_mem <slave> <addr> <bank> <offset> <count> ───────────────────────
+ * Read raw bytes from a DALI ballast's memory bank via raw commands.  Prints
+ * the bytes as a hex string, or "collision" if the address has 2+ gear. */
+static void cmd_read_mem(char **saveptr) {
+    char *as = strtok_r(NULL, " \t", saveptr);
+    char *ds = strtok_r(NULL, " \t", saveptr);
+    char *bs = strtok_r(NULL, " \t", saveptr);
+    char *os = strtok_r(NULL, " \t", saveptr);
+    char *cs = strtok_r(NULL, " \t", saveptr);
+    long slave, addr, bank, offset, count;
+    if (!parse_int_range_auto(as, 0, 247, &slave))  { txt_err("invalid_slave"); return; }
+    if (!parse_int_range_auto(ds, 0, 63,  &addr))   { txt_err("bad_arg"); return; }
+    if (!parse_int_range_auto(bs, 0, 255, &bank))   { txt_err("bad_arg"); return; }
+    if (!parse_int_range_auto(os, 0, 255, &offset)) { txt_err("bad_arg"); return; }
+    if (!parse_int_range_auto(cs, 1, 64,  &count))  { txt_err("bad_arg"); return; }
+    static uint8_t buf[64];
+    bool collision, absent;
+    LOG_INFO("cli", "read_mem slave=%ld addr=%ld bank=%ld off=%ld count=%ld",
+             slave, addr, bank, offset, count);
+    if (!dali_read_mem((uint8_t)slave, (uint8_t)addr, (uint8_t)bank,
+                       (uint8_t)offset, (uint8_t)count, buf, &collision, &absent))
+        return;
+    if (collision) { printf("collision: address %ld has multiple devices\n", addr); return; }
+    if (absent)    { txt_err("no_response"); return; }
+    printf("mem %ld.%ld bank %ld off %ld: ", slave, addr, bank, offset);
+    for (long i = 0; i < count; i++) printf("%02X", buf[i]);
+    printf("\n");
+}
+
+/* ── identify <slave> <addr> ───────────────────────────────────────────────
+ * Fetch a ballast's GTIN (memory bank 0, offset 0x03, 6 bytes) and serial /
+ * identification number (offset 0x0B, 8 bytes) and print them as hex.  A
+ * garbled read = a collision (two+ gear sharing the address). */
+static void cmd_identify(char **saveptr) {
+    char *as = strtok_r(NULL, " \t", saveptr);
+    char *ds = strtok_r(NULL, " \t", saveptr);
+    long slave, addr;
+    if (!parse_int_range_auto(as, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    if (!parse_int_range_auto(ds, 0, 63,  &addr))  { txt_err("bad_arg"); return; }
+    uint8_t gtin[6], serial[8];
+    bool col, absent;
+    LOG_INFO("cli", "identify slave=%ld addr=%ld", slave, addr);
+    if (!dali_read_mem((uint8_t)slave, (uint8_t)addr, 0, 0x03u, 6, gtin, &col, &absent)) return;
+    if (col)    { printf("collision: address %ld has multiple devices\n", addr); return; }
+    if (absent) { txt_err("no_response"); return; }
+    if (!dali_read_mem((uint8_t)slave, (uint8_t)addr, 0, 0x0Bu, 8, serial, &col, &absent)) return;
+    if (col)    { printf("collision: address %ld has multiple devices\n", addr); return; }
+    if (absent) { txt_err("no_response"); return; }
+    printf("identify %ld.%ld: gtin=", slave, addr);
+    for (int i = 0; i < 6; i++) printf("%02X", gtin[i]);
+    printf(" serial=");
+    for (int i = 0; i < 8; i++) printf("%02X", serial[i]);
+    printf("\n");
 }
 
 /* ── gw_reboot <slave> ─────────────────────────────────────────────────────
@@ -1500,6 +1643,14 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "dali_raw") == 0) {
         cmd_dali_raw(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "read_mem") == 0) {
+        cmd_read_mem(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "identify") == 0) {
+        cmd_identify(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "gw_reboot") == 0) {
