@@ -150,3 +150,55 @@ Use them to confirm any RX fix keeps `crc_error`/`frame_error` flat under load.
 
 `gw_reboot <slave>` (CLI) software-resets a gateway via its `MBREG_SYSTEM_RESET`
 register (`set_holding <slave> 0x1015 0xA5A5`). Handy if a gateway ever wedges.
+
+## DALI commissioning, collisions & device identity (2026-06-06)
+
+New ballasts often arrive pre-set to a short address (usually 0), colliding with
+existing gear. Tooling to detect and fix that, anchored on the device **serial
+number** (stable; the short address is not).
+
+### CLI commands (controller)
+- `dali_raw <slave> <cmd16> [twice]` — send a raw 16-bit DALI frame and **report
+  the result** (`ok 0x00FF` / `nak` / `err malformed`). Polls FC04 `0x0108`.
+- `read_mem <slave> <addr> <bank> <off> <n>` — read a ballast memory bank via
+  `SET DTR1/DTR0` + `READ MEMORY LOCATION` (0xC5). Re-sets DTR0 per byte (some
+  gear don't auto-increment and bank-0 offset `0x01` NAKs as an unreadable hole).
+- `identify <slave> <addr>` — GTIN + serial as hex; a **garbled** serial read →
+  `collision` (two+ gear at one address answer with different serials).
+- `blink <slave> <addr>` — flash one ballast (DAPC) to locate it physically
+  (DALI control gear has no IDENTIFY command).
+- `provision <slave> {all|new|<addr>}` — commission: `all`=full renumber,
+  `new`=incremental (un-addressed gear only), `<addr>`=**re-provision the gear at
+  one collided short address** onto free addresses.
+
+### Gateway commissioning modes (`MBREG_COMMISSION` 0x1014)
+`0x0001` full · `0x0002` incremental · **`0x03YY` re-provision the gear at short
+address YY** (mode 3 — reuses the binary-search commissioner; only touches the
+colliding gear). Status read-back: `0x00xx` idle, `0x01xx` running, `0x02xx`
+complete (count), `0x03xx` error.
+
+**DALI gotcha that shaped this:** you can't just `INITIALISE`-by-address then
+`PROGRAM SHORT ADDRESS` — PROGRAM only programs the gear the binary search has
+*selected* (SEARCHADDR == its random address). So re-addressing must run the full
+`INITIALISE → RANDOMISE → SEARCHADDR bisect → PROGRAM → VERIFY → WITHDRAW`, which
+is why mode 3 lives in the gateway commissioner, not as raw controller commands.
+
+### Memory bank 0 (mandatory, IEC 62386-102)
+`0x00` last-addr · `0x02` last-bank · **`0x03-0x08` GTIN** (per-product, same for
+identical fixtures) · `0x09-0x0A` fw ver · **`0x0B-0x12` serial** (unique per
+device) · `0x13-0x14` hw ver. Verified on the rig's ballasts.
+
+### Scripts (`test/`)
+- `dali_inventory.py <slave> [--all]` — scan, print each device's GTIN/serial,
+  flag collisions.
+- `dali_xlsx_sync.py {populate|remap} [--dry-run]` — sync the `Lights` sheet of
+  `Switch wiring.xlsx`. **populate**: record each device's GTIN+serial into its
+  (Device,Address) row. **remap**: after a re-provision changed addresses, scan
+  serial→address and rewrite each row's Address by matching its recorded serial.
+  Writes a timestamped `.bak` first (openpyxl may drop charts/images).
+
+### Workflow for a collision
+1. `dali_inventory.py <slave>` → find collided addresses.
+2. `provision <slave> <addr>` per collided address → split onto free addresses.
+3. `blink`/`identify` the new addresses, update the spreadsheet — or run
+   `dali_xlsx_sync.py remap` if serials were `populate`d beforehand.
