@@ -39,7 +39,7 @@ USAGE
   python3 mqtt_bridge.py \\
       --serial /dev/serial/by-id/usb-Raspberry_Pi_Pico_2-if00 \\
       --broker localhost \\
-      [--port 1883] [--user U] [--password P] [--prefix lighting] [--debug]
+      [--port 1883] [--user U] [--password P] [--debug]
 """
 
 from __future__ import annotations
@@ -91,12 +91,10 @@ class BridgeConfig:
     serial_log_path:    str | None = None
 
 
-# ── Per-instance identity ───────────────────────────────────────────────────────
-# NODE prefixes every HA unique_id + device identifier so multiple bridges (e.g.
-# a test rig and the main system) can share one broker without colliding. LABEL
-# optionally prefixes the human-readable device names. Both are set in main()
-# from --prefix / --node-name. Default "lighting"/"" → the main system is
-# byte-for-byte unchanged.
+# ── HA entity namespace ─────────────────────────────────────────────────────────
+# NODE prefixes every HA unique_id + topic ("lighting_dali_2_1",
+# "lighting/dali/2/1/state"). One lighting system per broker, so it's a fixed
+# constant, not configurable. LABEL is kept (empty) so device names stay clean.
 NODE  = "lighting"
 LABEL = ""
 
@@ -1238,10 +1236,7 @@ class Bridge:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
-    global NODE, LABEL
-
-    # Load a .env next to this script (so secrets like MQTT_PASSWORD stay out of
-    # the command line / process list). CLI flags still override env vars.
+    # Load a .env next to this script. CLI flags override env vars.
     load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
 
     def env(key: str, default: str | None = None) -> str | None:
@@ -1249,28 +1244,18 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(
         description="Switch gateway MQTT bridge. Config via flags or env / .env "
-                    "(SERIAL_PORT, MQTT_BROKER, MQTT_PORT, MQTT_USER, "
-                    "MQTT_PASSWORD, MQTT_PREFIX, NODE_NAME).",
+                    "(SERIAL_PORT, MQTT_BROKER, MQTT_PORT, MQTT_USER, MQTT_PASSWORD). "
+                    "One lighting system per broker.",
     )
     parser.add_argument(
         "--serial", default=env("SERIAL_PORT", "/dev/ttyUSB0"),
         help="Serial port. Prefer /dev/serial/by-id/... symlink for stability.",
     )
     parser.add_argument("--baud",     type=int, default=int(env("MQTT_BAUD", "115200")))
-    parser.add_argument("--broker",   default=env("MQTT_BROKER", "mqtt.8bitcloud.com"))
+    parser.add_argument("--broker",   default=env("MQTT_BROKER", "localhost"))
     parser.add_argument("--port",     type=int, default=int(env("MQTT_PORT", "1883")))
-    parser.add_argument("--user",     default=env("MQTT_USER", "lights"))
+    parser.add_argument("--user",     default=env("MQTT_USER"))      # unset → anonymous
     parser.add_argument("--password", default=env("MQTT_PASSWORD"))
-    parser.add_argument(
-        "--prefix", default=env("MQTT_PREFIX", "lighting"),
-        help="Topic prefix AND HA unique_id/device prefix — the instance id. Use a "
-             "distinct value (e.g. 'testrig') to co-exist with the main system.",
-    )
-    parser.add_argument(
-        "--node-name", default=env("NODE_NAME", ""),
-        help="Human label prefixed to HA device names (e.g. 'Test Rig'), to tell "
-             "instances apart in the HA UI.",
-    )
     parser.add_argument(
         "--serial-log", default=env("SERIAL_LOG", "controller.log"),
         help="File to tee the controller's '# ...' serial log lines to (rotating). "
@@ -1282,14 +1267,6 @@ def main() -> None:
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
 
-    # Instance identity — must be set before any discovery is built.
-    NODE  = args.prefix
-    LABEL = f"{args.node_name} " if args.node_name else ""
-
-    if not args.password:
-        log.warning("No MQTT password set (MQTT_PASSWORD in .env or --password). "
-                    "Continuing — broker may reject the connection.")
-
     cfg = BridgeConfig(
         serial_port=args.serial,
         serial_baud=args.baud,
@@ -1297,14 +1274,14 @@ def main() -> None:
         mqtt_port=args.port,
         mqtt_user=args.user,
         mqtt_password=args.password,
-        topic_prefix=args.prefix,
-        availability_topic=f"{args.prefix}/availability",
+        topic_prefix=NODE,
+        availability_topic=f"{NODE}/availability",
         serial_log_path=args.serial_log or None,
     )
 
     log.info("Serial: %s @ %d baud", cfg.serial_port, cfg.serial_baud)
-    log.info("MQTT:   %s:%d  user=%s  prefix=%s  label=%r",
-             cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_user, cfg.topic_prefix, LABEL)
+    log.info("MQTT:   %s:%d  user=%s", cfg.mqtt_broker, cfg.mqtt_port,
+             cfg.mqtt_user or "(anonymous)")
 
     Bridge(cfg).run()
 
