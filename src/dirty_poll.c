@@ -85,7 +85,7 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
                     ((uint64_t)((p[6]<<8)|p[7]) << 48);
 
     if (mask != 0) {
-        LOG_INFO("dirty", "slave=%u dirty_mask=0x%016llx",
+        LOG_DBG("dirty", "slave=%u dirty_mask=0x%016llx",
                  slave_id, (unsigned long long)mask);
     }
 
@@ -101,7 +101,7 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             if (mask & ((uint64_t)1 << a)) {
                 dp->state = DPOLL_AWAITING_BALLAST;
-                LOG_INFO("dirty",
+                LOG_DBG("dirty",
                          "slave=%u: ballast %d flagged dirty — reading BLOCK0 holding reg %u for fresh arc/status",
                          slave_id, a, (unsigned)(DALI_BLOCK0_START + a));
                 /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
@@ -130,7 +130,7 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
         uint8_t status = buf[3];
         uint8_t arc    = buf[4];
         lighting_emit_dali_state(slave, addr, arc, status);
-        LOG_INFO("dirty", "ballast %u.%u arc=%u status=0x%02x",
+        LOG_DBG("dirty", "ballast %u.%u arc=%u status=0x%02x",
                  slave, addr, arc, status);
         if ((status & 0x02) || (status & 0x80)) {
             lighting_emit_fault(slave, addr,
@@ -143,7 +143,7 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
     for (int a = addr + 1; a < DALI_ADDR_COUNT; a++) {
         if (dp->pending_dirty & ((uint64_t)1 << a)) {
             dp->state = DPOLL_AWAITING_BALLAST;
-            LOG_INFO("dirty",
+            LOG_DBG("dirty",
                      "slave=%u: ballast %d also dirty — reading next BLOCK0 holding reg %u",
                      slave, a, (unsigned)(DALI_BLOCK0_START + a));
             /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
@@ -284,7 +284,7 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     int idx = state_cache_slave_idx(slave_id);
     if (idx < 0) return;
 
-    LOG_INFO("dirty", "Full scan: slave %u", slave_id);
+    LOG_DBG("dirty", "Full scan: slave %u", slave_id);
 
     /* Trigger firmware scan */
     {
@@ -310,7 +310,7 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     s_dp[idx].last_present = present_mask;
 
     /* Block 0 in 16-register chunks (FC03 holding regs post refactor). */
-    LOG_INFO("dirty",
+    LOG_DBG("dirty",
              "slave=%u: full scan reading BLOCK0 arc/status for all %d ballasts (holding regs %u..%u)",
              slave_id, DALI_ADDR_COUNT, (unsigned)DALI_BLOCK0_START,
              (unsigned)(DALI_BLOCK0_START + DALI_ADDR_COUNT - 1));
@@ -330,7 +330,7 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     }
 
     /* BLOCK1..3 are FC03 holding regs post refactor. */
-    LOG_INFO("dirty",
+    LOG_DBG("dirty",
              "slave=%u: full scan reading BLOCK1-3 config (holding regs %u..%u) for all ballasts",
              slave_id, (unsigned)DALI_BLOCK1_START,
              (unsigned)(DALI_BLOCK3_START + DALI_ADDR_COUNT - 1));
@@ -387,7 +387,7 @@ void dirty_poll_background_check(uint8_t slave_id) {
         ((uint64_t)present_regs[2] << 32) |
         ((uint64_t)present_regs[3] << 48);
 
-    LOG_INFO("dirty", "background check slave=%u present=0x%016llx",
+    LOG_DBG("dirty", "background check slave=%u present=0x%016llx",
              slave_id, (unsigned long long)present_mask);
 
     uint64_t prev        = s_dp[idx].last_present;
