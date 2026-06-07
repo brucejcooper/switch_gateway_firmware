@@ -210,11 +210,9 @@ gateway BLOCK1-3) but didn't expose it; now it does.
 
 - **`state_dali` emit** carries the full config on every update:
   `min max power_on sys_fail fade_rate fade_time` (alongside `on/bri/fading/lamp_fail`).
-- **Get (CLI):** `show dali <slave> <addr>` prints it. **Get (JSON):**
-  `{"t":"get_dali_config","slave":S,"addr":A}` re-emits the ballast's `state_dali`.
-- **Set (CLI):** `set_dali_config <slave> <addr> <field> <value>`,
-  field ∈ `min|max|power_on|sys_fail|fade_rate|fade_time`. **Set (JSON):**
-  `{"t":"set_dali_config","slave":S,"addr":A, ...any subset of those fields...}`.
+- Get/set go through the **unified settings protocol** (see below): config
+  fields (`min max power_on sys_fail fade_rate fade_time`) are just more `v`
+  keys on `set_dali`/`dali <slave> <addr> key=val`, same as `on`/`bri`.
 - Fields map to gateway holding-register **pairs** (high byte first):
   `0x0040+addr=(min<<8)|max`, `0x0080+addr=(power_on<<8)|sys_fail`,
   `0x00C0+addr=(fade_rate<<8)|fade_time`. A register write arms the gateway's DALI
@@ -229,3 +227,41 @@ gateway BLOCK1-3) but didn't expose it; now it does.
   cancelled so reads looked right, but it left read and write byte-orders opposite.
   Corrected the opcodes and flipped the controller's BLOCK1 read (dirty_poll) to
   match, so read and write are now consistent at `(min<<8)|max`.
+
+## Unified settings protocol — `{t, d, v}` (2026-06-07)
+
+One envelope for **set, get, and report**, so a client (the Home Assistant
+bridge) sends values in the *same shape it receives them*.  `d` addresses the
+entity, `v` is a bag of field→value. Direction is in `t` (`set_*`/`get_*`
+command; `state_*`/`config_*` report). `ack` is the command receipt; the
+emitted `state_*` is the value confirmation.
+
+| Domain | `d` | settable `v` keys | report |
+|---|---|---|---|
+| dali   | `{slave,addr}` | `on`(true/false/toggle) `bri` `min` `max` `power_on` `sys_fail` `fade_rate` `fade_time` | `state_dali` |
+| relay  | `{ch}` | `on`(true/false/toggle) | `state_relay` |
+| group  | `{slave,group}` | `on` `bri` | `state_group` |
+| cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` | `state_cfg` |
+| mapping| `{fixture,button}` | `targets`(array) — empty deletes | `config_mapping` |
+
+```
+set : {"t":"set_dali","d":{"slave":2,"addr":1},"v":{"min":120,"bri":200}}  → ack + state_dali
+get : {"t":"get_dali","d":{"slave":2,"addr":1}}                            → state_dali
+report (unsolicited, e.g. button/dirty-poll): {"t":"state_dali","d":{…},"v":{…}}
+```
+
+Fields are parsed by **name** from the whole line, so the `d`/`v` nesting is the
+client's contract — the controller doesn't care where a field sits. Keys are
+unique across `d`/`v` (no `addr` vs `addr_byte` collisions).
+
+**CLI is the same model**, `key=value` pairs, **bare = get** (emits the JSON
+report, same as `get_*`):
+```
+dali 2 1                     dali 2 1 bri=200 on=toggle      dali 2 1 min=120 max=200
+dali 2 g3 bri=200            relay 0 on=true                 cfg long_press_ms=600
+```
+`show dali` stays as the human-readable text view. Bulk mapping load still uses
+the `replace_mappings_*` transaction. The old flat commands (`cmd_dali`,
+`cmd_relay`, `cmd_dali_group/broadcast`, `set_config`, `set_dali_config`) and the
+old positional CLI verbs (`dali 2 1 on`) were **removed** — this envelope is the
+only way.

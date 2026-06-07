@@ -56,8 +56,13 @@ static bool json_str(const char *json, const char *key, char *out, int out_len) 
     out[i] = '\0';
     return i > 0;
 }
-/* Forward decl — defined alongside the other DALI helpers further down. */
-static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t value);
+/* Forward decls — defined alongside the other DALI helpers further down. */
+static int  dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t value);
+static int  dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const char *val);
+static void emit_state_dali(uint8_t slave, uint8_t addr);
+static void emit_state_relay(uint8_t ch);
+static void emit_state_group(uint8_t slave, uint8_t group);
+static void emit_state_cfg(void);
 
 static bool json_int(const char *j, const char *k, int *out) {
     char buf[16];
@@ -155,92 +160,98 @@ static void handle_json_line(const char *line) {
     json_int(line, "id", &id);
     unsigned cmd_id = (unsigned)id;
 
-    /* ── cmd_relay ─────────────────────────────────────────────────────── */
-    if (strcmp(t, "cmd_relay") == 0) {
-        int ch = 0; bool on = false;
-        json_int(line, "ch", &ch);
-        json_bool(line, "on", &on);
-        lighting_set_relay((uint8_t)ch, on);
-        serial_tx_ack(cmd_id, true, NULL);
-        return;
-    }
-
-    /* ── cmd_dali ──────────────────────────────────────────────────────── */
-    if (strcmp(t, "cmd_dali") == 0) {
-        int slave = 0, addr = 0, bri = 0;
-        bool on = false;
+    /* ── set_dali / get_dali ───────────────────────────────────────────────
+     * {"t":"set_dali","d":{"slave":S,"addr":A},"v":{<any of: on bri min max
+     *   power_on sys_fail fade_rate fade_time>}}.  on accepts true/false/toggle.
+     * get_dali emits the state_dali report (same d/v shape). */
+    if (strcmp(t, "set_dali") == 0 || strcmp(t, "get_dali") == 0) {
+        int slave = 0, addr = 0;
         json_int(line, "slave", &slave);
         json_int(line, "addr",  &addr);
-        bool has_bri = json_int(line, "bri", &bri);
-        json_bool(line, "on", &on);
         if (state_cache_slave_idx((uint8_t)slave) < 0) {
-            serial_tx_ack(cmd_id, false, "invalid_slave");
-            return;
+            serial_tx_ack(cmd_id, false, "invalid_slave"); return;
         }
         if (addr < 0 || addr > 63) {
-            serial_tx_ack(cmd_id, false, "out_of_range");
-            return;
+            serial_tx_ack(cmd_id, false, "out_of_range"); return;
         }
-        if (has_bri) {
-            lighting_dali_set_level((uint8_t)slave, (uint8_t)addr, (uint8_t)bri);
-        } else {
-            lighting_set_on_off((uint8_t)slave, (uint8_t)addr, on);
+        if (t[0] == 'g') {
+            emit_state_dali((uint8_t)slave, (uint8_t)addr);
+            serial_tx_ack(cmd_id, true, NULL); return;
         }
-        dirty_poll_mark_active((uint8_t)slave);
+        static const char *keys[] = { "on", "bri", "min", "max",
+                                      "power_on", "sys_fail", "fade_rate", "fade_time" };
+        char buf[16];
+        bool any = false, ok = true;
+        for (unsigned i = 0; i < 8; i++)
+            if (json_str(line, keys[i], buf, sizeof buf)) {
+                any = true;
+                if (dali_apply_kv((uint8_t)slave, (uint8_t)addr, keys[i], buf) != 1) ok = false;
+            }
+        if (any) {
+            dirty_poll_mark_active((uint8_t)slave);
+            emit_state_dali((uint8_t)slave, (uint8_t)addr);
+        }
+        serial_tx_ack(cmd_id, any && ok, !any ? "no_fields" : (ok ? NULL : "set_failed"));
+        return;
+    }
+
+    /* ── set_relay / get_relay ──── {"d":{"ch":C},"v":{"on":true|false|toggle}} */
+    if (strcmp(t, "set_relay") == 0 || strcmp(t, "get_relay") == 0) {
+        int ch = 0;
+        json_int(line, "ch", &ch);
+        if (ch < 0 || ch >= RELAY_COUNT) { serial_tx_ack(cmd_id, false, "out_of_range"); return; }
+        if (t[0] == 'g') { emit_state_relay((uint8_t)ch); serial_tx_ack(cmd_id, true, NULL); return; }
+        char buf[16];
+        if (!json_str(line, "on", buf, sizeof buf)) { serial_tx_ack(cmd_id, false, "no_fields"); return; }
+        bool on = (strcasecmp(buf, "toggle") == 0) ? !state_cache_get_relay_on((uint8_t)ch)
+                : (strcmp(buf, "true") == 0 || strcmp(buf, "1") == 0 || strcasecmp(buf, "on") == 0);
+        lighting_set_relay((uint8_t)ch, on);
+        state_cache_set_relay((uint8_t)ch, on);   /* predictive — write cb confirms async */
+        emit_state_relay((uint8_t)ch);
         serial_tx_ack(cmd_id, true, NULL);
         return;
     }
 
-    /* ── cmd_dali_group ────────────────────────────────────────────────── */
-    if (strcmp(t, "cmd_dali_group") == 0) {
-        int slave = 0, group = 0, bri = 0;
-        bool on = false;
+    /* ── set_group / get_group ──── {"d":{"slave":S,"group":G},"v":{"on"|"bri"}} */
+    if (strcmp(t, "set_group") == 0 || strcmp(t, "get_group") == 0) {
+        int slave = 0, group = 0;
         json_int(line, "slave", &slave);
         json_int(line, "group", &group);
-        bool has_bri = json_int(line, "bri", &bri);
-        json_bool(line, "on", &on);
-        if (state_cache_slave_idx((uint8_t)slave) < 0) {
-            serial_tx_ack(cmd_id, false, "invalid_slave");
-            return;
+        if (state_cache_slave_idx((uint8_t)slave) < 0) { serial_tx_ack(cmd_id, false, "invalid_slave"); return; }
+        if (group < 0 || group > 15) { serial_tx_ack(cmd_id, false, "invalid_group"); return; }
+        if (t[0] == 'g') { emit_state_group((uint8_t)slave, (uint8_t)group); serial_tx_ack(cmd_id, true, NULL); return; }
+        int bri; bool on = false, any = false;
+        if (json_int(line, "bri", &bri)) {
+            lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)bri); any = true;
+        } else if (json_bool(line, "on", &on)) {
+            lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, on); any = true;
         }
-        if (group < 0 || group > 15) {
-            serial_tx_ack(cmd_id, false, "invalid_group");
-            return;
-        }
-        if (has_bri) {
-            lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)bri);
-        } else {
-            lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, on);
-        }
-        dirty_poll_mark_active((uint8_t)slave);
-        serial_tx_ack(cmd_id, true, NULL);
+        if (any) { dirty_poll_mark_active((uint8_t)slave); emit_state_group((uint8_t)slave, (uint8_t)group); }
+        serial_tx_ack(cmd_id, any, any ? NULL : "no_fields");
         return;
     }
 
-    /* ── cmd_dali_broadcast ────────────────────────────────────────────── */
-    if (strcmp(t, "cmd_dali_broadcast") == 0) {
-        int slave = 0, addr_byte = 0, bri = 0;
-        bool on = false;
-        json_int(line, "slave",     &slave);
-        json_int(line, "addr_byte", &addr_byte);
-        bool has_bri = json_int(line, "bri", &bri);
-        json_bool(line, "on", &on);
-        /* All forms now go through RAW_CMD (0x1000). The per-ballast bank
-         * shortcut isn't usable here because addr_byte may be a group or
-         * broadcast, not a short address. */
-        uint16_t val;
-        if (has_bri) {
-            /* DAPC: clear bit 0 of the address byte to force DAPC form. */
-            val = ((uint16_t)((uint8_t)addr_byte & 0xFEu) << 8) | (uint8_t)bri;
-        } else if (on) {
-            /* GOTO_LAST_ACTIVE (0x0A): set bit 0 to force command form. */
-            val = ((uint16_t)((uint8_t)addr_byte | 0x01u) << 8) | 0x0Au;
-        } else {
-            /* OFF (0x00): set bit 0 to force command form. */
-            val = ((uint16_t)((uint8_t)addr_byte | 0x01u) << 8) | 0x00u;
-        }
-        dali_raw_arm((uint8_t)slave, val, false);
-        dirty_poll_mark_active((uint8_t)slave);
+    /* ── set_cfg / get_cfg ──── controller timing config {"v":{...}} ───────── */
+    if (strcmp(t, "set_cfg") == 0 || strcmp(t, "get_cfg") == 0) {
+        if (t[0] == 'g') { emit_state_cfg(); serial_tx_ack(cmd_id, true, NULL); return; }
+        int v; bool any = false;
+        if (json_int(line, "long_press_ms", &v))      { g_config.long_press_ms = (uint16_t)v; any = true; }
+        if (json_int(line, "dim_repeat_ms", &v))      { g_config.dim_repeat_ms = (uint16_t)v; any = true; }
+        if (json_int(line, "reversal_window_ms", &v)) { g_config.reversal_window_ms = (uint16_t)v; any = true; }
+        if (any) config_save();
+        emit_state_cfg();
+        serial_tx_ack(cmd_id, any, any ? NULL : "no_fields");
+        return;
+    }
+
+    /* ── get_mapping ──── one (fixture,button) → config_mapping report ─────── */
+    if (strcmp(t, "get_mapping") == 0) {
+        int fixture = 0, button = 0;
+        json_int(line, "fixture", &fixture);
+        json_int(line, "button",  &button);
+        const mapping_record_t *rec = mapping_lookup((uint8_t)fixture, (uint8_t)button);
+        emit_config_mapping((uint8_t)fixture, (uint8_t)button,
+                            rec ? rec->targets : NULL, rec ? rec->target_count : 0);
         serial_tx_ack(cmd_id, true, NULL);
         return;
     }
@@ -346,56 +357,6 @@ static void handle_json_line(const char *line) {
     }
 
     /* ── set_config ────────────────────────────────────────────────────── */
-    if (strcmp(t, "set_config") == 0) {
-        int v = 0;
-        if (json_int(line, "long_press_ms", &v))
-            g_config.long_press_ms = (uint16_t)v;
-        if (json_int(line, "dim_repeat_ms", &v))
-            g_config.dim_repeat_ms = (uint16_t)v;
-        if (json_int(line, "reversal_window_ms", &v))
-            g_config.reversal_window_ms = (uint16_t)v;
-        config_save();
-        serial_tx_ack(cmd_id, true, NULL);
-        return;
-    }
-
-    /* ── set_dali_config ───────────────────────────────────────────────────
-     * {"t":"set_dali_config","slave":S,"addr":A,"min":..,"max":..,...}
-     * Any subset of min/max/power_on/sys_fail/fade_rate/fade_time. */
-    if (strcmp(t, "set_dali_config") == 0) {
-        int slave = 0, addr = 0;
-        json_int(line, "slave", &slave);
-        json_int(line, "addr",  &addr);
-        static const char *fields[] = { "min", "max", "power_on",
-                                        "sys_fail", "fade_rate", "fade_time" };
-        bool any = false, ok = true;
-        for (unsigned i = 0; i < 6; i++) {
-            int v;
-            if (json_int(line, fields[i], &v)) {
-                any = true;
-                if (dali_cfg_set((uint8_t)slave, (uint8_t)addr, fields[i],
-                                 (uint8_t)v) != 1)
-                    ok = false;
-            }
-        }
-        serial_tx_ack(cmd_id, any && ok, !any ? "no_fields" : (ok ? NULL : "set_failed"));
-        return;
-    }
-
-    /* ── get_dali_config ─── re-emit state_dali (which carries config) ────── */
-    if (strcmp(t, "get_dali_config") == 0) {
-        int slave = 0, addr = 0;
-        json_int(line, "slave", &slave);
-        json_int(line, "addr",  &addr);
-        int idx = state_cache_slave_idx((uint8_t)slave);
-        dali_ballast_state_t *b =
-            idx >= 0 ? state_cache_get_dali((uint8_t)idx, (uint8_t)addr) : NULL;
-        if (b) lighting_emit_dali_state((uint8_t)slave, (uint8_t)addr,
-                                        b->arc_level, b->status_byte);
-        serial_tx_ack(cmd_id, b != NULL, b ? NULL : "not_present");
-        return;
-    }
-
     /* ── set_baud ──────────────────────────────────────────────────────── */
     if (strcmp(t, "set_baud") == 0) {
         int baud = 0;
@@ -864,11 +825,11 @@ static void cmd_help(void) {
     printf("show group <slave> [<group>]               DALI group state\n");
     printf("show present <slave>                       present ballast addresses\n");
     printf("show provision                             provisioning status\n");
-    printf("relay <ch> {on|off|toggle}                 set one relay\n");
-    printf("dali <slave> <addr> {on|off|toggle|<bri>}  set one ballast\n");
+    printf("relay <ch> [on=true|false|toggle]          bare=get, else set\n");
+    printf("dali <slave> <addr|gN> [key=val ...]       bare=get; keys: on bri min max\n");
+    printf("                                           power_on sys_fail fade_rate fade_time\n");
+    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms reversal_window_ms\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
-    printf("set_dali_config <slave> <addr> <field> <val> field: min|max|power_on|sys_fail|fade_rate|fade_time\n");
-    printf("dali <slave> g<group> {on|off|<bri>}       set one group (no toggle)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
     printf("identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n");
@@ -1087,92 +1048,91 @@ static void cmd_log(char **saveptr) {
 }
 
 /* ── relay <ch> {on|off|toggle} ────────────────────────────────────────── */
+/* relay <ch> [on=true|false|toggle] — bare = get (emit state_relay). */
 static void cmd_relay(char **saveptr) {
     char *cs = strtok_r(NULL, " \t", saveptr);
-    char *vs = strtok_r(NULL, " \t", saveptr);
     int ch = 0;
-    if (!parse_int_range(cs, 0, RELAY_COUNT - 1, &ch)) {
-        txt_err("out_of_range"); return;
-    }
-    int v = parse_on_off_toggle(vs);
-    if (v < 0) { txt_err("bad_arg"); return; }
-    bool target;
-    if (v == 2) {
-        target = !state_cache_get_relay_on((uint8_t)ch);
-    } else {
-        target = v == 1;
-    }
-    LOG_INFO("cli", "relay %d %s", ch, target ? "on" : "off");
-    lighting_set_relay((uint8_t)ch, target);
-    txt_ok();
+    if (!parse_int_range(cs, 0, RELAY_COUNT - 1, &ch)) { txt_err("out_of_range"); return; }
+    char *kv = strtok_r(NULL, " \t", saveptr);
+    if (!kv) { emit_state_relay((uint8_t)ch); return; }   /* get */
+    do {
+        char *eq = strchr(kv, '=');
+        if (!eq) { txt_err("bad_arg expected key=value"); return; }
+        *eq = '\0';
+        if (strcasecmp(kv, "on") != 0) { txt_err("bad_field"); return; }
+        const char *val = eq + 1;
+        bool on = (strcasecmp(val, "toggle") == 0) ? !state_cache_get_relay_on((uint8_t)ch)
+                : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
+        lighting_set_relay((uint8_t)ch, on);
+        state_cache_set_relay((uint8_t)ch, on);   /* predictive — write cb confirms async */
+    } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
+    emit_state_relay((uint8_t)ch);
 }
 
-/* ── dali <slave> <addr|gN> {on|off|toggle|<bri>} ──────────────────────── */
+/* dali <slave> <addr|gN> [key=value ...] — bare = get; key=value = set.
+ * keys: on(true|false|toggle) bri min max power_on sys_fail fade_rate fade_time
+ * (groups take on/bri only). */
 static void cmd_dali(char **saveptr) {
     char *ss = strtok_r(NULL, " \t", saveptr);
     char *as = strtok_r(NULL, " \t", saveptr);
-    char *vs = strtok_r(NULL, " \t", saveptr);
     int slave = 0;
-    if (!parse_int_range(ss, 0, 247, &slave)) {
-        txt_err("invalid_slave"); return;
-    }
-    int idx = state_cache_slave_idx((uint8_t)slave);
-    if (idx < 0) { txt_err("invalid_slave"); return; }
-    if (!as || !vs) { txt_err("bad_arg"); return; }
+    if (!parse_int_range(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    if (state_cache_slave_idx((uint8_t)slave) < 0) { txt_err("invalid_slave"); return; }
+    if (!as) { txt_err("bad_arg"); return; }
 
     bool is_group = (as[0] == 'g' || as[0] == 'G');
-    if (is_group) {
-        int group = 0;
-        if (!parse_int_range(as + 1, 0, 15, &group)) {
-            txt_err("out_of_range"); return;
-        }
-        int v = parse_on_off_toggle(vs);
-        if (v == 2) {
-            txt_err("bad_arg group_toggle_unsupported");
-            return;
-        }
-        if (v >= 0) {
-            LOG_INFO("cli", "dali g%d on slave %d -> %s", group, slave, v ? "on" : "off");
-            lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, v == 1);
-        } else {
-            int bri = 0;
-            if (!parse_int_range(vs, 0, 254, &bri)) {
-                txt_err("bad_arg"); return;
-            }
-            LOG_INFO("cli", "dali g%d on slave %d -> bri=%d", group, slave, bri);
-            lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)bri);
-        }
-        dirty_poll_mark_active((uint8_t)slave);
-        txt_ok();
+    int group = 0, addr = 0;
+    if (is_group) { if (!parse_int_range(as + 1, 0, 15, &group)) { txt_err("out_of_range"); return; } }
+    else          { if (!parse_int_range(as, 0, 63, &addr))      { txt_err("out_of_range"); return; } }
+
+    char *kv = strtok_r(NULL, " \t", saveptr);
+    if (!kv) {   /* get */
+        if (is_group) emit_state_group((uint8_t)slave, (uint8_t)group);
+        else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
         return;
     }
-
-    int addr = 0;
-    if (!parse_int_range(as, 0, 63, &addr)) {
-        txt_err("out_of_range"); return;
-    }
-    int v = parse_on_off_toggle(vs);
-    if (v >= 0) {
-        bool on;
-        if (v == 2) {
-            dali_ballast_state_t *b =
-                state_cache_get_dali((uint8_t)idx, (uint8_t)addr);
-            on = (b && b->arc_level > 0) ? false : true;
+    do {
+        char *eq = strchr(kv, '=');
+        if (!eq) { txt_err("bad_arg expected key=value"); return; }
+        *eq = '\0';
+        const char *key = kv, *val = eq + 1;
+        if (is_group) {
+            if (strcasecmp(key, "bri") == 0)
+                lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)atoi(val));
+            else if (strcasecmp(key, "on") == 0)
+                lighting_group_set_on_off((uint8_t)slave, (uint8_t)group,
+                    strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
+            else { txt_err("bad_field"); return; }
         } else {
-            on = v == 1;
+            int r = dali_apply_kv((uint8_t)slave, (uint8_t)addr, key, val);
+            if (r == 0)  { txt_err("bad_field");   return; }
+            if (r == -1) { txt_err("not_present"); return; }
+            if (r == -2) return;   /* transport error already printed */
         }
-        LOG_INFO("cli", "dali %d.%d -> %s", slave, addr, on ? "on" : "off");
-        lighting_set_on_off((uint8_t)slave, (uint8_t)addr, on);
-    } else {
-        int bri = 0;
-        if (!parse_int_range(vs, 0, 254, &bri)) {
-            txt_err("bad_arg"); return;
-        }
-        LOG_INFO("cli", "dali %d.%d -> bri=%d", slave, addr, bri);
-        lighting_dali_set_level((uint8_t)slave, (uint8_t)addr, (uint8_t)bri);
-    }
+    } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
     dirty_poll_mark_active((uint8_t)slave);
-    txt_ok();
+    if (is_group) emit_state_group((uint8_t)slave, (uint8_t)group);
+    else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
+}
+
+/* cfg [key=value ...] — controller timing config; bare = get (emit state_cfg). */
+static void cmd_cfg(char **saveptr) {
+    char *kv = strtok_r(NULL, " \t", saveptr);
+    if (!kv) { emit_state_cfg(); return; }
+    bool any = false;
+    do {
+        char *eq = strchr(kv, '=');
+        if (!eq) { txt_err("bad_arg expected key=value"); return; }
+        *eq = '\0';
+        const char *key = kv; int val = atoi(eq + 1);
+        if      (strcasecmp(key, "long_press_ms") == 0)      g_config.long_press_ms = (uint16_t)val;
+        else if (strcasecmp(key, "dim_repeat_ms") == 0)      g_config.dim_repeat_ms = (uint16_t)val;
+        else if (strcasecmp(key, "reversal_window_ms") == 0) g_config.reversal_window_ms = (uint16_t)val;
+        else { txt_err("bad_field"); return; }
+        any = true;
+    } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
+    if (any) config_save();
+    emit_state_cfg();
 }
 
 /* ── btn <fixture> <button> [tap|press|release] ────────────────────────────
@@ -1236,27 +1196,82 @@ static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t 
     modbus_set_holding_register(slave, (uint16_t)(base + addr), regval, cli_mb_cb, &ctx);
     cli_mb_wait(&ctx);
     if (cli_mb_report_fail(&ctx)) return -2;
-    /* Predictive cache update + re-emit so HA sees the change immediately. */
+    /* Predictive cache update; the caller emits one state_dali after applying
+     * every field, so a multi-field set produces a single report. */
     state_cache_set_dali_config((uint8_t)idx, addr, mx, mn, po, sf, fr, ft);
-    lighting_emit_dali_state(slave, addr, b->arc_level, b->status_byte);
     return 1;
 }
 
-/* set_dali_config <slave> <addr> <field> <value> */
-static void cmd_set_dali_config(char **saveptr) {
-    char *ss = strtok_r(NULL, " \t", saveptr), *as = strtok_r(NULL, " \t", saveptr);
-    char *fs = strtok_r(NULL, " \t", saveptr), *vs = strtok_r(NULL, " \t", saveptr);
-    int slave, addr, value;
-    if (!parse_int_range(ss, 0, 247, &slave)) { txt_err("bad_slave"); return; }
-    if (!parse_int_range(as, 0, 63,  &addr))  { txt_err("bad_addr");  return; }
-    if (!fs)                                  { txt_err("bad_field"); return; }
-    if (!parse_int_range(vs, 0, 255, &value)) { txt_err("bad_value"); return; }
-    switch (dali_cfg_set((uint8_t)slave, (uint8_t)addr, fs, (uint8_t)value)) {
-        case 1:  txt_ok();               break;
-        case 0:  txt_err("bad_field");   break;
-        case -1: txt_err("not_present"); break;
-        default: /* -2: error already printed */ break;
+/* ── Unified {t,d,v} state reports — used by get_* and as set_* confirmation ─
+ * Same shape the client sends to set: {"t":"state_X","d":{addr},"v":{values}}. */
+static unsigned long now_ms_u(void) {
+    return (unsigned long)to_ms_since_boot(get_absolute_time());
+}
+
+static void emit_state_dali(uint8_t slave, uint8_t addr) {
+    int idx = state_cache_slave_idx(slave);
+    dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
+    printf("{\"t\":\"state_dali\",\"ts\":%lu,\"d\":{\"slave\":%u,\"addr\":%u},"
+           "\"v\":{\"on\":%s,\"bri\":%u,\"fading\":%s,\"lamp_fail\":%s,"
+           "\"min\":%u,\"max\":%u,\"power_on\":%u,\"sys_fail\":%u,"
+           "\"fade_rate\":%u,\"fade_time\":%u}}\n",
+           now_ms_u(), slave, addr,
+           (b && b->arc_level > 0) ? "true" : "false", b ? b->arc_level : 0,
+           (b && (b->status_byte & 0x10)) ? "true" : "false",
+           (b && (b->status_byte & 0x02)) ? "true" : "false",
+           b ? b->min_level : 0, b ? b->max_level : 0,
+           b ? b->power_on_level : 0, b ? b->sys_fail_level : 0,
+           b ? b->fade_rate : 0, b ? b->fade_time : 0);
+}
+
+static void emit_state_relay(uint8_t ch) {
+    printf("{\"t\":\"state_relay\",\"ts\":%lu,\"d\":{\"ch\":%u},\"v\":{\"on\":%s}}\n",
+           now_ms_u(), ch, state_cache_get_relay_on(ch) ? "true" : "false");
+}
+
+static void emit_state_group(uint8_t slave, uint8_t group) {
+    int idx = state_cache_slave_idx(slave);
+    bool    on  = idx >= 0 && state_cache_dali_group_any_on((uint8_t)idx, group);
+    uint8_t bri = idx >= 0 ? state_cache_dali_group_max_bri((uint8_t)idx, group) : 0;
+    printf("{\"t\":\"state_group\",\"ts\":%lu,\"d\":{\"slave\":%u,\"group\":%u},"
+           "\"v\":{\"on\":%s,\"bri\":%u}}\n",
+           now_ms_u(), slave, group, on ? "true" : "false", bri);
+}
+
+static void emit_state_cfg(void) {
+    printf("{\"t\":\"state_cfg\",\"ts\":%lu,\"v\":{\"long_press_ms\":%u,"
+           "\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u}}\n",
+           now_ms_u(), g_config.long_press_ms, g_config.dim_repeat_ms,
+           g_config.reversal_window_ms);
+}
+
+/* Apply one DALI key=value to a ballast (shared by set_dali JSON + `dali` CLI).
+ * State keys (on/bri) predictively update the cached arc so the immediate
+ * report is accurate; the dirty-poll later confirms.  Config keys go through
+ * dali_cfg_set.  Returns 1 ok, 0 unknown key, -1 not present, -2 transport err. */
+static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const char *val) {
+    int idx = state_cache_slave_idx(slave);
+    dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
+    if (strcasecmp(key, "bri") == 0) {
+        uint8_t lvl = (uint8_t)atoi(val);
+        lighting_dali_set_level(slave, addr, lvl);
+        if (idx >= 0) state_cache_set_dali_arc((uint8_t)idx, addr, lvl, b ? b->status_byte : 0);
+        return 1;
     }
+    if (strcasecmp(key, "on") == 0) {
+        bool on = (strcasecmp(val, "toggle") == 0) ? !(b && b->commanded_on)
+                : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
+                   strcasecmp(val, "on") == 0);
+        lighting_set_on_off(slave, addr, on);
+        if (idx >= 0) {
+            uint8_t a = !on ? 0u
+                      : (b && b->arc_level) ? b->arc_level
+                      : (b && b->max_level) ? b->max_level : 254u;
+            state_cache_set_dali_arc((uint8_t)idx, addr, a, b ? b->status_byte : 0);
+        }
+        return 1;
+    }
+    return dali_cfg_set(slave, addr, key, (uint8_t)atoi(val));
 }
 
 /* ── dali_raw <slave> <cmd16> [twice] ──────────────────────────────────────
@@ -1793,12 +1808,12 @@ static void handle_text_line(const char *original_line) {
         cmd_btn(&saveptr);
         return;
     }
-    if (strcasecmp(cmd, "set_dali_config") == 0) {
-        cmd_set_dali_config(&saveptr);
-        return;
-    }
     if (strcasecmp(cmd, "dali") == 0) {
         cmd_dali(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "cfg") == 0) {
+        cmd_cfg(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "dali_raw") == 0) {
