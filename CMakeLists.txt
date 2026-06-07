@@ -33,7 +33,23 @@ add_subdirectory(lib/pico-vfs)
 
 target_include_directories(light_switch PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src
+    ${CMAKE_BINARY_DIR}/generated      # version.h (git-derived FW_VERSION)
 )
+
+# ── FW_VERSION = base + git describe (tag/hash + -dirty), refreshed each build ──
+set(FW_BASE_VERSION "2.0.0")
+file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
+set(GEN_VERSION_ARGS
+    -DSRC_DIR=${CMAKE_CURRENT_LIST_DIR}
+    -DOUT=${CMAKE_BINARY_DIR}/generated/version.h
+    -DBASE_VERSION=${FW_BASE_VERSION}
+    -P ${CMAKE_CURRENT_LIST_DIR}/cmake/gen_version.cmake)
+execute_process(COMMAND ${CMAKE_COMMAND} ${GEN_VERSION_ARGS})   # exist at configure time
+add_custom_target(gen_version ALL
+    COMMAND ${CMAKE_COMMAND} ${GEN_VERSION_ARGS}
+    BYPRODUCTS ${CMAKE_BINARY_DIR}/generated/version.h
+    COMMENT "Updating version.h from git")
+add_dependencies(light_switch gen_version)
 
 target_link_libraries(light_switch PRIVATE
     pico_stdlib

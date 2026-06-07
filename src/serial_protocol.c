@@ -26,6 +26,8 @@
 #include <sys/stat.h>
 #include <dirent.h>
 
+#include "version.h"   /* FW_VERSION — generated from git at build time */
+
 /* Consume levt_t events from lighting_actions */
 extern bool lighting_evt_try_pop(void *out);  /* defined in lighting_actions.c */
 
@@ -75,6 +77,39 @@ static bool json_bool(const char *j, const char *k, bool *out) {
     if (!json_str(j, k, buf, sizeof(buf))) return false;
     *out = strcmp(buf, "true") == 0 || strcmp(buf, "1") == 0;
     return true;
+}
+
+/* Parse a JSON int array `"key":[a,b,c]` into out[]. Returns the count, or -1
+ * if the key is absent (so an omitted array is left unchanged by the caller). */
+static int json_uint8_array(const char *line, const char *key, uint8_t *out, int max) {
+    char needle[32];
+    snprintf(needle, sizeof needle, "\"%s\"", key);
+    const char *p = strstr(line, needle);
+    if (!p) return -1;
+    p += strlen(needle);
+    while (*p == ' ' || *p == ':') p++;
+    if (*p != '[') return -1;
+    p++;
+    int n = 0;
+    while (*p && *p != ']') {
+        while (*p == ' ' || *p == ',') p++;
+        if (*p < '0' || *p > '9') break;
+        if (n < max) out[n++] = (uint8_t)atoi(p);
+        while (*p && *p != ',' && *p != ']') p++;
+    }
+    return n;
+}
+
+/* Parse a CLI comma list "1,2,3" into out[]. Returns the count. */
+static int parse_csv_u8(const char *s, uint8_t *out, int max) {
+    int n = 0;
+    while (*s && n < max) {
+        while (*s == ',') s++;
+        if (*s < '0' || *s > '9') break;
+        out[n++] = (uint8_t)atoi(s);
+        while (*s && *s != ',') s++;
+    }
+    return n;
 }
 
 /* Parse `"targets":[{...},{...}]` out of `line`, populating `out` with up
@@ -231,16 +266,31 @@ static void handle_json_line(const char *line) {
         return;
     }
 
-    /* ── set_cfg / get_cfg ──── controller timing config {"v":{...}} ───────── */
+    /* ── set_cfg / get_cfg ──── controller device config {"v":{...}} ─────────
+     * Settable: long_press_ms dim_repeat_ms reversal_window_ms baud
+     *           relay_slaves[] dali_slaves[].  fw_version is read-only.
+     * baud takes effect on reboot. */
     if (strcmp(t, "set_cfg") == 0 || strcmp(t, "get_cfg") == 0) {
         if (t[0] == 'g') { emit_state_cfg(); serial_tx_ack(cmd_id, true, NULL); return; }
-        int v; bool any = false;
+        int v, n; bool any = false, reboot = false;
+        uint8_t arr[MAX_DALI_SLAVES > MAX_RELAY_SLAVES ? MAX_DALI_SLAVES : MAX_RELAY_SLAVES];
         if (json_int(line, "long_press_ms", &v))      { g_config.long_press_ms = (uint16_t)v; any = true; }
         if (json_int(line, "dim_repeat_ms", &v))      { g_config.dim_repeat_ms = (uint16_t)v; any = true; }
         if (json_int(line, "reversal_window_ms", &v)) { g_config.reversal_window_ms = (uint16_t)v; any = true; }
+        if ((n = json_uint8_array(line, "relay_slaves", arr, MAX_RELAY_SLAVES)) >= 0) {
+            g_config.relay_slave_count = (uint8_t)n;
+            for (int i = 0; i < n; i++) g_config.relay_slave_ids[i] = arr[i];
+            any = true;
+        }
+        if ((n = json_uint8_array(line, "dali_slaves", arr, MAX_DALI_SLAVES)) >= 0) {
+            g_config.dali_slave_count = (uint8_t)n;
+            for (int i = 0; i < n; i++) g_config.dali_slave_ids[i] = arr[i];
+            any = true;
+        }
+        if (json_int(line, "baud", &v) && v > 0) { modbus_set_baud((uint32_t)v); any = true; reboot = true; }
         if (any) config_save();
         emit_state_cfg();
-        serial_tx_ack(cmd_id, any, any ? NULL : "no_fields");
+        serial_tx_ack(cmd_id, any, !any ? "no_fields" : (reboot ? "reboot_required_for_baud" : NULL));
         return;
     }
 
@@ -353,20 +403,6 @@ static void handle_json_line(const char *line) {
     if (strcmp(t, "replace_mappings_abort") == 0) {
         mapping_txn_abort();
         serial_tx_ack(cmd_id, true, NULL);
-        return;
-    }
-
-    /* ── set_config ────────────────────────────────────────────────────── */
-    /* ── set_baud ──────────────────────────────────────────────────────── */
-    if (strcmp(t, "set_baud") == 0) {
-        int baud = 0;
-        if (json_int(line, "baud", &baud) && baud > 0) {
-            modbus_set_baud((uint32_t)baud);
-            printf("{\"t\":\"ack\",\"id\":%u,\"d\":{\"ok\":true,"
-                   "\"note\":\"reboot required for baud change\"}}\n", cmd_id);
-        } else {
-            serial_tx_ack(cmd_id, false, "invalid_baud");
-        }
         return;
     }
 
@@ -828,7 +864,8 @@ static void cmd_help(void) {
     printf("relay <ch> [on=true|false|toggle]          bare=get, else set\n");
     printf("dali <slave> <addr|gN> [key=val ...]       bare=get; keys: on bri min max\n");
     printf("                                           power_on sys_fail fade_rate fade_time\n");
-    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms reversal_window_ms\n");
+    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms\n");
+    printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
@@ -1115,7 +1152,9 @@ static void cmd_dali(char **saveptr) {
     else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
 }
 
-/* cfg [key=value ...] — controller timing config; bare = get (emit state_cfg). */
+/* cfg [key=value ...] — controller device config; bare = get (emit state_cfg).
+ * keys: long_press_ms dim_repeat_ms reversal_window_ms baud (reboot to apply)
+ *       relay_slaves=1,2  dali_slaves=2,3  (comma lists). fw_version is read-only. */
 static void cmd_cfg(char **saveptr) {
     char *kv = strtok_r(NULL, " \t", saveptr);
     if (!kv) { emit_state_cfg(); return; }
@@ -1124,10 +1163,15 @@ static void cmd_cfg(char **saveptr) {
         char *eq = strchr(kv, '=');
         if (!eq) { txt_err("bad_arg expected key=value"); return; }
         *eq = '\0';
-        const char *key = kv; int val = atoi(eq + 1);
-        if      (strcasecmp(key, "long_press_ms") == 0)      g_config.long_press_ms = (uint16_t)val;
-        else if (strcasecmp(key, "dim_repeat_ms") == 0)      g_config.dim_repeat_ms = (uint16_t)val;
-        else if (strcasecmp(key, "reversal_window_ms") == 0) g_config.reversal_window_ms = (uint16_t)val;
+        const char *key = kv, *val = eq + 1;
+        if      (strcasecmp(key, "long_press_ms") == 0)      g_config.long_press_ms = (uint16_t)atoi(val);
+        else if (strcasecmp(key, "dim_repeat_ms") == 0)      g_config.dim_repeat_ms = (uint16_t)atoi(val);
+        else if (strcasecmp(key, "reversal_window_ms") == 0) g_config.reversal_window_ms = (uint16_t)atoi(val);
+        else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
+        else if (strcasecmp(key, "relay_slaves") == 0)
+            g_config.relay_slave_count = (uint8_t)parse_csv_u8(val, g_config.relay_slave_ids, MAX_RELAY_SLAVES);
+        else if (strcasecmp(key, "dali_slaves") == 0)
+            g_config.dali_slave_count  = (uint8_t)parse_csv_u8(val, g_config.dali_slave_ids, MAX_DALI_SLAVES);
         else { txt_err("bad_field"); return; }
         any = true;
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
@@ -1239,10 +1283,16 @@ static void emit_state_group(uint8_t slave, uint8_t group) {
 }
 
 static void emit_state_cfg(void) {
-    printf("{\"t\":\"state_cfg\",\"ts\":%lu,\"v\":{\"long_press_ms\":%u,"
-           "\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u}}\n",
-           now_ms_u(), g_config.long_press_ms, g_config.dim_repeat_ms,
-           g_config.reversal_window_ms);
+    printf("{\"t\":\"state_cfg\",\"ts\":%lu,\"v\":{\"fw_version\":\"%s\","
+           "\"baud\":%lu,\"relay_slaves\":[",
+           now_ms_u(), FW_VERSION, (unsigned long)modbus_get_baud());
+    for (int i = 0; i < g_config.relay_slave_count; i++)
+        printf("%s%u", i ? "," : "", g_config.relay_slave_ids[i]);
+    printf("],\"dali_slaves\":[");
+    for (int i = 0; i < g_config.dali_slave_count; i++)
+        printf("%s%u", i ? "," : "", g_config.dali_slave_ids[i]);
+    printf("],\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u}}\n",
+           g_config.long_press_ms, g_config.dim_repeat_ms, g_config.reversal_window_ms);
 }
 
 /* Apply one DALI key=value to a ballast (shared by set_dali JSON + `dali` CLI).
@@ -2126,7 +2176,7 @@ void serial_protocol_init(void) {
 
 void serial_tx_hello(void) {
     printf("{\"t\":\"hello\",\"id\":0,\"ts\":0,"
-           "\"d\":{\"fw_version\":\"2.0.0\","
+           "\"d\":{\"fw_version\":\"" FW_VERSION "\","
            "\"relay_slaves\":[");
     for (int i = 0; i < g_config.relay_slave_count; i++) {
         printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);

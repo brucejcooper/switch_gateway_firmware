@@ -241,8 +241,15 @@ emitted `state_*` is the value confirmation.
 | dali   | `{slave,addr}` | `on`(true/false/toggle) `bri` `min` `max` `power_on` `sys_fail` `fade_rate` `fade_time` | `state_dali` |
 | relay  | `{ch}` | `on`(true/false/toggle) | `state_relay` |
 | group  | `{slave,group}` | `on` `bri` | `state_group` |
-| cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` | `state_cfg` |
+| cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` `baud`(reboot to apply) `relay_slaves`[] `dali_slaves`[] | `state_cfg` |
 | mapping| `{fixture,button}` | `targets`(array) — empty deletes | `config_mapping` |
+
+`cfg` is the whole **controller device config**, shown in HA like everything
+else. `state_cfg` (and `hello`) also report read-only `fw_version` — built from
+git: `<base>+<git describe --tags --always --dirty>` (e.g. `2.0.0+791ca0b-dirty`)
+via `cmake/gen_version.cmake` → `build/generated/version.h`, regenerated each
+build. CLI slave lists are comma form (`cfg dali_slaves=2,3`); JSON uses arrays.
+`set_baud` was folded into `set_cfg`'s `baud` key.
 
 ```
 set : {"t":"set_dali","d":{"slave":2,"addr":1},"v":{"min":120,"bri":200}}  → ack + state_dali
