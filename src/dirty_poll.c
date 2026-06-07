@@ -172,13 +172,26 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
             LOG_WARN("dirty", "ballast %u.%u read arc=0xFF (invalid) — ignoring",
                      slave, addr);
         } else {
-            lighting_emit_dali_state(slave, addr, arc, status);
-            LOG_DBG("dirty", "ballast %u.%u arc=%u status=0x%02x",
-                     slave, addr, arc, status);
-            if ((status & 0x02) || (status & 0x80)) {
-                lighting_emit_fault(slave, addr,
-                                    (status & 0x02) != 0,
-                                    (status & 0x80) != 0);
+            /* Only emit when something reportable actually changed. The gateway
+             * re-polls a fading ballast continuously (correct — until FADE_RUNNING
+             * clears), so without this we'd spam an identical state_dali every
+             * ~100 ms for the whole fade. We still update the cache and keep
+             * polling (to catch the level ramp and the fade end) — we just don't
+             * re-report no-ops. */
+            dali_ballast_state_t *b =
+                (idx >= 0) ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
+            bool report = (b == NULL)
+                || b->arc_level != arc
+                || ((b->status_byte ^ status) & 0x12u);  /* 0x10 fading | 0x02 lamp_fail */
+            if (report) {
+                lighting_emit_dali_state(slave, addr, arc, status);
+                LOG_DBG("dirty", "ballast %u.%u arc=%u status=0x%02x",
+                        slave, addr, arc, status);
+                if ((status & 0x02) || (status & 0x80))
+                    lighting_emit_fault(slave, addr,
+                                        (status & 0x02) != 0, (status & 0x80) != 0);
+            } else if (idx >= 0) {
+                state_cache_set_dali_arc((uint8_t)idx, addr, arc, status);
             }
         }
     }
