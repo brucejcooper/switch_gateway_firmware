@@ -112,3 +112,22 @@ real level reliably follows for fading lamps.
 Rig caveat: slave 2 hosts both a relay board and the DALI gateway, so its FC03/FC04
 reads occasionally collide (observed `None`/garbled query results). That adds read
 noise here that won't exist on a clean per-slave bus.
+
+## Update 2026-06-07 — A + C implemented (controller 8b2f98b)
+
+**A (backstop).** The dirty-poll no longer deactivates after 2 zero reads. A slave
+stays active for `DIRTY_ACTIVE_WINDOW_MS = 2000` after the last command/change
+(time-based), and a `DIRTY_SWEEP_MS = 1000` cheap dirty-mask sweep runs while idle
+so external / manual / post-fade changes reflect within ~1 s; a non-zero sweep
+re-activates fast polling. This covers the cases B can't — **instant (fade_time=0)
+ballasts and command-less changes**. Measured: fade=0 multi-target ON **2/8 → 12/12**.
+
+**C (no guess).** `set_dali "on"` no longer assumes a brightness (was max_level/254).
+GOTO_LAST_ACTIVE restores a level the controller can't know, so the immediate report
+is deferred — `commanded_on` is set and the now-reliable dirty-poll delivers the
+real level. `off` still reports immediately (0 is known). Verified: `on` emits the
+actual 255, not 254.
+
+**Net:** A + B + C together. HA now reflects the device reliably for fading *and*
+instant lamps, catches command-less changes within ~1 s, and never shows a guessed
+brightness. D (GOTO_LAST_ACTIVE jumping to max) remains a separate UX question.
