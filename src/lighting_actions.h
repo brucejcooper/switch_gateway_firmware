@@ -51,6 +51,11 @@ void lighting_emit_fault(uint8_t slave_id, uint8_t addr,
 /* fix #6: emitted by dirty_poll_full_scan() so bridge can set availability */
 void lighting_emit_scan_complete(uint8_t slave_id, uint64_t present_mask);
 
+/* Emitted by dirty_poll when a DALI gateway's reachability changes (online =
+ * responding to Modbus, offline = repeated read failures). Drives per-gateway
+ * availability in the bridge. */
+void lighting_emit_gateway_state(uint8_t slave_id, bool online);
+
 /* Recompute a group's derived (on, bri) from its present members and emit
  * a state_group event if it differs from the last emitted value. Called
  * automatically from lighting_emit_dali_state for every group containing

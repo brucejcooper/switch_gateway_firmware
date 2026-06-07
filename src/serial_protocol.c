@@ -2038,7 +2038,7 @@ static void handle_text_line(const char *original_line) {
 /* lighting_actions.c defines levt_t internally; we replicate the minimal
  * struct here for serialisation.  In a real project these would share a header. */
 typedef enum { LEVT_RELAY, LEVT_DALI, LEVT_PRESENCE, LEVT_FAULT,
-               LEVT_SCAN_COMPLETE, LEVT_GROUP } levt_type_t;
+               LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY } levt_type_t;
 typedef struct {
     levt_type_t type;
     union {
@@ -2048,6 +2048,7 @@ typedef struct {
         struct { uint8_t slave_id; uint8_t addr; bool lamp_fail; bool power_cycle; } fault;
         struct { uint8_t slave_id; uint64_t present_mask; } scan_complete;
         struct { uint8_t slave_id; uint8_t group; uint8_t bri; bool on; } group;
+        struct { uint8_t slave_id; bool online; } gateway;
     };
 } levt_t;
 
@@ -2219,6 +2220,15 @@ static void emit_event(const levt_t *e) {
         emit_state_group(e->group.slave_id, e->group.group);
         LOG_DBG("serial", "evt state_group slave=%u group=%u",
                 e->group.slave_id, e->group.group);
+        break;
+
+    case LEVT_GATEWAY:
+        printf("{\"t\":\"state_gateway\",\"ts\":%lu,"
+               "\"d\":{\"slave\":%u},\"v\":{\"online\":%s}}\n",
+               (unsigned long)ts, e->gateway.slave_id,
+               e->gateway.online ? "true" : "false");
+        LOG_INFO("serial", "state_gateway slave=%u online=%d",
+                 e->gateway.slave_id, e->gateway.online);
         break;
 }
 }

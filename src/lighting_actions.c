@@ -27,7 +27,7 @@
 
 typedef enum {
     LEVT_RELAY, LEVT_DALI, LEVT_PRESENCE, LEVT_FAULT,
-    LEVT_SCAN_COMPLETE, LEVT_GROUP
+    LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY
 } levt_type_t;
 
 typedef struct {
@@ -43,6 +43,7 @@ typedef struct {
         struct { uint8_t slave_id; uint64_t present_mask; }  scan_complete;
         struct { uint8_t slave_id; uint8_t group;
                  uint8_t bri; bool on; }                      group;
+        struct { uint8_t slave_id; bool online; }            gateway;
     };
 } levt_t;
 
@@ -301,6 +302,14 @@ void lighting_emit_scan_complete(uint8_t slave_id, uint64_t present_mask) {
     levt_t e = {
         .type          = LEVT_SCAN_COMPLETE,
         .scan_complete = { slave_id, present_mask }
+    };
+    push_evt(&e);
+}
+
+void lighting_emit_gateway_state(uint8_t slave_id, bool online) {
+    levt_t e = {
+        .type    = LEVT_GATEWAY,
+        .gateway = { slave_id, online }
     };
     push_evt(&e);
 }

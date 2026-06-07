@@ -26,6 +26,9 @@ typedef enum {
     DPOLL_AWAITING_BALLAST,
 } dpoll_state_t;
 
+/* Consecutive failed reads before a gateway is declared unreachable. */
+#define GATEWAY_FAIL_THRESHOLD 3u
+
 typedef struct {
     dpoll_state_t state;
     bool          active;
@@ -35,6 +38,8 @@ typedef struct {
     uint64_t      last_present;
     uint64_t      pending_dirty;
     uint8_t       next_ballast;
+    bool          reachable;     /* gateway responding to Modbus */
+    uint8_t       fail_count;    /* consecutive read failures */
 } dpoll_t;
 
 static dpoll_t s_dp[MAX_DALI_SLAVES];
@@ -46,6 +51,7 @@ static uint8_t s_dirty_ctx_slave[MAX_DALI_SLAVES];
 void dirty_poll_init(void) {
     memset(s_dp, 0, sizeof(s_dp));
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
+        s_dp[i].reachable = true;   /* optimistic; offline only after failures */
         s_dirty_ctx_slave[i] = g_config.dali_slave_ids[i];
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             s_bctx[i][a].slave_id = g_config.dali_slave_ids[i];
@@ -63,6 +69,26 @@ void dirty_poll_mark_active(uint8_t slave_id) {
 
 static void ballast_read_cb(int res, uint8_t *buf, void *ctx);   /* forward decl */
 
+/* Track a gateway's Modbus reachability and emit state_gateway on transition.
+ * `ok` = this read of the gateway succeeded. Debounced by GATEWAY_FAIL_THRESHOLD
+ * so a single timeout doesn't flap availability. */
+static void gateway_report(uint8_t slave_id, int idx, bool ok) {
+    dpoll_t *dp = &s_dp[idx];
+    if (ok) {
+        dp->fail_count = 0;
+        if (!dp->reachable) {
+            dp->reachable = true;
+            lighting_emit_gateway_state(slave_id, true);
+        }
+    } else if (dp->reachable) {
+        if (dp->fail_count < 0xFF) dp->fail_count++;
+        if (dp->fail_count >= GATEWAY_FAIL_THRESHOLD) {
+            dp->reachable = false;
+            lighting_emit_gateway_state(slave_id, false);
+        }
+    }
+}
+
 /* ── Dirty bitmask callback ──────────────────────────────────────────────── */
 static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
     uint8_t slave_id = *(uint8_t *)ctx;
@@ -75,8 +101,10 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
     /* fix #5: FC04 4-register frame = slave+FC+bytecount+8data+CRC = 13 bytes */
     if (res < 13) {
         LOG_WARN("dirty", "bitmask read failed slave %u (%d)", slave_id, res);
+        gateway_report(slave_id, idx, false);
         return;
     }
+    gateway_report(slave_id, idx, true);
 
     uint8_t *p = buf + 3;
     uint64_t mask = ((uint64_t)((p[0]<<8)|p[1]))       |
@@ -299,9 +327,10 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     }
     sleep_ms(200);
 
-    /* Present bitmask */
+    /* Present bitmask — also a gateway reachability signal. */
     uint16_t present_regs[4] = {0};
-    sync_read(slave_id, DALI_PRESENT_START, 4, present_regs);
+    gateway_report(slave_id, idx,
+                   sync_read(slave_id, DALI_PRESENT_START, 4, present_regs));
     uint64_t present_mask =
         ((uint64_t)present_regs[0])       |
         ((uint64_t)present_regs[1] << 16) |
@@ -379,7 +408,11 @@ void dirty_poll_background_check(uint8_t slave_id) {
     if (idx < 0 || s_dp[idx].active) return;
 
     uint16_t present_regs[4] = {0};
-    if (!sync_read(slave_id, DALI_PRESENT_START, 4, present_regs)) return;
+    if (!sync_read(slave_id, DALI_PRESENT_START, 4, present_regs)) {
+        gateway_report(slave_id, idx, false);
+        return;
+    }
+    gateway_report(slave_id, idx, true);
 
     uint64_t present_mask =
         ((uint64_t)present_regs[0])       |
