@@ -1326,7 +1326,7 @@ static void emit_state_group(uint8_t slave, uint8_t group) {
 
 /* Set a DALI group's full membership mask.  Writes the changed group-mask
  * registers (0x0110+); the gateway diffs old vs new and issues the DALI
- * ADD/REMOVE-from-group commands itself.  Updates the cache predictively. */
+ * ADD/REMOVE-from-group commands.  Updates the cache predictively. */
 static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_mask) {
     int idx = state_cache_slave_idx(slave);
     if (idx < 0) return;
@@ -1346,9 +1346,9 @@ static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_ma
         modbus_set_holding_register(slave,
             (uint16_t)(DALI_GROUP_MASK_START + group * 4 + w), reg_val, cli_mb_cb, &ctx);
         cli_mb_wait(&ctx);
-        /* The gateway refuses a new group write while one is in flight, so let
-         * its ADD/REMOVE traffic settle before the next changed word. */
-        if (w != last) sleep_ms(200);
+        /* The gateway processes one group write at a time, so let its ADD/REMOVE
+         * traffic settle before the next changed word. */
+        if (w != last) sleep_ms(250);
     }
     state_cache_set_dali_group((uint8_t)idx, group, new_mask);
 }
