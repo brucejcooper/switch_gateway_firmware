@@ -130,4 +130,9 @@ actual 255, not 254.
 
 **Net:** A + B + C together. HA now reflects the device reliably for fading *and*
 instant lamps, catches command-less changes within ~1 s, and never shows a guessed
-brightness. D (GOTO_LAST_ACTIVE jumping to max) remains a separate UX question.
+brightness.
+
+(Earlier "D" was a mis-framing. GOTO_LAST_ACTIVE — `on` → the lamp's last-active
+level — is the intended behavior; the fix is simply to **poll the brightness
+afterward** and report whatever the lamp actually landed on, which is what A+B+C do.
+No behavior change to `on` is wanted.)
