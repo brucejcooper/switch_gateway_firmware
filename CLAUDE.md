@@ -251,9 +251,12 @@ other value — `dali 2 g5 members=0,1` (replace) / `add=2` / `remove=1` (CLI), 
 the desired 64-bit mask to the gateway group-mask registers (`0x0110+`, byte-
 swapped per word); the **gateway** diffs old↔new and issues the DALI
 ADD/REMOVE-from-group commands (`dali_sync_arm_group_write`). Non-empty groups
-are emitted in `resync`. Caveat: a group DAPC (`g<N> bri=…`) doesn't refresh the
-member ballasts' cached level (the gateway doesn't flag them dirty), so
-`state_dali` for members lags until the next read.
+are emitted in `resync`. A group level/on/off command also flags its members for
+a re-read on the gateway (`apply_invalidation` walks the group mask → marks each
+member `SYNC_READ_LEVEL`), so each member's `state_dali` refreshes to its actual
+level shortly after — provided membership is correct (a stale/empty group mask
+has nothing to flag, which is what made group commands look like a no-op before
+the group-mask byte-order fix).
 
 `cfg` is the whole **controller device config**, shown in HA like everything
 else. `state_cfg` (and `hello`) also report read-only `fw_version` — built from
