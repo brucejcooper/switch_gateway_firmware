@@ -65,6 +65,7 @@ static void emit_state_dali(uint8_t slave, uint8_t addr);
 static void emit_state_relay(uint8_t ch);
 static void emit_state_group(uint8_t slave, uint8_t group);
 static void emit_state_cfg(void);
+static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_mask);
 
 static bool json_int(const char *j, const char *k, int *out) {
     char buf[16];
@@ -247,7 +248,9 @@ static void handle_json_line(const char *line) {
         return;
     }
 
-    /* ── set_group / get_group ──── {"d":{"slave":S,"group":G},"v":{"on"|"bri"}} */
+    /* ── set_group / get_group ──── {"d":{"slave":S,"group":G},
+     *   "v":{"on"|"bri", "members":[…] | "add":[…] | "remove":[…]}}.
+     * members replaces the membership; add/remove are granular. */
     if (strcmp(t, "set_group") == 0 || strcmp(t, "get_group") == 0) {
         int slave = 0, group = 0;
         json_int(line, "slave", &slave);
@@ -255,7 +258,28 @@ static void handle_json_line(const char *line) {
         if (state_cache_slave_idx((uint8_t)slave) < 0) { serial_tx_ack(cmd_id, false, "invalid_slave"); return; }
         if (group < 0 || group > 15) { serial_tx_ack(cmd_id, false, "invalid_group"); return; }
         if (t[0] == 'g') { emit_state_group((uint8_t)slave, (uint8_t)group); serial_tx_ack(cmd_id, true, NULL); return; }
-        int bri; bool on = false, any = false;
+        bool any = false;
+        /* membership */
+        int idx = state_cache_slave_idx((uint8_t)slave);
+        uint64_t mask = state_cache_get_dali_group((uint8_t)idx, (uint8_t)group);
+        bool mask_set = false;
+        uint8_t arr[DALI_ADDR_COUNT]; int n;
+        if ((n = json_uint8_array(line, "members", arr, DALI_ADDR_COUNT)) >= 0) {
+            mask = 0;
+            for (int i = 0; i < n; i++) if (arr[i] < 64) mask |= (uint64_t)1 << arr[i];
+            mask_set = true;
+        }
+        if ((n = json_uint8_array(line, "add", arr, DALI_ADDR_COUNT)) >= 0) {
+            for (int i = 0; i < n; i++) if (arr[i] < 64) mask |= (uint64_t)1 << arr[i];
+            mask_set = true;
+        }
+        if ((n = json_uint8_array(line, "remove", arr, DALI_ADDR_COUNT)) >= 0) {
+            for (int i = 0; i < n; i++) if (arr[i] < 64) mask &= ~((uint64_t)1 << arr[i]);
+            mask_set = true;
+        }
+        if (mask_set) { dali_group_set_members((uint8_t)slave, (uint8_t)group, mask); any = true; }
+        /* state */
+        int bri; bool on = false;
         if (json_int(line, "bri", &bri)) {
             lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)bri); any = true;
         } else if (json_bool(line, "on", &on)) {
@@ -864,6 +888,7 @@ static void cmd_help(void) {
     printf("relay <ch> [on=true|false|toggle]          bare=get, else set\n");
     printf("dali <slave> <addr|gN> [key=val ...]       bare=get; keys: on bri min max\n");
     printf("                                           power_on sys_fail fade_rate fade_time\n");
+    printf("                                           group (gN) also: members=0,1  add=2  remove=1\n");
     printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms\n");
     printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
@@ -1138,6 +1163,19 @@ static void cmd_dali(char **saveptr) {
             else if (strcasecmp(key, "on") == 0)
                 lighting_group_set_on_off((uint8_t)slave, (uint8_t)group,
                     strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
+            else if (strcasecmp(key, "members") == 0 || strcasecmp(key, "add") == 0 ||
+                     strcasecmp(key, "remove") == 0) {
+                uint8_t arr[DALI_ADDR_COUNT];
+                int gn = parse_csv_u8(val, arr, DALI_ADDR_COUNT);
+                int gidx = state_cache_slave_idx((uint8_t)slave);
+                uint64_t mask = gidx >= 0 ? state_cache_get_dali_group((uint8_t)gidx, (uint8_t)group) : 0;
+                uint64_t bits = 0;
+                for (int i = 0; i < gn; i++) if (arr[i] < 64) bits |= (uint64_t)1 << arr[i];
+                if      (strcasecmp(key, "members") == 0) mask = bits;
+                else if (strcasecmp(key, "add") == 0)     mask |= bits;
+                else                                      mask &= ~bits;
+                dali_group_set_members((uint8_t)slave, (uint8_t)group, mask);
+            }
             else { txt_err("bad_field"); return; }
         } else {
             int r = dali_apply_kv((uint8_t)slave, (uint8_t)addr, key, val);
@@ -1274,11 +1312,45 @@ static void emit_state_relay(uint8_t ch) {
 
 static void emit_state_group(uint8_t slave, uint8_t group) {
     int idx = state_cache_slave_idx(slave);
-    bool    on  = idx >= 0 && state_cache_dali_group_any_on((uint8_t)idx, group);
-    uint8_t bri = idx >= 0 ? state_cache_dali_group_max_bri((uint8_t)idx, group) : 0;
+    bool     on      = idx >= 0 && state_cache_dali_group_any_on((uint8_t)idx, group);
+    uint8_t  bri     = idx >= 0 ? state_cache_dali_group_max_bri((uint8_t)idx, group) : 0;
+    uint64_t members = idx >= 0 ? state_cache_get_dali_group((uint8_t)idx, group) : 0;
     printf("{\"t\":\"state_group\",\"ts\":%lu,\"d\":{\"slave\":%u,\"group\":%u},"
-           "\"v\":{\"on\":%s,\"bri\":%u}}\n",
+           "\"v\":{\"on\":%s,\"bri\":%u,\"members\":[",
            now_ms_u(), slave, group, on ? "true" : "false", bri);
+    bool first = true;
+    for (int a = 0; a < DALI_ADDR_COUNT; a++)
+        if (members & ((uint64_t)1 << a)) { printf("%s%d", first ? "" : ",", a); first = false; }
+    printf("]}}\n");
+}
+
+/* Set a DALI group's full membership mask.  Writes the changed group-mask
+ * registers (0x0110+); the gateway diffs old vs new and issues the DALI
+ * ADD/REMOVE-from-group commands itself.  Updates the cache predictively. */
+static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_mask) {
+    int idx = state_cache_slave_idx(slave);
+    if (idx < 0) return;
+    uint64_t old_mask = state_cache_get_dali_group((uint8_t)idx, group);
+    int last = -1;
+    for (int w = 0; w < 4; w++)
+        if (((old_mask ^ new_mask) >> (w * 16)) & 0xFFFFu) last = w;
+    for (int w = 0; w < 4; w++) {
+        uint16_t old_w = (uint16_t)((old_mask >> (w * 16)) & 0xFFFFu);
+        uint16_t new_w = (uint16_t)((new_mask >> (w * 16)) & 0xFFFFu);
+        if (old_w == new_w) continue;
+        /* group-mask wire order is byte-swapped vs the 16-bit word (mirror of
+         * read_all_group_masks). */
+        uint16_t reg_val = (uint16_t)(((new_w & 0xFFu) << 8) | (new_w >> 8));
+        static cli_mb_ctx_t ctx;
+        memset(&ctx, 0, sizeof ctx);
+        modbus_set_holding_register(slave,
+            (uint16_t)(DALI_GROUP_MASK_START + group * 4 + w), reg_val, cli_mb_cb, &ctx);
+        cli_mb_wait(&ctx);
+        /* The gateway refuses a new group write while one is in flight, so let
+         * its ADD/REMOVE traffic settle before the next changed word. */
+        if (w != last) sleep_ms(200);
+    }
+    state_cache_set_dali_group((uint8_t)idx, group, new_mask);
 }
 
 static void emit_state_cfg(void) {
@@ -2143,14 +2215,9 @@ static void emit_event(const levt_t *e) {
     }
 
     case LEVT_GROUP:
-        printf("{\"t\":\"state_group\",\"ts\":%lu,"
-               "\"d\":{\"slave\":%u,\"group\":%u},"
-               "\"v\":{\"on\":%s,\"bri\":%u}}\n",
-               (unsigned long)ts,
-               e->group.slave_id, e->group.group,
-               e->group.on ? "true" : "false",
-               e->group.bri);
-        LOG_DBG("serial", "evt state_group slave=%u addr=%u",
+        /* Same {t,d,v} report as get_group, including the members list. */
+        emit_state_group(e->group.slave_id, e->group.group);
+        LOG_DBG("serial", "evt state_group slave=%u group=%u",
                 e->group.slave_id, e->group.group);
         break;
 }

@@ -240,9 +240,17 @@ emitted `state_*` is the value confirmation.
 |---|---|---|---|
 | dali   | `{slave,addr}` | `on`(true/false/toggle) `bri` `min` `max` `power_on` `sys_fail` `fade_rate` `fade_time` | `state_dali` |
 | relay  | `{ch}` | `on`(true/false/toggle) | `state_relay` |
-| group  | `{slave,group}` | `on` `bri` | `state_group` |
+| group  | `{slave,group}` | `on` `bri` · `members`[] (replace) / `add`[] / `remove`[] | `state_group` (incl. `members`) |
 | cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` `baud`(reboot to apply) `relay_slaves`[] `dali_slaves`[] | `state_cfg` |
 | mapping| `{fixture,button}` | `targets`(array) — empty deletes | `config_mapping` |
+
+**DALI groups** are first-class entities: `state_group` reports `on/bri/members`
+(`members` = the member short addresses), and membership is editable like any
+other value — `dali 2 g5 members=0,1` (replace) / `add=2` / `remove=1` (CLI), or
+`set_group` with `members`/`add`/`remove` arrays (JSON). The controller writes
+the desired 64-bit mask to the gateway group-mask registers (`0x0110+`, byte-
+swapped per word); the **gateway** diffs old↔new and issues the DALI
+ADD/REMOVE-from-group commands. Non-empty groups are emitted in `resync`.
 
 `cfg` is the whole **controller device config**, shown in HA like everything
 else. `state_cfg` (and `hello`) also report read-only `fw_version` — built from
