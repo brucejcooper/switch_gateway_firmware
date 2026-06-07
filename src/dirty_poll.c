@@ -165,13 +165,21 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
     if (res >= 7) {
         uint8_t status = buf[3];
         uint8_t arc    = buf[4];
-        lighting_emit_dali_state(slave, addr, arc, status);
-        LOG_DBG("dirty", "ballast %u.%u arc=%u status=0x%02x",
-                 slave, addr, arc, status);
-        if ((status & 0x02) || (status & 0x80)) {
-            lighting_emit_fault(slave, addr,
-                                (status & 0x02) != 0,
-                                (status & 0x80) != 0);
+        if (arc == 0xFFu) {
+            /* 0xFF is not a valid DALI level (max is 254) — a corrupt or
+             * unavailable read. Drop it rather than reporting 100%; the cached
+             * (last good) level stands until a valid read arrives. */
+            LOG_WARN("dirty", "ballast %u.%u read arc=0xFF (invalid) — ignoring",
+                     slave, addr);
+        } else {
+            lighting_emit_dali_state(slave, addr, arc, status);
+            LOG_DBG("dirty", "ballast %u.%u arc=%u status=0x%02x",
+                     slave, addr, arc, status);
+            if ((status & 0x02) || (status & 0x80)) {
+                lighting_emit_fault(slave, addr,
+                                    (status & 0x02) != 0,
+                                    (status & 0x80) != 0);
+            }
         }
     }
 
