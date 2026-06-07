@@ -249,7 +249,15 @@ else. `state_cfg` (and `hello`) also report read-only `fw_version` — built fro
 git: `<base>+<git describe --tags --always --dirty>` (e.g. `2.0.0+791ca0b-dirty`)
 via `cmake/gen_version.cmake` → `build/generated/version.h`, regenerated each
 build. CLI slave lists are comma form (`cfg dali_slaves=2,3`); JSON uses arrays.
-`set_baud` was folded into `set_cfg`'s `baud` key.
+`set_baud` was folded into `set_cfg`'s `baud` key. `state_cfg` also reports the
+read-only **binding grid** dimensions `max_fixtures` `max_buttons` `max_targets`
+so HA knows the fixture/button space.
+
+**Bindings (mappings)** are fully in the scheme: `get_mapping`/`set_mapping`/
+`del_mapping` (and `get_mappings` — formerly `get_config` — dumps them all) emit
+`config_mapping`. CLI `map <fix> <btn> [targets=<s>:<a>,…]` — bare = get,
+`targets=` (empty) deletes; address `a` is `N` (ballast) or `gN` (group), e.g.
+`map 0 0 targets=2:1,2:g3`. Bulk load still uses `replace_mappings_*`.
 
 ```
 set : {"t":"set_dali","d":{"slave":2,"addr":1},"v":{"min":120,"bri":200}}  → ack + state_dali

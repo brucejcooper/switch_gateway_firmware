@@ -306,8 +306,8 @@ static void handle_json_line(const char *line) {
         return;
     }
 
-    /* ── get_config ────────────────────────────────────────────────────── */
-    if (strcmp(t, "get_config") == 0) {
+    /* ── get_mappings ──── dump every binding as config_mapping reports ────── */
+    if (strcmp(t, "get_mappings") == 0) {
         serial_tx_config_full();
         return;
     }
@@ -884,8 +884,7 @@ static void cmd_help(void) {
     printf("rs485 [{tx|always}]                         show / set RS485 DE mode (saved; tx=DE while transmitting)\n");
     printf("ls [<path>]                                list files in path (default /)\n");
     printf("cat <path>                                 dump file contents to console\n");
-    printf("map set <fix> <btn> <s>:<a>[,<s>:<a>...]   set mapping (a may be N or GN)\n");
-    printf("map del <fix> <btn>                        delete mapping\n");
+    printf("map <fix> <btn> [targets=<s>:<a>,...]     bare=get; targets= deletes (a=N or gN)\n");
     printf("log <level>                                set verbosity (off|err|warn|info|dbg)\n");
     printf("show log                                   current verbosity\n");
     printf("get_input <slave> <reg> [count]            raw FC04 read input registers\n");
@@ -1291,8 +1290,10 @@ static void emit_state_cfg(void) {
     printf("],\"dali_slaves\":[");
     for (int i = 0; i < g_config.dali_slave_count; i++)
         printf("%s%u", i ? "," : "", g_config.dali_slave_ids[i]);
-    printf("],\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u}}\n",
-           g_config.long_press_ms, g_config.dim_repeat_ms, g_config.reversal_window_ms);
+    printf("],\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,"
+           "\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u}}\n",
+           g_config.long_press_ms, g_config.dim_repeat_ms, g_config.reversal_window_ms,
+           (unsigned)MAX_FIXTURES, (unsigned)MAX_BUTTONS, (unsigned)MAX_TARGETS_PER_BTN);
 }
 
 /* Apply one DALI key=value to a ballast (shared by set_dali JSON + `dali` CLI).
@@ -1751,57 +1752,43 @@ static void cmd_cat(char **saveptr) {
 }
 
 /* ── map set / map del ─────────────────────────────────────────────────── */
+/* map <fixture> <button> [targets=<s>:<a>[,<s>:<a>...]] — bare = get (emit
+ * config_mapping); `targets=` (empty) deletes. Address a may be N or gN. */
 static void cmd_map(char **saveptr) {
-    char *sub = strtok_r(NULL, " \t", saveptr);
-    if (!sub) { txt_err("bad_arg"); return; }
+    char *fs = strtok_r(NULL, " \t", saveptr);
+    char *bs = strtok_r(NULL, " \t", saveptr);
+    int fix = 0, btn = 0;
+    if (!parse_int_range(fs, 0, MAX_FIXTURES - 1, &fix) ||
+        !parse_int_range(bs, 0, MAX_BUTTONS - 1, &btn)) { txt_err("bad_arg"); return; }
 
-    if (strcasecmp(sub, "set") == 0) {
-        char *fs = strtok_r(NULL, " \t", saveptr);
-        char *bs = strtok_r(NULL, " \t", saveptr);
-        char *ts = strtok_r(NULL, " \t", saveptr);
-        int fix = 0, btn = 0;
-        if (!parse_int_range(fs, 0, MAX_FIXTURES - 1, &fix) ||
-            !parse_int_range(bs, 0, MAX_BUTTONS - 1, &btn) ||
-            !ts) {
-            txt_err("bad_arg"); return;
-        }
-        mapping_target_t targets[MAX_TARGETS_PER_BTN];
-        uint8_t count = 0;
-        char *pair_save = NULL;
-        for (char *p = strtok_r(ts, ",", &pair_save);
-             p && count < MAX_TARGETS_PER_BTN;
-             p = strtok_r(NULL, ",", &pair_save)) {
-            if (!parse_target_pair(p, &targets[count])) {
-                txt_err("bad_arg"); return;
-            }
-            count++;
-        }
-        if (count == 0) { txt_err("bad_arg"); return; }
-        LOG_INFO("cli", "map set F%d B%d count=%u", fix, btn, count);
-        if (!mapping_set((uint8_t)fix, (uint8_t)btn, targets, count)) {
-            txt_err("save_failed"); return;
-        }
-        txt_ok();
+    char *kv = strtok_r(NULL, " \t", saveptr);
+    if (!kv) {   /* get */
+        const mapping_record_t *rec = mapping_lookup((uint8_t)fix, (uint8_t)btn);
+        emit_config_mapping((uint8_t)fix, (uint8_t)btn,
+                            rec ? rec->targets : NULL, rec ? rec->target_count : 0);
         return;
     }
-
-    if (strcasecmp(sub, "del") == 0) {
-        char *fs = strtok_r(NULL, " \t", saveptr);
-        char *bs = strtok_r(NULL, " \t", saveptr);
-        int fix = 0, btn = 0;
-        if (!parse_int_range(fs, 0, MAX_FIXTURES - 1, &fix) ||
-            !parse_int_range(bs, 0, MAX_BUTTONS - 1, &btn)) {
-            txt_err("bad_arg"); return;
-        }
-        LOG_INFO("cli", "map del F%d B%d", fix, btn);
-        if (!mapping_delete((uint8_t)fix, (uint8_t)btn)) {
-            txt_err("save_failed"); return;
-        }
-        txt_ok();
+    char *eq = strchr(kv, '=');
+    if (!eq) { txt_err("bad_arg expected key=value"); return; }
+    *eq = '\0';
+    if (strcasecmp(kv, "targets") != 0) { txt_err("bad_field"); return; }
+    char *list = eq + 1;
+    if (*list == '\0') {   /* targets= (empty) → delete */
+        if (!mapping_delete((uint8_t)fix, (uint8_t)btn)) { txt_err("save_failed"); return; }
+        emit_config_mapping((uint8_t)fix, (uint8_t)btn, NULL, 0);
         return;
     }
-
-    txt_err("bad_arg");
+    mapping_target_t targets[MAX_TARGETS_PER_BTN];
+    uint8_t count = 0;
+    char *pair_save = NULL;
+    for (char *p = strtok_r(list, ",", &pair_save);
+         p && count < MAX_TARGETS_PER_BTN;
+         p = strtok_r(NULL, ",", &pair_save)) {
+        if (!parse_target_pair(p, &targets[count])) { txt_err("bad_arg"); return; }
+        count++;
+    }
+    if (!mapping_set((uint8_t)fix, (uint8_t)btn, targets, count)) { txt_err("save_failed"); return; }
+    emit_config_mapping((uint8_t)fix, (uint8_t)btn, targets, count);
 }
 
 /* ── reboot ────────────────────────────────────────────────────────────── */
