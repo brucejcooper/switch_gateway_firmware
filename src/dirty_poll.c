@@ -84,6 +84,9 @@ static void gateway_report(uint8_t slave_id, int idx, bool ok) {
         if (dp->fail_count < 0xFF) dp->fail_count++;
         if (dp->fail_count >= GATEWAY_FAIL_THRESHOLD) {
             dp->reachable = false;
+            dp->active    = false;   /* stop fast-polling a dead gateway; the
+                                        60s background check still probes it and
+                                        recovers it (and a command re-activates) */
             lighting_emit_gateway_state(slave_id, false);
         }
     }
