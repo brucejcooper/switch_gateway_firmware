@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import logging.handlers
 import os
 import re
 import threading
@@ -87,6 +88,7 @@ class BridgeConfig:
     mqtt_password:      str | None
     topic_prefix:       str
     availability_topic: str
+    serial_log_path:    str | None = None
 
 
 # ── Per-instance identity ───────────────────────────────────────────────────────
@@ -278,6 +280,21 @@ class Bridge:
             (re.compile(rf"^{p}/config/([a-z_]+)/set$"),             "_cmd_cfg"),
             (re.compile(rf"^{p}/config/set$"),                         "_cmd_set_config"),
         ]
+
+        # Optional: tee the controller's "# ..." serial log lines to a rotating
+        # file so the user can `tail -F` and debug along. Disabled if path empty.
+        self._serial_log: logging.Logger | None = None
+        if cfg.serial_log_path:
+            slog = logging.getLogger("controller-serial")
+            slog.setLevel(logging.INFO)
+            slog.propagate = False
+            if not slog.handlers:
+                h = logging.handlers.RotatingFileHandler(
+                    cfg.serial_log_path, maxBytes=2_000_000, backupCount=3)
+                h.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+                slog.addHandler(h)
+            self._serial_log = slog
+            log.info("Controller serial log → %s", cfg.serial_log_path)
 
     # ── Helpers ───────────────────────────────────────────────────────────
 
@@ -641,6 +658,13 @@ class Bridge:
     # ── Inbound from Pico ─────────────────────────────────────────────────
 
     def dispatch_from_pico(self, line: str) -> None:
+        line = line.strip()
+        if not line.startswith("{"):
+            # Controller text log line ("# ...") or blank — not an event. Tee it
+            # to the serial log file (if configured) so the user can follow along.
+            if line and self._serial_log:
+                self._serial_log.info(line)
+            return
         try:
             msg = json.loads(line)
         except json.JSONDecodeError as exc:
@@ -1236,6 +1260,11 @@ def main() -> None:
         help="Human label prefixed to HA device names (e.g. 'Test Rig'), to tell "
              "instances apart in the HA UI.",
     )
+    parser.add_argument(
+        "--serial-log", default=env("SERIAL_LOG", "controller.log"),
+        help="File to tee the controller's '# ...' serial log lines to (rotating). "
+             "Empty to disable.",
+    )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
@@ -1259,6 +1288,7 @@ def main() -> None:
         mqtt_password=args.password,
         topic_prefix=args.prefix,
         availability_topic=f"{args.prefix}/availability",
+        serial_log_path=args.serial_log or None,
     )
 
     log.info("Serial: %s @ %d baud", cfg.serial_port, cfg.serial_baud)
