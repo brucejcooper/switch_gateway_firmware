@@ -142,10 +142,89 @@ def _dev_dali_ballast(slave: int, addr: int) -> dict:
 def _dev_switch_plate(fixture: int) -> dict:
     return {
         "identifiers":  [f"{NODE}_switch_plate_{fixture:02d}"],
-        "name":         f"{LABEL}Switch Plate {fixture + 1:02d}",
+        "name":         f"{LABEL}Fixture {fixture + 1:02d}",
         "manufacturer": "Mechination",
         "model":        "Switch Gateway Button Matrix",
+        "via_device":   f"{NODE}_controller",
     }
+
+
+def _dev_dali_group(slave: int, group: int) -> dict:
+    return {
+        "identifiers":  [f"{NODE}_group_{slave}_{group}"],
+        "name":         f"{LABEL}DALI Group {slave}.{group}",
+        "manufacturer": "Mechination",
+        "model":        "DALI Group",
+        "via_device":   f"{NODE}_dali_gw_{slave}",
+    }
+
+
+def _dev_controller(fw_version: str | None = None) -> dict:
+    d = {
+        "identifiers":  [f"{NODE}_controller"],
+        "name":         f"{LABEL}Switch Gateway Controller",
+        "manufacturer": "Mechination",
+        "model":        "Raspberry Pi Pico 2 Controller",
+    }
+    if fw_version:
+        d["sw_version"] = fw_version
+    return d
+
+
+# Per-ballast DALI config fields exposed as HA number entities.
+#   (key, friendly name, min, max)  — 0..254 levels, 0..15 fade rate/time
+DALI_CONFIG_FIELDS = [
+    ("min",       "Min Level",  0, 254),
+    ("max",       "Max Level",  0, 254),
+    ("power_on",  "Power-On Level",   0, 254),
+    ("sys_fail",  "System-Failure Level", 0, 254),
+    ("fade_rate", "Fade Rate",  0, 15),
+    ("fade_time", "Fade Time",  0, 15),
+]
+
+# Controller timing config exposed as HA number entities.
+CONTROLLER_CONFIG_FIELDS = [
+    ("long_press_ms",      "Long-Press (ms)",      100, 5000, 50),
+    ("dim_repeat_ms",      "Dim Repeat (ms)",       50, 2000, 10),
+    ("reversal_window_ms", "Reversal Window (ms)",  50, 2000, 10),
+]
+
+# A binding is a comma list of "<slave>:<addr>" (ballast) or "<slave>:g<group>"
+# targets, or empty to clear.  This regex is BOTH the HA text-entity client-side
+# validation pattern and (mirrored by _parse_binding_str) the bridge-side parser.
+BINDING_PATTERN = r"^\s*(\d{1,3}\s*:\s*[gG]?\d{1,3}(\s*,\s*\d{1,3}\s*:\s*[gG]?\d{1,3})*)?\s*$"
+
+
+def _binding_to_str(targets: list) -> str:
+    """[{slave,addr}|{slave,group}] → 's:a,s:gN' string for the HA text entity."""
+    out = []
+    for t in targets:
+        if "group" in t:
+            out.append(f"{t['slave']}:g{t['group']}")
+        else:
+            out.append(f"{t['slave']}:{t.get('addr', 0)}")
+    return ",".join(out)
+
+
+def _parse_binding_str(s: str) -> list | None:
+    """'s:a,s:gN' → [{slave,addr}|{slave,group}].  None if malformed (empty=[])."""
+    s = s.strip()
+    if not s:
+        return []
+    targets: list = []
+    for part in s.split(","):
+        sl, _, ad = part.strip().partition(":")
+        sl, ad = sl.strip(), ad.strip()
+        if not sl.isdigit() or not ad:
+            return None
+        try:
+            if ad[0] in "gG":
+                targets.append({"slave": int(sl), "group": int(ad[1:])})
+            else:
+                targets.append({"slave": int(sl), "addr": int(ad)})
+        except ValueError:
+            return None
+    return targets
 
 
 # ── Bridge ────────────────────────────────────────────────────────────────────
@@ -169,9 +248,13 @@ class Bridge:
 
         # Tracks whether discovery has been published for each entity.
         # Cleared on hello so reconnect republishes cleanly.
-        self._disc_relays:   set[int]            = set()
-        self._disc_ballasts: set[tuple[int, int]] = set()
-        self._disc_gateways: set[int]             = set()
+        self._disc_relays:      set[int]             = set()
+        self._disc_ballasts:    set[tuple[int, int]] = set()
+        self._disc_gateways:    set[int]             = set()
+        self._disc_ballast_cfg: set[tuple[int, int]] = set()
+        self._disc_group:       set[tuple[int, int]] = set()
+        self._disc_controller:  bool                 = False
+        self._fw_version:       str                  = "?"
 
         # Per-slave target address for "Commission Address" button
         self._prov_target: dict[int, int] = {}
@@ -180,15 +263,19 @@ class Bridge:
         p = re.escape(cfg.topic_prefix)
         self._RE: list[tuple[re.Pattern, str]] = [
             (re.compile(rf"^{p}/relay/(\d+)/set$"),                    "_cmd_relay"),
+            (re.compile(rf"^{p}/dali/(\d+)/(\d+)/config/([a-z_]+)/set$"), "_cmd_dali_config"),
             (re.compile(rf"^{p}/dali/(\d+)/(\d+)/set$"),              "_cmd_dali"),
+            (re.compile(rf"^{p}/group/(\d+)/(\d+)/members/set$"),     "_cmd_group_members"),
+            (re.compile(rf"^{p}/group/(\d+)/(\d+)/set$"),             "_cmd_group"),
             (re.compile(rf"^{p}/provision/(\d+)/start/all$"),         "_cmd_prov_all"),
             (re.compile(rf"^{p}/provision/(\d+)/start/unaddressed$"), "_cmd_prov_unaddressed"),
             (re.compile(rf"^{p}/provision/(\d+)/start/target$"),      "_cmd_prov_target"),
             (re.compile(rf"^{p}/provision/(\d+)/start/address$"),     "_cmd_prov_address"),
             (re.compile(rf"^{p}/provision/(\d+)/abort$"),             "_cmd_prov_abort"),
-            # fix #10: mapping and config commands
             (re.compile(rf"^{p}/mapping/(\d+)/(\d+)/set$"),           "_cmd_set_mapping"),
             (re.compile(rf"^{p}/mapping/(\d+)/(\d+)/delete$"),        "_cmd_del_mapping"),
+            (re.compile(rf"^{p}/binding/(\d+)/(\d+)/set$"),           "_cmd_binding"),
+            (re.compile(rf"^{p}/config/([a-z_]+)/set$"),             "_cmd_cfg"),
             (re.compile(rf"^{p}/config/set$"),                         "_cmd_set_config"),
         ]
 
@@ -415,6 +502,141 @@ class Bridge:
                 },
                 retained=True,
             )
+            # Editable binding for this button: a text entity holding the targets
+            # as "<slave>:<addr>" / "<slave>:g<group>" comma list (regex-validated).
+            buid = f"{NODE}_binding_{fixture:02d}_btn_{btn}"
+            self._pub(
+                f"homeassistant/text/{buid}/config",
+                {
+                    "unique_id":          buid,
+                    "name":               f"Button {btn + 1} Binding",
+                    "command_topic":      self._t("binding", str(fixture), str(btn), "set"),
+                    "state_topic":        self._t("binding", str(fixture), str(btn), "state"),
+                    "pattern":            BINDING_PATTERN,
+                    "availability_topic": self._cfg.availability_topic,
+                    "entity_category":    "config",
+                    "icon":               "mdi:link-variant",
+                    "device":             device,
+                },
+                retained=True,
+            )
+            self._pub(self._t("binding", str(fixture), str(btn), "state"), "", retained=True)
+
+    def _pub_ballast_config_discovery(self, slave: int, addr: int) -> None:
+        """Number entities for a present ballast's DALI config (config category)."""
+        if (slave, addr) in self._disc_ballast_cfg:
+            return
+        self._disc_ballast_cfg.add((slave, addr))
+        device  = _dev_dali_ballast(slave, addr)
+        state_t = self._t("dali", str(slave), str(addr), "config")
+        avail   = [
+            {"topic": self._cfg.availability_topic},
+            {"topic": self._ballast_avail_topic(slave, addr)},
+        ]
+        for key, name, lo, hi in DALI_CONFIG_FIELDS:
+            uid = f"{NODE}_dali_{slave}_{addr}_{key}"
+            self._pub(
+                f"homeassistant/number/{uid}/config",
+                {
+                    "unique_id":          uid,
+                    "name":               name,
+                    "command_topic":      self._t("dali", str(slave), str(addr),
+                                                  "config", key, "set"),
+                    "state_topic":        state_t,
+                    "value_template":     f"{{{{ value_json.{key} }}}}",
+                    "min": lo, "max": hi, "step": 1, "mode": "box",
+                    "availability":       avail,
+                    "availability_mode":  "all",
+                    "entity_category":    "config",
+                    "device":             device,
+                },
+                retained=True,
+            )
+
+    def _pub_group_discovery(self, slave: int, group: int) -> None:
+        """A DALI group as a light (on/bri) + an editable members text entity."""
+        if (slave, group) in self._disc_group:
+            return
+        self._disc_group.add((slave, group))
+        device = _dev_dali_group(slave, group)
+        uid    = f"{NODE}_group_{slave}_{group}"
+        self._pub(
+            f"homeassistant/light/{uid}/config",
+            {
+                "unique_id":                 uid,
+                "name":                      None,
+                "schema":                    "json",
+                "state_topic":               self._t("group", str(slave), str(group), "state"),
+                "command_topic":             self._t("group", str(slave), str(group), "set"),
+                "brightness":                True,
+                "brightness_scale":          254,
+                "state_value_template":      "{{ value_json.on | lower }}",
+                "brightness_value_template": "{{ value_json.bri }}",
+                "availability_topic":        self._cfg.availability_topic,
+                "device":                    device,
+            },
+            retained=True,
+        )
+        muid = f"{uid}_members"
+        self._pub(
+            f"homeassistant/text/{muid}/config",
+            {
+                "unique_id":          muid,
+                "name":               "Members",
+                "command_topic":      self._t("group", str(slave), str(group), "members", "set"),
+                "state_topic":        self._t("group", str(slave), str(group), "members", "state"),
+                "pattern":            r"^\s*(\d{1,2}(\s*,\s*\d{1,2})*)?\s*$",
+                "availability_topic": self._cfg.availability_topic,
+                "entity_category":    "config",
+                "icon":               "mdi:format-list-bulleted",
+                "device":             device,
+            },
+            retained=True,
+        )
+
+    def _pub_controller_discovery(self, v: dict) -> None:
+        """Controller device: timing number entities + fw/baud sensors."""
+        if self._disc_controller:
+            return
+        self._disc_controller = True
+        device  = _dev_controller(v.get("fw_version"))
+        state_t = self._t("config", "state")
+        for key, name, lo, hi, step in CONTROLLER_CONFIG_FIELDS:
+            uid = f"{NODE}_cfg_{key}"
+            self._pub(
+                f"homeassistant/number/{uid}/config",
+                {
+                    "unique_id":          uid,
+                    "name":               name,
+                    "command_topic":      self._t("config", key, "set"),
+                    "state_topic":        state_t,
+                    "value_template":     f"{{{{ value_json.{key} }}}}",
+                    "min": lo, "max": hi, "step": step, "mode": "box",
+                    "availability_topic": self._cfg.availability_topic,
+                    "entity_category":    "config",
+                    "device":             device,
+                },
+                retained=True,
+            )
+        for key, name, icon in [
+            ("fw_version", "Firmware",    "mdi:chip"),
+            ("baud",       "Modbus Baud", "mdi:speedometer"),
+        ]:
+            uid = f"{NODE}_cfg_{key}"
+            self._pub(
+                f"homeassistant/sensor/{uid}/config",
+                {
+                    "unique_id":          uid,
+                    "name":               name,
+                    "state_topic":        state_t,
+                    "value_template":     f"{{{{ value_json.{key} }}}}",
+                    "availability_topic": self._cfg.availability_topic,
+                    "entity_category":    "diagnostic",
+                    "icon":               icon,
+                    "device":             device,
+                },
+                retained=True,
+            )
 
     # ── Inbound from Pico ─────────────────────────────────────────────────
 
@@ -440,15 +662,19 @@ class Bridge:
         if relay_slaves is None:
             legacy = d.get("relay_slave")
             relay_slaves = [legacy] if legacy is not None else []
+        self._fw_version = d.get("fw_version", "?")
         log.info(
             "Pico hello: relay_slaves=%s dali_slaves=%s fw=%s",
-            relay_slaves, dali_slaves, d.get("fw_version", "?"),
+            relay_slaves, dali_slaves, self._fw_version,
         )
 
-        # Clear session state so reconnect publishes fresh discovery
+        # Clear session state so reconnect republishes fresh discovery
         self._disc_relays.clear()
         self._disc_ballasts.clear()
         self._disc_gateways.clear()
+        self._disc_ballast_cfg.clear()
+        self._disc_group.clear()
+        self._disc_controller = False
 
         self._pub(self._cfg.availability_topic, "online", retained=True)
 
@@ -461,6 +687,11 @@ class Bridge:
         for slave in dali_slaves:
             self._pub_gateway_discovery(slave)
             self._pub_all_ballasts_for_slave(slave)
+
+        # Pull device config (→ state_cfg) and the full mapping/group set
+        # (→ config_mapping / state_group) so HA repopulates after a reconnect.
+        self._send({"t": "get_cfg",      "id": self._next_id()})
+        self._send({"t": "get_mappings", "id": self._next_id()})
 
     def _pico_state_relay(self, msg: dict) -> None:
         ch = msg.get("d", {}).get("ch")
@@ -493,6 +724,42 @@ class Bridge:
             },
             retained=True,
         )
+        # Per-ballast DALI config (min/max/power_on/sys_fail/fade_*) → number
+        # entities. Only present ballasts emit state_dali, so config entities are
+        # created lazily for the ones that actually exist.
+        if any(k in v for k, *_ in DALI_CONFIG_FIELDS):
+            self._pub_ballast_config_discovery(slave, addr)
+            self._pub(
+                self._t("dali", str(slave), str(addr), "config"),
+                {k: v.get(k, 0) for k, *_ in DALI_CONFIG_FIELDS},
+                retained=True,
+            )
+
+    def _pico_state_group(self, msg: dict) -> None:
+        d     = msg.get("d", {})
+        v     = msg.get("v", {})
+        slave = d.get("slave")
+        group = d.get("group")
+        if slave is None or group is None:
+            return
+        self._pub_group_discovery(slave, group)
+        self._pub(
+            self._t("group", str(slave), str(group), "state"),
+            {"on": v.get("on", False), "bri": v.get("bri", 0)},
+            retained=True,
+        )
+        self._pub(
+            self._t("group", str(slave), str(group), "members", "state"),
+            ",".join(str(a) for a in v.get("members", [])),
+            retained=True,
+        )
+
+    def _pico_state_cfg(self, msg: dict) -> None:
+        v = msg.get("v", {})
+        if not v.get("fw_version"):
+            v = {**v, "fw_version": self._fw_version}
+        self._pub_controller_discovery(v)
+        self._pub(self._t("config", "state"), v, retained=True)
 
     def _pico_button(self, msg: dict) -> None:
         d          = msg.get("d", {})
@@ -590,8 +857,9 @@ class Bridge:
             log.warning("NAK id=%s err=%s", msg.get("id"), d.get("err"))
 
     def _pico_config_mapping(self, msg: dict) -> None:
-        """fix #9: Relay current button-to-light mapping to retained MQTT topic.
-        Published by firmware after set_mapping / del_mapping, and on get_config."""
+        """Relay a button's binding to retained MQTT topics. Published by firmware
+        after set_/del_mapping and on get_mappings/resync. Drives both the raw
+        mapping topic and the per-button binding text entity (string form)."""
         d       = msg.get("d", {})
         v       = msg.get("v", {})
         fixture = d.get("fixture")
@@ -602,6 +870,11 @@ class Bridge:
         self._pub(
             self._t("mapping", str(fixture), str(button)),
             {"fixture": fixture, "button": button, "targets": targets},
+            retained=True,
+        )
+        self._pub(
+            self._t("binding", str(fixture), str(button), "state"),
+            _binding_to_str(targets),
             retained=True,
         )
 
@@ -728,6 +1001,71 @@ class Bridge:
              if key in body}
         self._send({"t": "set_cfg", "id": self._next_id(), "v": v})
 
+    def _cmd_cfg(self, m: re.Match, payload: str) -> None:
+        """config/<field>/set — one controller config field from a number entity."""
+        field = m.group(1)
+        try:
+            val = int(float(payload.strip()))
+        except ValueError:
+            log.warning("Bad config value for %s: %s", field, payload)
+            return
+        self._send({"t": "set_cfg", "id": self._next_id(), "v": {field: val}})
+
+    def _cmd_dali_config(self, m: re.Match, payload: str) -> None:
+        """dali/<slave>/<addr>/config/<field>/set — one DALI config field (number)."""
+        slave, addr, field = int(m.group(1)), int(m.group(2)), m.group(3)
+        try:
+            val = int(float(payload.strip()))
+        except ValueError:
+            log.warning("Bad dali config value for %s: %s", field, payload)
+            return
+        self._send({
+            "t": "set_dali", "id": self._next_id(),
+            "d": {"slave": slave, "addr": addr}, "v": {field: val},
+        })
+
+    def _cmd_group(self, m: re.Match, payload: str) -> None:
+        """group/<slave>/<group>/set — JSON-schema light command for a DALI group."""
+        slave, group = int(m.group(1)), int(m.group(2))
+        try:
+            body = json.loads(payload)
+        except json.JSONDecodeError:
+            log.warning("Bad group payload: %s", payload)
+            return
+        out: dict[str, Any] = {
+            "t": "set_group", "id": self._next_id(),
+            "d": {"slave": slave, "group": group}, "v": {},
+        }
+        if "brightness" in body:
+            out["v"]["bri"] = int(body["brightness"])
+        elif "state" in body:
+            out["v"]["on"] = str(body["state"]).upper() == "ON"
+        else:
+            return
+        self._send(out)
+
+    def _cmd_group_members(self, m: re.Match, payload: str) -> None:
+        """group/<slave>/<group>/members/set — comma list of short addresses."""
+        slave, group = int(m.group(1)), int(m.group(2))
+        s = payload.strip()
+        members = [int(x) for x in s.split(",") if x.strip().isdigit()] if s else []
+        self._send({
+            "t": "set_group", "id": self._next_id(),
+            "d": {"slave": slave, "group": group}, "v": {"members": members},
+        })
+
+    def _cmd_binding(self, m: re.Match, payload: str) -> None:
+        """binding/<fixture>/<button>/set — a button binding as a targets string."""
+        fixture, button = int(m.group(1)), int(m.group(2))
+        targets = _parse_binding_str(payload)
+        if targets is None:
+            log.warning("Bad binding string for F%d.B%d: %r", fixture, button, payload)
+            return
+        self._send({
+            "t": "set_mapping", "id": self._next_id(),
+            "d": {"fixture": fixture, "button": button}, "v": {"targets": targets},
+        })
+
     # ── MQTT subscriptions ────────────────────────────────────────────────
 
     def _subscriptions(self) -> list[str]:
@@ -735,15 +1073,19 @@ class Bridge:
         return [
             f"{p}/relay/+/set",
             f"{p}/dali/+/+/set",
+            f"{p}/dali/+/+/config/+/set",
+            f"{p}/group/+/+/set",
+            f"{p}/group/+/+/members/set",
             f"{p}/provision/+/start/all",
             f"{p}/provision/+/start/unaddressed",
             f"{p}/provision/+/start/target",
             f"{p}/provision/+/start/address",
             f"{p}/provision/+/abort",
-            # fix #10: mapping and config
             f"{p}/mapping/+/+/set",
             f"{p}/mapping/+/+/delete",
+            f"{p}/binding/+/+/set",
             f"{p}/config/set",
+            f"{p}/config/+/set",
         ]
 
     # ── Serial reader ──────────────────────────────────────────────────────
@@ -770,6 +1112,9 @@ class Bridge:
                         "Serial opened: %s @ %d baud",
                         self._cfg.serial_port, self._cfg.serial_baud,
                     )
+                    # Pull a fresh full state (hello, all device state, groups,
+                    # mappings) so HA repopulates even if the Pico didn't reboot.
+                    self._send({"t": "resync", "id": self._next_id()})
                     buf = b""
                     break
                 except serial.SerialException as exc:
