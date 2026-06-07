@@ -217,15 +217,20 @@ static void handle_json_line(const char *line) {
         static const char *keys[] = { "on", "bri", "min", "max",
                                       "power_on", "sys_fail", "fade_rate", "fade_time" };
         char buf[16];
-        bool any = false, ok = true;
+        bool any = false, ok = true, emit_now = false;
         for (unsigned i = 0; i < 8; i++)
             if (json_str(line, keys[i], buf, sizeof buf)) {
                 any = true;
-                if (dali_apply_kv((uint8_t)slave, (uint8_t)addr, keys[i], buf) != 1) ok = false;
+                int r = dali_apply_kv((uint8_t)slave, (uint8_t)addr, keys[i], buf);
+                if (r == 1) emit_now = true;   /* a key with a known resulting level */
+                else if (r != 2) ok = false;   /* 2 = applied, level deferred to the read */
             }
         if (any) {
             dirty_poll_mark_active((uint8_t)slave);
-            emit_state_dali((uint8_t)slave, (uint8_t)addr);
+            /* Emit the optimistic report only when we actually know the new level.
+             * A bare "on" defers — the dirty-poll delivers the real brightness so
+             * HA reflects the device instead of a guess. */
+            if (emit_now) emit_state_dali((uint8_t)slave, (uint8_t)addr);
         }
         serial_tx_ack(cmd_id, any && ok, !any ? "no_fields" : (ok ? NULL : "set_failed"));
         return;
@@ -1386,13 +1391,16 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
                 : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
                    strcasecmp(val, "on") == 0);
         lighting_set_on_off(slave, addr, on);
-        if (idx >= 0) {
-            uint8_t a = !on ? 0u
-                      : (b && b->arc_level) ? b->arc_level
-                      : (b && b->max_level) ? b->max_level : 254u;
-            state_cache_set_dali_arc((uint8_t)idx, addr, a, b ? b->status_byte : 0);
+        if (!on) {
+            /* Off: the resulting level is definitively 0 — emit it now. */
+            if (idx >= 0) state_cache_set_dali_arc((uint8_t)idx, addr, 0u, b ? b->status_byte : 0);
+            return 1;
         }
-        return 1;
+        /* On: GOTO_LAST_ACTIVE restores a level the controller does NOT know.
+         * Don't assume it (the old code guessed max_level/254) — commanded_on is
+         * already set by lighting_set_on_off, and the dirty-poll reports the real
+         * brightness shortly.  Return 2 = "applied, no level to report yet". */
+        return 2;
     }
     return dali_cfg_set(slave, addr, key, (uint8_t)atoi(val));
 }

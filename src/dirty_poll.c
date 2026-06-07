@@ -32,8 +32,9 @@ typedef enum {
 typedef struct {
     dpoll_state_t state;
     bool          active;
-    uint8_t       zero_count;
+    uint32_t      last_activity_ms;  /* last command or detected change; drives the active window */
     uint32_t      last_poll_ms;
+    uint32_t      last_sweep_ms;     /* last idle dirty-mask sweep */
     uint32_t      last_bg_ms;
     uint64_t      last_present;
     uint64_t      pending_dirty;
@@ -63,8 +64,8 @@ void dirty_poll_init(void) {
 void dirty_poll_mark_active(uint8_t slave_id) {
     int idx = state_cache_slave_idx(slave_id);
     if (idx < 0) return;
-    s_dp[idx].active     = true;
-    s_dp[idx].zero_count = 0;
+    s_dp[idx].active           = true;
+    s_dp[idx].last_activity_ms = to_ms_since_boot(get_absolute_time());
 }
 
 static void ballast_read_cb(int res, uint8_t *buf, void *ctx);   /* forward decl */
@@ -98,8 +99,9 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
     int     idx      = state_cache_slave_idx(slave_id);
     if (idx < 0) return;
 
-    dpoll_t *dp = &s_dp[idx];
-    dp->state   = DPOLL_IDLE;
+    dpoll_t *dp     = &s_dp[idx];
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    dp->state       = DPOLL_IDLE;
 
     /* fix #5: FC04 4-register frame = slave+FC+bytecount+8data+CRC = 13 bytes */
     if (res < 13) {
@@ -121,14 +123,17 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
     }
 
     if (mask == 0) {
-        dp->zero_count++;
-        if (dp->zero_count >= DIRTY_ZERO_SETTLE_COUNT) {
-            dp->active     = false;
-            dp->zero_count = 0;
+        /* Deactivate only once the active window has fully elapsed since the last
+         * command or detected change — not after a couple of quick zero reads.
+         * On/fade/multi-target dirty bits can land hundreds of ms after the
+         * command, well past the old 2-zero (~200ms) cutoff. */
+        if (now_ms - dp->last_activity_ms >= DIRTY_ACTIVE_WINDOW_MS) {
+            dp->active = false;
         }
     } else {
-        dp->zero_count    = 0;
-        dp->pending_dirty = mask;
+        dp->active           = true;   /* a sweep that finds a change re-activates fast polling */
+        dp->last_activity_ms = now_ms;
+        dp->pending_dirty    = mask;
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             if (mask & ((uint64_t)1 << a)) {
                 dp->state = DPOLL_AWAITING_BALLAST;
@@ -211,6 +216,16 @@ void dirty_poll_tick(void) {
             if (now_ms - dp->last_bg_ms >= BACKGROUND_CHECK_MS) {
                 dp->last_bg_ms = now_ms;
                 dirty_poll_background_check(slave_id);
+            } else if (dp->reachable
+                       && now_ms - dp->last_sweep_ms >= DIRTY_SWEEP_MS) {
+                /* Regular cheap dirty-mask sweep so external / manual / post-fade
+                 * changes reflect within ~1s even when no command was issued. A
+                 * non-zero mask re-activates fast polling (see dirty_bitmask_cb). */
+                dp->last_sweep_ms = now_ms;
+                dp->state         = DPOLL_AWAITING_DIRTY;
+                modbus_get_input_registers(slave_id, DALI_DIRTY_START, 4,
+                                           dirty_bitmask_cb,
+                                           &s_dirty_ctx_slave[i]);
             }
         }
     }

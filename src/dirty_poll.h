@@ -15,9 +15,10 @@ void dirty_poll_full_scan(uint8_t slave_id);
 /* 60s background presence + status anomaly check */
 void dirty_poll_background_check(uint8_t slave_id);
 
-#define DIRTY_POLL_INTERVAL_MS   100u
-#define DIRTY_ZERO_SETTLE_COUNT  2u
-#define BACKGROUND_CHECK_MS      60000u
+#define DIRTY_POLL_INTERVAL_MS   100u    /* fast dirty-mask poll while active */
+#define DIRTY_ACTIVE_WINDOW_MS   2000u   /* stay active this long after the last command/change */
+#define DIRTY_SWEEP_MS           1000u   /* regular cheap dirty-mask sweep while idle */
+#define BACKGROUND_CHECK_MS      60000u  /* heavy presence/group/fault scan */
 
 /* TinyModbus register addresses (post task-1-flag-driven refactor).
  * Per-ballast banks (BLOCK0..BLOCK3) are FC03 holding registers; the
