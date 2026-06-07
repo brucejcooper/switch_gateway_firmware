@@ -386,8 +386,8 @@ class Bridge:
                 "command_topic":             self._t("dali", str(slave), str(addr), "set"),
                 "brightness":                True,
                 "brightness_scale":          254,
-                "state_value_template":      "{{ value_json.on | lower }}",
-                "brightness_value_template": "{{ value_json.bri }}",
+                # JSON-schema lights read state/brightness from the JSON payload
+                # ({"state":"ON","brightness":N}); value templates don't apply.
                 # Both topics must be "online" for entity to be available.
                 "availability": [
                     {"topic": self._cfg.availability_topic},
@@ -587,8 +587,6 @@ class Bridge:
                 "command_topic":             self._t("group", str(slave), str(group), "set"),
                 "brightness":                True,
                 "brightness_scale":          254,
-                "state_value_template":      "{{ value_json.on | lower }}",
-                "brightness_value_template": "{{ value_json.bri }}",
                 "availability_topic":        self._cfg.availability_topic,
                 "device":                    device,
             },
@@ -740,12 +738,7 @@ class Bridge:
         self._pub_ballast_discovery(slave, addr)
         self._pub(
             self._t("dali", str(slave), str(addr), "state"),
-            {
-                "on":        v.get("on", False),
-                "bri":       v.get("bri", 0),
-                "fading":    v.get("fading", False),
-                "lamp_fail": v.get("lamp_fail", False),
-            },
+            {"state": "ON" if v.get("on") else "OFF", "brightness": v.get("bri", 0)},
             retained=True,
         )
         # Per-ballast DALI config (min/max/power_on/sys_fail/fade_*) → number
@@ -769,7 +762,7 @@ class Bridge:
         self._pub_group_discovery(slave, group)
         self._pub(
             self._t("group", str(slave), str(group), "state"),
-            {"on": v.get("on", False), "bri": v.get("bri", 0)},
+            {"state": "ON" if v.get("on") else "OFF", "brightness": v.get("bri", 0)},
             retained=True,
         )
         self._pub(
@@ -1129,6 +1122,7 @@ class Bridge:
                         self._cfg.serial_port,
                         self._cfg.serial_baud,
                         timeout=0.1,
+                        exclusive=True,   # fail fast if another bridge holds the port
                     )
                     with self._serial_lock:
                         self._serial = port
