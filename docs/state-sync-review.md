@@ -87,3 +87,28 @@ no-op vs GOTO_LAST_ACTIVE — so it doesn't jump to max.
 
 A alone fixes the reported intermittency and needs no gateway reflash; B makes fade
 levels accurate; C removes the misleading optimism.
+
+## Update 2026-06-07 — B implemented (TinyModbus 307d130)
+
+B turned out to fix the *intermittency too*, not just accuracy — for ballasts that
+fade. By keeping `SYNC_READ_LEVEL` set while FADE_RUNNING, the gateway re-reads for
+the whole (multi-second) fade, so the dirty bit stays set long enough that the
+controller's 100 ms poll reliably catches it and stays active. As a bonus `on` now
+reports the real settled level instead of the optimistic 254.
+
+Measured on the rig (fixture-0/btn-0 → `2:0,2:1`, 4 ON taps):
+
+| | before B | after B |
+|---|---|---|
+| fade_time = 4 (fades) | ~0–2 / 8 | **8 / 8** |
+| fade_time = 0 (instant) | ~0–2 / 8 | 2 / 8 |
+| single `on` emitted level | guessed 254 | actual 137 |
+
+So **B covers the realistic (fading) case**. **A is still wanted** as the backstop
+for instant ballasts (fade_time=0 still races the 200 ms window) and for changes
+that arrive with no command (external/manual). C is now lower priority since the
+real level reliably follows for fading lamps.
+
+Rig caveat: slave 2 hosts both a relay board and the DALI gateway, so its FC03/FC04
+reads occasionally collide (observed `None`/garbled query results). That adds read
+noise here that won't exist on a clean per-slave bus.
