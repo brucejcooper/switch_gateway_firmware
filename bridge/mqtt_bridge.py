@@ -417,6 +417,21 @@ class Bridge:
         for addr in range(DALI_ADDR_COUNT):
             self._pub_ballast_discovery(slave, addr)
 
+    def _pub_all_groups_for_slave(self, slave: int) -> None:
+        """
+        Publish discovery for all 16 DALI groups on a slave, seeded empty/off.
+        DALI groups are a fixed 0-15 set per gateway, so every group is always
+        present (gated on gateway availability) — which lets the mapper populate
+        an empty group. The controller's state_group then fills in the ones that
+        actually have members.
+        """
+        for group in range(16):
+            self._pub_group_discovery(slave, group)
+            self._pub(self._t("group", str(slave), str(group), "state"),
+                      {"state": "OFF"}, retained=True)
+            self._pub(self._t("group", str(slave), str(group), "members", "state"),
+                      "", retained=True)
+
     def _pub_gateway_discovery(self, slave: int) -> None:
         """Publish provisioning entities for one DALI gateway (once per session)."""
         if slave in self._disc_gateways:
@@ -711,6 +726,7 @@ class Bridge:
         for slave in dali_slaves:
             self._pub_gateway_discovery(slave)
             self._pub_all_ballasts_for_slave(slave)
+            self._pub_all_groups_for_slave(slave)   # all 16 groups, always present
             # Seed gateway reachable (optimistic). The controller pushes
             # state_gateway offline/online if it stops/starts responding.
             self._pub(self._gateway_avail_topic(slave), "online", retained=True)
