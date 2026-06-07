@@ -2268,9 +2268,16 @@ void serial_tx_ack(unsigned cmd_id, bool ok, const char *err) {
 }
 
 void serial_tx_config_full(void) {
-    static char buf[4096];
-    int n = mapping_serialise_all(buf, sizeof(buf));
-    if (n > 0) printf("%.*s", n, buf);
+    /* Emit every populated binding as its own config_mapping line, incrementally
+     * — NOT serialised into one fixed buffer. The old 4 KB buffer made
+     * mapping_serialise_all() return -1 (and print nothing) once the table grew
+     * past ~45 bindings, so get_mappings answered empty and HA showed no bindings
+     * after every reconnect, even though the controller's table was intact. */
+    for (uint8_t f = 0; f < MAX_FIXTURES; f++)
+        for (uint8_t b = 0; b < MAX_BUTTONS; b++) {
+            const mapping_record_t *rec = mapping_lookup(f, b);
+            if (rec) emit_config_mapping(f, b, rec->targets, rec->target_count);
+        }
 }
 
 void serial_poll(void) {
