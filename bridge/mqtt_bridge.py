@@ -324,6 +324,17 @@ class Bridge:
     def _ballast_avail_topic(self, slave: int, addr: int) -> str:
         return self._t("dali", str(slave), str(addr), "availability")
 
+    def _gateway_avail_topic(self, slave: int) -> str:
+        return self._t("gateway", str(slave), "availability")
+
+    def _gw_avail(self, slave: int, *extra: str) -> dict:
+        """HA availability fragment gating on system + gateway (+ extra) topics,
+        all required online."""
+        topics = [self._cfg.availability_topic, self._gateway_avail_topic(slave),
+                  *extra]
+        return {"availability": [{"topic": t} for t in topics],
+                "availability_mode": "all"}
+
     def _set_ballast_availability(self, slave: int, addr: int,
                                    online: bool) -> None:
         self._pub(
@@ -384,16 +395,13 @@ class Bridge:
                 "schema":                    "json",
                 "state_topic":               self._t("dali", str(slave), str(addr), "state"),
                 "command_topic":             self._t("dali", str(slave), str(addr), "set"),
-                "brightness":                True,
+                # Modern brightness declaration (the standalone "brightness" flag
+                # no longer reliably renders a slider). JSON-schema lights read
+                # state/color_mode/brightness from the JSON state payload.
+                "supported_color_modes":     ["brightness"],
                 "brightness_scale":          254,
-                # JSON-schema lights read state/brightness from the JSON payload
-                # ({"state":"ON","brightness":N}); value templates don't apply.
-                # Both topics must be "online" for entity to be available.
-                "availability": [
-                    {"topic": self._cfg.availability_topic},
-                    {"topic": avail_t},
-                ],
-                "availability_mode":         "all",
+                # System + gateway + per-ballast must all be online.
+                **self._gw_avail(slave, avail_t),
                 "device":                    _dev_dali_ballast(slave, addr),
             },
             retained=True,
@@ -437,7 +445,7 @@ class Bridge:
                     "name":               name,
                     "state_topic":        status_t,
                     "value_template":     tmpl,
-                    "availability_topic": self._cfg.availability_topic,
+                    **self._gw_avail(slave),
                     "icon":               icon,
                     "entity_category":    "diagnostic",
                     "device":             device,
@@ -463,7 +471,7 @@ class Bridge:
                     "name":               name,
                     "command_topic":      cmd,
                     "payload_press":      "PRESS",
-                    "availability_topic": self._cfg.availability_topic,
+                    **self._gw_avail(slave),
                     "icon":               icon,
                     "entity_category":    "config",
                     "device":             device,
@@ -483,7 +491,7 @@ class Bridge:
                 "max":                63,
                 "step":               1,
                 "mode":               "box",
-                "availability_topic": self._cfg.availability_topic,
+                **self._gw_avail(slave),
                 "icon":               "mdi:numeric",
                 "entity_category":    "config",
                 "device":             device,
@@ -546,10 +554,7 @@ class Bridge:
         self._disc_ballast_cfg.add((slave, addr))
         device  = _dev_dali_ballast(slave, addr)
         state_t = self._t("dali", str(slave), str(addr), "config")
-        avail   = [
-            {"topic": self._cfg.availability_topic},
-            {"topic": self._ballast_avail_topic(slave, addr)},
-        ]
+        gwa     = self._gw_avail(slave, self._ballast_avail_topic(slave, addr))
         for key, name, lo, hi in DALI_CONFIG_FIELDS:
             uid = f"{NODE}_dali_{slave}_{addr}_{key}"
             self._pub(
@@ -562,8 +567,7 @@ class Bridge:
                     "state_topic":        state_t,
                     "value_template":     f"{{{{ value_json.{key} }}}}",
                     "min": lo, "max": hi, "step": 1, "mode": "box",
-                    "availability":       avail,
-                    "availability_mode":  "all",
+                    **gwa,
                     "entity_category":    "config",
                     "device":             device,
                 },
@@ -585,9 +589,9 @@ class Bridge:
                 "schema":                    "json",
                 "state_topic":               self._t("group", str(slave), str(group), "state"),
                 "command_topic":             self._t("group", str(slave), str(group), "set"),
-                "brightness":                True,
+                "supported_color_modes":     ["brightness"],
                 "brightness_scale":          254,
-                "availability_topic":        self._cfg.availability_topic,
+                **self._gw_avail(slave),
                 "device":                    device,
             },
             retained=True,
@@ -601,7 +605,7 @@ class Bridge:
                 "command_topic":      self._t("group", str(slave), str(group), "members", "set"),
                 "state_topic":        self._t("group", str(slave), str(group), "members", "state"),
                 "pattern":            r"^\s*(\d{1,2}(\s*,\s*\d{1,2})*)?\s*$",
-                "availability_topic": self._cfg.availability_topic,
+                **self._gw_avail(slave),
                 "entity_category":    "config",
                 "icon":               "mdi:format-list-bulleted",
                 "device":             device,
@@ -709,6 +713,9 @@ class Bridge:
         for slave in dali_slaves:
             self._pub_gateway_discovery(slave)
             self._pub_all_ballasts_for_slave(slave)
+            # Seed gateway reachable (optimistic). The controller pushes
+            # state_gateway offline/online if it stops/starts responding.
+            self._pub(self._gateway_avail_topic(slave), "online", retained=True)
 
         # Pull device config (→ state_cfg) and the full mapping/group set
         # (→ config_mapping / state_group) so HA repopulates after a reconnect.
@@ -736,11 +743,11 @@ class Bridge:
             return
         # Discovery should already exist from hello, but publish defensively
         self._pub_ballast_discovery(slave, addr)
-        self._pub(
-            self._t("dali", str(slave), str(addr), "state"),
-            {"state": "ON" if v.get("on") else "OFF", "brightness": v.get("bri", 0)},
-            retained=True,
-        )
+        st = {"state": "ON"} if v.get("on") else {"state": "OFF"}
+        if v.get("on"):
+            st["color_mode"] = "brightness"
+            st["brightness"] = v.get("bri", 0)
+        self._pub(self._t("dali", str(slave), str(addr), "state"), st, retained=True)
         # Per-ballast DALI config (min/max/power_on/sys_fail/fade_*) → number
         # entities. Only present ballasts emit state_dali, so config entities are
         # created lazily for the ones that actually exist.
@@ -760,11 +767,11 @@ class Bridge:
         if slave is None or group is None:
             return
         self._pub_group_discovery(slave, group)
-        self._pub(
-            self._t("group", str(slave), str(group), "state"),
-            {"state": "ON" if v.get("on") else "OFF", "brightness": v.get("bri", 0)},
-            retained=True,
-        )
+        gst = {"state": "ON"} if v.get("on") else {"state": "OFF"}
+        if v.get("on"):
+            gst["color_mode"] = "brightness"
+            gst["brightness"] = v.get("bri", 0)
+        self._pub(self._t("group", str(slave), str(group), "state"), gst, retained=True)
         self._pub(
             self._t("group", str(slave), str(group), "members", "state"),
             ",".join(str(a) for a in v.get("members", [])),
@@ -777,6 +784,16 @@ class Bridge:
             v = {**v, "fw_version": self._fw_version}
         self._pub_controller_discovery(v)
         self._pub(self._t("config", "state"), v, retained=True)
+
+    def _pico_state_gateway(self, msg: dict) -> None:
+        slave = msg.get("d", {}).get("slave")
+        if slave is None:
+            return
+        online = msg.get("v", {}).get("online", True)
+        self._pub(self._gateway_avail_topic(slave),
+                  "online" if online else "offline", retained=True)
+        log.info("Gateway %s reachability: %s", slave,
+                 "online" if online else "OFFLINE")
 
     def _pico_button(self, msg: dict) -> None:
         d          = msg.get("d", {})
