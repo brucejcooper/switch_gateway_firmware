@@ -136,3 +136,32 @@ brightness.
 level — is the intended behavior; the fix is simply to **poll the brightness
 afterward** and report whatever the lamp actually landed on, which is what A+B+C do.
 No behavior change to `on` is wanted.)
+
+## Update 2026-06-07 — the 255 root cause, WIRE-PROVEN (TinyModbus c9e4853)
+
+Symptom: after `on`, the lamp went to the right (dimmed) level but HA showed 100%.
+The controller was reading `arc=255` from the gateway. 255 (0xFF) is not a valid
+DALI level (max 254), so it was being injected, not measured.
+
+Proof, off the DALI bus (Saleae on D0 DALI-TX / D1 DALI-RX, Manchester-decoded by
+`test/dali_wire_proof.py`; the decoder self-validates because the forward frames
+decode to the exact known opcodes — `03 0A` GLA, `03 90` QSTATUS, `03 A0` QACTUAL):
+
+```
+GOTO_LAST_ACTIVE
+QUERY_STATUS → 0x00 (not fading) ; QUERY_ACTUAL → 0xFF   ← 255 on the wire
+QUERY_STATUS → 0x00 (not fading) ; QUERY_ACTUAL → 0xFF   ← 255 on the wire
+QUERY_STATUS → 0x14 (FADING)     ; QUERY_ACTUAL → 0x64 (100) … ramps to 137
+```
+
+So the **ballast itself** answers QUERY ACTUAL with `0xFF` (DALI MASK / "level not
+available") in the short window after GOTO_LAST_ACTIVE *before the fade starts*
+(status still 0x00). The old gateway read that single 0xFF, saw not-fading, stopped,
+and stored 255.
+
+Fix (the one common path every level command funnels through — `OP_LEVEL_READ`,
+reached via the unified invalidation for DAPC/OFF/UP/DOWN/GLA/RECALL_MAX): keep
+re-reading while the level is `0xFF` **or** the lamp is fading; only store/settle on
+a valid (≤254) level once fading is idle. 0xFF is never stored. Controller has a
+belt-and-braces drop of any 0xFF read too. Verified: DAPC/on/off/up/down/GOTO_MAX
+all trace through to `fading:false` and never report 255.
