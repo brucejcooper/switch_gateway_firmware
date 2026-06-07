@@ -32,6 +32,13 @@
 #define MODBUS_RESPONSE_TIMEOUT_MS 50
 #define MODBUS_MAX_RETRIES         2
 
+/* A gateway mid-DALI-frame answers a new RAW_CMD with DEVICE_BUSY (0x06). Rather
+ * than dropping the command, wait roughly one average DALI forward-frame time and
+ * try again, polling up to DALI_BUSY_RETRIES times. This transparently serialises
+ * rapid same-gateway commands (e.g. a button bound to several ballasts). */
+#define DALI_BUSY_RETRY_US         10000u   /* ~avg DALI forward-frame execution */
+#define DALI_BUSY_RETRIES          6u
+
 #define UART_ID      uart1
 #define UART_TX_PIN  4
 #define UART_RX_PIN  5
@@ -81,6 +88,7 @@ static queue_t               response_queue;
 /* Retry bookkeeping for the in-flight action: attempts remaining and whether a
  * re-transmit is pending once the post-timeout gap elapses. */
 static uint8_t               s_attempts_left;
+static uint8_t               s_busy_left;     /* DEVICE_BUSY retries remaining */
 static bool                  s_retry_pending;
 
 static bool modbus_rx_valid(void) { return true; }
@@ -373,6 +381,7 @@ void modbus_poll(void) {
     case MODBUS_IDLE:
         if (queue_try_remove(&action_queue, &currentAction)) {
             s_attempts_left = MODBUS_MAX_RETRIES;
+            s_busy_left     = DALI_BUSY_RETRIES;
             s_retry_pending = false;
             log_action_intent(&currentAction);
             start_action_tx();
@@ -393,6 +402,7 @@ void modbus_poll(void) {
         uart_set_irqs_enabled(UART_ID, false, false);
 
         bool retry = false;
+        bool busy_retry = false;
         if (readbuf_sz == 0) {
             /* No valid reply.  Retry the same request if attempts remain,
              * otherwise deliver the failure (length 0) to the caller. */
@@ -411,11 +421,21 @@ void modbus_poll(void) {
             }
         } else if (readbuf_sz >= 2 && (buf[1] & 0x80)) {
             uint8_t exc = (readbuf_sz >= 3) ? buf[2] : 0xFFu;
-            LOG_WARN("modbus", "rx exception slave=%u fc=0x%02x code=0x%02x (%s)",
-                     currentAction.device, (unsigned)currentAction.action,
-                     (unsigned)exc, modbus_exception_str(exc));
-            if (currentAction.callback)
-                currentAction.callback(-(int)readbuf_sz, buf, currentAction.ctx);
+            if (exc == 0x06u && s_busy_left > 0) {
+                /* gateway mid-DALI-frame: wait ~a frame time and poll again */
+                s_busy_left--;
+                retry = true;
+                busy_retry = true;
+                LOG_DBG("modbus", "slave=%u fc=0x%02x busy — retrying (%u left)",
+                        currentAction.device, (unsigned)currentAction.action,
+                        (unsigned)s_busy_left);
+            } else {
+                LOG_WARN("modbus", "rx exception slave=%u fc=0x%02x code=0x%02x (%s)",
+                         currentAction.device, (unsigned)currentAction.action,
+                         (unsigned)exc, modbus_exception_str(exc));
+                if (currentAction.callback)
+                    currentAction.callback(-(int)readbuf_sz, buf, currentAction.ctx);
+            }
         } else {
             LOG_DBG("modbus", "rx ok slave=%u fc=0x%02x bytes=%d",
                     currentAction.device, (unsigned)currentAction.action,
@@ -430,8 +450,10 @@ void modbus_poll(void) {
          * retry, wait the full 3.5-char inter-frame silence (min 2 ms) so the
          * slave's receiver resets any partial frame from the failed attempt. */
         {
-            uint32_t dt    = retry ? (35000000u / s_baud) : (15000000u / s_baud);
-            uint32_t floor = retry ? 2000u : 750u;
+            uint32_t dt, floor;
+            if (busy_retry)  { dt = DALI_BUSY_RETRY_US; floor = DALI_BUSY_RETRY_US; }
+            else if (retry)  { dt = 35000000u / s_baud; floor = 2000u; }
+            else             { dt = 15000000u / s_baud; floor = 750u; }
             if (dt < floor) dt = floor;
             readTimeout = make_timeout_time_us((uint64_t)dt);
         }
