@@ -259,6 +259,18 @@ so HA knows the fixture/button space.
 `targets=` (empty) deletes; address `a` is `N` (ballast) or `gN` (group), e.g.
 `map 0 0 targets=2:1,2:g3`. Bulk load still uses `replace_mappings_*`.
 
+**Persistence (2026-06-07):** bindings are stored as **line-delimited JSON** in
+`/mappings.json` — a `{"format":"mappings","version":N}` header line, then one
+`{"fixture":F,"button":B,"targets":[…]}` per binding, with explicit
+(de)serialisation (`mapping_save`/`mapping_load`). This replaced a **versionless
+raw `fwrite()` of `mapping_record_t`** (`/mappings.bin`), which was fragile: any
+struct-layout change (or whole-table overwrite when the table was momentarily
+empty) silently dropped every binding — that's how mappings were lost across a
+firmware change while `/config.json` (tolerant JSON) survived. The new format is
+struct-decoupled, version-tagged, tolerant of missing/extra fields, and
+human-inspectable. `mapping_load` does a one-time migration from a valid legacy
+`/mappings.bin` and re-saves as JSON.
+
 ```
 set : {"t":"set_dali","d":{"slave":2,"addr":1},"v":{"min":120,"bri":200}}  → ack + state_dali
 get : {"t":"get_dali","d":{"slave":2,"addr":1}}                            → state_dali
