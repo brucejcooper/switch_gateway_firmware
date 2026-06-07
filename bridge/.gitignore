@@ -1,0 +1,2 @@
+# Local secrets — never commit. Holds MQTT_PASSWORD.
+.env

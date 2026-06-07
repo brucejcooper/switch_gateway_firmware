@@ -47,6 +47,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -55,6 +56,12 @@ from typing import Any
 
 import serial
 import paho.mqtt.client as mqtt
+
+try:
+    from dotenv import load_dotenv
+except ImportError:  # optional dependency; env vars still work without a .env file
+    def load_dotenv(*_a, **_k):  # type: ignore
+        return False
 
 logging.basicConfig(
     level=logging.INFO,
@@ -82,12 +89,22 @@ class BridgeConfig:
     availability_topic: str
 
 
+# ── Per-instance identity ───────────────────────────────────────────────────────
+# NODE prefixes every HA unique_id + device identifier so multiple bridges (e.g.
+# a test rig and the main system) can share one broker without colliding. LABEL
+# optionally prefixes the human-readable device names. Both are set in main()
+# from --prefix / --node-name. Default "lighting"/"" → the main system is
+# byte-for-byte unchanged.
+NODE  = "lighting"
+LABEL = ""
+
+
 # ── Device info builders ───────────────────────────────────────────────────────
 
 def _dev_relay_board() -> dict:
     return {
-        "identifiers":  ["lighting_relay_board"],
-        "name":         "Relay Board",
+        "identifiers":  [f"{NODE}_relay_board"],
+        "name":         f"{LABEL}Relay Board",
         "manufacturer": "Waveshare",
         "model":        "Modbus RTU Relay 32CH",
     }
@@ -95,18 +112,18 @@ def _dev_relay_board() -> dict:
 
 def _dev_relay_channel(channel: int) -> dict:
     return {
-        "identifiers":  [f"lighting_relay_{channel}"],
-        "name":         f"Relay Channel {channel}",
+        "identifiers":  [f"{NODE}_relay_{channel}"],
+        "name":         f"{LABEL}Relay Channel {channel}",
         "manufacturer": "Waveshare",
         "model":        "Relay Channel",
-        "via_device":   "lighting_relay_board",
+        "via_device":   f"{NODE}_relay_board",
     }
 
 
 def _dev_dali_gateway(slave: int) -> dict:
     return {
-        "identifiers":  [f"lighting_dali_gw_{slave}"],
-        "name":         f"DALI Gateway {slave}",
+        "identifiers":  [f"{NODE}_dali_gw_{slave}"],
+        "name":         f"{LABEL}DALI Gateway {slave}",
         "manufacturer": "Mechination",
         "model":        "TinyModbus ATtiny1604 DALI Gateway",
     }
@@ -114,18 +131,18 @@ def _dev_dali_gateway(slave: int) -> dict:
 
 def _dev_dali_ballast(slave: int, addr: int) -> dict:
     return {
-        "identifiers":  [f"lighting_dali_{slave}_{addr}"],
-        "name":         f"DALI {slave}.{addr:02d}",
+        "identifiers":  [f"{NODE}_dali_{slave}_{addr}"],
+        "name":         f"{LABEL}DALI {slave}.{addr:02d}",
         "manufacturer": "Mechination",
         "model":        "DALI Ballast",
-        "via_device":   f"lighting_dali_gw_{slave}",
+        "via_device":   f"{NODE}_dali_gw_{slave}",
     }
 
 
 def _dev_switch_plate(fixture: int) -> dict:
     return {
-        "identifiers":  [f"lighting_switch_plate_{fixture:02d}"],
-        "name":         f"Switch Plate {fixture + 1:02d}",
+        "identifiers":  [f"{NODE}_switch_plate_{fixture:02d}"],
+        "name":         f"{LABEL}Switch Plate {fixture + 1:02d}",
         "manufacturer": "Mechination",
         "model":        "Switch Gateway Button Matrix",
     }
@@ -218,7 +235,7 @@ class Bridge:
         if channel in self._disc_relays:
             return
         self._disc_relays.add(channel)
-        uid = f"lighting_relay_{channel}"
+        uid = f"{NODE}_relay_{channel}"
         self._pub(
             f"homeassistant/switch/{uid}/config",
             {
@@ -252,7 +269,7 @@ class Bridge:
             return
         self._disc_ballasts.add((slave, addr))
 
-        uid      = f"lighting_dali_{slave}_{addr}"
+        uid      = f"{NODE}_dali_{slave}_{addr}"
         avail_t  = self._ballast_avail_topic(slave, addr)
 
         self._pub(
@@ -297,7 +314,7 @@ class Bridge:
         self._disc_gateways.add(slave)
 
         device   = _dev_dali_gateway(slave)
-        uid_base = f"lighting_prov_{slave}"
+        uid_base = f"{NODE}_prov_{slave}"
         status_t = self._t("provision", str(slave), "status")
 
         # Diagnostic sensors
@@ -383,7 +400,7 @@ class Bridge:
     def _pub_switch_plate_discovery(self, fixture: int) -> None:
         device = _dev_switch_plate(fixture)
         for btn in range(MAX_BUTTONS):
-            uid = f"lighting_switch_{fixture:02d}_btn_{btn}"
+            uid = f"{NODE}_switch_{fixture:02d}_btn_{btn}"
             self._pub(
                 f"homeassistant/event/{uid}/config",
                 {
@@ -606,8 +623,8 @@ class Bridge:
         except (json.JSONDecodeError, AttributeError):
             on = payload.strip().upper() == "ON"
         self._send({
-            "t": "cmd_relay", "id": self._next_id(),
-            "d": {"ch": channel, "on": on},
+            "t": "set_relay", "id": self._next_id(),
+            "d": {"ch": channel}, "v": {"on": on},
         })
 
     def _cmd_dali(self, m: re.Match, payload: str) -> None:
@@ -619,15 +636,15 @@ class Bridge:
             log.warning("Bad DALI payload: %s", payload)
             return
         out: dict[str, Any] = {
-            "t": "cmd_dali", "id": self._next_id(),
+            "t": "set_dali", "id": self._next_id(),
             "d": {"slave": slave, "addr": addr},
+            "v": {},
         }
         if "brightness" in body:
-            bri = int(body["brightness"])
-            out["d"]["bri"] = bri
-            out["d"]["on"]  = bri > 0
+            # bri sets the level directly (0 = off); the controller derives on.
+            out["v"]["bri"] = int(body["brightness"])
         elif "state" in body:
-            out["d"]["on"] = str(body["state"]).upper() == "ON"
+            out["v"]["on"] = str(body["state"]).upper() == "ON"
         else:
             log.warning("DALI command missing brightness and state")
             return
@@ -706,11 +723,10 @@ class Bridge:
         except json.JSONDecodeError as exc:
             log.warning("Bad set_config payload: %s — %s", payload, exc)
             return
-        msg: dict[str, Any] = {"t": "set_config", "id": self._next_id()}
-        for key in ("long_press_ms", "dim_repeat_ms", "reversal_window_ms"):
-            if key in body:
-                msg[key] = int(body[key])
-        self._send(msg)
+        v = {key: int(body[key])
+             for key in ("long_press_ms", "dim_repeat_ms", "reversal_window_ms")
+             if key in body}
+        self._send({"t": "set_cfg", "id": self._next_id(), "v": v})
 
     # ── MQTT subscriptions ────────────────────────────────────────────────
 
@@ -842,27 +858,52 @@ class Bridge:
 # ── Entry point ───────────────────────────────────────────────────────────────
 
 def main() -> None:
+    global NODE, LABEL
+
+    # Load a .env next to this script (so secrets like MQTT_PASSWORD stay out of
+    # the command line / process list). CLI flags still override env vars.
+    load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"))
+
+    def env(key: str, default: str | None = None) -> str | None:
+        return os.environ.get(key, default)
+
     parser = argparse.ArgumentParser(
-        description="Switch gateway MQTT bridge — no config file needed.",
+        description="Switch gateway MQTT bridge. Config via flags or env / .env "
+                    "(SERIAL_PORT, MQTT_BROKER, MQTT_PORT, MQTT_USER, "
+                    "MQTT_PASSWORD, MQTT_PREFIX, NODE_NAME).",
     )
     parser.add_argument(
-        "--serial", default="/dev/ttyUSB0",
+        "--serial", default=env("SERIAL_PORT", "/dev/ttyUSB0"),
         help="Serial port. Prefer /dev/serial/by-id/... symlink for stability.",
     )
-    parser.add_argument("--baud",     type=int, default=115200)
-    parser.add_argument("--broker",   default="localhost")
-    parser.add_argument("--port",     type=int, default=1883)
-    parser.add_argument("--user",     default=None)
-    parser.add_argument("--password", default=None)
+    parser.add_argument("--baud",     type=int, default=int(env("MQTT_BAUD", "115200")))
+    parser.add_argument("--broker",   default=env("MQTT_BROKER", "mqtt.8bitcloud.com"))
+    parser.add_argument("--port",     type=int, default=int(env("MQTT_PORT", "1883")))
+    parser.add_argument("--user",     default=env("MQTT_USER", "lights"))
+    parser.add_argument("--password", default=env("MQTT_PASSWORD"))
     parser.add_argument(
-        "--prefix", default="lighting",
-        help="MQTT topic prefix (default: lighting)",
+        "--prefix", default=env("MQTT_PREFIX", "lighting"),
+        help="Topic prefix AND HA unique_id/device prefix — the instance id. Use a "
+             "distinct value (e.g. 'testrig') to co-exist with the main system.",
+    )
+    parser.add_argument(
+        "--node-name", default=env("NODE_NAME", ""),
+        help="Human label prefixed to HA device names (e.g. 'Test Rig'), to tell "
+             "instances apart in the HA UI.",
     )
     parser.add_argument("--debug", action="store_true")
     args = parser.parse_args()
 
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
+
+    # Instance identity — must be set before any discovery is built.
+    NODE  = args.prefix
+    LABEL = f"{args.node_name} " if args.node_name else ""
+
+    if not args.password:
+        log.warning("No MQTT password set (MQTT_PASSWORD in .env or --password). "
+                    "Continuing — broker may reject the connection.")
 
     cfg = BridgeConfig(
         serial_port=args.serial,
@@ -876,7 +917,8 @@ def main() -> None:
     )
 
     log.info("Serial: %s @ %d baud", cfg.serial_port, cfg.serial_baud)
-    log.info("MQTT:   %s:%d  prefix=%s", cfg.mqtt_broker, cfg.mqtt_port, cfg.topic_prefix)
+    log.info("MQTT:   %s:%d  user=%s  prefix=%s  label=%r",
+             cfg.mqtt_broker, cfg.mqtt_port, cfg.mqtt_user, cfg.topic_prefix, LABEL)
 
     Bridge(cfg).run()
 
