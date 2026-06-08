@@ -82,7 +82,13 @@ target_sources(light_switch PRIVATE
     ${IOLIB}/Internet/DHCP/dhcp.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/wizchip_glue.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/mqtt_app.c
 )
+
+# ── coreMQTT (FreeRTOS standalone; static, malloc/float-free) ───────────────
+include(${CMAKE_CURRENT_LIST_DIR}/lib/coreMQTT/mqttFilePaths.cmake)
+target_sources(light_switch PRIVATE ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES})
+target_include_directories(light_switch PRIVATE ${MQTT_INCLUDE_PUBLIC_DIRS})
 target_include_directories(light_switch PRIVATE
     ${IOLIB}/Ethernet
     ${IOLIB}/Ethernet/W5100S

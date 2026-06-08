@@ -14,6 +14,7 @@
 #include "core1.h"
 #include "intercore.h"
 #include "net/netif.h"
+#include "net/mqtt_app.h"
 #include "log.h"
 
 #include "pico/multicore.h"
@@ -42,9 +43,11 @@ static void core1_entry(void) {
     s_ready = true;
     LOG_INFO("core1", "flash lockout victim init %s", ok ? "ok" : "FAILED");
 
-    /* Bring up the W5100S (DHCP by default; the /config.json net settings are
-     * wired in later). netif_tick() pumps the bring-up/DHCP/link/recovery SM. */
+    /* Bring up the W5100S (DHCP by default) and the MQTT connection manager.
+     * Both run as non-blocking state machines pumped from this loop. The
+     * /config.json net + broker settings are wired in later. */
     netif_init(NULL);
+    mqtt_app_init(NULL);
 
     uint32_t discarded = 0, last_log_ms = 0;
     ic_event_t ev;
@@ -52,14 +55,16 @@ static void core1_entry(void) {
         s_heartbeat_ms = to_ms_since_boot(get_absolute_time());
 
         netif_tick();
+        mqtt_app_tick();
 
-        /* Drain and discard for now (MQTT publish replaces this later). */
+        /* Drain and discard for now (the translation layer publishes these). */
         while (intercore_pop_event(&ev)) discarded++;
 
         if (s_heartbeat_ms - last_log_ms >= 5000u) {
             last_log_ms = s_heartbeat_ms;
-            LOG_INFO("core1", "alive: ready=%d link=%d events_drained=%lu drops=%lu",
-                     (int)netif_ready(), (int)netif_link_up(),
+            LOG_INFO("core1", "alive: link=%d ready=%d mqtt=%d drained=%lu drops=%lu",
+                     (int)netif_link_up(), (int)netif_ready(),
+                     (int)mqtt_app_connected(),
                      (unsigned long)discarded,
                      (unsigned long)intercore_event_drops());
         }
