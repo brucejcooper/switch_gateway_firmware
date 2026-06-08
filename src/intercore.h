@@ -150,3 +150,17 @@ bool intercore_pop_cmd(ic_cmd_t *c);
 
 /* Total events dropped on a full event queue (diagnostics). */
 uint32_t intercore_event_drops(void);
+
+/* ── Config snapshot (core 0 -> core 1) ──────────────────────────────────────
+ * The slave lists core 1 needs to build HA discovery. Filled by core 0 before
+ * core 1 launch (and is effectively read-only thereafter; a runtime slave-list
+ * change needs a reboot to re-discover, like a baud change). */
+typedef struct {
+    uint8_t relay_slaves[MAX_RELAY_SLAVES];
+    uint8_t relay_count;
+    uint8_t dali_slaves[MAX_DALI_SLAVES];
+    uint8_t dali_count;
+} ic_snapshot_t;
+
+void intercore_set_snapshot(const ic_snapshot_t *s);
+const ic_snapshot_t *intercore_snapshot(void);

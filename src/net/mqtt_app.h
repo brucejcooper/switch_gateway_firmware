@@ -44,6 +44,10 @@ bool mqtt_app_publish(const char *topic, const void *payload, size_t len, bool r
 /* Subscribe (QoS0) to a topic filter. */
 bool mqtt_app_subscribe(const char *filter);
 
+/* Free space in the socket TX buffer (bytes). Used to flow-control the bulk
+ * discovery publish so it never blocks on a full buffer. 0 if not connected. */
+uint16_t mqtt_app_tx_free(void);
+
 /* The configured topic prefix (e.g. "lighting"). */
 const char *mqtt_app_prefix(void);
 

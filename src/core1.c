@@ -15,6 +15,7 @@
 #include "intercore.h"
 #include "net/netif.h"
 #include "net/mqtt_app.h"
+#include "net/ha_bridge.h"
 #include "log.h"
 
 #include "pico/multicore.h"
@@ -48,6 +49,7 @@ static void core1_entry(void) {
      * /config.json net + broker settings are wired in later. */
     netif_init(NULL);
     mqtt_app_init(NULL);
+    ha_bridge_init();
 
     uint32_t discarded = 0, last_log_ms = 0;
     ic_event_t ev;
@@ -56,6 +58,7 @@ static void core1_entry(void) {
 
         netif_tick();
         mqtt_app_tick();
+        ha_bridge_tick();   /* incremental discovery publish while connected */
 
         /* Drain and discard for now (the translation layer publishes these). */
         while (intercore_pop_event(&ev)) discarded++;

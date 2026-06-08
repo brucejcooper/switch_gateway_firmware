@@ -48,3 +48,7 @@ bool intercore_pop_cmd(ic_cmd_t *c) {
 uint32_t intercore_event_drops(void) {
     return s_event_drops;
 }
+
+static ic_snapshot_t s_snapshot;
+void intercore_set_snapshot(const ic_snapshot_t *s) { s_snapshot = *s; }
+const ic_snapshot_t *intercore_snapshot(void) { return &s_snapshot; }

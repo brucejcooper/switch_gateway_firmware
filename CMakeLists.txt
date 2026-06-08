@@ -83,6 +83,7 @@ target_sources(light_switch PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/net/wizchip_glue.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/mqtt_app.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/ha_bridge.c
 )
 
 # ── coreMQTT (FreeRTOS standalone; static, malloc/float-free) ───────────────

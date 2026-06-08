@@ -258,6 +258,11 @@ bool mqtt_app_subscribe(const char *filter) {
     return MQTT_Subscribe(&s_mqtt, &si, 1, MQTT_GetPacketId(&s_mqtt)) == MQTTSuccess;
 }
 
+uint16_t mqtt_app_tx_free(void) {
+    if (s_state != MA_ONLINE && s_state != MA_MQTT_CONNECTING) return 0;
+    return getSn_TX_FSR(MQTT_SOCKET);
+}
+
 const char *mqtt_app_prefix(void) { return s_cfg.prefix; }
 
 void mqtt_app_set_connected_cb(void (*cb)(void)) { s_on_connected = cb; }

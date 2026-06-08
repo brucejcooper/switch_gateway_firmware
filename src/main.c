@@ -27,7 +27,9 @@
 #include "dali_provision.h"
 #include "bus_discovery.h"
 #include "core1.h"
+#include "intercore.h"
 #include "log.h"
+#include <string.h>
 
 #include <hardware/timer.h>
 #include <hardware/watchdog.h>
@@ -150,8 +152,17 @@ int main(void) {
 
     serial_protocol_init();   /* inits the inter-core queues */
 
-    /* Launch core 1 (the network bridge) now that the queues exist. Blocks until
-     * core 1 has registered as the flash lockout victim. */
+    /* Snapshot the slave lists for core 1's HA discovery, then launch core 1
+     * (the network bridge). core1_launch blocks until core 1 has registered as
+     * the flash lockout victim. */
+    ic_snapshot_t snap;
+    memset(&snap, 0, sizeof snap);
+    snap.relay_count = g_config.relay_slave_count;
+    memcpy(snap.relay_slaves, g_config.relay_slave_ids, g_config.relay_slave_count);
+    snap.dali_count = g_config.dali_slave_count;
+    memcpy(snap.dali_slaves, g_config.dali_slave_ids, g_config.dali_slave_count);
+    intercore_set_snapshot(&snap);
+
     core1_launch();
 
     watchdog_enable(5000, 1);
