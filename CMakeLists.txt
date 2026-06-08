@@ -17,6 +17,7 @@ pico_sdk_init()
 add_executable(light_switch
     src/main.c
     src/intercore.c
+    src/core1.c
     src/modbus.c
     src/button_actions.c
     src/button_fsm.c

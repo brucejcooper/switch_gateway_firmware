@@ -26,6 +26,7 @@
 #include "serial_protocol.h"
 #include "dali_provision.h"
 #include "bus_discovery.h"
+#include "core1.h"
 #include "log.h"
 
 #include <hardware/timer.h>
@@ -56,6 +57,20 @@ static void relay_read_cb(int res, uint8_t *buf, void *ctx) {
         c->ok = true;
     }
     c->done = true;
+}
+
+/* Grace window end: core 0 feeds the watchdog unconditionally until here. */
+static absolute_time_t s_core1_grace_until;
+
+/* Feed the hardware watchdog only while core 1's heartbeat is fresh (or during
+ * the post-launch grace window). A network outage keeps core 1 looping and
+ * beating, so it never reboots; only a genuine core-1 wedge (stuck SPI, infinite
+ * loop) stops the beat and lets the 5 s watchdog fire. */
+static void wd_feed(void) {
+    if (!time_reached(s_core1_grace_until) ||
+        (to_ms_since_boot(get_absolute_time()) - core1_heartbeat_ms()) < CORE1_STALE_MS) {
+        watchdog_update();
+    }
 }
 
 int main(void) {
@@ -133,27 +148,33 @@ int main(void) {
     button_fsm_init();
     buttongrid_init();
 
-    serial_protocol_init();
+    serial_protocol_init();   /* inits the inter-core queues */
+
+    /* Launch core 1 (the network bridge) now that the queues exist. Blocks until
+     * core 1 has registered as the flash lockout victim. */
+    core1_launch();
 
     watchdog_enable(5000, 1);
+    s_core1_grace_until = make_timeout_time_ms(CORE1_GRACE_MS);
 
     /* Announce over USB */
     sleep_ms(100);
     serial_tx_hello();
 
-    LOG_INFO("boot", "main loop entering, watchdog=5000 ms");
+    LOG_INFO("boot", "main loop entering, watchdog=5000 ms, core1 grace=%u ms",
+             (unsigned)CORE1_GRACE_MS);
 
     /* ── Main loop ────────────────────────────────────────────────────── */
     while (true) {
         modbus_poll();
-        watchdog_update();
+        wd_feed();
 
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();
         serial_poll();
 
-        watchdog_update();
+        wd_feed();
     }
 
     panic_unsupported();
