@@ -12,8 +12,8 @@
 /* Event queue (core0 -> core1). Sized to hold a full synchronous resync burst
  * without dropping: worst case 32 relays + 2*64 ballasts + 2*16 groups +
  * 2 scan_completes + up to 24*8 mappings = ~386 events, all pushed in one
- * IC_CMD_RESYNC handler before core 1 next drains. 512 leaves margin.
- * At ~32 B/element that is ~16 KB of SRAM. */
+ * IC_CMD_RESYNC handler before core 1 next drains. 512 leaves margin
+ * (~50 KB heap at this element size — plenty on the RP2040's 264 KB). */
 #define IC_EVENT_QUEUE_DEPTH 512
 /* Command queue (core1 -> core0). Commands are small and infrequent. */
 #define IC_CMD_QUEUE_DEPTH   16

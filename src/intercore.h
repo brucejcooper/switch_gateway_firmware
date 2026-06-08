@@ -20,6 +20,10 @@
 #include <stdbool.h>
 #include "mapping.h"   /* mapping_target_t, MAX_TARGETS_PER_BTN */
 
+/* Longest provisioning status message carried to core 1 (matches the gateway's
+ * PROV_STATUS_MSG_MAX; an independent constant to avoid header coupling). */
+#define IC_PROV_MSG_MAX 80
+
 /* Tri-state for on/off/toggle commands. */
 typedef enum { IC_TRI_OFF = 0, IC_TRI_ON = 1, IC_TRI_TOGGLE = 2 } ic_tri_t;
 
@@ -65,10 +69,10 @@ typedef struct {
         struct { uint8_t fixture, button; ic_btn_action_t action; } button;
         struct { uint8_t fixture, button, count;
                  mapping_target_t targets[MAX_TARGETS_PER_BTN]; } mapping;
-        /* state = raw prov_run_state_t value; consumer maps it to state + message
-         * strings (the gateway's free-form msg is not carried — keeps the event
-         * element small so the queue holds a full resync burst). */
-        struct { uint8_t slave, state, count; } provision;
+        /* state = raw prov_run_state_t value (consumer maps it to the short state
+         * string); msg is the gateway's free-form status text, carried verbatim
+         * so HA's "Commission Status" sensor keeps its detail. */
+        struct { uint8_t slave, state, count; char msg[IC_PROV_MSG_MAX]; } provision;
         struct { uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
                  uint32_t baud; } cfg;
     };
