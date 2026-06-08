@@ -21,6 +21,7 @@
 #include "pico/multicore.h"
 #include "pico/flash.h"
 #include "pico/time.h"
+#include <string.h>
 
 /* Explicit 8 KB core-1 stack (deliberately sized for the upcoming network stack
  * depth rather than taken on faith under the tighter RP2040 SRAM budget). */
@@ -44,11 +45,28 @@ static void core1_entry(void) {
     s_ready = true;
     LOG_INFO("core1", "flash lockout victim init %s", ok ? "ok" : "FAILED");
 
-    /* Bring up the W5100S (DHCP by default) and the MQTT connection manager.
-     * Both run as non-blocking state machines pumped from this loop. The
-     * /config.json net + broker settings are wired in later. */
-    netif_init(NULL);
-    mqtt_app_init(NULL);
+    /* Bring up the W5100S and the MQTT connection manager from the config
+     * snapshot core 0 filled before launch. Both are non-blocking SMs. */
+    const ic_snapshot_t *sn = intercore_snapshot();
+    netif_config_t nc;
+    memset(&nc, 0, sizeof nc);
+    nc.dhcp = sn->net_dhcp;
+    memcpy(nc.ip, sn->net_ip, 4);
+    memcpy(nc.sn, sn->net_mask, 4);
+    memcpy(nc.gw, sn->net_gw, 4);
+    memcpy(nc.dns, sn->net_dns, 4);
+    netif_init(&nc);
+
+    mqtt_config_t mc;
+    memset(&mc, 0, sizeof mc);
+    memcpy(mc.broker_ip, sn->mqtt_ip, 4);
+    mc.broker_port = sn->mqtt_port;
+    memcpy(mc.user, sn->mqtt_user, sizeof mc.user);
+    memcpy(mc.pass, sn->mqtt_pass, sizeof mc.pass);
+    memcpy(mc.prefix, sn->mqtt_prefix, sizeof mc.prefix);
+    mc.have_creds = sn->mqtt_have_creds;
+    mqtt_app_init(&mc);
+
     ha_bridge_init();
 
     uint32_t last_log_ms = 0;

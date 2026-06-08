@@ -156,10 +156,22 @@ uint32_t intercore_event_drops(void);
  * core 1 launch (and is effectively read-only thereafter; a runtime slave-list
  * change needs a reboot to re-discover, like a baud change). */
 typedef struct {
-    uint8_t relay_slaves[MAX_RELAY_SLAVES];
-    uint8_t relay_count;
-    uint8_t dali_slaves[MAX_DALI_SLAVES];
-    uint8_t dali_count;
+    uint8_t  relay_slaves[MAX_RELAY_SLAVES];
+    uint8_t  relay_count;
+    uint8_t  dali_slaves[MAX_DALI_SLAVES];
+    uint8_t  dali_count;
+
+    /* MQTT broker (host already resolved to an IP by core 0). */
+    uint8_t  mqtt_ip[4];
+    uint16_t mqtt_port;
+    char     mqtt_user[48];
+    char     mqtt_pass[64];
+    char     mqtt_prefix[24];
+    bool     mqtt_have_creds;
+
+    /* Network. */
+    bool     net_dhcp;
+    uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
 } ic_snapshot_t;
 
 void intercore_set_snapshot(const ic_snapshot_t *s);

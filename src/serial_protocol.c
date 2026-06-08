@@ -1932,6 +1932,71 @@ static void cmd_echo(char **saveptr) {
     txt_ok();
 }
 
+/* ── mqtt / net config CLI ─────────────────────────────────────────────── */
+static bool parse_ip4(const char *s, uint8_t ip[4]) {
+    unsigned a, b, c, d;
+    if (sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
+    ip[0] = (uint8_t)a; ip[1] = (uint8_t)b; ip[2] = (uint8_t)c; ip[3] = (uint8_t)d;
+    return true;
+}
+
+static void cmd_mqtt(char **sp) {
+    char *sub = strtok_r(NULL, " \t", sp);
+    if (!sub || strcasecmp(sub, "show") == 0) {
+        printf("mqtt host=%s port=%u user=%s prefix=%s creds=%s\n",
+               g_config.mqtt_host, g_config.mqtt_port, g_config.mqtt_user,
+               g_config.mqtt_prefix, g_config.mqtt_user[0] ? "yes" : "no");
+        return;
+    }
+    if (strcasecmp(sub, "set") != 0) { txt_err("bad_arg"); return; }
+    char *tok; bool any = false;
+    while ((tok = strtok_r(NULL, " \t", sp))) {
+        char *eq = strchr(tok, '='); if (!eq) continue;
+        *eq = '\0'; const char *k = tok, *v = eq + 1;
+        if      (!strcasecmp(k, "host"))   { strncpy(g_config.mqtt_host,   v, sizeof g_config.mqtt_host - 1);   any = true; }
+        else if (!strcasecmp(k, "port"))   { g_config.mqtt_port = (uint16_t)atoi(v);                            any = true; }
+        else if (!strcasecmp(k, "user"))   { strncpy(g_config.mqtt_user,   v, sizeof g_config.mqtt_user - 1);   any = true; }
+        else if (!strcasecmp(k, "pass"))   { strncpy(g_config.mqtt_pass,   v, sizeof g_config.mqtt_pass - 1);   any = true; }
+        else if (!strcasecmp(k, "prefix")) { strncpy(g_config.mqtt_prefix, v, sizeof g_config.mqtt_prefix - 1); any = true; }
+        else { txt_err("bad_key"); return; }
+    }
+    if (!any) { txt_err("no_fields"); return; }
+    config_save();
+    printf("ok (reboot to apply)\n");
+}
+
+static void cmd_net(char **sp) {
+    char *sub = strtok_r(NULL, " \t", sp);
+    if (!sub || strcasecmp(sub, "show") == 0) {
+        printf("net dhcp=%s ip=%u.%u.%u.%u mask=%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u\n",
+               g_config.net_dhcp ? "on" : "off",
+               g_config.net_ip[0], g_config.net_ip[1], g_config.net_ip[2], g_config.net_ip[3],
+               g_config.net_mask[0], g_config.net_mask[1], g_config.net_mask[2], g_config.net_mask[3],
+               g_config.net_gw[0], g_config.net_gw[1], g_config.net_gw[2], g_config.net_gw[3],
+               g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3]);
+        return;
+    }
+    if (strcasecmp(sub, "set") != 0) { txt_err("bad_arg"); return; }
+    char *tok; bool any = false;
+    while ((tok = strtok_r(NULL, " \t", sp))) {
+        char *eq = strchr(tok, '='); if (!eq) continue;
+        *eq = '\0'; const char *k = tok, *v = eq + 1;
+        if (!strcasecmp(k, "dhcp")) {
+            int o = parse_on_off_toggle(v);
+            if (o != 0 && o != 1) { txt_err("bad_arg"); return; }
+            g_config.net_dhcp = (uint8_t)o; any = true;
+        }
+        else if (!strcasecmp(k, "ip"))   { if (!parse_ip4(v, g_config.net_ip))   { txt_err("bad_ip"); return; } any = true; }
+        else if (!strcasecmp(k, "mask")) { if (!parse_ip4(v, g_config.net_mask)) { txt_err("bad_ip"); return; } any = true; }
+        else if (!strcasecmp(k, "gw"))   { if (!parse_ip4(v, g_config.net_gw))   { txt_err("bad_ip"); return; } any = true; }
+        else if (!strcasecmp(k, "dns"))  { if (!parse_ip4(v, g_config.net_dns))  { txt_err("bad_ip"); return; } any = true; }
+        else { txt_err("bad_key"); return; }
+    }
+    if (!any) { txt_err("no_fields"); return; }
+    config_save();
+    printf("ok (reboot to apply)\n");
+}
+
 /* ── Top-level text dispatcher ─────────────────────────────────────────── */
 static void handle_text_line(const char *original_line) {
     LOG_INFO("cli", "rx: %s", original_line);
@@ -1968,6 +2033,14 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "cfg") == 0) {
         cmd_cfg(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "mqtt") == 0) {
+        cmd_mqtt(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "net") == 0) {
+        cmd_net(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "dali_raw") == 0) {

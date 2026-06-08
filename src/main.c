@@ -161,6 +161,24 @@ int main(void) {
     memcpy(snap.relay_slaves, g_config.relay_slave_ids, g_config.relay_slave_count);
     snap.dali_count = g_config.dali_slave_count;
     memcpy(snap.dali_slaves, g_config.dali_slave_ids, g_config.dali_slave_count);
+    /* MQTT: parse the broker host (dotted-quad) to an IP; 0.0.0.0 if unset. */
+    {
+        unsigned a0, a1, a2, a3;
+        if (sscanf(g_config.mqtt_host, "%u.%u.%u.%u", &a0, &a1, &a2, &a3) == 4) {
+            snap.mqtt_ip[0] = (uint8_t)a0; snap.mqtt_ip[1] = (uint8_t)a1;
+            snap.mqtt_ip[2] = (uint8_t)a2; snap.mqtt_ip[3] = (uint8_t)a3;
+        }
+    }
+    snap.mqtt_port = g_config.mqtt_port;
+    memcpy(snap.mqtt_user,   g_config.mqtt_user,   sizeof snap.mqtt_user);
+    memcpy(snap.mqtt_pass,   g_config.mqtt_pass,   sizeof snap.mqtt_pass);
+    memcpy(snap.mqtt_prefix, g_config.mqtt_prefix, sizeof snap.mqtt_prefix);
+    snap.mqtt_have_creds = g_config.mqtt_user[0] != '\0';
+    snap.net_dhcp = g_config.net_dhcp != 0;
+    memcpy(snap.net_ip,   g_config.net_ip,   4);
+    memcpy(snap.net_mask, g_config.net_mask, 4);
+    memcpy(snap.net_gw,   g_config.net_gw,   4);
+    memcpy(snap.net_dns,  g_config.net_dns,  4);
     intercore_set_snapshot(&snap);
 
     core1_launch();

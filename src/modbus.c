@@ -11,6 +11,7 @@
  */
 
 #include "modbus.h"
+#include "config.h"
 #include "log.h"
 #include "hardware/gpio.h"
 #include "hardware/uart.h"
@@ -233,31 +234,10 @@ static int64_t release_de(alarm_id_t id, void *userdata) {
 }
 
 /* ── Config helpers ──────────────────────────────────────────────────────── */
-static char *trimwhitespace(char *str) {
-    char *end;
-    while (isspace((unsigned char)*str)) str++;
-    if (*str == 0) return str;
-    end = str + strlen(str) - 1;
-    while (end > str && isspace((unsigned char)*end)) end--;
-    end[1] = '\0';
-    return str;
-}
-
-static modbus_de_mode_t parseDeMode(const char *str) {
-    for (modbus_de_mode_t mode = 0; mode < MODBUS_DE_MAX; mode++) {
-        if (strcmp(str, modbus_de_mode_str[mode]) == 0) return mode;
-    }
-    LOG_WARN("modbus", "unknown DE mode '%s' — assuming tx", str);
-    return MODBUS_DE_WHENTX;
-}
-
 void set_modbus_de_mode(modbus_de_mode_t mode) {
-    de_mode    = mode;
-    FILE *fp   = fopen("/modbus_config.txt", "w");
-    if (fp) {
-        fprintf(fp, "%s\n", modbus_de_mode_str[mode]);
-        fclose(fp);
-    }
+    de_mode = mode;
+    g_config.de_mode = (uint8_t)mode;   /* persisted via the unified config.json */
+    config_save();
 }
 
 modbus_de_mode_t modbus_get_de_mode(void) { return de_mode; }
@@ -268,12 +248,9 @@ const char *modbus_de_mode_to_str(modbus_de_mode_t mode) {
 }
 
 void modbus_set_baud(uint32_t baud) {
-    s_baud   = baud;
-    FILE *fp = fopen("/modbus_baud.txt", "w");
-    if (fp) {
-        fprintf(fp, "%lu\n", (unsigned long)baud);
-        fclose(fp);
-    }
+    s_baud = baud;
+    g_config.baud = baud;               /* persisted via the unified config.json */
+    config_save();
 }
 
 uint32_t modbus_get_baud(void) { return s_baud; }
@@ -289,28 +266,11 @@ void modbus_init(void) {
     queue_init(&action_queue,   sizeof(modbus_action_t), 256);
     queue_init(&response_queue, sizeof(modbus_action_t),  20);
 
-    /* Load DE mode */
-    char tmp_buf[32];
-    FILE *fp = fopen("/modbus_config.txt", "r");
-    if (fp) {
-        size_t n = fread(tmp_buf, 1, sizeof(tmp_buf) - 1, fp);
-        tmp_buf[n] = '\0';
-        fclose(fp);
-        de_mode = parseDeMode(trimwhitespace(tmp_buf));
-    } else {
-        de_mode = MODBUS_DE_WHENTX;
-    }
-
-    /* Load baud rate */
-    fp = fopen("/modbus_baud.txt", "r");
-    if (fp) {
-        unsigned long b = DEFAULT_BAUD_RATE;
-        fscanf(fp, "%lu", &b);
-        fclose(fp);
-        s_baud = (uint32_t)b;
-    } else {
-        s_baud = DEFAULT_BAUD_RATE;
-    }
+    /* Baud + DE mode now come from the unified config (loaded by config_load()
+     * before modbus_init(); migrated once from the legacy /modbus_*.txt files). */
+    de_mode = (g_config.de_mode < MODBUS_DE_MAX) ? (modbus_de_mode_t)g_config.de_mode
+                                                 : MODBUS_DE_WHENTX;
+    s_baud  = g_config.baud ? g_config.baud : DEFAULT_BAUD_RATE;
 
     LOG_INFO("modbus", "init de_mode=%s baud=%lu",
              modbus_de_mode_str[de_mode], (unsigned long)s_baud);

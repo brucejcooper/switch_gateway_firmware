@@ -70,8 +70,11 @@ target_link_libraries(light_switch PRIVATE
     pico_time
 )
 
-# jsmn — single-header JSON tokenizer used by core 1 (malloc-free, float-free).
+# jsmn — single-header JSON tokenizer (malloc-free, float-free). JSMN_STATIC so
+# each TU that includes it (config.c on core 0, ha_bridge.c on core 1) gets its
+# own copy — no duplicate-symbol link error.
 target_include_directories(light_switch PRIVATE ${CMAKE_CURRENT_LIST_DIR}/lib/jsmn)
+target_compile_definitions(light_switch PRIVATE JSMN_STATIC)
 
 # ── WIZnet W5100S networking (ioLibrary_Driver) — core 1 only ───────────────
 set(IOLIB ${CMAKE_CURRENT_LIST_DIR}/lib/ioLibrary_Driver)
