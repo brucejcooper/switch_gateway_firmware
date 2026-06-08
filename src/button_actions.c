@@ -82,9 +82,9 @@ void buttongrid_init(void) {
         &buttongrid_program, &pio, &sm, &offset);
     hard_assert(success);
 
-    unsigned pioIrq = (pio == pio0) ? PIO0_IRQ_0
-                    : (pio == pio1) ? PIO1_IRQ_0
-                                    : PIO2_IRQ_0;
+    /* Platform-agnostic PIO->IRQ mapping. The old hand-rolled ternary fell back
+     * to PIO2_IRQ_0, which only exists on RP2350 (3 PIO blocks); RP2040 has 2. */
+    unsigned pioIrq = (unsigned)pio_get_irq_num(pio, 0);
     irq_set_exclusive_handler(pioIrq, sample_available);
     irq_set_enabled(pioIrq, true);
 

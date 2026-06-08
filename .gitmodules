@@ -4,3 +4,9 @@
 [submodule "lib/pico-vfs"]
 	path = lib/pico-vfs
 	url = https://github.com/oyama/pico-vfs.git
+[submodule "lib/ioLibrary_Driver"]
+	path = lib/ioLibrary_Driver
+	url = https://github.com/Wiznet/ioLibrary_Driver.git
+[submodule "lib/coreMQTT"]
+	path = lib/coreMQTT
+	url = https://github.com/FreeRTOS/coreMQTT.git

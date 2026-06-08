@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.13)
 
-set(PICO_PLATFORM "rp2350")
+# Board: WIZnet W5100S-EVB-Pico (RP2040). The board header pins PICO_PLATFORM=rp2040,
+# the W5100S SPI0 pins (SCK18/MOSI19/MISO16/CS17/RST20/INT21), 2 MB flash + W25Q080
+# stage2. (Was a bare Pico 2 / rp2350 before the on-board-bridge work.)
+set(PICO_BOARD wiznet_w5100s_evb_pico)
 set(PICO_SDK_PATH "lib/pico-sdk")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -60,9 +63,13 @@ target_link_libraries(light_switch PRIVATE
     hardware_watchdog
     hardware_flash
     pico_flash
-    pico_util          # queue_t
+    pico_multicore     # core 1 network bridge
+    pico_util          # queue_t (inter-core SPSC queues)
     pico_time
 )
+
+# jsmn — single-header JSON tokenizer used by core 1 (malloc-free, float-free).
+target_include_directories(light_switch PRIVATE ${CMAKE_CURRENT_LIST_DIR}/lib/jsmn)
 
 # USB CDC for serial protocol (replaces Lua REPL)
 pico_enable_stdio_usb(light_switch 1)
