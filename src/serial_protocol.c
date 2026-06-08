@@ -2450,6 +2450,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         break;
     case IC_CMD_RESYNC:
         serial_tx_hello();
+        emit_state_cfg();          /* core 1 builds the controller config device */
         lighting_resync_emit();
         serial_tx_config_full();
         break;

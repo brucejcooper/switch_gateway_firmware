@@ -51,24 +51,19 @@ static void core1_entry(void) {
     mqtt_app_init(NULL);
     ha_bridge_init();
 
-    uint32_t discarded = 0, last_log_ms = 0;
-    ic_event_t ev;
+    uint32_t last_log_ms = 0;
     while (true) {
         s_heartbeat_ms = to_ms_since_boot(get_absolute_time());
 
         netif_tick();
         mqtt_app_tick();
-        ha_bridge_tick();   /* incremental discovery publish while connected */
-
-        /* Drain and discard for now (the translation layer publishes these). */
-        while (intercore_pop_event(&ev)) discarded++;
+        ha_bridge_tick();   /* discovery + availability sweep + event->MQTT pump */
 
         if (s_heartbeat_ms - last_log_ms >= 5000u) {
             last_log_ms = s_heartbeat_ms;
-            LOG_INFO("core1", "alive: link=%d ready=%d mqtt=%d drained=%lu drops=%lu",
+            LOG_INFO("core1", "alive: link=%d ready=%d mqtt=%d evt_drops=%lu",
                      (int)netif_link_up(), (int)netif_ready(),
                      (int)mqtt_app_connected(),
-                     (unsigned long)discarded,
                      (unsigned long)intercore_event_drops());
         }
     }
