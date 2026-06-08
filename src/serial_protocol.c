@@ -158,28 +158,6 @@ static uint8_t parse_targets(const char *line, mapping_target_t *out, uint8_t ma
  * (count == 0) clears the bridge's retained MQTT entry for that button. */
 static void emit_config_mapping(uint8_t fixture, uint8_t button,
                                 const mapping_target_t *targets, uint8_t count) {
-    char mbuf[256];
-    int n = snprintf(mbuf, sizeof(mbuf),
-                     "{\"t\":\"config_mapping\","
-                     "\"d\":{\"fixture\":%u,\"button\":%u},"
-                     "\"v\":{\"targets\":[",
-                     fixture, button);
-    for (int i = 0; i < count; i++) {
-        if (TARGET_IS_GROUP(targets[i])) {
-            n += snprintf(mbuf + n, sizeof(mbuf) - n,
-                          "%s{\"slave\":%u,\"group\":%u}",
-                          i > 0 ? "," : "",
-                          targets[i].slave, TARGET_GROUP_NUM(targets[i]));
-        } else {
-            n += snprintf(mbuf + n, sizeof(mbuf) - n,
-                          "%s{\"slave\":%u,\"addr\":%u}",
-                          i > 0 ? "," : "",
-                          targets[i].slave, targets[i].addr);
-        }
-    }
-    n += snprintf(mbuf + n, sizeof(mbuf) - n, "]}}\n");
-    printf("%s", mbuf);
-
     /* Forward the binding to core 1 (the MQTT bridge) as a typed struct. */
     ic_event_t ev = { .type = IC_EVT_MAPPING };
     ev.mapping.fixture = fixture;
@@ -188,210 +166,6 @@ static void emit_config_mapping(uint8_t fixture, uint8_t button,
     for (int i = 0; i < count && i < MAX_TARGETS_PER_BTN; i++)
         ev.mapping.targets[i] = targets[i];
     intercore_push_event(&ev);
-}
-
-/* ── Process one inbound JSON line ──────────────────────────────────────── */
-static void handle_json_line(const char *line) {
-    char t[32];
-    if (!json_str(line, "t", t, sizeof(t))) return;
-
-    int id = 0;
-    json_int(line, "id", &id);
-    unsigned cmd_id = (unsigned)id;
-
-    /* ── set_dali / get_dali ───────────────────────────────────────────────
-     * {"t":"set_dali","d":{"slave":S,"addr":A},"v":{<any of: on bri min max
-     *   power_on sys_fail fade_rate fade_time>}}.  on accepts true/false/toggle.
-     * get_dali emits the state_dali report (same d/v shape). */
-    if (strcmp(t, "set_dali") == 0 || strcmp(t, "get_dali") == 0) {
-        int slave = 0, addr = 0;
-        json_int(line, "slave", &slave);
-        json_int(line, "addr",  &addr);
-        if (state_cache_slave_idx((uint8_t)slave) < 0) {
-            serial_tx_ack(cmd_id, false, "invalid_slave"); return;
-        }
-        if (addr < 0 || addr > 63) {
-            serial_tx_ack(cmd_id, false, "out_of_range"); return;
-        }
-        if (t[0] == 'g') {
-            emit_state_dali((uint8_t)slave, (uint8_t)addr);
-            serial_tx_ack(cmd_id, true, NULL); return;
-        }
-        static const char *keys[] = { "on", "bri", "min", "max",
-                                      "power_on", "sys_fail", "fade_rate", "fade_time" };
-        char buf[16];
-        bool any = false, ok = true, emit_now = false;
-        for (unsigned i = 0; i < 8; i++)
-            if (json_str(line, keys[i], buf, sizeof buf)) {
-                any = true;
-                int r = dali_apply_kv((uint8_t)slave, (uint8_t)addr, keys[i], buf);
-                if (r == 1) emit_now = true;   /* a key with a known resulting level */
-                else if (r != 2) ok = false;   /* 2 = applied, level deferred to the read */
-            }
-        if (any) {
-            dirty_poll_mark_active((uint8_t)slave);
-            /* Emit the optimistic report only when we actually know the new level.
-             * A bare "on" defers — the dirty-poll delivers the real brightness so
-             * HA reflects the device instead of a guess. */
-            if (emit_now) emit_state_dali((uint8_t)slave, (uint8_t)addr);
-        }
-        serial_tx_ack(cmd_id, any && ok, !any ? "no_fields" : (ok ? NULL : "set_failed"));
-        return;
-    }
-
-    /* ── set_relay / get_relay ──── {"d":{"ch":C},"v":{"on":true|false|toggle}} */
-    if (strcmp(t, "set_relay") == 0 || strcmp(t, "get_relay") == 0) {
-        int ch = 0;
-        json_int(line, "ch", &ch);
-        if (ch < 0 || ch >= RELAY_COUNT) { serial_tx_ack(cmd_id, false, "out_of_range"); return; }
-        if (t[0] == 'g') { emit_state_relay((uint8_t)ch); serial_tx_ack(cmd_id, true, NULL); return; }
-        char buf[16];
-        if (!json_str(line, "on", buf, sizeof buf)) { serial_tx_ack(cmd_id, false, "no_fields"); return; }
-        bool on = (strcasecmp(buf, "toggle") == 0) ? !state_cache_get_relay_on((uint8_t)ch)
-                : (strcmp(buf, "true") == 0 || strcmp(buf, "1") == 0 || strcasecmp(buf, "on") == 0);
-        lighting_set_relay((uint8_t)ch, on);
-        state_cache_set_relay((uint8_t)ch, on);   /* predictive — write cb confirms async */
-        emit_state_relay((uint8_t)ch);
-        serial_tx_ack(cmd_id, true, NULL);
-        return;
-    }
-
-    /* ── set_group / get_group ──── {"d":{"slave":S,"group":G},
-     *   "v":{"on"|"bri", "members":[…] | "add":[…] | "remove":[…]}}.
-     * members replaces the membership; add/remove are granular. */
-    if (strcmp(t, "set_group") == 0 || strcmp(t, "get_group") == 0) {
-        int slave = 0, group = 0;
-        json_int(line, "slave", &slave);
-        json_int(line, "group", &group);
-        if (state_cache_slave_idx((uint8_t)slave) < 0) { serial_tx_ack(cmd_id, false, "invalid_slave"); return; }
-        if (group < 0 || group > 15) { serial_tx_ack(cmd_id, false, "invalid_group"); return; }
-        if (t[0] == 'g') { emit_state_group((uint8_t)slave, (uint8_t)group); serial_tx_ack(cmd_id, true, NULL); return; }
-        bool any = false;
-        /* membership */
-        int idx = state_cache_slave_idx((uint8_t)slave);
-        uint64_t mask = state_cache_get_dali_group((uint8_t)idx, (uint8_t)group);
-        bool mask_set = false;
-        uint8_t arr[DALI_ADDR_COUNT]; int n;
-        if ((n = json_uint8_array(line, "members", arr, DALI_ADDR_COUNT)) >= 0) {
-            mask = 0;
-            for (int i = 0; i < n; i++) if (arr[i] < 64) mask |= (uint64_t)1 << arr[i];
-            mask_set = true;
-        }
-        if ((n = json_uint8_array(line, "add", arr, DALI_ADDR_COUNT)) >= 0) {
-            for (int i = 0; i < n; i++) if (arr[i] < 64) mask |= (uint64_t)1 << arr[i];
-            mask_set = true;
-        }
-        if ((n = json_uint8_array(line, "remove", arr, DALI_ADDR_COUNT)) >= 0) {
-            for (int i = 0; i < n; i++) if (arr[i] < 64) mask &= ~((uint64_t)1 << arr[i]);
-            mask_set = true;
-        }
-        if (mask_set) { dali_group_set_members((uint8_t)slave, (uint8_t)group, mask); any = true; }
-        /* state */
-        int bri; bool on = false;
-        if (json_int(line, "bri", &bri)) {
-            lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)bri); any = true;
-        } else if (json_bool(line, "on", &on)) {
-            lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, on); any = true;
-        }
-        if (any) { dirty_poll_mark_active((uint8_t)slave); emit_state_group((uint8_t)slave, (uint8_t)group); }
-        serial_tx_ack(cmd_id, any, any ? NULL : "no_fields");
-        return;
-    }
-
-    /* ── set_cfg / get_cfg ──── controller device config {"v":{...}} ─────────
-     * Settable: long_press_ms dim_repeat_ms reversal_window_ms baud
-     *           relay_slaves[] dali_slaves[].  fw_version is read-only.
-     * baud takes effect on reboot. */
-    if (strcmp(t, "set_cfg") == 0 || strcmp(t, "get_cfg") == 0) {
-        if (t[0] == 'g') { emit_state_cfg(); serial_tx_ack(cmd_id, true, NULL); return; }
-        int v, n; bool any = false, reboot = false;
-        uint8_t arr[MAX_DALI_SLAVES > MAX_RELAY_SLAVES ? MAX_DALI_SLAVES : MAX_RELAY_SLAVES];
-        if (json_int(line, "long_press_ms", &v))      { g_config.long_press_ms = (uint16_t)v; any = true; }
-        if (json_int(line, "dim_repeat_ms", &v))      { g_config.dim_repeat_ms = (uint16_t)v; any = true; }
-        if (json_int(line, "reversal_window_ms", &v)) { g_config.reversal_window_ms = (uint16_t)v; any = true; }
-        if ((n = json_uint8_array(line, "relay_slaves", arr, MAX_RELAY_SLAVES)) >= 0) {
-            g_config.relay_slave_count = (uint8_t)n;
-            for (int i = 0; i < n; i++) g_config.relay_slave_ids[i] = arr[i];
-            any = true;
-        }
-        if ((n = json_uint8_array(line, "dali_slaves", arr, MAX_DALI_SLAVES)) >= 0) {
-            g_config.dali_slave_count = (uint8_t)n;
-            for (int i = 0; i < n; i++) g_config.dali_slave_ids[i] = arr[i];
-            any = true;
-        }
-        if (json_int(line, "baud", &v) && v > 0) { modbus_set_baud((uint32_t)v); any = true; reboot = true; }
-        if (any) config_save();
-        emit_state_cfg();
-        serial_tx_ack(cmd_id, any, !any ? "no_fields" : (reboot ? "reboot_required_for_baud" : NULL));
-        return;
-    }
-
-    /* ── get_mapping ──── one (fixture,button) → config_mapping report ─────── */
-    if (strcmp(t, "get_mapping") == 0) {
-        int fixture = 0, button = 0;
-        json_int(line, "fixture", &fixture);
-        json_int(line, "button",  &button);
-        const mapping_record_t *rec = mapping_lookup((uint8_t)fixture, (uint8_t)button);
-        emit_config_mapping((uint8_t)fixture, (uint8_t)button,
-                            rec ? rec->targets : NULL, rec ? rec->target_count : 0);
-        serial_tx_ack(cmd_id, true, NULL);
-        return;
-    }
-
-    /* ── get_mappings ──── dump every binding as config_mapping reports ────── */
-    if (strcmp(t, "get_mappings") == 0) {
-        serial_tx_config_full();
-        return;
-    }
-
-    /* ── resync ────────────────────────────────────────────────────────── */
-    if (strcmp(t, "resync") == 0) {
-        serial_tx_hello();
-        lighting_resync_emit();
-        serial_tx_config_full();
-        serial_tx_ack(cmd_id, true, NULL);
-        return;
-    }
-
-    /* ── set_mapping ───────────────────────────────────────────────────── */
-    if (strcmp(t, "set_mapping") == 0) {
-        int fixture = 0, button = 0;
-        json_int(line, "fixture", &fixture);
-        json_int(line, "button",  &button);
-        mapping_target_t targets[MAX_TARGETS_PER_BTN];
-        uint8_t count = parse_targets(line, targets, MAX_TARGETS_PER_BTN);
-        bool ok = mapping_set((uint8_t)fixture, (uint8_t)button, targets, count);
-        if (ok) {
-            emit_config_mapping((uint8_t)fixture, (uint8_t)button, targets, count);
-        }
-        serial_tx_ack(cmd_id, ok, ok ? NULL : "save_failed");
-        return;
-    }
-
-    /* ── del_mapping ───────────────────────────────────────────────────── */
-    if (strcmp(t, "del_mapping") == 0) {
-        int fixture = 0, button = 0;
-        json_int(line, "fixture", &fixture);
-        json_int(line, "button",  &button);
-        bool ok = mapping_delete((uint8_t)fixture, (uint8_t)button);
-        if (ok) {
-            emit_config_mapping((uint8_t)fixture, (uint8_t)button, NULL, 0);
-        }
-        serial_tx_ack(cmd_id, ok, ok ? NULL : "save_failed");
-        return;
-    }
-
-    /* ── provision_start ──────────────────────────────────────────────── */
-    if (strcmp(t, "provision_start") == 0) {
-        serial_handle_provision_start(line, cmd_id);
-        return;
-    }
-
-    /* ── provision_abort ──────────────────────────────────────────────── */
-    if (strcmp(t, "provision_abort") == 0) {
-        serial_handle_provision_abort(line, cmd_id);
-        return;
-    }
 }
 
 /* ──────────────────────────────────────────────────────────────────────────
@@ -409,11 +183,10 @@ static void handle_line(const char *line) {
     while (*line == ' ' || *line == '\t') line++;
     if (*line == '\0') return;
 
-    if (*line == '{') {
-        handle_json_line(line);
-    } else {
-        handle_text_line(line);
-    }
+    /* USB CDC is a human text CLI only — JSON is gone (core 1 owns the MQTT
+     * wire). Ignore any stray '{' line rather than parse it. */
+    if (*line == '{') return;
+    handle_text_line(line);
 }
 
 /* ── helpers ────────────────────────────────────────────────────────────── */
@@ -1240,26 +1013,13 @@ static unsigned long now_ms_u(void) {
     return (unsigned long)to_ms_since_boot(get_absolute_time());
 }
 
+/* Push the cached state of one entity to core 1 (the network bridge). These are
+ * the get/predictive paths; the unsolicited dirty-poll path goes through the
+ * lighting event ring + levt_to_ic in serial_poll(). USB CDC carries no JSON —
+ * it is a human text CLI only (see `show`). */
 static void emit_state_dali(uint8_t slave, uint8_t addr) {
     int idx = state_cache_slave_idx(slave);
     dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
-    printf("{\"t\":\"state_dali\",\"ts\":%lu,\"d\":{\"slave\":%u,\"addr\":%u},"
-           "\"v\":{\"on\":%s,\"bri\":%u,\"fading\":%s,\"lamp_fail\":%s,"
-           "\"min\":%u,\"max\":%u,\"power_on\":%u,\"sys_fail\":%u,"
-           "\"fade_rate\":%u,\"fade_time\":%u}}\n",
-           now_ms_u(), slave, addr,
-           (b && b->arc_level > 0) ? "true" : "false", b ? b->arc_level : 0,
-           (b && (b->status_byte & 0x10)) ? "true" : "false",
-           (b && (b->status_byte & 0x02)) ? "true" : "false",
-           b ? b->min_level : 0, b ? b->max_level : 0,
-           b ? b->power_on_level : 0, b ? b->sys_fail_level : 0,
-           b ? b->fade_rate : 0, b ? b->fade_time : 0);
-
-    /* Forward to core 1. emit_state_dali() is the get/predictive path (the
-     * unsolicited dirty-poll path goes through emit_event + levt_to_ic), so this
-     * is the only place a config-only set_dali — which produces no dirty-poll
-     * dali event — reaches core 1. The predictive level reports are idempotent
-     * with the later dirty-poll confirmation. */
     ic_event_t ev = { .type = IC_EVT_DALI };
     ev.dali.slave     = slave;
     ev.dali.addr      = addr;
@@ -1275,22 +1035,21 @@ static void emit_state_dali(uint8_t slave, uint8_t addr) {
 }
 
 static void emit_state_relay(uint8_t ch) {
-    printf("{\"t\":\"state_relay\",\"ts\":%lu,\"d\":{\"ch\":%u},\"v\":{\"on\":%s}}\n",
-           now_ms_u(), ch, state_cache_get_relay_on(ch) ? "true" : "false");
+    ic_event_t ev = { .type = IC_EVT_RELAY };
+    ev.relay.ch = ch;
+    ev.relay.on = state_cache_get_relay_on(ch);
+    intercore_push_event(&ev);
 }
 
 static void emit_state_group(uint8_t slave, uint8_t group) {
     int idx = state_cache_slave_idx(slave);
-    bool     on      = idx >= 0 && state_cache_dali_group_any_on((uint8_t)idx, group);
-    uint8_t  bri     = idx >= 0 ? state_cache_dali_group_max_bri((uint8_t)idx, group) : 0;
-    uint64_t members = idx >= 0 ? state_cache_get_dali_group((uint8_t)idx, group) : 0;
-    printf("{\"t\":\"state_group\",\"ts\":%lu,\"d\":{\"slave\":%u,\"group\":%u},"
-           "\"v\":{\"on\":%s,\"bri\":%u,\"members\":[",
-           now_ms_u(), slave, group, on ? "true" : "false", bri);
-    bool first = true;
-    for (int a = 0; a < DALI_ADDR_COUNT; a++)
-        if (members & ((uint64_t)1 << a)) { printf("%s%d", first ? "" : ",", a); first = false; }
-    printf("]}}\n");
+    ic_event_t ev = { .type = IC_EVT_GROUP };
+    ev.group.slave   = slave;
+    ev.group.group   = group;
+    ev.group.on      = idx >= 0 && state_cache_dali_group_any_on((uint8_t)idx, group);
+    ev.group.bri     = idx >= 0 ? state_cache_dali_group_max_bri((uint8_t)idx, group) : 0;
+    ev.group.members = idx >= 0 ? state_cache_get_dali_group((uint8_t)idx, group) : 0;
+    intercore_push_event(&ev);
 }
 
 /* Set a DALI group's full membership mask.  Writes the changed group-mask
@@ -1323,21 +1082,8 @@ static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_ma
 }
 
 static void emit_state_cfg(void) {
-    printf("{\"t\":\"state_cfg\",\"ts\":%lu,\"v\":{\"fw_version\":\"%s\","
-           "\"baud\":%lu,\"relay_slaves\":[",
-           now_ms_u(), FW_VERSION, (unsigned long)modbus_get_baud());
-    for (int i = 0; i < g_config.relay_slave_count; i++)
-        printf("%s%u", i ? "," : "", g_config.relay_slave_ids[i]);
-    printf("],\"dali_slaves\":[");
-    for (int i = 0; i < g_config.dali_slave_count; i++)
-        printf("%s%u", i ? "," : "", g_config.dali_slave_ids[i]);
-    printf("],\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,"
-           "\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u}}\n",
-           g_config.long_press_ms, g_config.dim_repeat_ms, g_config.reversal_window_ms,
-           (unsigned)MAX_FIXTURES, (unsigned)MAX_BUTTONS, (unsigned)MAX_TARGETS_PER_BTN);
-
-    /* Forward the controller config to core 1. fw_version / slave lists / grid
-     * dimensions are derived on core 1 from its config snapshot + version.h. */
+    /* fw_version / slave lists / grid dimensions are derived on core 1 from its
+     * config snapshot + version.h. */
     ic_event_t ev = { .type = IC_EVT_CFG };
     ev.cfg.long_press_ms      = g_config.long_press_ms;
     ev.cfg.dim_repeat_ms      = g_config.dim_repeat_ms;
@@ -2106,187 +1852,6 @@ typedef struct {
     };
 } levt_t;
 
-static void emit_event(const levt_t *e) {
-    uint32_t ts = to_ms_since_boot(get_absolute_time());
-
-    switch (e->type) {
-    case LEVT_RELAY: {
-        uint8_t rsid = g_config.relay_slave_count > 0
-                       ? g_config.relay_slave_ids[0] : 0;
-        printf("{\"t\":\"state_relay\",\"ts\":%lu,"
-               "\"d\":{\"ch\":%u},\"v\":{\"on\":%s}}\n",
-               (unsigned long)ts, e->relay.ch,
-               e->relay.on ? "true" : "false");
-        LOG_DBG("serial", "evt state_relay slave=%u addr=%u",
-                rsid, e->relay.ch);
-        break;
-    }
-
-    case LEVT_DALI: {
-        bool fading    = (e->dali.status & 0x10) != 0;
-        bool lamp_fail = (e->dali.status & 0x02) != 0;
-        /* Include the cached ballast config so Home Assistant gets min/max/fade
-         * with every state update (the values come from the full scan). */
-        int didx = state_cache_slave_idx(e->dali.slave_id);
-        dali_ballast_state_t *b =
-            didx >= 0 ? state_cache_get_dali((uint8_t)didx, e->dali.addr) : NULL;
-        printf("{\"t\":\"state_dali\",\"ts\":%lu,"
-               "\"d\":{\"slave\":%u,\"addr\":%u},"
-               "\"v\":{\"on\":%s,\"bri\":%u,\"fading\":%s,\"lamp_fail\":%s,"
-               "\"min\":%u,\"max\":%u,\"power_on\":%u,\"sys_fail\":%u,"
-               "\"fade_rate\":%u,\"fade_time\":%u}}\n",
-               (unsigned long)ts,
-               e->dali.slave_id, e->dali.addr,
-               e->dali.arc > 0 ? "true" : "false",
-               e->dali.arc,
-               fading    ? "true" : "false",
-               lamp_fail ? "true" : "false",
-               b ? b->min_level : 0, b ? b->max_level : 0,
-               b ? b->power_on_level : 0, b ? b->sys_fail_level : 0,
-               b ? b->fade_rate : 0, b ? b->fade_time : 0);
-        LOG_DBG("serial", "evt state_dali slave=%u addr=%u",
-                e->dali.slave_id, e->dali.addr);
-        break;
-    }
-
-    case LEVT_PRESENCE: {
-        char appeared[192]    = "[";
-        char disappeared[192] = "[";
-        int  ap = 1, dp = 1;
-        bool fa = true, fd = true;
-        for (int a = 0; a < 64; a++) {
-            if (e->presence.appeared    & ((uint64_t)1 << a))
-                ap += snprintf(appeared + ap, sizeof(appeared) - ap,
-                               "%s%d", fa ? (fa=false,"") : ",", a);
-            if (e->presence.disappeared & ((uint64_t)1 << a))
-                dp += snprintf(disappeared + dp, sizeof(disappeared) - dp,
-                               "%s%d", fd ? (fd=false,"") : ",", a);
-        }
-        strncat(appeared,    "]", sizeof(appeared)    - strlen(appeared)    - 1);
-        strncat(disappeared, "]", sizeof(disappeared) - strlen(disappeared) - 1);
-        printf("{\"t\":\"presence\",\"ts\":%lu,"
-               "\"d\":{\"slave\":%u},"
-               "\"v\":{\"appeared\":%s,\"disappeared\":%s}}\n",
-               (unsigned long)ts, e->presence.slave_id, appeared, disappeared);
-        LOG_DBG("serial", "presence slave=%u +0x%016llx -0x%016llx",
-                e->presence.slave_id,
-                (unsigned long long)e->presence.appeared,
-                (unsigned long long)e->presence.disappeared);
-        break;
-    }
-
-    case LEVT_FAULT:
-        printf("{\"t\":\"fault\",\"ts\":%lu,"
-               "\"d\":{\"slave\":%u,\"addr\":%u},"
-               "\"v\":{\"lamp_fail\":%s,\"power_cycle\":%s}}\n",
-               (unsigned long)ts,
-               e->fault.slave_id, e->fault.addr,
-               e->fault.lamp_fail   ? "true" : "false",
-               e->fault.power_cycle ? "true" : "false");
-        LOG_INFO("serial", "fault slave=%u.%u lamp=%s pwr=%s",
-                 e->fault.slave_id, e->fault.addr,
-                 e->fault.lamp_fail   ? "true" : "false",
-                 e->fault.power_cycle ? "true" : "false");
-        break;
-
-    case LEVT_SCAN_COMPLETE: {
-        /* Emit present bitmask as a JSON array of responding addresses.
-         * fix #6: bridge uses this to set per-ballast MQTT availability.
-         * Also emit per-group membership read live from state_cache —
-         * see Layer 2 design notes (Option A). */
-        char present_arr[256] = "[";
-        int  pp = 1;
-        bool first = true;
-        for (int a = 0; a < 64; a++) {
-            if (e->scan_complete.present_mask & ((uint64_t)1 << a)) {
-                pp += snprintf(present_arr + pp, sizeof(present_arr) - pp,
-                               "%s%d", first ? "" : ",", a);
-                first = false;
-            }
-        }
-        strncat(present_arr, "]",
-                sizeof(present_arr) - strlen(present_arr) - 1);
-
-        /* Build the groups object. Empty groups are omitted. Member arrays
-         * are intersected with the present mask. */
-        /* Worst case: 16 groups × 64 members × 3 chars per "NN," ~ 3200,
-         * plus per-group "G":[]" framing. Round up generously. */
-        char groups_obj[4096] = "{";
-        int  gp = 1;
-        bool first_group = true;
-        int  slave_idx = state_cache_slave_idx(e->scan_complete.slave_id);
-        if (slave_idx >= 0) {
-            for (uint8_t g = 0; g < 16; g++) {
-                uint64_t members =
-                    state_cache_get_dali_group((uint8_t)slave_idx, g)
-                    & e->scan_complete.present_mask;
-                if (!members) continue;
-                gp += snprintf(groups_obj + gp, sizeof(groups_obj) - gp,
-                               "%s\"%u\":[", first_group ? "" : ",", g);
-                first_group = false;
-                bool first_m = true;
-                for (int a = 0; a < 64; a++) {
-                    if (members & ((uint64_t)1 << a)) {
-                        gp += snprintf(groups_obj + gp,
-                                       sizeof(groups_obj) - gp,
-                                       "%s%d", first_m ? "" : ",", a);
-                        first_m = false;
-                    }
-                }
-                gp += snprintf(groups_obj + gp, sizeof(groups_obj) - gp, "]");
-            }
-        }
-        strncat(groups_obj, "}",
-                sizeof(groups_obj) - strlen(groups_obj) - 1);
-
-        printf("{\"t\":\"scan_complete\",\"ts\":%lu,"
-               "\"d\":{\"slave\":%u},"
-               "\"v\":{\"present\":%s,\"groups\":%s}}\n",
-               (unsigned long)ts,
-               e->scan_complete.slave_id,
-               present_arr,
-               groups_obj);
-        {
-            int present_count = 0;
-            int group_count   = 0;
-            for (int a = 0; a < 64; a++) {
-                if (e->scan_complete.present_mask & ((uint64_t)1 << a))
-                    present_count++;
-            }
-            int sidx = state_cache_slave_idx(e->scan_complete.slave_id);
-            if (sidx >= 0) {
-                for (uint8_t g = 0; g < 16; g++) {
-                    uint64_t members =
-                        state_cache_get_dali_group((uint8_t)sidx, g)
-                        & e->scan_complete.present_mask;
-                    if (members) group_count++;
-                }
-            }
-            LOG_INFO("serial",
-                     "scan_complete slave=%u present_count=%d group_count=%d",
-                     e->scan_complete.slave_id, present_count, group_count);
-        }
-        break;
-    }
-
-    case LEVT_GROUP:
-        /* Same {t,d,v} report as get_group, including the members list. */
-        emit_state_group(e->group.slave_id, e->group.group);
-        LOG_DBG("serial", "evt state_group slave=%u group=%u",
-                e->group.slave_id, e->group.group);
-        break;
-
-    case LEVT_GATEWAY:
-        printf("{\"t\":\"state_gateway\",\"ts\":%lu,"
-               "\"d\":{\"slave\":%u},\"v\":{\"online\":%s}}\n",
-               (unsigned long)ts, e->gateway.slave_id,
-               e->gateway.online ? "true" : "false");
-        LOG_INFO("serial", "state_gateway slave=%u online=%d",
-                 e->gateway.slave_id, e->gateway.online);
-        break;
-}
-}
-
 /* ── Inter-core seam (core0 -> core1 events, core1 -> core0 commands) ─────────
  * Convert a drained levt_t (the core-0 staging-ring event) to the typed
  * ic_event_t forwarded to core 1. Runs on core 0 in serial_poll(), so it can
@@ -2474,33 +2039,12 @@ void serial_protocol_init(void) {
     intercore_init();
 }
 
+/* Boot/ready announce — a human text log (no JSON on USB). core 1 derives the
+ * slave lists / fw_version from its config snapshot, not from a hello event. */
 void serial_tx_hello(void) {
-    printf("{\"t\":\"hello\",\"id\":0,\"ts\":0,"
-           "\"d\":{\"fw_version\":\"" FW_VERSION "\","
-           "\"relay_slaves\":[");
-    for (int i = 0; i < g_config.relay_slave_count; i++) {
-        printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
-    }
-    printf("],\"dali_slaves\":[");
-    for (int i = 0; i < g_config.dali_slave_count; i++) {
-        printf("%s%u", i > 0 ? "," : "", g_config.dali_slave_ids[i]);
-    }
-    printf("],\"long_press_ms\":%u,\"dim_repeat_ms\":%u,"
-           "\"reversal_window_ms\":%u,\"baud\":%lu}}\n",
-           g_config.long_press_ms, g_config.dim_repeat_ms,
-           g_config.reversal_window_ms,
-           (unsigned long)modbus_get_baud());
-    LOG_INFO("serial", "hello");
-}
-
-void serial_tx_ack(unsigned cmd_id, bool ok, const char *err) {
-    if (ok) {
-        printf("{\"t\":\"ack\",\"id\":%u,\"d\":{\"ok\":true}}\n", cmd_id);
-    } else {
-        printf("{\"t\":\"ack\",\"id\":%u,\"d\":{\"ok\":false,\"err\":\"%s\"}}\n",
-               cmd_id, err ? err : "unknown");
-    }
-    LOG_INFO("serial", "ack id=%u ok=%s", cmd_id, ok ? "true" : "false");
+    LOG_INFO("serial", "hello fw=" FW_VERSION " baud=%lu relays=%u dali=%u",
+             (unsigned long)modbus_get_baud(),
+             g_config.relay_slave_count, g_config.dali_slave_count);
 }
 
 void serial_tx_config_full(void) {
@@ -2557,16 +2101,15 @@ void serial_poll(void) {
         ic_dispatch_cmd(&cmd);
     }
 
-    /* Drain outbound state events: emit JSON to USB CDC (debug/CLI) AND forward
-     * the typed struct to core 1. The event queue is sized for a full resync
-     * burst, so this does not drop. */
+    /* Drain outbound state events and forward each to core 1 (the network
+     * bridge) as a typed struct. The event queue is sized for a full resync
+     * burst, so this does not drop. USB CDC carries no JSON. */
     levt_t evt;
     while (lighting_evt_try_pop(&evt)) {
-        emit_event(&evt);
         ic_event_t ic;
         if (levt_to_ic(&evt, &ic)) intercore_push_event(&ic);
     }
 
-    /* Emit any pending provision status update */
+    /* Push any pending provision status update to core 1. */
     serial_provision_poll();
 }

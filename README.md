@@ -1,50 +1,60 @@
 # Switch Gateway Lighting System
 
-A complete home lighting control system built around a Raspberry Pi Pico 2 as the
-central controller. The Pico owns all physical hardware, controls lights in response
-to button presses, and exposes the entire system to Home Assistant via MQTT.
+A complete home lighting control system built around a **WIZnet W5100S-EVB-Pico
+(RP2040)** as the central controller. The board owns all physical hardware,
+controls lights in response to button presses, and talks to Home Assistant via
+MQTT **directly over its on-board Ethernet** — no external bridge host.
+
+> **Topology change (on-board MQTT).** The MQTT bridge that used to run as
+> `bridge/mqtt_bridge.py` on a USB-tethered Linux host now runs **on-board on
+> core 1**, over the W5100S hardwired TCP/IP chip. The board changed from a bare
+> Pico 2 (RP2350) to the W5100S-EVB-Pico (RP2040). `bridge/mqtt_bridge.py` is
+> retained for **reference only** (it remains the behavioural spec for core 1)
+> and is no longer a runtime component.
 
 ---
 
 ## System Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│  RS-485 bus @ 19200 baud  (canonical; firmware auto-recovers    │
-│                            slaves stuck at the factory 9600)    │
-│                                                                 │
-│  Pico 2 (Modbus master, single source of truth)                 │
-│  ├── Waveshare 32CH Relay Board (slave 1)   — 32 relay coils    │
-│  ├── TinyModbus DALI Gateway (slave 2)      — up to 64 ballasts │
-│  └── TinyModbus DALI Gateway (slave 3)      — up to 64 ballasts │
-│                                                                 │
-│  Pico 2 also scans                                              │
-│  └── 24 switch fixtures × up to 7 buttons each (PIO matrix)     │
-└─────────────────────┬───────────────────────────────────────────┘
-                      │ USB CDC serial, 115200 baud
-                      │ Line-delimited JSON
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Linux host (Docker)                                            │
-│  ├── mqtt_bridge.py  — serial ↔ MQTT translation                │
-│  ├── Mosquitto       — MQTT broker                              │
-│  └── Home Assistant  — dashboards, automations, scenes          │
-└─────────────────────────────────────────────────────────────────┘
+RS-485 bus @ 19200 baud (canonical; firmware auto-recovers slaves stuck at 9600)
+
+W5100S-EVB-Pico (RP2040) — Modbus master, single source of truth
+ ├── core 0: Modbus master · button matrix (PIO) · dirty-bit polling ·
+ │           state cache · persistence · USB-CDC text debug CLI
+ ├── core 1: W5100S Ethernet · MQTT connection mgmt · Home Assistant
+ │           discovery / availability / state ↔ command translation
+ │
+ ├── Waveshare 32CH Relay Board (slave 1)   — 32 relay coils
+ ├── TinyModbus DALI Gateway (slave 2)      — up to 64 ballasts
+ ├── TinyModbus DALI Gateway (slave 3)      — up to 64 ballasts
+ └── 24 switch fixtures × up to 7 buttons   — PIO matrix scan
+
+   │ Ethernet (W5100S, on-board)              │ USB CDC (text CLI only)
+   ▼                                          ▼
+ Mosquitto + Home Assistant            screen/picocom · dali_xlsx_sync.py
 ```
+
+The two cores exchange **typed C structs** over two SPSC queues (not JSON): core 0
+forwards state events to core 1, core 1 forwards translated commands to core 0.
+JSON exists only at core 1's MQTT edge.
 
 ### Key design principles
 
-**Pico is the master.** It owns the RS-485 bus and all lighting state. HA is a
-client — it can send commands, but if HA goes offline, buttons and lights
-continue working normally.
+**The board is the master.** It owns the RS-485 bus and all lighting state. HA is
+a client — if HA, the broker, or the network goes away, buttons and lights keep
+working normally. A network outage never reboots the device: core 1 keeps looping
+through its reconnect state machine while core 0 runs the lights.
 
-**State is never assumed.** The Pico only updates its state cache from hardware
+**State is never assumed.** Core 0 only updates its state cache from hardware
 readback (dirty-bit polling from TinyModbus), never from the commands it sent.
 This correctly handles DALI min/max level clamping and ballast-side fade curves.
 
-**No configuration files needed for the bridge.** The bridge learns everything
-from the Pico's `hello` message and subsequent state messages. All friendly
-names and room assignments are done in HA's device registry UI.
+**Discovery is republished on every connect.** On each MQTT (re)connect core 1
+re-publishes the full HA auto-discovery set and then requests a `resync`, so HA
+repopulates from scratch. Broker and network settings live in `/config.json`
+(set with the `mqtt set` / `net set` USB-CDC commands); friendly names and rooms
+are done in HA's device registry UI.
 
 ---
 
@@ -55,12 +65,12 @@ names and room assignments are done in HA's device registry UI.
 | Waveshare Modbus RTU Relay 32CH | Relay control — lights, fans, switches | 1 |
 | TinyModbus ATtiny1604 DALI Gateway #1 | DALI bus A — up to 64 ballasts | 2 |
 | TinyModbus ATtiny1604 DALI Gateway #2 | DALI bus B — up to 64 ballasts | 3 |
-| Raspberry Pi Pico 2 | Main controller, button scanner, Modbus master | — |
+| WIZnet W5100S-EVB-Pico (RP2040) | Main controller, button scanner, Modbus master, on-board Ethernet/MQTT | — |
 
 Function-code mappings and register addresses for the Waveshare board:
 <https://www.waveshare.com/wiki/Modbus_RTU_Relay_32CH>.
 
-### Pin assignments (Pico 2)
+### Pin assignments (W5100S-EVB-Pico, RP2040)
 
 | Function | GPIO |
 |----------|------|
@@ -69,7 +79,16 @@ Function-code mappings and register addresses for the Waveshare board:
 | RS-485 DE (drive enable) | 1 |
 | Button matrix SER | 6 |
 | Button matrix CLK | 7 |
-| Button matrix COL base | 8 |
+| Button matrix COL base (8 columns → GP8–GP15) | 8 |
+| W5100S SPI0 SCK | 18 |
+| W5100S SPI0 MOSI | 19 |
+| W5100S SPI0 MISO | 16 |
+| W5100S SPI0 CSn | 17 |
+| W5100S RSTn | 20 |
+| W5100S INTn | 21 |
+
+SPI0 (GP16–21) is owned exclusively by core 1; the RS-485 UART and USB CDC are
+owned by core 0. The button matrix tops out at GP15, leaving the SPI block clear.
 
 ### Baud rate setup
 
@@ -106,7 +125,11 @@ manually before the first boot.
 
 ### Building
 
-Requires the Pico SDK and pico-vfs. Set `PICO_SDK_PATH` before configuring.
+Requires the Pico SDK, pico-vfs, ioLibrary_Driver and coreMQTT (all git
+submodules — `git submodule update --init --recursive`). The board is selected
+in `CMakeLists.txt` (`PICO_BOARD wiznet_w5100s_evb_pico`), which targets the
+RP2040 and pins the W5100S SPI defaults — a Pico 2 / RP2350 UF2 will not boot
+this board.
 
 ```bash
 mkdir build && cd build
@@ -305,16 +328,17 @@ Hardware change
 
 ---
 
-## Serial Protocol
+## Protocol
 
-The CDC port carries three multiplexed line types: JSON events
-(machine-readable, leading `{`), logs (human-readable, leading `# `), and text
-command output (human-readable, anything else). The bridge only consumes lines
-starting with `{` — see the [Manual Testing via CDC](#manual-testing-via-cdc)
-section for everything else.
-
-All communication between the Pico and the MQTT bridge uses line-delimited
-JSON over USB CDC at 115200 baud. One message per line, `\n` terminated.
+> **On-board topology note.** This section documents the `{t,d,v}` message model.
+> It is now the **core 0 ↔ core 1 inter-core contract**, exchanged as **typed C
+> structs** over SPSC queues — *not* JSON on a wire. The JSON shapes below are
+> the logical/reference form (and `bridge/mqtt_bridge.py` remains the behavioural
+> spec core 1 reproduces). **USB CDC no longer carries JSON at all** — it is a
+> human **text CLI** only (logs prefixed `# `, plus `key=value` command output).
+> The text CLI keeps `dali_xlsx_sync.py` and manual `screen`/`picocom` testing
+> working unchanged; configure the broker/network there with `mqtt set …` /
+> `net set …` (and `mqtt show` / `net show`).
 
 ### Message envelope
 
