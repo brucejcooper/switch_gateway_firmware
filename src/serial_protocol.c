@@ -190,13 +190,6 @@ static void emit_config_mapping(uint8_t fixture, uint8_t button,
     intercore_push_event(&ev);
 }
 
-static void diff_emit_cb(uint8_t fixture, uint8_t button,
-                         const mapping_target_t *new_targets,
-                         uint8_t new_count, void *user) {
-    (void)user;
-    emit_config_mapping(fixture, button, new_targets, new_count);
-}
-
 /* ── Process one inbound JSON line ──────────────────────────────────────── */
 static void handle_json_line(const char *line) {
     char t[32];
@@ -385,63 +378,6 @@ static void handle_json_line(const char *line) {
             emit_config_mapping((uint8_t)fixture, (uint8_t)button, NULL, 0);
         }
         serial_tx_ack(cmd_id, ok, ok ? NULL : "save_failed");
-        return;
-    }
-
-    /* ── replace_mappings_begin ─────────────────────────────────────────
-     * Wipe-and-replace transaction. Sequence: begin → add* → commit (or
-     * abort). The 256-byte serial line cap means we can't send all 24×8
-     * possible mappings in one message, so the txn buffers everything in
-     * RAM and only swaps live + saves to flash on commit. */
-    if (strcmp(t, "replace_mappings_begin") == 0) {
-        mapping_txn_begin();
-        serial_tx_ack(cmd_id, true, NULL);
-        return;
-    }
-
-    /* ── replace_mapping_add ─────────────────────────────────────────────
-     * Same payload as set_mapping, but stages into the txn scratch buffer.
-     * Bad ranges latch a sticky error so the eventual commit refuses. */
-    if (strcmp(t, "replace_mapping_add") == 0) {
-        if (!mapping_txn_active()) {
-            serial_tx_ack(cmd_id, false, "no_txn");
-            return;
-        }
-        int fixture = 0, button = 0;
-        json_int(line, "fixture", &fixture);
-        json_int(line, "button",  &button);
-        mapping_target_t targets[MAX_TARGETS_PER_BTN];
-        uint8_t count = parse_targets(line, targets, MAX_TARGETS_PER_BTN);
-        bool ok = mapping_txn_add((uint8_t)fixture, (uint8_t)button,
-                                  targets, count);
-        serial_tx_ack(cmd_id, ok, ok ? NULL : "out_of_range");
-        return;
-    }
-
-    /* ── replace_mappings_commit ─────────────────────────────────────────
-     * Atomically swap the scratch in, save to flash, and emit
-     * config_mapping for every (fixture, button) whose targets changed. */
-    if (strcmp(t, "replace_mappings_commit") == 0) {
-        if (!mapping_txn_active()) {
-            serial_tx_ack(cmd_id, false, "no_txn");
-            return;
-        }
-        if (mapping_txn_errored()) {
-            mapping_txn_abort();
-            serial_tx_ack(cmd_id, false, "txn_invalid");
-            return;
-        }
-        /* Walk diffs BEFORE the swap so we can compare scratch vs live. */
-        mapping_txn_for_each_change(diff_emit_cb, NULL);
-        bool ok = mapping_txn_commit();
-        serial_tx_ack(cmd_id, ok, ok ? NULL : "save_failed");
-        return;
-    }
-
-    /* ── replace_mappings_abort ─────────────────────────────────────────── */
-    if (strcmp(t, "replace_mappings_abort") == 0) {
-        mapping_txn_abort();
-        serial_tx_ack(cmd_id, true, NULL);
         return;
     }
 
