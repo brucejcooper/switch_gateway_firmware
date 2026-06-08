@@ -73,6 +73,33 @@ target_link_libraries(light_switch PRIVATE
 # jsmn — single-header JSON tokenizer used by core 1 (malloc-free, float-free).
 target_include_directories(light_switch PRIVATE ${CMAKE_CURRENT_LIST_DIR}/lib/jsmn)
 
+# ── WIZnet W5100S networking (ioLibrary_Driver) — core 1 only ───────────────
+set(IOLIB ${CMAKE_CURRENT_LIST_DIR}/lib/ioLibrary_Driver)
+target_sources(light_switch PRIVATE
+    ${IOLIB}/Ethernet/wizchip_conf.c
+    ${IOLIB}/Ethernet/socket.c
+    ${IOLIB}/Ethernet/W5100S/w5100s.c
+    ${IOLIB}/Internet/DHCP/dhcp.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/wizchip_glue.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
+)
+target_include_directories(light_switch PRIVATE
+    ${IOLIB}/Ethernet
+    ${IOLIB}/Ethernet/W5100S
+    ${IOLIB}/Internet/DHCP
+    ${CMAKE_CURRENT_LIST_DIR}/src/net
+)
+target_compile_definitions(light_switch PRIVATE _WIZCHIP_=W5100S)
+target_link_libraries(light_switch PRIVATE hardware_spi pico_unique_id)
+
+# Vendored third-party: don't subject ioLibrary to our -Wall -Wextra.
+set_source_files_properties(
+    ${IOLIB}/Ethernet/wizchip_conf.c
+    ${IOLIB}/Ethernet/socket.c
+    ${IOLIB}/Ethernet/W5100S/w5100s.c
+    ${IOLIB}/Internet/DHCP/dhcp.c
+    PROPERTIES COMPILE_OPTIONS "-w")
+
 # USB CDC for serial protocol (replaces Lua REPL)
 pico_enable_stdio_usb(light_switch 1)
 pico_enable_stdio_uart(light_switch 0)

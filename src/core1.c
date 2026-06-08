@@ -13,6 +13,7 @@
 
 #include "core1.h"
 #include "intercore.h"
+#include "net/netif.h"
 #include "log.h"
 
 #include "pico/multicore.h"
@@ -41,17 +42,24 @@ static void core1_entry(void) {
     s_ready = true;
     LOG_INFO("core1", "flash lockout victim init %s", ok ? "ok" : "FAILED");
 
+    /* Bring up the W5100S (DHCP by default; the /config.json net settings are
+     * wired in later). netif_tick() pumps the bring-up/DHCP/link/recovery SM. */
+    netif_init(NULL);
+
     uint32_t discarded = 0, last_log_ms = 0;
     ic_event_t ev;
     while (true) {
         s_heartbeat_ms = to_ms_since_boot(get_absolute_time());
 
-        /* Drain and discard for now (no MQTT yet). */
+        netif_tick();
+
+        /* Drain and discard for now (MQTT publish replaces this later). */
         while (intercore_pop_event(&ev)) discarded++;
 
         if (s_heartbeat_ms - last_log_ms >= 5000u) {
             last_log_ms = s_heartbeat_ms;
-            LOG_INFO("core1", "alive: events_drained=%lu drops=%lu",
+            LOG_INFO("core1", "alive: ready=%d link=%d events_drained=%lu drops=%lu",
+                     (int)netif_ready(), (int)netif_link_up(),
                      (unsigned long)discarded,
                      (unsigned long)intercore_event_drops());
         }
