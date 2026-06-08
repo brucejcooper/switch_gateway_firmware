@@ -15,6 +15,7 @@
 #include "serial_protocol.h"
 #include "dali_provision.h"
 #include "config.h"
+#include "intercore.h"
 #include "log.h"
 #include <stdio.h>
 #include <string.h>
@@ -92,6 +93,14 @@ void serial_provision_poll(void) {
            state_str,
            ps->msg,
            ps->devices_found);
+
+    /* Forward to core 1. The raw run_state enum is carried; core 1 maps it to
+     * the state + message strings (the free-form msg is not carried). */
+    ic_event_t ev = { .type = IC_EVT_PROVISION };
+    ev.provision.slave = ps->slave_id;
+    ev.provision.state = (uint8_t)ps->run_state;
+    ev.provision.count = ps->devices_found;
+    intercore_push_event(&ev);
 }
 
 /* Called from serial_protocol handle_line() for provision_start messages */

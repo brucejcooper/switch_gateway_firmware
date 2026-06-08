@@ -11,7 +11,9 @@
  */
 
 #include <stdio.h>
+#include <string.h>
 #include <pico/time.h>
+#include "intercore.h"
 
 /*
  * Emit a button event as a JSON line to USB CDC stdout.
@@ -30,4 +32,14 @@ void emit_button_event(uint8_t fixture, uint8_t button, const char *action) {
            "\"v\":{\"action\":\"%s\"}}\n",
            (unsigned long)to_ms_since_boot(get_absolute_time()),
            fixture, button, action);
+
+    /* Forward to core 1 (the MQTT bridge) as a typed event. */
+    ic_event_t ev = { .type = IC_EVT_BUTTON };
+    ev.button.fixture = fixture;
+    ev.button.button  = button;
+    ev.button.action  = strcmp(action, "release") == 0           ? IC_BTN_RELEASE
+                      : strcmp(action, "long_press_start") == 0   ? IC_BTN_LONG_PRESS_START
+                      : strcmp(action, "long_press_repeat") == 0  ? IC_BTN_LONG_PRESS_REPEAT
+                                                                  : IC_BTN_PRESS;
+    intercore_push_event(&ev);
 }

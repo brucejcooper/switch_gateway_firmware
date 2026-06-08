@@ -15,6 +15,7 @@
 #include "dirty_poll.h"
 #include "bus_discovery.h"
 #include "modbus.h"
+#include "intercore.h"
 #include "log.h"
 #include <stdio.h>
 #include <string.h>
@@ -178,6 +179,15 @@ static void emit_config_mapping(uint8_t fixture, uint8_t button,
     }
     n += snprintf(mbuf + n, sizeof(mbuf) - n, "]}}\n");
     printf("%s", mbuf);
+
+    /* Forward the binding to core 1 (the MQTT bridge) as a typed struct. */
+    ic_event_t ev = { .type = IC_EVT_MAPPING };
+    ev.mapping.fixture = fixture;
+    ev.mapping.button  = button;
+    ev.mapping.count   = count;
+    for (int i = 0; i < count && i < MAX_TARGETS_PER_BTN; i++)
+        ev.mapping.targets[i] = targets[i];
+    intercore_push_event(&ev);
 }
 
 static void diff_emit_cb(uint8_t fixture, uint8_t button,
@@ -1308,6 +1318,24 @@ static void emit_state_dali(uint8_t slave, uint8_t addr) {
            b ? b->min_level : 0, b ? b->max_level : 0,
            b ? b->power_on_level : 0, b ? b->sys_fail_level : 0,
            b ? b->fade_rate : 0, b ? b->fade_time : 0);
+
+    /* Forward to core 1. emit_state_dali() is the get/predictive path (the
+     * unsolicited dirty-poll path goes through emit_event + levt_to_ic), so this
+     * is the only place a config-only set_dali — which produces no dirty-poll
+     * dali event — reaches core 1. The predictive level reports are idempotent
+     * with the later dirty-poll confirmation. */
+    ic_event_t ev = { .type = IC_EVT_DALI };
+    ev.dali.slave     = slave;
+    ev.dali.addr      = addr;
+    ev.dali.arc       = b ? b->arc_level   : 0;
+    ev.dali.status    = b ? b->status_byte : 0;
+    ev.dali.min       = b ? b->min_level       : 0;
+    ev.dali.max       = b ? b->max_level       : 0;
+    ev.dali.power_on  = b ? b->power_on_level   : 0;
+    ev.dali.sys_fail  = b ? b->sys_fail_level   : 0;
+    ev.dali.fade_rate = b ? b->fade_rate        : 0;
+    ev.dali.fade_time = b ? b->fade_time        : 0;
+    intercore_push_event(&ev);
 }
 
 static void emit_state_relay(uint8_t ch) {
@@ -1371,6 +1399,15 @@ static void emit_state_cfg(void) {
            "\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u}}\n",
            g_config.long_press_ms, g_config.dim_repeat_ms, g_config.reversal_window_ms,
            (unsigned)MAX_FIXTURES, (unsigned)MAX_BUTTONS, (unsigned)MAX_TARGETS_PER_BTN);
+
+    /* Forward the controller config to core 1. fw_version / slave lists / grid
+     * dimensions are derived on core 1 from its config snapshot + version.h. */
+    ic_event_t ev = { .type = IC_EVT_CFG };
+    ev.cfg.long_press_ms      = g_config.long_press_ms;
+    ev.cfg.dim_repeat_ms      = g_config.dim_repeat_ms;
+    ev.cfg.reversal_window_ms = g_config.reversal_window_ms;
+    ev.cfg.baud               = modbus_get_baud();
+    intercore_push_event(&ev);
 }
 
 /* Apply one DALI key=value to a ballast (shared by set_dali JSON + `dali` CLI).
@@ -2241,9 +2278,190 @@ static void emit_event(const levt_t *e) {
 }
 }
 
+/* ── Inter-core seam (core0 -> core1 events, core1 -> core0 commands) ─────────
+ * Convert a drained levt_t (the core-0 staging-ring event) to the typed
+ * ic_event_t forwarded to core 1. Runs on core 0 in serial_poll(), so it can
+ * read state_cache for the bundled DALI config and group membership. Returns
+ * false for kinds with no core-1 representation (none currently). */
+static bool levt_to_ic(const levt_t *e, ic_event_t *ic) {
+    switch (e->type) {
+    case LEVT_RELAY:
+        ic->type = IC_EVT_RELAY;
+        ic->relay.ch = e->relay.ch;
+        ic->relay.on = e->relay.on;
+        return true;
+    case LEVT_DALI: {
+        ic->type = IC_EVT_DALI;
+        ic->dali.slave  = e->dali.slave_id;
+        ic->dali.addr   = e->dali.addr;
+        ic->dali.arc    = e->dali.arc;
+        ic->dali.status = e->dali.status;
+        int didx = state_cache_slave_idx(e->dali.slave_id);
+        dali_ballast_state_t *b =
+            didx >= 0 ? state_cache_get_dali((uint8_t)didx, e->dali.addr) : NULL;
+        ic->dali.min       = b ? b->min_level       : 0;
+        ic->dali.max       = b ? b->max_level       : 0;
+        ic->dali.power_on  = b ? b->power_on_level   : 0;
+        ic->dali.sys_fail  = b ? b->sys_fail_level   : 0;
+        ic->dali.fade_rate = b ? b->fade_rate        : 0;
+        ic->dali.fade_time = b ? b->fade_time        : 0;
+        return true;
+    }
+    case LEVT_PRESENCE:
+        ic->type = IC_EVT_PRESENCE;
+        ic->presence.slave       = e->presence.slave_id;
+        ic->presence.appeared    = e->presence.appeared;
+        ic->presence.disappeared = e->presence.disappeared;
+        return true;
+    case LEVT_FAULT:
+        ic->type = IC_EVT_FAULT;
+        ic->fault.slave       = e->fault.slave_id;
+        ic->fault.addr        = e->fault.addr;
+        ic->fault.lamp_fail   = e->fault.lamp_fail;
+        ic->fault.power_cycle = e->fault.power_cycle;
+        return true;
+    case LEVT_SCAN_COMPLETE:
+        ic->type = IC_EVT_SCAN_COMPLETE;
+        ic->scan_complete.slave        = e->scan_complete.slave_id;
+        ic->scan_complete.present_mask = e->scan_complete.present_mask;
+        return true;
+    case LEVT_GROUP: {
+        ic->type = IC_EVT_GROUP;
+        ic->group.slave = e->group.slave_id;
+        ic->group.group = e->group.group;
+        ic->group.bri   = e->group.bri;
+        ic->group.on    = e->group.on;
+        int sidx = state_cache_slave_idx(e->group.slave_id);
+        ic->group.members = sidx >= 0
+            ? state_cache_get_dali_group((uint8_t)sidx, e->group.group) : 0;
+        return true;
+    }
+    case LEVT_GATEWAY:
+        ic->type = IC_EVT_GATEWAY;
+        ic->gateway.slave  = e->gateway.slave_id;
+        ic->gateway.online = e->gateway.online;
+        return true;
+    }
+    return false;
+}
+
+/* Dispatch a command from core 1 through the same domain entry points the JSON
+ * and text CLIs use. The tiny value-string reconstruction for set_dali keeps all
+ * clamping/handling inside dali_apply_kv() (one place); the cost is negligible
+ * and only on infrequent commands. */
+static void ic_dispatch_cmd(const ic_cmd_t *c) {
+    switch (c->type) {
+    case IC_CMD_SET_RELAY: {
+        uint8_t ch = c->set_relay.ch;
+        if (ch >= RELAY_COUNT) break;
+        bool on = (c->set_relay.on == IC_TRI_TOGGLE) ? !state_cache_get_relay_on(ch)
+                                                     : (c->set_relay.on == IC_TRI_ON);
+        lighting_set_relay(ch, on);
+        state_cache_set_relay(ch, on);   /* predictive; write cb confirms async */
+        emit_state_relay(ch);
+        break;
+    }
+    case IC_CMD_SET_DALI: {
+        uint8_t slave = c->set_dali.slave, addr = c->set_dali.addr;
+        if (state_cache_slave_idx(slave) < 0 || addr > 63) break;
+        char vb[12];
+        bool any = false, emit_now = false;
+        if (c->set_dali.fields & IC_DALI_F_ON) {
+            const char *v = c->set_dali.on == IC_TRI_TOGGLE ? "toggle"
+                          : c->set_dali.on == IC_TRI_ON     ? "true" : "false";
+            if (dali_apply_kv(slave, addr, "on", v) == 1) emit_now = true;
+            any = true;
+        }
+        #define IC_DALI_APPLY(flag, key, field)                                  \
+            if (c->set_dali.fields & (flag)) {                                   \
+                snprintf(vb, sizeof vb, "%u", c->set_dali.field);                \
+                if (dali_apply_kv(slave, addr, (key), vb) == 1) emit_now = true; \
+                any = true;                                                      \
+            }
+        IC_DALI_APPLY(IC_DALI_F_BRI,       "bri",       bri);
+        IC_DALI_APPLY(IC_DALI_F_MIN,       "min",       min);
+        IC_DALI_APPLY(IC_DALI_F_MAX,       "max",       max);
+        IC_DALI_APPLY(IC_DALI_F_POWER_ON,  "power_on",  power_on);
+        IC_DALI_APPLY(IC_DALI_F_SYS_FAIL,  "sys_fail",  sys_fail);
+        IC_DALI_APPLY(IC_DALI_F_FADE_RATE, "fade_rate", fade_rate);
+        IC_DALI_APPLY(IC_DALI_F_FADE_TIME, "fade_time", fade_time);
+        #undef IC_DALI_APPLY
+        if (any) {
+            dirty_poll_mark_active(slave);
+            if (emit_now) emit_state_dali(slave, addr);
+        }
+        break;
+    }
+    case IC_CMD_SET_GROUP: {
+        uint8_t slave = c->set_group.slave, group = c->set_group.group;
+        if (state_cache_slave_idx(slave) < 0 || group > 15) break;
+        bool any = false;
+        if (c->set_group.fields & IC_GRP_F_MEMBERS) {
+            dali_group_set_members(slave, group, c->set_group.members);
+            any = true;
+        }
+        if (c->set_group.fields & IC_GRP_F_BRI) {
+            lighting_group_set_level(slave, group, c->set_group.bri);
+            any = true;
+        } else if (c->set_group.fields & IC_GRP_F_ON) {
+            lighting_group_set_on_off(slave, group, c->set_group.on == IC_TRI_ON);
+            any = true;
+        }
+        if (any) { dirty_poll_mark_active(slave); emit_state_group(slave, group); }
+        break;
+    }
+    case IC_CMD_SET_CFG: {
+        bool any = false;
+        if (c->set_cfg.fields & IC_CFG_F_LONG_PRESS) { g_config.long_press_ms      = c->set_cfg.long_press_ms;      any = true; }
+        if (c->set_cfg.fields & IC_CFG_F_DIM_REPEAT) { g_config.dim_repeat_ms      = c->set_cfg.dim_repeat_ms;      any = true; }
+        if (c->set_cfg.fields & IC_CFG_F_REVERSAL)   { g_config.reversal_window_ms = c->set_cfg.reversal_window_ms; any = true; }
+        if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
+        if (any) config_save();
+        emit_state_cfg();
+        break;
+    }
+    case IC_CMD_SET_MAPPING: {
+        uint8_t count = c->set_mapping.count;
+        if (count > MAX_TARGETS_PER_BTN) count = MAX_TARGETS_PER_BTN;
+        if (mapping_set(c->set_mapping.fixture, c->set_mapping.button,
+                        c->set_mapping.targets, count))
+            emit_config_mapping(c->set_mapping.fixture, c->set_mapping.button,
+                                c->set_mapping.targets, count);
+        break;
+    }
+    case IC_CMD_DEL_MAPPING:
+        if (mapping_delete(c->del_mapping.fixture, c->del_mapping.button))
+            emit_config_mapping(c->del_mapping.fixture, c->del_mapping.button, NULL, 0);
+        break;
+    case IC_CMD_PROVISION_START: {
+        bool valid = false;
+        for (int i = 0; i < g_config.dali_slave_count; i++)
+            if (g_config.dali_slave_ids[i] == c->provision_start.slave) valid = true;
+        if (!valid || dali_provision_busy()) break;
+        prov_mode_t mode = c->provision_start.mode == IC_PROV_UNADDRESSED ? PROV_UNADDRESSED
+                         : c->provision_start.mode == IC_PROV_ADDRESS     ? PROV_ADDRESS
+                                                                          : PROV_ALL;
+        if (mode == PROV_ADDRESS && c->provision_start.target > 63) break;
+        dali_provision_start(c->provision_start.slave, mode, c->provision_start.target);
+        break;
+    }
+    case IC_CMD_PROVISION_ABORT:
+        dali_provision_abort();
+        break;
+    case IC_CMD_RESYNC:
+        serial_tx_hello();
+        lighting_resync_emit();
+        serial_tx_config_full();
+        break;
+    }
+}
+
 /* ── Public interface ────────────────────────────────────────────────────── */
 void serial_protocol_init(void) {
-    /* Nothing — stdio_usb is enabled by pico_enable_stdio_usb in CMakeLists */
+    /* stdio_usb is enabled by pico_enable_stdio_usb in CMakeLists. Init the
+     * inter-core queues here, before the main loop (and before core 1 launch)
+     * — no event producer runs until serial_poll() does. */
+    intercore_init();
 }
 
 void serial_tx_hello(void) {
@@ -2321,10 +2539,22 @@ void serial_poll(void) {
         if (echo_on) fflush(stdout);
     }
 
-    /* Drain outbound state events */
+    /* Drain inbound commands from core 1 (the network bridge) and dispatch them
+     * through the same domain entry points the CLI/JSON use. Empty until core 1
+     * is launched. */
+    ic_cmd_t cmd;
+    while (intercore_pop_cmd(&cmd)) {
+        ic_dispatch_cmd(&cmd);
+    }
+
+    /* Drain outbound state events: emit JSON to USB CDC (debug/CLI) AND forward
+     * the typed struct to core 1. The event queue is sized for a full resync
+     * burst, so this does not drop. */
     levt_t evt;
     while (lighting_evt_try_pop(&evt)) {
         emit_event(&evt);
+        ic_event_t ic;
+        if (levt_to_ic(&evt, &ic)) intercore_push_event(&ic);
     }
 
     /* Emit any pending provision status update */
