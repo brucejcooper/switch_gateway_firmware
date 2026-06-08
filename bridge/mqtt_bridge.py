@@ -73,6 +73,7 @@ log = logging.getLogger("bridge")
 BUTTON_EVENT_TYPES = ["press", "release", "long_press_start", "long_press_repeat"]
 MAX_FIXTURES       = 24
 MAX_BUTTONS        = 7
+RELAY_CHANNELS     = 32   # coils the controller reads per relay board
 DALI_ADDR_COUNT    = 64
 
 
@@ -249,6 +250,7 @@ class Bridge:
         # Tracks whether discovery has been published for each entity.
         # Cleared on hello so reconnect republishes cleanly.
         self._disc_relays:      set[int]             = set()
+        self._relay_slaves:     list[int]            = []   # relay board slave ids (from hello)
         self._disc_ballasts:    set[tuple[int, int]] = set()
         self._disc_gateways:    set[int]             = set()
         self._disc_ballast_cfg: set[tuple[int, int]] = set()
@@ -343,30 +345,43 @@ class Bridge:
 
     # ── Discovery ─────────────────────────────────────────────────────────
 
-    def _pub_relay_discovery(self, channel: int) -> None:
+    def _pub_all_relays_for_slave(self, slave: int) -> None:
+        """Publish all 32 relay channels for a board, gated on its reachability, so
+        the channels appear (unavailable) even when the board never reports state —
+        mirroring how all 64 DALI addresses are seeded per gateway."""
+        for ch in range(RELAY_CHANNELS):
+            self._pub_relay_discovery(ch, slave)
+
+    def _pub_relay_discovery(self, channel: int, slave=None) -> None:
         """Publish discovery for one relay channel as a switch (once per session)."""
         if channel in self._disc_relays:
             return
         self._disc_relays.add(channel)
+        if slave is None and self._relay_slaves:
+            slave = self._relay_slaves[0]
         uid = f"{NODE}_relay_{channel}"
-        self._pub(
-            f"homeassistant/switch/{uid}/config",
-            {
-                "unique_id":            uid,
-                # name=None → HA uses device name; user can rename in device registry
-                "name":                 None,
-                "state_topic":          self._t("relay", str(channel), "state"),
-                "command_topic":        self._t("relay", str(channel), "set"),
-                "state_value_template": "{{ value_json.state }}",
-                "payload_on":           '{"state":"ON"}',
-                "payload_off":          '{"state":"OFF"}',
-                # Relay channels use only the system availability topic.
-                # There is no per-channel presence concept on the Waveshare board.
-                "availability_topic":   self._cfg.availability_topic,
-                "device":               _dev_relay_channel(channel),
-            },
-            retained=True,
-        )
+        disc = {
+            "unique_id":            uid,
+            # name=None → HA uses device name; user can rename in device registry
+            "name":                 None,
+            "state_topic":          self._t("relay", str(channel), "state"),
+            "command_topic":        self._t("relay", str(channel), "set"),
+            "state_value_template": "{{ value_json.state }}",
+            "payload_on":           '{"state":"ON"}',
+            "payload_off":          '{"state":"OFF"}',
+            "device":               _dev_relay_channel(channel),
+        }
+        # Gate on system + the relay board's reachability (its state_gateway topic),
+        # so a channel goes unavailable when the board is absent — like a ballast.
+        if slave is not None:
+            disc["availability"] = [
+                {"topic": self._cfg.availability_topic},
+                {"topic": self._gateway_avail_topic(slave)},
+            ]
+            disc["availability_mode"] = "all"
+        else:
+            disc["availability_topic"] = self._cfg.availability_topic
+        self._pub(f"homeassistant/switch/{uid}/config", disc, retained=True)
 
     def _pub_ballast_discovery(self, slave: int, addr: int) -> None:
         """
@@ -731,6 +746,15 @@ class Bridge:
             # state_gateway offline/online if it stops/starts responding.
             self._pub(self._gateway_avail_topic(slave), "online", retained=True)
 
+        # Relay board(s): seed reachable + publish all channels gated on that
+        # reachability, so they show unavailable when the board is absent. The
+        # controller's relay poll flips the gateway topic the same as for DALI.
+        self._relay_slaves = list(relay_slaves)
+        for slave in relay_slaves:
+            self._pub(self._gateway_avail_topic(slave), "online", retained=True)
+        if relay_slaves:
+            self._pub_all_relays_for_slave(relay_slaves[0])
+
         # Pull device config (→ state_cfg) and the full mapping/group set
         # (→ config_mapping / state_group) so HA repopulates after a reconnect.
         self._send({"t": "get_cfg",      "id": self._next_id()})
@@ -741,7 +765,7 @@ class Bridge:
         on = msg.get("v", {}).get("on", False)
         if ch is None:
             return
-        self._pub_relay_discovery(ch)
+        self._pub_relay_discovery(ch, self._relay_slaves[0] if self._relay_slaves else None)
         self._pub(
             self._t("relay", str(ch), "state"),
             {"state": "ON" if on else "OFF"},

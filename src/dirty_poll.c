@@ -49,6 +49,14 @@ typedef struct { uint8_t slave_id; uint8_t addr; } ballast_ctx_t;
 static ballast_ctx_t s_bctx[MAX_DALI_SLAVES][DALI_ADDR_COUNT];
 static uint8_t s_dirty_ctx_slave[MAX_DALI_SLAVES];
 
+/* Relay-board reachability: poll each relay slave's coils periodically and emit
+ * state_gateway on a transition, exactly like a DALI gateway, so HA marks relay
+ * switches unavailable when the board is absent (not just on the system topic). */
+#define RELAY_POLL_INTERVAL_MS 2000u
+typedef struct { bool reachable; uint8_t fail_count; uint32_t last_poll_ms; bool awaiting; } rpoll_t;
+static rpoll_t s_rp[MAX_RELAY_SLAVES];
+static uint8_t s_rp_idx[MAX_RELAY_SLAVES];   /* callback ctx → relay-slave index */
+
 void dirty_poll_init(void) {
     memset(s_dp, 0, sizeof(s_dp));
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
@@ -57,6 +65,30 @@ void dirty_poll_init(void) {
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             s_bctx[i][a].slave_id = g_config.dali_slave_ids[i];
             s_bctx[i][a].addr     = (uint8_t)a;
+        }
+    }
+    memset(s_rp, 0, sizeof(s_rp));
+    for (int i = 0; i < MAX_RELAY_SLAVES; i++) {
+        s_rp[i].reachable = true;   /* optimistic, same as DALI gateways */
+        s_rp_idx[i]       = (uint8_t)i;
+    }
+}
+
+/* Relay coil-read result → reachability, debounced like gateway_report(). */
+static void relay_health_cb(int res, uint8_t *buf, void *ctx) {
+    (void)buf;
+    uint8_t  i     = *(uint8_t *)ctx;
+    rpoll_t *rp    = &s_rp[i];
+    uint8_t  slave = g_config.relay_slave_ids[i];
+    rp->awaiting   = false;
+    if (res >= 7) {            /* a valid FC01 coil response */
+        rp->fail_count = 0;
+        if (!rp->reachable) { rp->reachable = true; lighting_emit_gateway_state(slave, true); }
+    } else if (rp->reachable) {
+        if (rp->fail_count < 0xFF) rp->fail_count++;
+        if (rp->fail_count >= GATEWAY_FAIL_THRESHOLD) {
+            rp->reachable = false;
+            lighting_emit_gateway_state(slave, false);
         }
     }
 }
@@ -215,6 +247,18 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
 /* ── Tick ────────────────────────────────────────────────────────────────── */
 void dirty_poll_tick(void) {
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+
+    /* Relay-board reachability: a cheap coil read every RELAY_POLL_INTERVAL_MS.
+     * relay_health_cb flips state_gateway when the board appears/disappears. */
+    for (int i = 0; i < g_config.relay_slave_count; i++) {
+        rpoll_t *rp = &s_rp[i];
+        if (rp->awaiting) continue;
+        if (now_ms - rp->last_poll_ms >= RELAY_POLL_INTERVAL_MS) {
+            rp->last_poll_ms = now_ms;
+            rp->awaiting     = true;
+            modbus_get_coils(g_config.relay_slave_ids[i], 0, 32, relay_health_cb, &s_rp_idx[i]);
+        }
+    }
 
     for (int i = 0; i < g_config.dali_slave_count; i++) {
         uint8_t  slave_id = g_config.dali_slave_ids[i];
