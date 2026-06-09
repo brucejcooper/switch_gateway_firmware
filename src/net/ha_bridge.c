@@ -1,0 +1,848 @@
+/*
+ * ha_bridge.c — Home Assistant discovery + availability + translation (core 1).
+ *
+ * Reproduces bridge/mqtt_bridge.py: MQTT auto-discovery, the availability model,
+ * event->state-topic translation, and inbound command translation (jsmn).
+ *
+ * Everything that can burst is published INCREMENTALLY, gated on free socket-TX
+ * space, a bounded amount per tick:
+ *   - the ~900-entity discovery set (one entity per disc_step),
+ *   - the per-slave 64-address availability sweep from scan_complete.
+ * Blasting these synchronously would overrun the socket TX buffer and freeze the
+ * core-1 heartbeat. Payloads are built one at a time into a single reused buffer.
+ */
+
+#include "ha_bridge.h"
+#include "mqtt_app.h"
+#include "intercore.h"
+#include "log.h"
+#include "version.h"     /* FW_VERSION */
+#include "jsmn.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <stdbool.h>
+
+#define MFR_MECH   "Mechination"
+#define MFR_WAVE   "Waveshare"
+#define CTRL_MODEL "WIZnet W5100S-EVB-Pico Controller"
+
+/* HA number-entity regex patterns. The bytes on the wire must contain JSON-
+ * escaped backslashes (\\), so each regex backslash is four backslashes in C. */
+#define BINDING_PATTERN \
+  "^\\\\s*(\\\\d{1,3}\\\\s*:\\\\s*[gG]?\\\\d{1,3}(\\\\s*,\\\\s*\\\\d{1,3}\\\\s*:\\\\s*[gG]?\\\\d{1,3})*)?\\\\s*$"
+#define MEMBERS_PATTERN \
+  "^\\\\s*(\\\\d{1,2}(\\\\s*,\\\\s*\\\\d{1,2})*)?\\\\s*$"
+
+#define DALI_ADDRS    64
+#define DALI_GROUPS   16
+#define RELAY_CHANS   32
+#define MAX_FIX       24
+#define MAX_BTN        7
+#define PL_CAP      1536
+#define DISC_BATCH     6
+#define TX_GATE     1100        /* min free TX before a discovery/sweep step */
+#define PUMP_GATE    900        /* min free TX before draining a state event */
+#define SWEEP_BATCH    8        /* availability topics per sweep tick */
+
+static char s_pl[PL_CAP];
+static char s_top[112];
+
+/* ── publish helpers ─────────────────────────────────────────────────────── */
+static void pub_cfg(const char *component, const char *objid) {
+    snprintf(s_top, sizeof s_top, "homeassistant/%s/%s/config", component, objid);
+    mqtt_app_publish(s_top, s_pl, strlen(s_pl), true);
+}
+static void pub_str(const char *topic, const char *payload, bool retain) {
+    mqtt_app_publish(topic, payload, strlen(payload), retain);
+}
+static int dev(int n, const char *ids, const char *name,
+               const char *mfr, const char *model, const char *via) {
+    n += snprintf(s_pl + n, PL_CAP - n,
+                  ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\","
+                  "\"manufacturer\":\"%s\",\"model\":\"%s\"", ids, name, mfr, model);
+    if (via) n += snprintf(s_pl + n, PL_CAP - n, ",\"via_device\":\"%s\"", via);
+    n += snprintf(s_pl + n, PL_CAP - n, "}}");
+    return n;
+}
+
+static int slave_idx(uint8_t id) {
+    const ic_snapshot_t *sn = intercore_snapshot();
+    for (int i = 0; i < sn->dali_count; i++) if (sn->dali_slaves[i] == id) return i;
+    return -1;
+}
+
+/* ── discovery builders ──────────────────────────────────────────────────── */
+static void disc_plate_event(uint8_t fix, uint8_t btn) {
+    const char *P = mqtt_app_prefix();
+    char ids[40], name[24], objid[40];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_switch_%02u_btn_%u\",\"name\":\"Button %u\","
+        "\"state_topic\":\"%s/button/%u/%u\","
+        "\"event_types\":[\"press\",\"release\",\"long_press_start\",\"long_press_repeat\"],"
+        "\"value_template\":\"{{ value_json.event_type }}\","
+        "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"",
+        fix, btn, btn + 1, P, fix, btn, P);
+    snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
+    snprintf(name, sizeof name, "Fixture %02u", fix + 1);
+    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", "lighting_controller");
+    snprintf(objid, sizeof objid, "lighting_switch_%02u_btn_%u", fix, btn);
+    pub_cfg("event", objid);
+}
+
+static void disc_plate_binding(uint8_t fix, uint8_t btn) {
+    const char *P = mqtt_app_prefix();
+    char ids[40], name[24], objid[40];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_binding_%02u_btn_%u\",\"name\":\"Button %u Binding\","
+        "\"command_topic\":\"%s/binding/%u/%u/set\",\"state_topic\":\"%s/binding/%u/%u/state\","
+        "\"pattern\":\"%s\",\"availability_topic\":\"%s/availability\","
+        "\"entity_category\":\"config\",\"icon\":\"mdi:link-variant\"",
+        fix, btn, btn + 1, P, fix, btn, P, fix, btn, BINDING_PATTERN, P);
+    snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
+    snprintf(name, sizeof name, "Fixture %02u", fix + 1);
+    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", "lighting_controller");
+    snprintf(objid, sizeof objid, "lighting_binding_%02u_btn_%u", fix, btn);
+    pub_cfg("text", objid);
+    snprintf(s_top, sizeof s_top, "%s/binding/%u/%u/state", P, fix, btn);
+    pub_str(s_top, "", true);
+}
+
+static void disc_relay(uint8_t slave, uint8_t ch) {
+    const char *P = mqtt_app_prefix();
+    char ids[32], name[24], objid[32];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_relay_%u\",\"name\":null,"
+        "\"state_topic\":\"%s/relay/%u/state\",\"command_topic\":\"%s/relay/%u/set\","
+        "\"state_value_template\":\"{{ value_json.state }}\","
+        "\"payload_on\":\"{\\\"state\\\":\\\"ON\\\"}\","
+        "\"payload_off\":\"{\\\"state\\\":\\\"OFF\\\"}\","
+        "\"availability\":[{\"topic\":\"%s/availability\"},"
+        "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"",
+        ch, P, ch, P, ch, P, P, slave);
+    snprintf(ids, sizeof ids, "lighting_relay_%u", ch);
+    snprintf(name, sizeof name, "Relay Channel %u", ch);
+    dev(n, ids, name, MFR_WAVE, "Relay Channel", "lighting_relay_board");
+    snprintf(objid, sizeof objid, "lighting_relay_%u", ch);
+    pub_cfg("switch", objid);
+}
+
+static void disc_ballast(uint8_t slave, uint8_t addr) {
+    const char *P = mqtt_app_prefix();
+    char ids[40], name[24], gw[32], objid[40];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_dali_%u_%u\",\"name\":null,\"schema\":\"json\","
+        "\"state_topic\":\"%s/dali/%u/%u/state\",\"command_topic\":\"%s/dali/%u/%u/set\","
+        "\"supported_color_modes\":[\"brightness\"],\"brightness_scale\":254,"
+        "\"availability\":[{\"topic\":\"%s/availability\"},"
+        "{\"topic\":\"%s/gateway/%u/availability\"},"
+        "{\"topic\":\"%s/dali/%u/%u/availability\"}],\"availability_mode\":\"all\"",
+        slave, addr, P, slave, addr, P, slave, addr, P, P, slave, P, slave, addr);
+    snprintf(ids, sizeof ids, "lighting_dali_%u_%u", slave, addr);
+    snprintf(name, sizeof name, "DALI %u.%02u", slave, addr);
+    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    dev(n, ids, name, MFR_MECH, "DALI Ballast", gw);
+    snprintf(objid, sizeof objid, "lighting_dali_%u_%u", slave, addr);
+    pub_cfg("light", objid);
+    snprintf(s_top, sizeof s_top, "%s/dali/%u/%u/availability", P, slave, addr);
+    pub_str(s_top, "offline", true);
+}
+
+/* one of the 6 per-ballast config number entities */
+static void disc_ballast_cfg(uint8_t slave, uint8_t addr, uint8_t k) {
+    static const struct { const char *key, *name; int lo, hi; } F[] = {
+        { "min", "Min Level", 0, 254 }, { "max", "Max Level", 0, 254 },
+        { "power_on", "Power-On Level", 0, 254 }, { "sys_fail", "System-Failure Level", 0, 254 },
+        { "fade_rate", "Fade Rate", 0, 15 }, { "fade_time", "Fade Time", 0, 15 },
+    };
+    const char *P = mqtt_app_prefix();
+    char ids[40], name[24], gw[32], objid[48];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_dali_%u_%u_%s\",\"name\":\"%s\","
+        "\"command_topic\":\"%s/dali/%u/%u/config/%s/set\","
+        "\"state_topic\":\"%s/dali/%u/%u/config\",\"value_template\":\"{{ value_json.%s }}\","
+        "\"min\":%d,\"max\":%d,\"step\":1,\"mode\":\"box\","
+        "\"availability\":[{\"topic\":\"%s/availability\"},"
+        "{\"topic\":\"%s/gateway/%u/availability\"},"
+        "{\"topic\":\"%s/dali/%u/%u/availability\"}],\"availability_mode\":\"all\","
+        "\"entity_category\":\"config\"",
+        slave, addr, F[k].key, F[k].name, P, slave, addr, F[k].key,
+        P, slave, addr, F[k].key, F[k].lo, F[k].hi, P, P, slave, P, slave, addr);
+    snprintf(ids, sizeof ids, "lighting_dali_%u_%u", slave, addr);
+    snprintf(name, sizeof name, "DALI %u.%02u", slave, addr);
+    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    dev(n, ids, name, MFR_MECH, "DALI Ballast", gw);
+    snprintf(objid, sizeof objid, "lighting_dali_%u_%u_%s", slave, addr, F[k].key);
+    pub_cfg("number", objid);
+}
+
+static void disc_group_light(uint8_t slave, uint8_t grp) {
+    const char *P = mqtt_app_prefix();
+    char ids[40], name[28], gw[32], objid[40];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_group_%u_%u\",\"name\":null,\"schema\":\"json\","
+        "\"state_topic\":\"%s/group/%u/%u/state\",\"command_topic\":\"%s/group/%u/%u/set\","
+        "\"supported_color_modes\":[\"brightness\"],\"brightness_scale\":254,"
+        "\"availability\":[{\"topic\":\"%s/availability\"},"
+        "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"",
+        slave, grp, P, slave, grp, P, slave, grp, P, P, slave);
+    snprintf(ids, sizeof ids, "lighting_group_%u_%u", slave, grp);
+    snprintf(name, sizeof name, "DALI Group %u.%u", slave, grp);
+    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    dev(n, ids, name, MFR_MECH, "DALI Group", gw);
+    snprintf(objid, sizeof objid, "lighting_group_%u_%u", slave, grp);
+    pub_cfg("light", objid);
+    snprintf(s_top, sizeof s_top, "%s/group/%u/%u/state", P, slave, grp);
+    pub_str(s_top, "{\"state\":\"OFF\"}", true);
+}
+
+static void disc_group_members(uint8_t slave, uint8_t grp) {
+    const char *P = mqtt_app_prefix();
+    char ids[40], name[28], gw[32], objid[48];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_group_%u_%u_members\",\"name\":\"Members\","
+        "\"command_topic\":\"%s/group/%u/%u/members/set\","
+        "\"state_topic\":\"%s/group/%u/%u/members/state\","
+        "\"pattern\":\"%s\",\"availability\":[{\"topic\":\"%s/availability\"},"
+        "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\","
+        "\"entity_category\":\"config\",\"icon\":\"mdi:format-list-bulleted\"",
+        slave, grp, P, slave, grp, P, slave, grp, MEMBERS_PATTERN, P, P, slave);
+    snprintf(ids, sizeof ids, "lighting_group_%u_%u", slave, grp);
+    snprintf(name, sizeof name, "DALI Group %u.%u", slave, grp);
+    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    dev(n, ids, name, MFR_MECH, "DALI Group", gw);
+    snprintf(objid, sizeof objid, "lighting_group_%u_%u_members", slave, grp);
+    pub_cfg("text", objid);
+    snprintf(s_top, sizeof s_top, "%s/group/%u/%u/members/state", P, slave, grp);
+    pub_str(s_top, "", true);
+}
+
+static void disc_prov(uint8_t slave, uint8_t k) {
+    const char *P = mqtt_app_prefix();
+    char gwids[32], gwname[24], objid[48], status[64];
+    snprintf(gwids, sizeof gwids, "lighting_dali_gw_%u", slave);
+    snprintf(gwname, sizeof gwname, "DALI Gateway %u", slave);
+    snprintf(status, sizeof status, "%s/provision/%u/status", P, slave);
+
+    #define PROV_TAIL(cat) do { \
+        int _n = (int)strlen(s_pl); \
+        _n += snprintf(s_pl+_n, PL_CAP-_n, \
+            ",\"availability\":[{\"topic\":\"%s/availability\"}," \
+            "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"," \
+            "\"entity_category\":\"" cat "\"", P, P, slave); \
+        dev(_n, gwids, gwname, MFR_MECH, "TinyModbus ATtiny1604 DALI Gateway", NULL); \
+    } while (0)
+
+    switch (k) {
+    case 0:
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_state\","
+            "\"name\":\"Commission State\",\"state_topic\":\"%s\","
+            "\"value_template\":\"{{ value_json.state }}\",\"icon\":\"mdi:lightning-bolt-circle\"",
+            slave, status);
+        PROV_TAIL("diagnostic");
+        snprintf(objid, sizeof objid, "lighting_prov_%u_state", slave); pub_cfg("sensor", objid);
+        break;
+    case 1:
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_msg\","
+            "\"name\":\"Commission Status\",\"state_topic\":\"%s\","
+            "\"value_template\":\"{{ value_json.msg }}\",\"icon\":\"mdi:text-box-outline\"",
+            slave, status);
+        PROV_TAIL("diagnostic");
+        snprintf(objid, sizeof objid, "lighting_prov_%u_msg", slave); pub_cfg("sensor", objid);
+        break;
+    case 2:
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_count\","
+            "\"name\":\"Devices Found\",\"state_topic\":\"%s\","
+            "\"value_template\":\"{{ value_json.devices_found }}\",\"icon\":\"mdi:counter\"",
+            slave, status);
+        PROV_TAIL("diagnostic");
+        snprintf(objid, sizeof objid, "lighting_prov_%u_count", slave); pub_cfg("sensor", objid);
+        break;
+    case 3: case 4: case 5: case 6: {
+        static const char *suf[]  = { "all", "unaddressed", "address", "abort" };
+        static const char *nm[]   = { "Commission All", "Commission New Devices",
+                                      "Commission Address", "Abort Commission" };
+        static const char *icon[] = { "mdi:lightbulb-group", "mdi:lightbulb-plus",
+                                      "mdi:lightbulb-on", "mdi:stop-circle" };
+        static const char *cmd[]  = { "start/all", "start/unaddressed", "start/address", "abort" };
+        int b = k - 3;
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_%s\",\"name\":\"%s\","
+            "\"command_topic\":\"%s/provision/%u/%s\",\"payload_press\":\"PRESS\",\"icon\":\"%s\"",
+            slave, suf[b], nm[b], P, slave, cmd[b], icon[b]);
+        PROV_TAIL("config");
+        snprintf(objid, sizeof objid, "lighting_prov_%u_%s", slave, suf[b]); pub_cfg("button", objid);
+        break;
+    }
+    case 7:
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_target\","
+            "\"name\":\"Target Address\",\"command_topic\":\"%s/provision/%u/start/target\","
+            "\"state_topic\":\"%s/provision/%u/target_state\","
+            "\"min\":0,\"max\":63,\"step\":1,\"mode\":\"box\",\"icon\":\"mdi:numeric\"",
+            slave, P, slave, P, slave);
+        PROV_TAIL("config");
+        snprintf(objid, sizeof objid, "lighting_prov_%u_target", slave); pub_cfg("number", objid);
+        break;
+    case 8:
+        snprintf(s_top, sizeof s_top, "%s/provision/%u/target_state", P, slave);
+        pub_str(s_top, "0", true);
+        break;
+    case 9:
+        snprintf(s_top, sizeof s_top, "%s/provision/%u/status", P, slave);
+        pub_str(s_top, "{\"state\":\"idle\",\"msg\":\"Idle\",\"devices_found\":0}", true);
+        break;
+    }
+    #undef PROV_TAIL
+}
+
+/* one of the 5 controller-config entities (3 numbers + 2 sensors). No values
+ * needed for discovery — the config/state topic carries them. */
+static void disc_controller(uint8_t k) {
+    const char *P = mqtt_app_prefix();
+    char objid[32];
+    if (k < 3) {
+        static const struct { const char *key, *name; int lo, hi, step; } N[] = {
+            { "long_press_ms", "Long-Press (ms)", 100, 5000, 50 },
+            { "dim_repeat_ms", "Dim Repeat (ms)", 50, 2000, 10 },
+            { "reversal_window_ms", "Reversal Window (ms)", 50, 2000, 10 },
+        };
+        int n = snprintf(s_pl, PL_CAP,
+            "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\","
+            "\"command_topic\":\"%s/config/%s/set\",\"state_topic\":\"%s/config/state\","
+            "\"value_template\":\"{{ value_json.%s }}\",\"min\":%d,\"max\":%d,\"step\":%d,"
+            "\"mode\":\"box\",\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\"",
+            N[k].key, N[k].name, P, N[k].key, P, N[k].key, N[k].lo, N[k].hi, N[k].step, P);
+        snprintf(s_pl + n, PL_CAP - n,
+            ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+            "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
+            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
+        snprintf(objid, sizeof objid, "lighting_cfg_%s", N[k].key); pub_cfg("number", objid);
+    } else {
+        static const struct { const char *key, *name, *icon; } S[] = {
+            { "fw_version", "Firmware", "mdi:chip" },
+            { "baud", "Modbus Baud", "mdi:speedometer" },
+        };
+        int b = k - 3;
+        int n = snprintf(s_pl, PL_CAP,
+            "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\",\"state_topic\":\"%s/config/state\","
+            "\"value_template\":\"{{ value_json.%s }}\",\"availability_topic\":\"%s/availability\","
+            "\"entity_category\":\"diagnostic\",\"icon\":\"%s\"",
+            S[b].key, S[b].name, P, S[b].key, P, S[b].icon);
+        snprintf(s_pl + n, PL_CAP - n,
+            ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+            "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
+            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
+        snprintf(objid, sizeof objid, "lighting_cfg_%s", S[b].key); pub_cfg("sensor", objid);
+    }
+}
+
+static void seed_gateway_avail(uint8_t slave) {
+    snprintf(s_top, sizeof s_top, "%s/gateway/%u/availability", mqtt_app_prefix(), slave);
+    pub_str(s_top, "online", true);
+}
+
+/* ── incremental discovery cursor ────────────────────────────────────────── */
+typedef enum {
+    PH_GW_AVAIL, PH_CONTROLLER, PH_PLATE_EVT, PH_PLATE_BIND, PH_RELAY,
+    PH_BALLAST, PH_BALLAST_CFG, PH_GROUP_L, PH_GROUP_M, PH_PROV, PH_DONE
+} disc_phase_t;
+
+static bool         s_disc_active;
+static disc_phase_t s_ph;
+static uint16_t     s_i, s_j, s_k;
+
+typedef enum { DISC_MORE, DISC_STALL, DISC_DONE } disc_res_t;
+
+static disc_res_t disc_step(void) {
+    const ic_snapshot_t *sn = intercore_snapshot();
+    if (mqtt_app_tx_free() < TX_GATE) return DISC_STALL;
+
+    switch (s_ph) {
+    case PH_GW_AVAIL:
+        if (s_i < sn->dali_count) { seed_gateway_avail(sn->dali_slaves[s_i]); s_i++; }
+        else if (s_i < sn->dali_count + sn->relay_count) {
+            seed_gateway_avail(sn->relay_slaves[s_i - sn->dali_count]); s_i++;
+        }
+        if (s_i >= sn->dali_count + sn->relay_count) { s_ph = PH_CONTROLLER; s_i = 0; }
+        return DISC_MORE;
+    case PH_CONTROLLER:
+        disc_controller((uint8_t)s_i);
+        if (++s_i >= 5) { s_ph = PH_PLATE_EVT; s_i = s_j = 0; }
+        return DISC_MORE;
+    case PH_PLATE_EVT:
+        disc_plate_event((uint8_t)s_i, (uint8_t)s_j);
+        if (++s_j >= MAX_BTN) { s_j = 0; if (++s_i >= MAX_FIX) { s_ph = PH_PLATE_BIND; s_i = 0; } }
+        return DISC_MORE;
+    case PH_PLATE_BIND:
+        disc_plate_binding((uint8_t)s_i, (uint8_t)s_j);
+        if (++s_j >= MAX_BTN) { s_j = 0; if (++s_i >= MAX_FIX) { s_ph = PH_RELAY; s_i = 0; } }
+        return DISC_MORE;
+    case PH_RELAY:
+        if (sn->relay_count > 0) disc_relay(sn->relay_slaves[0], (uint8_t)s_i);
+        if (++s_i >= RELAY_CHANS || sn->relay_count == 0) { s_ph = PH_BALLAST; s_i = s_j = 0; }
+        return DISC_MORE;
+    case PH_BALLAST:
+        if (s_i >= sn->dali_count) { s_ph = PH_BALLAST_CFG; s_i = s_j = s_k = 0; return DISC_MORE; }
+        disc_ballast(sn->dali_slaves[s_i], (uint8_t)s_j);
+        if (++s_j >= DALI_ADDRS) { s_j = 0; s_i++; }
+        return DISC_MORE;
+    case PH_BALLAST_CFG:
+        if (s_i >= sn->dali_count) { s_ph = PH_GROUP_L; s_i = s_j = 0; return DISC_MORE; }
+        disc_ballast_cfg(sn->dali_slaves[s_i], (uint8_t)s_j, (uint8_t)s_k);
+        if (++s_k >= 6) { s_k = 0; if (++s_j >= DALI_ADDRS) { s_j = 0; s_i++; } }
+        return DISC_MORE;
+    case PH_GROUP_L:
+        if (s_i >= sn->dali_count) { s_ph = PH_GROUP_M; s_i = s_j = 0; return DISC_MORE; }
+        disc_group_light(sn->dali_slaves[s_i], (uint8_t)s_j);
+        if (++s_j >= DALI_GROUPS) { s_j = 0; s_i++; }
+        return DISC_MORE;
+    case PH_GROUP_M:
+        if (s_i >= sn->dali_count) { s_ph = PH_PROV; s_i = s_j = 0; return DISC_MORE; }
+        disc_group_members(sn->dali_slaves[s_i], (uint8_t)s_j);
+        if (++s_j >= DALI_GROUPS) { s_j = 0; s_i++; }
+        return DISC_MORE;
+    case PH_PROV:
+        if (s_i >= sn->dali_count) { s_ph = PH_DONE; return DISC_MORE; }
+        disc_prov(sn->dali_slaves[s_i], (uint8_t)s_j);
+        if (++s_j >= 10) { s_j = 0; s_i++; }
+        return DISC_MORE;
+    case PH_DONE:
+    default:
+        return DISC_DONE;
+    }
+}
+
+static void subscribe_all(void) {
+    const char *P = mqtt_app_prefix();
+    static const char *const filt[] = {
+        "relay/+/set", "dali/+/+/config/+/set", "dali/+/+/set",
+        "group/+/+/members/set", "group/+/+/set",
+        "provision/+/start/all", "provision/+/start/unaddressed",
+        "provision/+/start/address", "provision/+/start/target", "provision/+/abort",
+        "mapping/+/+/set", "mapping/+/+/delete", "binding/+/+/set",
+        "config/set", "config/+/set",
+    };
+    char f[64];
+    for (unsigned i = 0; i < sizeof filt / sizeof filt[0]; i++) {
+        snprintf(f, sizeof f, "%s/%s", P, filt[i]);
+        mqtt_app_subscribe(f);
+    }
+}
+
+/* ── availability sweep (scan_complete -> 64 per-ballast topics) ──────────── */
+static bool     s_sweep_pending;
+static uint8_t  s_sweep_slave;
+static uint64_t s_sweep_mask;
+static uint8_t  s_sweep_addr;
+
+static void sweep_step(void) {
+    const char *P = mqtt_app_prefix();
+    for (int n = 0; n < SWEEP_BATCH && s_sweep_addr < DALI_ADDRS; n++) {
+        if (mqtt_app_tx_free() < TX_GATE) return;
+        bool present = s_sweep_mask & ((uint64_t)1 << s_sweep_addr);
+        snprintf(s_top, sizeof s_top, "%s/dali/%u/%u/availability", P, s_sweep_slave, s_sweep_addr);
+        pub_str(s_top, present ? "online" : "offline", true);
+        s_sweep_addr++;
+    }
+    if (s_sweep_addr >= DALI_ADDRS) s_sweep_pending = false;
+}
+
+/* ── event -> MQTT state translation ─────────────────────────────────────── */
+static const char *const PROV_STATE_STR[] = {
+    "idle", "clearing", "scanning", "terminating", "initialising", "randomising",
+    "searching", "assigning", "verifying", "withdrawing", "complete", "error"
+};
+static const char *prov_state_str(uint8_t s) {
+    return s < sizeof PROV_STATE_STR / sizeof PROV_STATE_STR[0] ? PROV_STATE_STR[s] : "unknown";
+}
+
+static void json_escape(const char *in, char *out, size_t cap) {
+    size_t o = 0;
+    for (; *in && o + 2 < cap; in++) {
+        unsigned char c = (unsigned char)*in;
+        if (c == '"' || c == '\\') { out[o++] = '\\'; out[o++] = c; }
+        else if (c >= 0x20) out[o++] = c;
+        else out[o++] = ' ';
+    }
+    out[o] = '\0';
+}
+
+static void members_csv(uint64_t mask, char *out, size_t cap) {
+    int n = 0; bool first = true;
+    for (int a = 0; a < 64 && n < (int)cap - 4; a++)
+        if (mask & ((uint64_t)1 << a)) { n += snprintf(out + n, cap - n, "%s%d", first ? "" : ",", a); first = false; }
+    out[n] = '\0';
+}
+
+void ha_bridge_publish_event(const ic_event_t *e) {
+    const char *P = mqtt_app_prefix();
+    char top[80], pl[320];
+    switch (e->type) {
+    case IC_EVT_RELAY:
+        snprintf(top, sizeof top, "%s/relay/%u/state", P, e->relay.ch);
+        snprintf(pl, sizeof pl, "{\"state\":\"%s\"}", e->relay.on ? "ON" : "OFF");
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        break;
+    case IC_EVT_DALI:
+        snprintf(top, sizeof top, "%s/dali/%u/%u/state", P, e->dali.slave, e->dali.addr);
+        if (e->dali.arc == 0) snprintf(pl, sizeof pl, "{\"state\":\"OFF\"}");
+        else snprintf(pl, sizeof pl,
+            "{\"state\":\"ON\",\"color_mode\":\"brightness\",\"brightness\":%u}", e->dali.arc);
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        snprintf(top, sizeof top, "%s/dali/%u/%u/config", P, e->dali.slave, e->dali.addr);
+        snprintf(pl, sizeof pl,
+            "{\"min\":%u,\"max\":%u,\"power_on\":%u,\"sys_fail\":%u,\"fade_rate\":%u,\"fade_time\":%u}",
+            e->dali.min, e->dali.max, e->dali.power_on, e->dali.sys_fail, e->dali.fade_rate, e->dali.fade_time);
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        break;
+    case IC_EVT_GROUP: {
+        snprintf(top, sizeof top, "%s/group/%u/%u/state", P, e->group.slave, e->group.group);
+        if (!e->group.on) snprintf(pl, sizeof pl, "{\"state\":\"OFF\"}");
+        else snprintf(pl, sizeof pl,
+            "{\"state\":\"ON\",\"color_mode\":\"brightness\",\"brightness\":%u}", e->group.bri);
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        char csv[208];
+        members_csv(e->group.members, csv, sizeof csv);
+        snprintf(top, sizeof top, "%s/group/%u/%u/members/state", P, e->group.slave, e->group.group);
+        mqtt_app_publish(top, csv, strlen(csv), true);
+        break;
+    }
+    case IC_EVT_GATEWAY:
+        snprintf(top, sizeof top, "%s/gateway/%u/availability", P, e->gateway.slave);
+        pub_str(top, e->gateway.online ? "online" : "offline", true);
+        break;
+    case IC_EVT_PRESENCE:
+        for (int a = 0; a < 64; a++) {
+            if (e->presence.appeared & ((uint64_t)1 << a)) {
+                snprintf(top, sizeof top, "%s/dali/%u/%u/availability", P, e->presence.slave, a);
+                pub_str(top, "online", true);
+            }
+            if (e->presence.disappeared & ((uint64_t)1 << a)) {
+                snprintf(top, sizeof top, "%s/dali/%u/%u/availability", P, e->presence.slave, a);
+                pub_str(top, "offline", true);
+            }
+        }
+        break;
+    case IC_EVT_BUTTON: {
+        static const char *const act[] = { "press", "release", "long_press_start", "long_press_repeat" };
+        snprintf(top, sizeof top, "%s/button/%u/%u", P, e->button.fixture, e->button.button);
+        snprintf(pl, sizeof pl, "{\"event_type\":\"%s\"}", act[e->button.action <= 3 ? e->button.action : 0]);
+        mqtt_app_publish(top, pl, strlen(pl), false);   /* momentary, not retained */
+        break;
+    }
+    case IC_EVT_MAPPING: {
+        char arr[256]; int n = snprintf(arr, sizeof arr, "[");
+        for (int i = 0; i < e->mapping.count; i++) {
+            const mapping_target_t *t = &e->mapping.targets[i];
+            if (TARGET_IS_GROUP(*t))
+                n += snprintf(arr + n, sizeof arr - n, "%s{\"slave\":%u,\"group\":%u}", i ? "," : "", t->slave, TARGET_GROUP_NUM(*t));
+            else
+                n += snprintf(arr + n, sizeof arr - n, "%s{\"slave\":%u,\"addr\":%u}", i ? "," : "", t->slave, t->addr);
+        }
+        snprintf(arr + n, sizeof arr - n, "]");
+        snprintf(top, sizeof top, "%s/mapping/%u/%u", P, e->mapping.fixture, e->mapping.button);
+        snprintf(pl, sizeof pl, "{\"fixture\":%u,\"button\":%u,\"targets\":%s}", e->mapping.fixture, e->mapping.button, arr);
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        char bs[160]; int m = 0; bs[0] = '\0';
+        for (int i = 0; i < e->mapping.count; i++) {
+            const mapping_target_t *t = &e->mapping.targets[i];
+            if (TARGET_IS_GROUP(*t)) m += snprintf(bs + m, sizeof bs - m, "%s%u:g%u", i ? "," : "", t->slave, TARGET_GROUP_NUM(*t));
+            else m += snprintf(bs + m, sizeof bs - m, "%s%u:%u", i ? "," : "", t->slave, t->addr);
+        }
+        snprintf(top, sizeof top, "%s/binding/%u/%u/state", P, e->mapping.fixture, e->mapping.button);
+        mqtt_app_publish(top, bs, strlen(bs), true);
+        break;
+    }
+    case IC_EVT_PROVISION: {
+        char msg[2 * 80];
+        json_escape(e->provision.msg, msg, sizeof msg);
+        snprintf(top, sizeof top, "%s/provision/%u/status", P, e->provision.slave);
+        snprintf(pl, sizeof pl, "{\"state\":\"%s\",\"msg\":\"%s\",\"devices_found\":%u}",
+                 prov_state_str(e->provision.state), msg, e->provision.count);
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        break;
+    }
+    case IC_EVT_CFG:
+        snprintf(top, sizeof top, "%s/config/state", P);
+        snprintf(pl, sizeof pl,
+            "{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,\"baud\":%lu,"
+            "\"fw_version\":\"" FW_VERSION "\",\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u}",
+            e->cfg.long_press_ms, e->cfg.dim_repeat_ms, e->cfg.reversal_window_ms,
+            (unsigned long)e->cfg.baud, MAX_FIX, MAX_BTN, MAX_TARGETS_PER_BTN);
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        break;
+    case IC_EVT_SCAN_COMPLETE:   /* handled by the sweep cursor, not here */
+        break;
+    case IC_EVT_FAULT:           /* mqtt_bridge.py logs faults only — no topic */
+        break;
+    }
+}
+
+/* ── inbound MQTT -> ic_cmd_t ────────────────────────────────────────────── */
+static uint8_t s_prov_target[MAX_DALI_SLAVES];
+
+static int split(char *s, char d, char **out, int max) {
+    int n = 0;
+    out[n++] = s;
+    for (; *s && n < max; s++) if (*s == d) { *s = '\0'; out[n++] = s + 1; }
+    return n;
+}
+static bool jtok_eq(const char *js, const jsmntok_t *t, const char *s) {
+    int len = t->end - t->start;
+    return t->type == JSMN_STRING && (int)strlen(s) == len && strncmp(js + t->start, s, len) == 0;
+}
+static int jfind(const char *js, const jsmntok_t *t, int n, const char *key) {
+    for (int i = 1; i < n; i++) if (jtok_eq(js, &t[i], key)) return i + 1;
+    return -1;
+}
+static long jint(const char *js, const jsmntok_t *t) {
+    char b[16]; int len = t->end - t->start; if (len >= (int)sizeof b) len = (int)sizeof b - 1;
+    memcpy(b, js + t->start, len); b[len] = '\0'; return strtol(b, NULL, 10);
+}
+
+/* HA JSON light cmd -> set_dali-style fields (shared by dali + group). */
+static void parse_light(const char *pay, uint16_t *fields, ic_tri_t *on, uint8_t *bri) {
+    jsmn_parser jp; jsmntok_t tk[24]; jsmn_init(&jp);
+    int nt = jsmn_parse(&jp, pay, strlen(pay), tk, 24);
+    if (nt < 1) return;
+    int bi = jfind(pay, tk, nt, "brightness");
+    if (bi >= 0) { *bri = (uint8_t)jint(pay, &tk[bi]); *fields |= IC_DALI_F_BRI; return; }
+    int si = jfind(pay, tk, nt, "state");
+    if (si >= 0) { *on = jtok_eq(pay, &tk[si], "ON") ? IC_TRI_ON : IC_TRI_OFF; *fields |= IC_DALI_F_ON; }
+}
+
+static uint8_t parse_binding(const char *str, mapping_target_t *out, uint8_t max) {
+    const char *s = str; uint8_t c = 0;
+    while (*s && c < max) {
+        while (*s == ' ' || *s == ',') s++;
+        if (!*s) break;
+        char *e;
+        long sl = strtol(s, &e, 10);
+        if (e == s) break;
+        s = e;
+        if (*s != ':') break;
+        s++;
+        bool grp = (*s == 'g' || *s == 'G');
+        if (grp) s++;
+        long v = strtol(s, &e, 10);
+        if (e == s) break;
+        s = e;
+        out[c].slave = (uint8_t)sl;
+        out[c].addr = grp ? TARGET_MAKE_GROUP(v) : (uint8_t)(v & 0x3F);
+        c++;
+    }
+    return c;
+}
+
+static uint8_t parse_targets_json(const char *pay, mapping_target_t *out, uint8_t max) {
+    jsmn_parser jp; jsmntok_t tk[64]; jsmn_init(&jp);
+    int nt = jsmn_parse(&jp, pay, strlen(pay), tk, 64);
+    if (nt < 1 || tk[0].type != JSMN_ARRAY) return 0;
+    uint8_t c = 0; int i = 1;
+    while (i < nt && c < max) {
+        if (tk[i].type != JSMN_OBJECT) break;
+        int sz = tk[i].size; i++;
+        int sl = 0, addr = 0, grp = -1;
+        for (int f = 0; f < sz && i + 1 < nt; f++) {
+            if (jtok_eq(pay, &tk[i], "slave"))      sl = (int)jint(pay, &tk[i + 1]);
+            else if (jtok_eq(pay, &tk[i], "addr"))  addr = (int)jint(pay, &tk[i + 1]);
+            else if (jtok_eq(pay, &tk[i], "group")) grp = (int)jint(pay, &tk[i + 1]);
+            i += 2;
+        }
+        out[c].slave = (uint8_t)sl;
+        out[c].addr = grp >= 0 ? TARGET_MAKE_GROUP(grp) : (uint8_t)(addr & 0x3F);
+        c++;
+    }
+    return c;
+}
+
+static void ha_on_message(const char *topic, uint16_t tlen,
+                          const uint8_t *payload, uint16_t plen) {
+    char t[160]; uint16_t tl = tlen < sizeof t - 1 ? tlen : sizeof t - 1;
+    memcpy(t, topic, tl); t[tl] = '\0';
+    char pay[512]; uint16_t pn = plen < sizeof pay - 1 ? plen : sizeof pay - 1;
+    memcpy(pay, payload, pn); pay[pn] = '\0';
+
+    const char *P = mqtt_app_prefix(); size_t pl0 = strlen(P);
+    if (strncmp(t, P, pl0) != 0 || t[pl0] != '/') return;
+    char *seg[8];
+    int ns = split(t + pl0 + 1, '/', seg, 8);
+    if (ns < 1) return;
+
+    ic_cmd_t c; memset(&c, 0, sizeof c);
+
+    if (!strcmp(seg[0], "relay") && ns >= 3 && !strcmp(seg[2], "set")) {
+        c.type = IC_CMD_SET_RELAY;
+        c.set_relay.ch = (uint8_t)atoi(seg[1]);
+        c.set_relay.on = strstr(pay, "OFF") ? IC_TRI_OFF : IC_TRI_ON;
+        intercore_push_cmd(&c);
+        return;
+    }
+    if (!strcmp(seg[0], "dali") && ns >= 4) {
+        uint8_t s = (uint8_t)atoi(seg[1]), a = (uint8_t)atoi(seg[2]);
+        if (!strcmp(seg[3], "set")) {
+            c.type = IC_CMD_SET_DALI; c.set_dali.slave = s; c.set_dali.addr = a;
+            parse_light(pay, &c.set_dali.fields, &c.set_dali.on, &c.set_dali.bri);
+            if (c.set_dali.fields) intercore_push_cmd(&c);
+        } else if (ns >= 6 && !strcmp(seg[3], "config") && !strcmp(seg[5], "set")) {
+            c.type = IC_CMD_SET_DALI; c.set_dali.slave = s; c.set_dali.addr = a;
+            uint8_t v = (uint8_t)atoi(pay); const char *f = seg[4];
+            if      (!strcmp(f, "min"))       { c.set_dali.fields = IC_DALI_F_MIN;       c.set_dali.min = v; }
+            else if (!strcmp(f, "max"))       { c.set_dali.fields = IC_DALI_F_MAX;       c.set_dali.max = v; }
+            else if (!strcmp(f, "power_on"))  { c.set_dali.fields = IC_DALI_F_POWER_ON;  c.set_dali.power_on = v; }
+            else if (!strcmp(f, "sys_fail"))  { c.set_dali.fields = IC_DALI_F_SYS_FAIL;  c.set_dali.sys_fail = v; }
+            else if (!strcmp(f, "fade_rate")) { c.set_dali.fields = IC_DALI_F_FADE_RATE; c.set_dali.fade_rate = v; }
+            else if (!strcmp(f, "fade_time")) { c.set_dali.fields = IC_DALI_F_FADE_TIME; c.set_dali.fade_time = v; }
+            if (c.set_dali.fields) intercore_push_cmd(&c);
+        }
+        return;
+    }
+    if (!strcmp(seg[0], "group") && ns >= 4) {
+        uint8_t s = (uint8_t)atoi(seg[1]), g = (uint8_t)atoi(seg[2]);
+        if (!strcmp(seg[3], "set")) {
+            c.type = IC_CMD_SET_GROUP; c.set_group.slave = s; c.set_group.group = g;
+            uint16_t f = 0; ic_tri_t on = IC_TRI_OFF; uint8_t bri = 0;
+            parse_light(pay, &f, &on, &bri);
+            if (f & IC_DALI_F_BRI) { c.set_group.fields |= IC_GRP_F_BRI; c.set_group.bri = bri; }
+            if (f & IC_DALI_F_ON)  { c.set_group.fields |= IC_GRP_F_ON;  c.set_group.on = on; }
+            if (c.set_group.fields) intercore_push_cmd(&c);
+        } else if (ns >= 5 && !strcmp(seg[3], "members") && !strcmp(seg[4], "set")) {
+            c.type = IC_CMD_SET_GROUP; c.set_group.slave = s; c.set_group.group = g;
+            c.set_group.fields = IC_GRP_F_MEMBERS;
+            uint64_t m = 0; const char *q = pay;
+            while (*q) {
+                while (*q == ' ' || *q == ',') q++;
+                if (!*q) break;
+                char *e; long v = strtol(q, &e, 10); if (e == q) break; q = e;
+                if (v >= 0 && v < 64) m |= (uint64_t)1 << v;
+            }
+            c.set_group.members = m;
+            intercore_push_cmd(&c);
+        }
+        return;
+    }
+    if (!strcmp(seg[0], "provision") && ns >= 3) {
+        uint8_t s = (uint8_t)atoi(seg[1]); int idx = slave_idx(s);
+        if (!strcmp(seg[2], "abort")) {
+            c.type = IC_CMD_PROVISION_ABORT; c.provision_abort.slave = s; intercore_push_cmd(&c);
+        } else if (!strcmp(seg[2], "start") && ns >= 4) {
+            const char *m = seg[3];
+            if (!strcmp(m, "target")) {
+                if (idx >= 0) {
+                    s_prov_target[idx] = (uint8_t)atoi(pay);
+                    char ts[8]; snprintf(ts, sizeof ts, "%u", s_prov_target[idx]);
+                    char top[64]; snprintf(top, sizeof top, "%s/provision/%u/target_state", P, s);
+                    mqtt_app_publish(top, ts, strlen(ts), true);
+                }
+                return;
+            }
+            c.type = IC_CMD_PROVISION_START; c.provision_start.slave = s;
+            if      (!strcmp(m, "all"))         c.provision_start.mode = IC_PROV_ALL;
+            else if (!strcmp(m, "unaddressed")) c.provision_start.mode = IC_PROV_UNADDRESSED;
+            else if (!strcmp(m, "address")) {
+                c.provision_start.mode = IC_PROV_ADDRESS;
+                c.provision_start.target = idx >= 0 ? s_prov_target[idx] : 0;
+            } else return;
+            intercore_push_cmd(&c);
+        }
+        return;
+    }
+    if (!strcmp(seg[0], "mapping") && ns >= 4) {
+        uint8_t f = (uint8_t)atoi(seg[1]), b = (uint8_t)atoi(seg[2]);
+        if (!strcmp(seg[3], "set")) {
+            c.type = IC_CMD_SET_MAPPING; c.set_mapping.fixture = f; c.set_mapping.button = b;
+            c.set_mapping.count = parse_targets_json(pay, c.set_mapping.targets, MAX_TARGETS_PER_BTN);
+            intercore_push_cmd(&c);
+        } else if (!strcmp(seg[3], "delete")) {
+            c.type = IC_CMD_DEL_MAPPING; c.del_mapping.fixture = f; c.del_mapping.button = b;
+            intercore_push_cmd(&c);
+        }
+        return;
+    }
+    if (!strcmp(seg[0], "binding") && ns >= 4 && !strcmp(seg[3], "set")) {
+        c.type = IC_CMD_SET_MAPPING;
+        c.set_mapping.fixture = (uint8_t)atoi(seg[1]);
+        c.set_mapping.button = (uint8_t)atoi(seg[2]);
+        c.set_mapping.count = parse_binding(pay, c.set_mapping.targets, MAX_TARGETS_PER_BTN);
+        intercore_push_cmd(&c);
+        return;
+    }
+    if (!strcmp(seg[0], "config")) {
+        c.type = IC_CMD_SET_CFG;
+        if (ns >= 2 && !strcmp(seg[1], "set")) {
+            jsmn_parser jp; jsmntok_t tk[24]; jsmn_init(&jp);
+            int nt = jsmn_parse(&jp, pay, strlen(pay), tk, 24);
+            int i;
+            if ((i = jfind(pay, tk, nt, "long_press_ms")) >= 0)      { c.set_cfg.fields |= IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = (uint16_t)jint(pay, &tk[i]); }
+            if ((i = jfind(pay, tk, nt, "dim_repeat_ms")) >= 0)      { c.set_cfg.fields |= IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = (uint16_t)jint(pay, &tk[i]); }
+            if ((i = jfind(pay, tk, nt, "reversal_window_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = (uint16_t)jint(pay, &tk[i]); }
+        } else if (ns >= 3 && !strcmp(seg[2], "set")) {
+            uint16_t v = (uint16_t)atoi(pay); const char *f = seg[1];
+            if      (!strcmp(f, "long_press_ms"))      { c.set_cfg.fields = IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = v; }
+            else if (!strcmp(f, "dim_repeat_ms"))      { c.set_cfg.fields = IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = v; }
+            else if (!strcmp(f, "reversal_window_ms")) { c.set_cfg.fields = IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = v; }
+        }
+        if (c.set_cfg.fields) intercore_push_cmd(&c);
+        return;
+    }
+}
+
+/* ── hooks + tick ────────────────────────────────────────────────────────── */
+static void ha_on_connected(void) {
+    LOG_INFO("mqtt", "session up — (re)publishing discovery");
+    s_disc_active = true;
+    s_ph = PH_GW_AVAIL;
+    s_i = s_j = s_k = 0;
+    s_sweep_pending = false;
+}
+
+void ha_bridge_init(void) {
+    mqtt_app_set_connected_cb(ha_on_connected);
+    mqtt_app_set_message_cb(ha_on_message);
+}
+
+void ha_bridge_tick(void) {
+    /* Disconnected: drop queued events (a fresh resync repopulates on reconnect). */
+    if (!mqtt_app_connected()) {
+        s_disc_active = false;
+        s_sweep_pending = false;
+        ic_event_t ev;
+        while (intercore_pop_event(&ev)) { }
+        return;
+    }
+
+    /* Finish the discovery burst before publishing any state. */
+    if (s_disc_active) {
+        for (int n = 0; n < DISC_BATCH; n++) {
+            disc_res_t r = disc_step();
+            if (r == DISC_STALL) break;
+            if (r == DISC_DONE) {
+                s_disc_active = false;
+                LOG_INFO("mqtt", "discovery complete — subscribe + resync");
+                subscribe_all();
+                ic_cmd_t rc; memset(&rc, 0, sizeof rc); rc.type = IC_CMD_RESYNC;
+                intercore_push_cmd(&rc);
+                break;
+            }
+        }
+        return;
+    }
+
+    /* Finish an availability sweep before draining more events. */
+    if (s_sweep_pending) { sweep_step(); return; }
+
+    /* Pump state events to MQTT, TX-flow-controlled and bounded per tick. */
+    ic_event_t ev;
+    for (int budget = 24; budget > 0; budget--) {
+        if (mqtt_app_tx_free() < PUMP_GATE) break;
+        if (!intercore_pop_event(&ev)) break;
+        if (ev.type == IC_EVT_SCAN_COMPLETE) {
+            s_sweep_pending = true;
+            s_sweep_slave   = ev.scan_complete.slave;
+            s_sweep_mask    = ev.scan_complete.present_mask;
+            s_sweep_addr    = 0;
+            break;   /* run the sweep on following ticks before more events */
+        }
+        ha_bridge_publish_event(&ev);
+    }
+}

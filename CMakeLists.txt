@@ -1,6 +1,9 @@
 cmake_minimum_required(VERSION 3.13)
 
-set(PICO_PLATFORM "rp2350")
+# Board: WIZnet W5100S-EVB-Pico (RP2040). The board header pins PICO_PLATFORM=rp2040,
+# the W5100S SPI0 pins (SCK18/MOSI19/MISO16/CS17/RST20/INT21), 2 MB flash + W25Q080
+# stage2. (Was a bare Pico 2 / rp2350 before the on-board-bridge work.)
+set(PICO_BOARD wiznet_w5100s_evb_pico)
 set(PICO_SDK_PATH "lib/pico-sdk")
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -13,6 +16,8 @@ pico_sdk_init()
 
 add_executable(light_switch
     src/main.c
+    src/intercore.c
+    src/core1.c
     src/modbus.c
     src/button_actions.c
     src/button_fsm.c
@@ -60,9 +65,79 @@ target_link_libraries(light_switch PRIVATE
     hardware_watchdog
     hardware_flash
     pico_flash
-    pico_util          # queue_t
+    pico_multicore     # core 1 network bridge
+    pico_util          # queue_t (inter-core SPSC queues)
     pico_time
 )
+
+# jsmn — single-header JSON tokenizer (malloc-free, float-free). JSMN_STATIC so
+# each TU that includes it (config.c on core 0, ha_bridge.c on core 1) gets its
+# own copy — no duplicate-symbol link error.
+target_include_directories(light_switch PRIVATE ${CMAKE_CURRENT_LIST_DIR}/lib/jsmn)
+target_compile_definitions(light_switch PRIVATE JSMN_STATIC)
+
+# ── WIZnet W5100S networking (ioLibrary_Driver) — core 1 only ───────────────
+set(IOLIB ${CMAKE_CURRENT_LIST_DIR}/lib/ioLibrary_Driver)
+
+# Build-time patch: ioLibrary recv() returns SOCK_BUSY before checking whether
+# data is actually present in non-block mode (upstream issue #173), which leaves
+# the MQTT CONNACK unread forever. We keep the submodule pristine and apply the
+# one-line fix here, idempotently, so it's repeatable and trivially removable
+# once upstream fixes #173. Reverse-check first to detect an already-patched
+# tree (re-configures, dirty checkouts); a forward-apply failure is non-fatal
+# (warns) so an upstream fix that obsoletes the patch doesn't break the build.
+set(IOLIB_RECV_PATCH ${CMAKE_CURRENT_LIST_DIR}/patches/0001-ioLibrary-recv-nonblock-issue-173.patch)
+execute_process(
+    COMMAND git apply --reverse --check ${IOLIB_RECV_PATCH}
+    WORKING_DIRECTORY ${IOLIB}
+    RESULT_VARIABLE _iolib_patch_rev ERROR_QUIET OUTPUT_QUIET)
+if(_iolib_patch_rev EQUAL 0)
+    message(STATUS "ioLibrary recv() #173 patch: already applied")
+else()
+    execute_process(
+        COMMAND git apply ${IOLIB_RECV_PATCH}
+        WORKING_DIRECTORY ${IOLIB}
+        RESULT_VARIABLE _iolib_patch_app ERROR_QUIET OUTPUT_QUIET)
+    if(_iolib_patch_app EQUAL 0)
+        message(STATUS "ioLibrary recv() #173 patch: applied")
+    else()
+        message(WARNING "ioLibrary recv() #173 patch did not apply — upstream may "
+            "have fixed #173. Verify Ethernet/socket.c recv() non-block handling "
+            "and remove patches/0001-ioLibrary-recv-nonblock-issue-173.patch if so.")
+    endif()
+endif()
+
+target_sources(light_switch PRIVATE
+    ${IOLIB}/Ethernet/wizchip_conf.c
+    ${IOLIB}/Ethernet/socket.c
+    ${IOLIB}/Ethernet/W5100S/w5100s.c
+    ${IOLIB}/Internet/DHCP/dhcp.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/wizchip_glue.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/mqtt_app.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/ha_bridge.c
+)
+
+# ── coreMQTT (FreeRTOS standalone; static, malloc/float-free) ───────────────
+include(${CMAKE_CURRENT_LIST_DIR}/lib/coreMQTT/mqttFilePaths.cmake)
+target_sources(light_switch PRIVATE ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES})
+target_include_directories(light_switch PRIVATE ${MQTT_INCLUDE_PUBLIC_DIRS})
+target_include_directories(light_switch PRIVATE
+    ${IOLIB}/Ethernet
+    ${IOLIB}/Ethernet/W5100S
+    ${IOLIB}/Internet/DHCP
+    ${CMAKE_CURRENT_LIST_DIR}/src/net
+)
+target_compile_definitions(light_switch PRIVATE _WIZCHIP_=W5100S)
+target_link_libraries(light_switch PRIVATE hardware_spi pico_unique_id)
+
+# Vendored third-party: don't subject ioLibrary to our -Wall -Wextra.
+set_source_files_properties(
+    ${IOLIB}/Ethernet/wizchip_conf.c
+    ${IOLIB}/Ethernet/socket.c
+    ${IOLIB}/Ethernet/W5100S/w5100s.c
+    ${IOLIB}/Internet/DHCP/dhcp.c
+    PROPERTIES COMPILE_OPTIONS "-w")
 
 # USB CDC for serial protocol (replaces Lua REPL)
 pico_enable_stdio_usb(light_switch 1)

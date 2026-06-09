@@ -11,10 +11,7 @@ void serial_poll(void);
 /* Emit hello message after boot */
 void serial_tx_hello(void);
 
-/* Emit ack for an HA command */
-void serial_tx_ack(unsigned cmd_id, bool ok, const char *err);
-
-/* Emit full mapping config dump */
+/* Push every binding to core 1 as config_mapping events (used by resync). */
 void serial_tx_config_full(void);
 
 #define SERIAL_LINE_MAX 256
@@ -24,6 +21,3 @@ void serial_tx_config_full(void);
 void serial_provision_status_changed(void);
 /* Call from serial_poll() each iteration */
 void serial_provision_poll(void);
-/* Dispatch provision_start / provision_abort inbound messages */
-void serial_handle_provision_start(const char *line, unsigned cmd_id);
-void serial_handle_provision_abort(const char *line, unsigned cmd_id);

@@ -17,6 +17,22 @@ typedef struct {
     uint8_t  relay_slave_count;
     uint8_t  dali_slave_ids[MAX_DALI_SLAVES];
     uint8_t  dali_slave_count;
+
+    /* Modbus bus settings (migrated from /modbus_baud.txt + /modbus_config.txt). */
+    uint32_t baud;                 /* default 19200 */
+    uint8_t  de_mode;              /* modbus_de_mode_t, default 0 (when-tx) */
+
+    /* MQTT broker. host is a dotted-quad IP (hostname/DNS is a follow-up).
+     * Compile defaults are placeholders only — never commit secrets. */
+    char     mqtt_host[64];
+    uint16_t mqtt_port;            /* default 1883 */
+    char     mqtt_user[48];
+    char     mqtt_pass[64];
+    char     mqtt_prefix[24];      /* default "lighting" */
+
+    /* Network. dhcp default on; static fields used only when dhcp == 0. */
+    uint8_t  net_dhcp;             /* default 1 */
+    uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
 } global_config_t;
 
 extern global_config_t g_config;

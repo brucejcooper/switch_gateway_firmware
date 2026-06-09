@@ -26,7 +26,10 @@
 #include "serial_protocol.h"
 #include "dali_provision.h"
 #include "bus_discovery.h"
+#include "core1.h"
+#include "intercore.h"
 #include "log.h"
+#include <string.h>
 
 #include <hardware/timer.h>
 #include <hardware/watchdog.h>
@@ -58,15 +61,39 @@ static void relay_read_cb(int res, uint8_t *buf, void *ctx) {
     c->done = true;
 }
 
+/* Grace window end: core 0 feeds the watchdog unconditionally until here. */
+static absolute_time_t s_core1_grace_until;
+
+/* Feed the hardware watchdog only while core 1's heartbeat is fresh (or during
+ * the post-launch grace window). A network outage keeps core 1 looping and
+ * beating, so it never reboots; only a genuine core-1 wedge (stuck SPI, infinite
+ * loop) stops the beat and lets the 5 s watchdog fire. */
+static void wd_feed(void) {
+    if (!time_reached(s_core1_grace_until) ||
+        (to_ms_since_boot(get_absolute_time()) - core1_heartbeat_ms()) < CORE1_STALE_MS) {
+        watchdog_update();
+    }
+}
+
 int main(void) {
     stdio_init_all();
-    fs_init();
     alarm_pool_init_default();
 
     int rc = pico_led_init();
     hard_assert(rc == PICO_OK);
 
     busy_wait_ms(2500); /* USB enumeration settling time */
+
+    /* Launch core 1 BEFORE fs_init(): core 1 registers as the flash lockout
+     * victim (flash_safe_execute_core_init), which the first-boot littlefs
+     * format requires — otherwise flash_safe_execute() returns NOT_PERMITTED and
+     * the filesystem never mounts (so config/mappings can't persist). core 1
+     * then parks waiting for the config snapshot before bringing up the network. */
+    intercore_init();
+    core1_launch();
+
+    if (!fs_init())
+        LOG_ERR("boot", "fs_init failed — persistence unavailable");
 
     if (watchdog_enable_caused_reboot()) {
         LOG_INFO("boot", "Rebooted by Watchdog");
@@ -135,25 +162,56 @@ int main(void) {
 
     serial_protocol_init();
 
+    /* Fill the config snapshot (slave lists + broker/net settings) for core 1,
+     * then release it to bring up the network. */
+    ic_snapshot_t snap;
+    memset(&snap, 0, sizeof snap);
+    snap.relay_count = g_config.relay_slave_count;
+    memcpy(snap.relay_slaves, g_config.relay_slave_ids, g_config.relay_slave_count);
+    snap.dali_count = g_config.dali_slave_count;
+    memcpy(snap.dali_slaves, g_config.dali_slave_ids, g_config.dali_slave_count);
+    /* MQTT: parse the broker host (dotted-quad) to an IP; 0.0.0.0 if unset. */
+    {
+        unsigned a0, a1, a2, a3;
+        if (sscanf(g_config.mqtt_host, "%u.%u.%u.%u", &a0, &a1, &a2, &a3) == 4) {
+            snap.mqtt_ip[0] = (uint8_t)a0; snap.mqtt_ip[1] = (uint8_t)a1;
+            snap.mqtt_ip[2] = (uint8_t)a2; snap.mqtt_ip[3] = (uint8_t)a3;
+        }
+    }
+    snap.mqtt_port = g_config.mqtt_port;
+    memcpy(snap.mqtt_user,   g_config.mqtt_user,   sizeof snap.mqtt_user);
+    memcpy(snap.mqtt_pass,   g_config.mqtt_pass,   sizeof snap.mqtt_pass);
+    memcpy(snap.mqtt_prefix, g_config.mqtt_prefix, sizeof snap.mqtt_prefix);
+    snap.mqtt_have_creds = g_config.mqtt_user[0] != '\0';
+    snap.net_dhcp = g_config.net_dhcp != 0;
+    memcpy(snap.net_ip,   g_config.net_ip,   4);
+    memcpy(snap.net_mask, g_config.net_mask, 4);
+    memcpy(snap.net_gw,   g_config.net_gw,   4);
+    memcpy(snap.net_dns,  g_config.net_dns,  4);
+    intercore_set_snapshot(&snap);
+    core1_config_ready();   /* core 1 may now bring up netif + MQTT */
+
     watchdog_enable(5000, 1);
+    s_core1_grace_until = make_timeout_time_ms(CORE1_GRACE_MS);
 
     /* Announce over USB */
     sleep_ms(100);
     serial_tx_hello();
 
-    LOG_INFO("boot", "main loop entering, watchdog=5000 ms");
+    LOG_INFO("boot", "main loop entering, watchdog=5000 ms, core1 grace=%u ms",
+             (unsigned)CORE1_GRACE_MS);
 
     /* ── Main loop ────────────────────────────────────────────────────── */
     while (true) {
         modbus_poll();
-        watchdog_update();
+        wd_feed();
 
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();
         serial_poll();
 
-        watchdog_update();
+        wd_feed();
     }
 
     panic_unsupported();
