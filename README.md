@@ -258,11 +258,17 @@ is controlled by the ballast hardware.
 Every button gesture is also published to HA as an event entity, so HA
 automations can react to button presses independently of the built-in mapping.
 
+Physical `press`/`release` frame every interaction; the gesture events
+(`click`, `long_press`, `long_press_repeat`) overlay them. A **tap** emits
+`press` then `click` + `release`; a **hold** emits `press`, `long_press`,
+`long_press_repeat`…, `release`.
+
 | Event type | When fired |
 |------------|------------|
-| `press` | Short press released |
-| `release` | Released after any hold |
-| `long_press_start` | Hold threshold crossed (also fires on direction reversal) |
+| `press` | Physical button down (every interaction) |
+| `release` | Physical button up (every interaction) |
+| `click` | A completed short tap (down→up before the long-press threshold) |
+| `long_press` | Hold threshold crossed (also fires on direction reversal) |
 | `long_press_repeat` | Each dim-rate tick while held (~5 Hz) |
 
 ---

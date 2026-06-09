@@ -13,9 +13,10 @@
  * Push a classified button event to core 1 (the MQTT bridge) as a typed
  * inter-core event; core 1 publishes it to Home Assistant.  Called from
  * button_fsm.c at each classified event:
- *   press             — short press released
- *   release           — released after a hold
- *   long_press_start  — hold threshold crossed (or direction reversed)
+ *   press             — physical button down (every interaction)
+ *   release           — physical button up (every interaction)
+ *   click             — completed short tap (down->up before long-press)
+ *   long_press        — hold threshold crossed (or direction reversed)
  *   long_press_repeat — repeat tick while holding
  *
  * No JSON/USB output here — USB CDC is a human text CLI only; the button
@@ -26,7 +27,8 @@ void emit_button_event(uint8_t fixture, uint8_t button, const char *action) {
     ev.button.fixture = fixture;
     ev.button.button  = button;
     ev.button.action  = strcmp(action, "release") == 0           ? IC_BTN_RELEASE
-                      : strcmp(action, "long_press_start") == 0   ? IC_BTN_LONG_PRESS_START
+                      : strcmp(action, "click") == 0              ? IC_BTN_CLICK
+                      : strcmp(action, "long_press") == 0         ? IC_BTN_LONG_PRESS
                       : strcmp(action, "long_press_repeat") == 0  ? IC_BTN_LONG_PRESS_REPEAT
                                                                   : IC_BTN_PRESS;
     intercore_push_event(&ev);

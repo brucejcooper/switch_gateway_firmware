@@ -29,10 +29,11 @@ typedef enum { IC_TRI_OFF = 0, IC_TRI_ON = 1, IC_TRI_TOGGLE = 2 } ic_tri_t;
 
 /* Button action — mirrors the FSM's action strings. */
 typedef enum {
-    IC_BTN_PRESS = 0,
-    IC_BTN_RELEASE,
-    IC_BTN_LONG_PRESS_START,
-    IC_BTN_LONG_PRESS_REPEAT,
+    IC_BTN_PRESS = 0,         /* physical button down (every interaction) */
+    IC_BTN_RELEASE,           /* physical button up (every interaction) */
+    IC_BTN_CLICK,             /* completed short tap (down->up before long-press) */
+    IC_BTN_LONG_PRESS,        /* held past the long-press threshold */
+    IC_BTN_LONG_PRESS_REPEAT, /* repeats while held */
 } ic_btn_action_t;
 
 /* ── core0 -> core1 : events ─────────────────────────────────────────────── */

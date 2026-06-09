@@ -88,7 +88,7 @@ static void disc_plate_event(uint8_t fix, uint8_t btn) {
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_switch_%02u_btn_%u\",\"name\":\"Button %u\","
         "\"state_topic\":\"%s/button/%u/%u\","
-        "\"event_types\":[\"press\",\"release\",\"long_press_start\",\"long_press_repeat\"],"
+        "\"event_types\":[\"press\",\"release\",\"click\",\"long_press\",\"long_press_repeat\"],"
         "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"",
         fix, btn, btn + 1, P, fix, btn, P);
     snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
@@ -531,9 +531,10 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         }
         break;
     case IC_EVT_BUTTON: {
-        static const char *const act[] = { "press", "release", "long_press_start", "long_press_repeat" };
+        static const char *const act[] = { "press", "release", "click", "long_press", "long_press_repeat" };
         snprintf(top, sizeof top, "%s/button/%u/%u", P, e->button.fixture, e->button.button);
-        snprintf(pl, sizeof pl, "{\"event_type\":\"%s\"}", act[e->button.action <= 3 ? e->button.action : 0]);
+        snprintf(pl, sizeof pl, "{\"event_type\":\"%s\"}",
+                 act[e->button.action <= 4 ? e->button.action : 0]);
         mqtt_app_publish(top, pl, strlen(pl), false);   /* momentary, not retained */
         break;
     }
