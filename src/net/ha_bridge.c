@@ -434,6 +434,8 @@ static void subscribe_all(void) {
         snprintf(f, sizeof f, "%s/%s", P, filt[i]);
         mqtt_app_subscribe(f);
     }
+    /* HA birth/will (not under our prefix): lets us re-assert on an HA restart. */
+    mqtt_app_subscribe("homeassistant/status");
 }
 
 /* ── availability sweep (scan_complete -> 64 per-ballast topics) ──────────── */
@@ -670,6 +672,22 @@ static void ha_on_message(const char *topic, uint16_t tlen,
     memcpy(t, topic, tl); t[tl] = '\0';
     char pay[512]; uint16_t pn = plen < sizeof pay - 1 ? plen : sizeof pay - 1;
     memcpy(pay, payload, pn); pay[pn] = '\0';
+
+    /* Home Assistant birth message: HA publishes "online" to homeassistant/status
+     * when it (re)starts. Re-run discovery + a full state resync so HA is brought
+     * fully up to date immediately, instead of relying solely on the broker's
+     * retained copies. (Discovery stays retained, as the fallback.) Same kick as
+     * ha_on_connected; ha_bridge_tick runs the burst. */
+    if (!strcmp(t, "homeassistant/status")) {
+        if (!strcmp(pay, "online")) {
+            LOG_INFO("mqtt", "HA online — re-publishing discovery + resync");
+            s_disc_active   = true;
+            s_ph            = PH_GW_AVAIL;
+            s_i = s_j = s_k = 0;
+            s_sweep_pending = false;
+        }
+        return;
+    }
 
     const char *P = mqtt_app_prefix(); size_t pl0 = strlen(P);
     if (strncmp(t, P, pl0) != 0 || t[pl0] != '/') return;
