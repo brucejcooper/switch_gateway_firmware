@@ -658,6 +658,74 @@ device registry and persist across reboots and firmware updates.
 
 ---
 
+## Config Web UI (core 1)
+
+An embedded HTTP server on core 1 serves a single-page configuration app directly
+from the controller — a **fallback for commissioning a fresh device and pointing
+it at Home Assistant** before (or instead of) MQTT. It runs alongside the MQTT
+client; both share the W5100S.
+
+- **Access:** browse to the controller's IP (port 80). Find the IP from the
+  `DHCP lease` line in the serial log, your DHCP server, or set a static IP via
+  the UI / `net` CLI verb.
+- **Auth:** HTTP **Basic auth**, credentials in `/config.json` (`web_user` /
+  `web_pass`), default **`admin` / `admin`**, changeable from the UI's *Password*
+  tab. **Plain HTTP — there is no TLS on the W5100S** — so Basic auth is base64,
+  not encrypted. Treat this as a **LAN-only** commissioning tool, not an
+  internet-facing surface, and change the default password.
+- **What it does:** view live state (gateways, ballasts, groups, button
+  fixtures) and edit everything the CLI can — RS-485 baud + DE mode, slave lists,
+  per-ballast settings, groups, button bindings, provisioning, network (DHCP /
+  static), and the MQTT broker. Network/MQTT changes apply on reboot (core 1
+  reads them from the launch snapshot); lighting/baud/DE changes apply live.
+- **API:** a small REST surface — `GET /api/state` (full snapshot, polled ~1.5 s)
+  and `POST /api/{relay,dali,group,cfg,net,mqtt,auth,mapping,provision}`. Reads
+  come from a core-1 cache fed by the same event stream the MQTT bridge consumes
+  (`web_state.c`); writes become typed inter-core commands to core 0, exactly
+  like MQTT-inbound commands. The UI **polls** rather than using SSE — see the
+  socket note below.
+- **Wire format:** `/api/state` is organised the way the domain is — `relays` a
+  boolean array indexed by channel, and `dali` keyed by gateway slave, each slave
+  an object `{ online, ballasts[], groups[] }` where `ballasts` is indexed by
+  short address and `groups` by group number, with `null` for an unavailable
+  slot (so positions stay stable as devices drop). `mappings`/`provision`/`cfg`
+  are plain keyed objects. The renderer (`web_state.c`) streams this in ≤2 KB
+  chunks via a resumable cursor. The UI has a single boundary —
+  `web/src/decode.js` — that flattens the per-slave structure into the one
+  consistently-named view model the tabs share; keep it in lock-step with the
+  renderer.
+
+### Why polling, and the W5100S socket budget
+
+The W5100S has only **4 hardware sockets**: 0 = DHCP, 1 = MQTT, leaving **two**
+for the web server (sockets 2–3). A long-lived SSE stream would permanently
+consume one of those two, so the UI **short-polls** instead — the sockets stay
+interchangeable and multiple tabs degrade gracefully instead of deadlocking.
+
+To claw back a third socket, `netif` **lends the idle DHCP socket (0)** to the
+web server between lease renewals and reclaims it a guard band before each T1
+renewal (`netif_web_sock0_enabled()`); under a static IP there is no DHCP socket
+so socket 0 is web-owned permanently. The web server treats socket 0 as
+**revocable bonus capacity** and never depends on it. Each connection serves one
+request then closes (no keep-alive), and all I/O is non-blocking and bounded to
+one ≤2 KB chunk per socket per tick so MQTT and the watchdog stay healthy.
+
+### Building the web UI
+
+The app lives in `web/` (Vite, vanilla JS, **no runtime framework**). The
+firmware build **requires Node/npm**: CMake runs the Vite build, gzips the
+single-file output, and `web/tools/gen-assets.mjs` emits
+`build/generated/web_assets.c` — a `const` gzipped blob served from flash (XIP,
+no RAM copy, `Content-Encoding: gzip`). It rebuilds only when a `web/` source
+changes. The whole UI is ~8 KB gzipped; `/config.json` on littlefs remains the
+only mutable state.
+
+```sh
+make -C build            # builds web/ (Vite) + firmware in one step
+```
+
+---
+
 ## DALI Commissioning
 
 Commissioning assigns DALI short addresses (0–63) to ballasts. It is required

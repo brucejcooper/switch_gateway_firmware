@@ -35,3 +35,9 @@ void netif_get_ip(uint8_t ip[4]);
 
 /* DNS server address (from DHCP or static config); zeros if unknown. */
 void netif_get_dns(uint8_t dns[4]);
+
+/* True when the DHCP socket (0) may currently be used by the web server as an
+ * opportunistic 3rd listening socket: always true under static IP (no DHCP
+ * socket), and true between DHCP renewals (dropping a guard band before each T1).
+ * The web server must relinquish socket 0 promptly when this returns false. */
+bool netif_web_sock0_enabled(void);

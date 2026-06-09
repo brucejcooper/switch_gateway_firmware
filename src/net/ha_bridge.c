@@ -15,6 +15,7 @@
 #include "ha_bridge.h"
 #include "mqtt_app.h"
 #include "intercore.h"
+#include "web_state.h"   /* fan-out: feed the web read model from the event drain */
 #include "log.h"
 #include "version.h"     /* FW_VERSION */
 #include "jsmn.h"
@@ -802,12 +803,15 @@ void ha_bridge_init(void) {
 }
 
 void ha_bridge_tick(void) {
-    /* Disconnected: drop queued events (a fresh resync repopulates on reconnect). */
+    /* Disconnected: MQTT gets nothing, but still fold every event into the web
+     * read model — the config UI must stay live exactly when the broker is down
+     * (its whole point is commissioning before Home Assistant exists). The queue
+     * is drained fully each tick; web_state_on_event is cheap (no I/O). */
     if (!mqtt_app_connected()) {
         s_disc_active = false;
         s_sweep_pending = false;
         ic_event_t ev;
-        while (intercore_pop_event(&ev)) { }
+        while (intercore_pop_event(&ev)) web_state_on_event(&ev);
         return;
     }
 
@@ -836,6 +840,7 @@ void ha_bridge_tick(void) {
     for (int budget = 24; budget > 0; budget--) {
         if (mqtt_app_tx_free() < PUMP_GATE) break;
         if (!intercore_pop_event(&ev)) break;
+        web_state_on_event(&ev);   /* keep the web read model in lock-step */
         if (ev.type == IC_EVT_SCAN_COMPLETE) {
             s_sweep_pending = true;
             s_sweep_slave   = ev.scan_complete.slave;

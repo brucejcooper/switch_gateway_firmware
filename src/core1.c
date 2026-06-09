@@ -16,6 +16,8 @@
 #include "net/netif.h"
 #include "net/mqtt_app.h"
 #include "net/ha_bridge.h"
+#include "net/web_state.h"
+#include "net/http_server.h"
 #include "log.h"
 
 #include "pico/multicore.h"
@@ -80,7 +82,18 @@ static void core1_entry(void) {
     mc.have_creds = sn->mqtt_have_creds;
     mqtt_app_init(&mc);
 
+    web_state_init();
     ha_bridge_init();
+    http_server_init();
+
+    /* Hydrate the web read model independent of MQTT: ask core 0 to re-emit all
+     * cached state now, so the config UI is fully populated even when no broker
+     * is reachable. (A second resync also fires after MQTT discovery completes;
+     * the re-emit is idempotent.) */
+    {
+        ic_cmd_t rc; memset(&rc, 0, sizeof rc); rc.type = IC_CMD_RESYNC;
+        intercore_push_cmd(&rc);
+    }
 
     uint32_t last_log_ms = 0;
     while (true) {
@@ -88,7 +101,8 @@ static void core1_entry(void) {
 
         netif_tick();
         mqtt_app_tick();
-        ha_bridge_tick();   /* discovery + availability sweep + event->MQTT pump */
+        ha_bridge_tick();    /* discovery + availability sweep + event->MQTT pump */
+        http_server_tick();  /* config web UI (sockets 2-3) */
 
         if (s_heartbeat_ms - last_log_ms >= 5000u) {
             last_log_ms = s_heartbeat_ms;

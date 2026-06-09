@@ -90,6 +90,37 @@ now a single segment.
 interface (machine clients went away with the on-board bridge), so local echo +
 backspace editing is what you want. `echo off` restores a clean byte stream.
 
+## Config web UI (core 1) — 2026-06-09
+
+An embedded HTTP server on core 1 (`src/net/http_server.c`) serves a single-page
+config app (in `web/`, Vite + vanilla JS) as a **LAN-only fallback** for
+commissioning a device before HA. Runs alongside MQTT on the W5100S. Full detail
+in `README.md` (“Config Web UI”). The load-bearing facts:
+
+- **W5100S has only 4 sockets** (0=DHCP, 1=MQTT) → just **2** for the web server
+  (sockets 2–3). That's why the UI **polls** (`GET /api/state` every ~1.5 s)
+  instead of SSE — SSE would pin one of two sockets. `netif` lends the **idle
+  DHCP socket 0** as a revocable 3rd socket between renewals
+  (`netif_web_sock0_enabled()`); invariant: **never call `DHCP_run()` while
+  socket 0 is lent** (its self-heal at `dhcp.c:797` would reopen UDP over the web
+  TCP socket). Static IP → socket 0 is web-owned permanently.
+- **Read model** is `web_state.c`: a core-1 cache fed from the *same* event drain
+  `ha_bridge` consumes (the drain now calls `web_state_on_event` in both the
+  connected pump and the disconnected discard path, so the UI stays live exactly
+  when MQTT is down). Core 1 pushes one `IC_CMD_RESYNC` at boot to hydrate it
+  independent of MQTT. **Writes** become typed `ic_cmd_t` to core 0 — the new
+  `IC_CMD_SET_NETCFG/MQTTCFG/AUTH` + `de_mode` in `SET_CFG`. Config stays
+  **core-0-owned** (single writer to `/config.json`).
+- **Auth:** Basic, creds in `/config.json` (`web_user`/`web_pass`, default
+  admin/admin), in the core-0→core-1 snapshot. Plain HTTP (no TLS on W5100S).
+- **Same hot-path rule as MQTT:** *do NOT log in the http recv/send pump.* All
+  http I/O is non-blocking, one ≤2 KB chunk per socket per tick, one request per
+  connection then close — keeps MQTT + the watchdog healthy.
+- **Build requires Node:** CMake runs the Vite build and embeds the gzipped
+  single-file output as a `const` flash blob via `web/tools/gen-assets.mjs` →
+  `build/generated/web_assets.c` (rebuilds only when `web/` changes). `make -C
+  build` does it all.
+
 ## Building & flashing the TinyModbus gateway (attiny1604)
 
 The DALI gateways run the firmware in `../TinyModbus`. When debugging the

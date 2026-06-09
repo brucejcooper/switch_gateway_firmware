@@ -33,6 +33,11 @@ typedef struct {
     /* Network. dhcp default on; static fields used only when dhcp == 0. */
     uint8_t  net_dhcp;             /* default 1 */
     uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
+
+    /* Embedded config web UI (core 1). Basic-auth credentials; default
+     * admin/admin. Plain HTTP (no TLS on the W5100S) — LAN-only fallback. */
+    char     web_user[32];         /* default "admin" */
+    char     web_pass[48];         /* default "admin" */
 } global_config_t;
 
 extern global_config_t g_config;

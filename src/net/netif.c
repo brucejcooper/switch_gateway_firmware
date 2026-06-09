@@ -22,6 +22,17 @@
 #define DHCP_BUF_SIZE   1024
 static uint8_t s_dhcp_buf[DHCP_BUF_SIZE];
 
+/* Socket-0 lending: the W5100S has only 4 sockets (0=DHCP, 1=MQTT), leaving 2
+ * for the web server. Between DHCP renewals the DHCP socket sits idle, so we
+ * lend it to the web LISTEN pool as an opportunistic 3rd socket and reclaim it a
+ * guard band before the T1 renewal (lease/2). The invariant that makes this safe
+ * is simple: while lent, netif must NOT call DHCP_run() (its socket-0 self-heal,
+ * dhcp.c:797, would reopen UDP over the web TCP socket). The web server treats
+ * socket 0 as revocable bonus capacity and never depends on it. */
+#define DHCP_RENEW_GUARD_S  15u
+static volatile bool s_web_sock0 = false;   /* may the web server use socket 0 now? */
+static uint32_t      s_lease_elapsed_s = 0; /* seconds since the current lease/renew */
+
 typedef enum { NS_RESET, NS_LINK_WAIT, NS_DHCP, NS_READY, NS_FAULT } netif_state_t;
 
 static netif_state_t s_state = NS_RESET;
@@ -97,6 +108,7 @@ static void dhcp_assigned(void) {
     getDNSfromDHCP(s_netinfo.dns);
     s_netinfo.dhcp = NETINFO_DHCP;
     wizchip_setnetinfo(&s_netinfo);
+    s_lease_elapsed_s = 0;              /* fresh lease/renew: restart the T1 clock */
     log_ip("DHCP lease");
 }
 static void dhcp_conflict(void) { LOG_WARN("net", "DHCP IP conflict"); }
@@ -123,6 +135,10 @@ void netif_init(const netif_config_t *cfg) {
 
 void netif_tick(void) {
     uint32_t now = to_ms_since_boot(get_absolute_time());
+
+    /* Default each tick: socket 0 belongs to DHCP. The NS_READY arms below grant
+     * it to the web server when it is genuinely idle. */
+    s_web_sock0 = false;
 
     switch (s_state) {
     case NS_RESET:
@@ -163,9 +179,29 @@ void netif_tick(void) {
 
     case NS_READY:
         if (!link_up()) { LOG_WARN("net", "PHY link down"); s_state = NS_LINK_WAIT; break; }
-        if (s_cfg.dhcp) {   /* keep the lease renewed */
-            if (now - s_last_1s_ms >= 1000) { s_last_1s_ms += 1000; DHCP_time_handler(); }
-            if (DHCP_run() == DHCP_FAILED) enter_fault(now);
+        if (s_cfg.dhcp) {   /* keep the lease renewed, lend socket 0 between renews */
+            if (now - s_last_1s_ms >= 1000) {
+                s_last_1s_ms += 1000;
+                DHCP_time_handler();        /* must keep ticking even while lending */
+                s_lease_elapsed_s++;
+            }
+            uint32_t lease = getDHCPLeasetime();        /* seconds */
+            bool finite = lease != 0 && lease != 0xFFFFFFFFu;
+            bool renewal_due = finite &&
+                (s_lease_elapsed_s + DHCP_RENEW_GUARD_S >= lease / 2);
+            if (renewal_due) {
+                /* Reclaim socket 0 for the renewal. DHCP_run()'s self-heal
+                 * reopens it as UDP (stomping any web TCP use); since netif_tick
+                 * runs before http_server_tick, the web server sees the flag drop
+                 * this same tick and backs off. */
+                if (DHCP_run() == DHCP_FAILED) enter_fault(now);
+            } else {
+                /* Idle mid-lease: lend socket 0. Deliberately skip DHCP_run() so
+                 * it can't reopen UDP over the web socket. */
+                s_web_sock0 = true;
+            }
+        } else {
+            s_web_sock0 = true;   /* static IP: no DHCP socket, lend it permanently */
         }
         break;
 
@@ -179,5 +215,6 @@ void netif_tick(void) {
 
 bool netif_ready(void)   { return s_state == NS_READY; }
 bool netif_link_up(void) { return link_up(); }
+bool netif_web_sock0_enabled(void) { return s_web_sock0; }
 void netif_get_ip(uint8_t ip[4])   { memcpy(ip, s_netinfo.ip, 4); }
 void netif_get_dns(uint8_t dns[4]) { memcpy(dns, s_netinfo.dns, 4); }

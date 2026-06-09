@@ -1096,6 +1096,7 @@ static void emit_state_cfg(void) {
     ev.cfg.dim_repeat_ms      = g_config.dim_repeat_ms;
     ev.cfg.reversal_window_ms = g_config.reversal_window_ms;
     ev.cfg.baud               = modbus_get_baud();
+    ev.cfg.de_mode            = (uint8_t)modbus_get_de_mode();
     intercore_push_event(&ev);
 }
 
@@ -1998,9 +1999,39 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (c->set_cfg.fields & IC_CFG_F_REVERSAL)   { g_config.reversal_window_ms = c->set_cfg.reversal_window_ms; any = true; }
         if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
         if (any) config_save();
+        /* de_mode applies live and self-persists; keep it out of the `any` save. */
+        if ((c->set_cfg.fields & IC_CFG_F_DE_MODE) && c->set_cfg.de_mode < MODBUS_DE_MAX)
+            set_modbus_de_mode((modbus_de_mode_t)c->set_cfg.de_mode);
         emit_state_cfg();
         break;
     }
+    case IC_CMD_SET_NETCFG: {
+        uint16_t f = c->set_netcfg.fields;
+        if (f & IC_NET_F_DHCP) g_config.net_dhcp = c->set_netcfg.dhcp ? 1 : 0;
+        if (f & IC_NET_F_IP)   memcpy(g_config.net_ip,   c->set_netcfg.ip,   4);
+        if (f & IC_NET_F_MASK) memcpy(g_config.net_mask, c->set_netcfg.mask, 4);
+        if (f & IC_NET_F_GW)   memcpy(g_config.net_gw,   c->set_netcfg.gw,   4);
+        if (f & IC_NET_F_DNS)  memcpy(g_config.net_dns,  c->set_netcfg.dns,  4);
+        if (f) config_save();   /* reboot to apply (core 1 reads net at launch) */
+        break;
+    }
+    case IC_CMD_SET_MQTTCFG: {
+        uint16_t f = c->set_mqttcfg.fields;
+        if (f & IC_MQTT_F_HOST)   { strncpy(g_config.mqtt_host,   c->set_mqttcfg.host,   sizeof g_config.mqtt_host   - 1); g_config.mqtt_host[sizeof g_config.mqtt_host - 1] = '\0'; }
+        if (f & IC_MQTT_F_PORT)   g_config.mqtt_port = c->set_mqttcfg.port;
+        if (f & IC_MQTT_F_USER)   { strncpy(g_config.mqtt_user,   c->set_mqttcfg.user,   sizeof g_config.mqtt_user   - 1); g_config.mqtt_user[sizeof g_config.mqtt_user - 1] = '\0'; }
+        if (f & IC_MQTT_F_PASS)   { strncpy(g_config.mqtt_pass,   c->set_mqttcfg.pass,   sizeof g_config.mqtt_pass   - 1); g_config.mqtt_pass[sizeof g_config.mqtt_pass - 1] = '\0'; }
+        if (f & IC_MQTT_F_PREFIX) { strncpy(g_config.mqtt_prefix, c->set_mqttcfg.prefix, sizeof g_config.mqtt_prefix - 1); g_config.mqtt_prefix[sizeof g_config.mqtt_prefix - 1] = '\0'; }
+        if (f) config_save();   /* reboot to apply */
+        break;
+    }
+    case IC_CMD_SET_AUTH:
+        strncpy(g_config.web_user, c->set_auth.user, sizeof g_config.web_user - 1);
+        g_config.web_user[sizeof g_config.web_user - 1] = '\0';
+        strncpy(g_config.web_pass, c->set_auth.pass, sizeof g_config.web_pass - 1);
+        g_config.web_pass[sizeof g_config.web_pass - 1] = '\0';
+        config_save();
+        break;
     case IC_CMD_SET_MAPPING: {
         uint8_t count = c->set_mapping.count;
         if (count > MAX_TARGETS_PER_BTN) count = MAX_TARGETS_PER_BTN;

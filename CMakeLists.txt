@@ -56,6 +56,37 @@ add_custom_target(gen_version ALL
     COMMENT "Updating version.h from git")
 add_dependencies(light_switch gen_version)
 
+# ── Embed the Vite single-file config web UI into flash (requires Node/npm) ──
+# The web app under web/ is built to one self-contained index.html, then
+# web/tools/gen-assets.mjs gzips it and emits generated/web_assets.c (the
+# web_assets_lookup table served by src/net/http_server.c). Rebuilds only when a
+# web source changes (custom-command DEPENDS), so the firmware dev loop isn't
+# slowed by a Vite run every make.
+set(WEB_DIR ${CMAKE_CURRENT_LIST_DIR}/web)
+set(GEN_WEB_ASSETS ${CMAKE_BINARY_DIR}/generated/web_assets.c)
+find_program(NPM_EXECUTABLE npm)
+if(NOT NPM_EXECUTABLE)
+    message(FATAL_ERROR
+        "npm not found, but the config web UI is built into the firmware. Install "
+        "Node.js (the web/ Vite build is required), or build a Node-free variant by "
+        "compiling a hand-written web_assets.c instead of the generated one.")
+endif()
+file(GLOB_RECURSE WEB_SRCS CONFIGURE_DEPENDS
+    ${WEB_DIR}/src/*
+    ${WEB_DIR}/index.html
+    ${WEB_DIR}/package.json
+    ${WEB_DIR}/vite.config.js
+    ${WEB_DIR}/tools/gen-assets.mjs)
+add_custom_command(
+    OUTPUT ${GEN_WEB_ASSETS}
+    COMMAND ${NPM_EXECUTABLE} --prefix ${WEB_DIR} install --no-audit --no-fund --silent
+    COMMAND ${CMAKE_COMMAND} -E env GEN_OUT=${GEN_WEB_ASSETS}
+            ${NPM_EXECUTABLE} --prefix ${WEB_DIR} run build --silent
+    DEPENDS ${WEB_SRCS}
+    COMMENT "Building web UI (Vite) + embedding gzipped assets"
+    VERBATIM)
+set_source_files_properties(${GEN_WEB_ASSETS} PROPERTIES GENERATED TRUE)
+
 target_link_libraries(light_switch PRIVATE
     pico_stdlib
     hardware_pio
@@ -116,6 +147,9 @@ target_sources(light_switch PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/mqtt_app.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/ha_bridge.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/web_state.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/http_server.c
+    ${GEN_WEB_ASSETS}                  # generated: gzipped Vite UI (web/)
 )
 
 # ── coreMQTT (FreeRTOS standalone; static, malloc/float-free) ───────────────
