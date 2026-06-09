@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include "intercore.h"
+#include "log.h"
 
 /*
  * Push a classified button event to core 1 (the MQTT bridge) as a typed
@@ -31,5 +32,11 @@ void emit_button_event(uint8_t fixture, uint8_t button, const char *action) {
                       : strcmp(action, "long_press") == 0         ? IC_BTN_LONG_PRESS
                       : strcmp(action, "long_press_repeat") == 0  ? IC_BTN_LONG_PRESS_REPEAT
                                                                   : IC_BTN_PRESS;
+    /* Log every emitted event so the USB CLI mirrors exactly what reaches HA
+     * (the repeat tick is high-frequency, so keep it at debug level). */
+    if (ev.button.action == IC_BTN_LONG_PRESS_REPEAT)
+        LOG_DBG("btn", "F%u.B%u %s", fixture, button, action);
+    else
+        LOG_INFO("btn", "F%u.B%u %s", fixture, button, action);
     intercore_push_event(&ev);
 }
