@@ -78,11 +78,17 @@ static int slave_idx(uint8_t id) {
 static void disc_plate_event(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
     char ids[40], name[24], objid[40];
+    /* No value_template: HA's MQTT *event* platform parses the raw payload as
+     * JSON and takes event_type from it (and any extra keys as attributes). A
+     * value_template would be applied first and its *result* must itself be a
+     * JSON object — "{{ value_json.event_type }}" renders the bare string
+     * "press", which HA rejects ("No valid JSON event payload"). The publish
+     * already sends {"event_type":"press"} (see ha_bridge_publish_event), which
+     * is exactly what the platform wants. */
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_switch_%02u_btn_%u\",\"name\":\"Button %u\","
         "\"state_topic\":\"%s/button/%u/%u\","
         "\"event_types\":[\"press\",\"release\",\"long_press_start\",\"long_press_repeat\"],"
-        "\"value_template\":\"{{ value_json.event_type }}\","
         "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"",
         fix, btn, btn + 1, P, fix, btn, P);
     snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
