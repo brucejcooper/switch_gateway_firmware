@@ -77,13 +77,23 @@ static void wd_feed(void) {
 
 int main(void) {
     stdio_init_all();
-    fs_init();
     alarm_pool_init_default();
 
     int rc = pico_led_init();
     hard_assert(rc == PICO_OK);
 
     busy_wait_ms(2500); /* USB enumeration settling time */
+
+    /* Launch core 1 BEFORE fs_init(): core 1 registers as the flash lockout
+     * victim (flash_safe_execute_core_init), which the first-boot littlefs
+     * format requires — otherwise flash_safe_execute() returns NOT_PERMITTED and
+     * the filesystem never mounts (so config/mappings can't persist). core 1
+     * then parks waiting for the config snapshot before bringing up the network. */
+    intercore_init();
+    core1_launch();
+
+    if (!fs_init())
+        LOG_ERR("boot", "fs_init failed — persistence unavailable");
 
     if (watchdog_enable_caused_reboot()) {
         LOG_INFO("boot", "Rebooted by Watchdog");
@@ -150,11 +160,10 @@ int main(void) {
     button_fsm_init();
     buttongrid_init();
 
-    serial_protocol_init();   /* inits the inter-core queues */
+    serial_protocol_init();
 
-    /* Snapshot the slave lists for core 1's HA discovery, then launch core 1
-     * (the network bridge). core1_launch blocks until core 1 has registered as
-     * the flash lockout victim. */
+    /* Fill the config snapshot (slave lists + broker/net settings) for core 1,
+     * then release it to bring up the network. */
     ic_snapshot_t snap;
     memset(&snap, 0, sizeof snap);
     snap.relay_count = g_config.relay_slave_count;
@@ -180,8 +189,7 @@ int main(void) {
     memcpy(snap.net_gw,   g_config.net_gw,   4);
     memcpy(snap.net_dns,  g_config.net_dns,  4);
     intercore_set_snapshot(&snap);
-
-    core1_launch();
+    core1_config_ready();   /* core 1 may now bring up netif + MQTT */
 
     watchdog_enable(5000, 1);
     s_core1_grace_until = make_timeout_time_ms(CORE1_GRACE_MS);

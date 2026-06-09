@@ -139,7 +139,15 @@ static bool mqtt_connect(void) {
 
     bool session = false;
     MQTTStatus_t st = MQTT_Connect(&s_mqtt, &ci, &will, MQTT_CONNECT_TIMEOUT_MS, &session);
-    if (st != MQTTSuccess) { LOG_WARN("mqtt", "MQTT_Connect=%d", (int)st); return false; }
+    if (st != MQTTSuccess) {
+        /* Diagnostics: socket state + unread RX bytes. rxrsr>0 means CONNACK
+         * reached the chip but wasn't read (recv path); sr!=ESTABLISHED means
+         * the link dropped. */
+        LOG_WARN("mqtt", "MQTT_Connect=%d sr=0x%02x rx_rsr=%u tx_fsr=%u",
+                 (int)st, getSn_SR(MQTT_SOCKET), getSn_RX_RSR(MQTT_SOCKET),
+                 getSn_TX_FSR(MQTT_SOCKET));
+        return false;
+    }
     return true;
 }
 

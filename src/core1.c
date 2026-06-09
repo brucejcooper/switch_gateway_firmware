@@ -28,11 +28,16 @@
 #define CORE1_STACK_WORDS 2048u
 static uint32_t s_core1_stack[CORE1_STACK_WORDS];
 
-static volatile uint32_t s_heartbeat_ms = 0;
-static volatile bool     s_ready        = false;
+static volatile uint32_t s_heartbeat_ms  = 0;
+static volatile bool     s_ready         = false;
+static volatile bool     s_config_ready  = false;
 
 uint32_t core1_heartbeat_ms(void) {
     return s_heartbeat_ms;
+}
+
+void core1_config_ready(void) {
+    s_config_ready = true;
 }
 
 static void core1_entry(void) {
@@ -42,11 +47,19 @@ static void core1_entry(void) {
      * this core while core 0 writes. Core 1 never writes flash itself. */
     bool ok = flash_safe_execute_core_init();
     s_heartbeat_ms = to_ms_since_boot(get_absolute_time());
-    s_ready = true;
+    s_ready = true;   /* core 0's fs_init() flash format may now lock us out */
     LOG_INFO("core1", "flash lockout victim init %s", ok ? "ok" : "FAILED");
 
+    /* Park until core 0 has loaded config + filled the snapshot. Keep beating the
+     * heartbeat (core 0 enables the watchdog only after this point, but be safe).
+     * While we spin here, core 0's fs_init/config writes can lock us out. */
+    while (!s_config_ready) {
+        s_heartbeat_ms = to_ms_since_boot(get_absolute_time());
+        tight_loop_contents();
+    }
+
     /* Bring up the W5100S and the MQTT connection manager from the config
-     * snapshot core 0 filled before launch. Both are non-blocking SMs. */
+     * snapshot. Both are non-blocking SMs. */
     const ic_snapshot_t *sn = intercore_snapshot();
     netif_config_t nc;
     memset(&nc, 0, sizeof nc);

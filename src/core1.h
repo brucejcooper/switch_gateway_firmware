@@ -21,10 +21,15 @@
  * tens of ms; littlefs GC can be longer, but well under 2 s. */
 #define CORE1_STALE_MS 2000u
 
-/* Launch core 1. Call once on core 0 AFTER intercore_init(). Blocks (bounded)
- * until core 1 has registered as the flash lockout victim, so a subsequent
- * core-0 littlefs write is safe. */
+/* Launch core 1. Call once on core 0 AFTER intercore_init() and BEFORE the first
+ * core-0 flash write (e.g. fs_init's first-boot format). Blocks (bounded) until
+ * core 1 has registered as the flash lockout victim. Core 1 then parks until
+ * core1_config_ready(). */
 void core1_launch(void);
+
+/* Release core 1 to bring up the network. Call on core 0 after the config
+ * snapshot (intercore_set_snapshot) is populated. */
+void core1_config_ready(void);
 
 /* Last core-1 loop timestamp (ms since boot). Updated every core-1 iteration,
  * including mid-reconnect — means "core 1's loop is alive", not "connected".

@@ -2033,10 +2033,8 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
 
 /* ── Public interface ────────────────────────────────────────────────────── */
 void serial_protocol_init(void) {
-    /* stdio_usb is enabled by pico_enable_stdio_usb in CMakeLists. Init the
-     * inter-core queues here, before the main loop (and before core 1 launch)
-     * — no event producer runs until serial_poll() does. */
-    intercore_init();
+    /* stdio_usb is enabled by pico_enable_stdio_usb in CMakeLists; the inter-core
+     * queues are initialised in main() before core 1 launch. Nothing to do. */
 }
 
 /* Boot/ready announce — a human text log (no JSON on USB). core 1 derives the
