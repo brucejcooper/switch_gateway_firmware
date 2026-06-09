@@ -15,6 +15,14 @@ void dirty_poll_full_scan(uint8_t slave_id);
 /* 60s background presence + status anomaly check */
 void dirty_poll_background_check(uint8_t slave_id);
 
+/* Re-emit each relay + DALI slave's CURRENT reachability as a gateway-state
+ * event. Reachability is tracked here as a one-shot transition (online→offline
+ * fires once), so resync must replay it: on every MQTT (re)connect core 1's
+ * discovery re-seeds every gateway-availability topic "online", and without
+ * this an already-offline board would stay falsely online. Called from
+ * lighting_resync_emit(). */
+void dirty_poll_emit_gateway_states(void);
+
 #define DIRTY_POLL_INTERVAL_MS   100u    /* fast dirty-mask poll while active */
 #define DIRTY_ACTIVE_WINDOW_MS   2000u   /* stay active this long after the last command/change */
 #define DIRTY_SWEEP_MS           1000u   /* regular cheap dirty-mask sweep while idle */

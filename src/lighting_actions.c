@@ -327,6 +327,13 @@ void lighting_emit_gateway_state(uint8_t slave_id, bool online) {
 void lighting_resync_emit(void) {
     LOG_INFO("light", "resync emit");
 
+    /* Re-assert each gateway's current reachability. Core 1 re-seeds every
+     * gateway-availability topic "online" during its post-connect discovery;
+     * reachability is a one-shot transition in dirty_poll, so without replaying
+     * it here an already-offline relay board / DALI gateway would show online
+     * forever (relays have no per-channel presence to fall back on). */
+    dirty_poll_emit_gateway_states();
+
     /* Per-relay state from cache */
     for (uint8_t ch = 0; ch < RELAY_COUNT; ch++) {
         levt_t e = { .type = LEVT_RELAY,
