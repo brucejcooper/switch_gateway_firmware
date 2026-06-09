@@ -1,0 +1,13 @@
+diff --git a/Ethernet/socket.c b/Ethernet/socket.c
+index 4f6ee50..d2a8ef8 100644
+--- a/Ethernet/socket.c
++++ b/Ethernet/socket.c
+@@ -684,7 +684,7 @@ int32_t recv(uint8_t sn, uint8_t * buf, uint16_t len) { //lihan
+                 return SOCK_BUSY;
+             }
+ #else
+-            if (sock_io_mode & (1 << sn)) {
++            if ((sock_io_mode & (1 << sn)) && (recvsize == 0)) {
+                 return SOCK_BUSY;
+             }
+             if (recvsize != 0) {

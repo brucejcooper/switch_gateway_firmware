@@ -78,6 +78,35 @@ target_compile_definitions(light_switch PRIVATE JSMN_STATIC)
 
 # ── WIZnet W5100S networking (ioLibrary_Driver) — core 1 only ───────────────
 set(IOLIB ${CMAKE_CURRENT_LIST_DIR}/lib/ioLibrary_Driver)
+
+# Build-time patch: ioLibrary recv() returns SOCK_BUSY before checking whether
+# data is actually present in non-block mode (upstream issue #173), which leaves
+# the MQTT CONNACK unread forever. We keep the submodule pristine and apply the
+# one-line fix here, idempotently, so it's repeatable and trivially removable
+# once upstream fixes #173. Reverse-check first to detect an already-patched
+# tree (re-configures, dirty checkouts); a forward-apply failure is non-fatal
+# (warns) so an upstream fix that obsoletes the patch doesn't break the build.
+set(IOLIB_RECV_PATCH ${CMAKE_CURRENT_LIST_DIR}/patches/0001-ioLibrary-recv-nonblock-issue-173.patch)
+execute_process(
+    COMMAND git apply --reverse --check ${IOLIB_RECV_PATCH}
+    WORKING_DIRECTORY ${IOLIB}
+    RESULT_VARIABLE _iolib_patch_rev ERROR_QUIET OUTPUT_QUIET)
+if(_iolib_patch_rev EQUAL 0)
+    message(STATUS "ioLibrary recv() #173 patch: already applied")
+else()
+    execute_process(
+        COMMAND git apply ${IOLIB_RECV_PATCH}
+        WORKING_DIRECTORY ${IOLIB}
+        RESULT_VARIABLE _iolib_patch_app ERROR_QUIET OUTPUT_QUIET)
+    if(_iolib_patch_app EQUAL 0)
+        message(STATUS "ioLibrary recv() #173 patch: applied")
+    else()
+        message(WARNING "ioLibrary recv() #173 patch did not apply — upstream may "
+            "have fixed #173. Verify Ethernet/socket.c recv() non-block handling "
+            "and remove patches/0001-ioLibrary-recv-nonblock-issue-173.patch if so.")
+    endif()
+endif()
+
 target_sources(light_switch PRIVATE
     ${IOLIB}/Ethernet/wizchip_conf.c
     ${IOLIB}/Ethernet/socket.c

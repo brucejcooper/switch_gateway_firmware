@@ -53,25 +53,12 @@ static uint32_t rng_next(void) { s_rng = s_rng * 1664525u + 1013904223u; return 
 
 /* ── coreMQTT transport (non-blocking; SOCK_BUSY -> 0, error -> -1) ─────────── */
 static int32_t transport_recv(NetworkContext_t *ctx, void *buf, size_t len) {
-    /* Read Sn_RX_RSR until two reads agree (W5100S volatile-register quirk). */
-    uint16_t a, b;
-    do { a = getSn_RX_RSR(ctx->sn); b = getSn_RX_RSR(ctx->sn); } while (a != b);
-    if (a == 0) return 0;   /* no data yet */
-
-    /* Work around an ioLibrary_Driver bug: on the non-IPv6 path, recv() on a
-     * SF_IO_NONBLOCK socket returns SOCK_BUSY *before* checking for available
-     * data, so it never delivers a received packet (the IPv6 path has the
-     * checks in the correct order). Upstream issue:
-     *   https://github.com/Wiznet/ioLibrary_Driver/issues/173  (open)
-     * suggested one-line fix: `if ((sock_io_mode & (1<<sn)) && (recvsize == 0))`.
-     * We work around it here instead of patching the vendored submodule: flip to
-     * blocking just for this read — data is confirmed present, so it cannot
-     * block — then restore non-block. */
-    uint8_t mode = SOCK_IO_BLOCK;
-    ctlsocket(ctx->sn, CS_SET_IOMODE, &mode);
+    /* recv() on a non-block socket returns SOCK_BUSY (no data) -> 0 bytes; the
+     * ioLibrary non-block ordering bug (issue #173) that made this return
+     * SOCK_BUSY even with data waiting is fixed by the build-time patch
+     * patches/0001-ioLibrary-recv-nonblock-issue-173.patch (see CMakeLists). */
     int32_t r = recv(ctx->sn, (uint8_t *)buf, (uint16_t)len);
-    mode = SOCK_IO_NONBLOCK;
-    ctlsocket(ctx->sn, CS_SET_IOMODE, &mode);
+    if (r == SOCK_BUSY) return 0;
     return r < 0 ? -1 : r;
 }
 static int32_t transport_send(NetworkContext_t *ctx, const void *buf, size_t len) {
