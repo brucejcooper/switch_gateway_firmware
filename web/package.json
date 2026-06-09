@@ -1,0 +1,15 @@
+{
+  "name": "lightswitch-web",
+  "private": true,
+  "type": "module",
+  "version": "0.0.0",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build && node tools/gen-assets.mjs",
+    "preview": "vite preview"
+  },
+  "devDependencies": {
+    "vite": "^5",
+    "vite-plugin-singlefile": "^2"
+  }
+}

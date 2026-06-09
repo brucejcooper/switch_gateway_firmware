@@ -29,10 +29,11 @@ typedef enum { IC_TRI_OFF = 0, IC_TRI_ON = 1, IC_TRI_TOGGLE = 2 } ic_tri_t;
 
 /* Button action — mirrors the FSM's action strings. */
 typedef enum {
-    IC_BTN_PRESS = 0,
-    IC_BTN_RELEASE,
-    IC_BTN_LONG_PRESS_START,
-    IC_BTN_LONG_PRESS_REPEAT,
+    IC_BTN_PRESS = 0,         /* physical button down (every interaction) */
+    IC_BTN_RELEASE,           /* physical button up (every interaction) */
+    IC_BTN_CLICK,             /* completed short tap (down->up before long-press) */
+    IC_BTN_LONG_PRESS,        /* held past the long-press threshold */
+    IC_BTN_LONG_PRESS_REPEAT, /* repeats while held */
 } ic_btn_action_t;
 
 /* ── core0 -> core1 : events ─────────────────────────────────────────────── */
@@ -74,7 +75,7 @@ typedef struct {
          * so HA's "Commission Status" sensor keeps its detail. */
         struct { uint8_t slave, state, count; char msg[IC_PROV_MSG_MAX]; } provision;
         struct { uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; } cfg;
+                 uint32_t baud; uint8_t de_mode; } cfg;
     };
 } ic_event_t;
 
@@ -99,6 +100,21 @@ typedef struct {
 #define IC_CFG_F_DIM_REPEAT (1u << 1)
 #define IC_CFG_F_REVERSAL   (1u << 2)
 #define IC_CFG_F_BAUD       (1u << 3)
+#define IC_CFG_F_DE_MODE    (1u << 4)
+
+/* set_netcfg field-present bits */
+#define IC_NET_F_DHCP       (1u << 0)
+#define IC_NET_F_IP         (1u << 1)
+#define IC_NET_F_MASK       (1u << 2)
+#define IC_NET_F_GW         (1u << 3)
+#define IC_NET_F_DNS        (1u << 4)
+
+/* set_mqttcfg field-present bits */
+#define IC_MQTT_F_HOST      (1u << 0)
+#define IC_MQTT_F_PORT      (1u << 1)
+#define IC_MQTT_F_USER      (1u << 2)
+#define IC_MQTT_F_PASS      (1u << 3)
+#define IC_MQTT_F_PREFIX    (1u << 4)
 
 /* provision mode — mirrors prov_mode_t */
 typedef enum { IC_PROV_ALL = 0, IC_PROV_UNADDRESSED = 1, IC_PROV_ADDRESS = 2 } ic_prov_mode_t;
@@ -113,6 +129,9 @@ typedef enum {
     IC_CMD_PROVISION_START,
     IC_CMD_PROVISION_ABORT,
     IC_CMD_RESYNC,
+    IC_CMD_SET_NETCFG,    /* network settings — reboot to apply */
+    IC_CMD_SET_MQTTCFG,   /* MQTT broker settings — reboot to apply */
+    IC_CMD_SET_AUTH,      /* web UI Basic-auth credentials */
 } ic_cmd_type_t;
 
 typedef struct {
@@ -125,12 +144,19 @@ typedef struct {
         struct { uint8_t slave, group; uint16_t fields; ic_tri_t on; uint8_t bri;
                  uint64_t members; } set_group;
         struct { uint16_t fields; uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; } set_cfg;
+                 uint32_t baud; uint8_t de_mode; } set_cfg;
         struct { uint8_t fixture, button, count;
                  mapping_target_t targets[MAX_TARGETS_PER_BTN]; } set_mapping;
         struct { uint8_t fixture, button; } del_mapping;
         struct { uint8_t slave; ic_prov_mode_t mode; uint8_t target; } provision_start;
         struct { uint8_t slave; } provision_abort;
+        /* Network + MQTT settings persisted by core 0 (reboot to apply, since
+         * core 1 reads them from the launch snapshot). */
+        struct { uint16_t fields; uint8_t dhcp;
+                 uint8_t ip[4], mask[4], gw[4], dns[4]; } set_netcfg;
+        struct { uint16_t fields; uint16_t port;
+                 char host[64], user[48], pass[64], prefix[24]; } set_mqttcfg;
+        struct { char user[32], pass[48]; } set_auth;
     };
 } ic_cmd_t;
 
@@ -172,6 +198,10 @@ typedef struct {
     /* Network. */
     bool     net_dhcp;
     uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
+
+    /* Config web UI Basic-auth credentials (core 1 checks these). */
+    char     web_user[32];
+    char     web_pass[48];
 } ic_snapshot_t;
 
 void intercore_set_snapshot(const ic_snapshot_t *s);

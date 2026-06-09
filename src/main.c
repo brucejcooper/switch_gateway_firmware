@@ -188,6 +188,8 @@ int main(void) {
     memcpy(snap.net_mask, g_config.net_mask, 4);
     memcpy(snap.net_gw,   g_config.net_gw,   4);
     memcpy(snap.net_dns,  g_config.net_dns,  4);
+    memcpy(snap.web_user, g_config.web_user, sizeof snap.web_user);
+    memcpy(snap.web_pass, g_config.web_pass, sizeof snap.web_pass);
     intercore_set_snapshot(&snap);
     core1_config_ready();   /* core 1 may now bring up netif + MQTT */
 

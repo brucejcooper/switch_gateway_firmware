@@ -93,6 +93,15 @@ static void relay_health_cb(int res, uint8_t *buf, void *ctx) {
     }
 }
 
+void dirty_poll_emit_gateway_states(void) {
+    /* Replay current reachability for resync. s_rp/s_dp are indexed by config
+     * order, matching the relay-poll and dirty-poll loops below. */
+    for (int i = 0; i < g_config.relay_slave_count; i++)
+        lighting_emit_gateway_state(g_config.relay_slave_ids[i], s_rp[i].reachable);
+    for (int i = 0; i < g_config.dali_slave_count; i++)
+        lighting_emit_gateway_state(g_config.dali_slave_ids[i], s_dp[i].reachable);
+}
+
 void dirty_poll_mark_active(uint8_t slave_id) {
     int idx = state_cache_slave_idx(slave_id);
     if (idx < 0) return;

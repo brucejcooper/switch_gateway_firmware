@@ -100,7 +100,7 @@ static void process_raw(uint8_t fixture, uint8_t button,
     switch (fsm->state) {
     case BTN_STATE_IDLE:
         if (raw == BTN_RAW_PRESS) {
-            LOG_INFO("btn", "F%u.B%u press", fixture, button);
+            emit_button_event(fixture, button, "press");   /* physical down (logged in emit) */
             fsm->press_time          = event_time;
             fsm->long_press_deadline = delayed_by_ms(event_time,
                                                      g_config.long_press_ms);
@@ -111,7 +111,9 @@ static void process_raw(uint8_t fixture, uint8_t button,
 
     case BTN_STATE_PRESSED:
         if (raw == BTN_RAW_RELEASE) {
-            emit_button_event(fixture, button, "press");
+            /* short tap: down->up before the long-press threshold = a click */
+            emit_button_event(fixture, button, "click");
+            emit_button_event(fixture, button, "release");
             do_toggle(fixture, button);
             fsm->state = BTN_STATE_IDLE;
         }
@@ -120,8 +122,8 @@ static void process_raw(uint8_t fixture, uint8_t button,
     case BTN_STATE_HOLDING:
         if (raw == BTN_RAW_RELEASE) {
             int64_t held_us = absolute_time_diff_us(fsm->press_time, event_time);
-            LOG_INFO("btn", "F%u.B%u release held=%lu ms",
-                     fixture, button, (unsigned long)(held_us / 1000));
+            LOG_DBG("btn", "F%u.B%u held=%lu ms",
+                    fixture, button, (unsigned long)(held_us / 1000));
             emit_button_event(fixture, button, "release");
             fsm->reversal_window_end = delayed_by_ms(event_time,
                                                      g_config.reversal_window_ms);
@@ -131,6 +133,7 @@ static void process_raw(uint8_t fixture, uint8_t button,
 
     case BTN_STATE_RELEASED_AFTER_HOLD:
         if (raw == BTN_RAW_PRESS) {
+            emit_button_event(fixture, button, "press");   /* physical down */
             /* still in reversal window iff event_time hasn't reached the end */
             bool in_window = absolute_time_diff_us(event_time,
                                                    fsm->reversal_window_end) > 0;
@@ -139,16 +142,14 @@ static void process_raw(uint8_t fixture, uint8_t button,
                 fsm->last_dir   = (fsm->last_dir == DIM_DOWN) ? DIM_UP : DIM_DOWN;
                 fsm->dir_locked = true;
                 fsm->press_time = event_time;
-                LOG_INFO("btn", "F%u.B%u long_press_start dir=%s",
-                         fixture, button,
-                         fsm->last_dir == DIM_UP ? "up" : "down");
-                emit_button_event(fixture, button, "long_press_start");
+                LOG_DBG("btn", "F%u.B%u dir=%s", fixture, button,
+                        fsm->last_dir == DIM_UP ? "up" : "down");
+                emit_button_event(fixture, button, "long_press");
                 do_dim_step(fixture, button, fsm->last_dir);
                 fsm->next_repeat_at = delayed_by_ms(event_time,
                                                     g_config.dim_repeat_ms);
                 fsm->state          = BTN_STATE_HOLDING;
             } else {
-                LOG_INFO("btn", "F%u.B%u press", fixture, button);
                 fsm->press_time          = event_time;
                 fsm->long_press_deadline = delayed_by_ms(event_time,
                                                          g_config.long_press_ms);
@@ -181,10 +182,9 @@ void button_fsm_tick(void) {
                         fsm->last_dir   = initial_dir(f, b);
                         fsm->dir_locked = true;
                     }
-                    LOG_INFO("btn", "F%u.B%u long_press_start dir=%s",
-                             (unsigned)f, (unsigned)b,
-                             fsm->last_dir == DIM_UP ? "up" : "down");
-                    emit_button_event(f, b, "long_press_start");
+                    LOG_DBG("btn", "F%u.B%u dir=%s", (unsigned)f, (unsigned)b,
+                            fsm->last_dir == DIM_UP ? "up" : "down");
+                    emit_button_event(f, b, "long_press");
                     do_dim_step(f, b, fsm->last_dir);
                     fsm->next_repeat_at = make_timeout_time_ms(g_config.dim_repeat_ms);
                     fsm->state          = BTN_STATE_HOLDING;
@@ -193,7 +193,6 @@ void button_fsm_tick(void) {
 
             case BTN_STATE_HOLDING:
                 if (time_reached(fsm->next_repeat_at)) {
-                    LOG_DBG("btn", "F%u.B%u repeat", (unsigned)f, (unsigned)b);
                     emit_button_event(f, b, "long_press_repeat");
                     do_dim_step(f, b, fsm->last_dir);
                     fsm->next_repeat_at = make_timeout_time_ms(g_config.dim_repeat_ms);

@@ -15,6 +15,7 @@
 #include "ha_bridge.h"
 #include "mqtt_app.h"
 #include "intercore.h"
+#include "web_state.h"   /* fan-out: feed the web read model from the event drain */
 #include "log.h"
 #include "version.h"     /* FW_VERSION */
 #include "jsmn.h"
@@ -77,11 +78,17 @@ static int slave_idx(uint8_t id) {
 static void disc_plate_event(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
     char ids[40], name[24], objid[40];
+    /* No value_template: HA's MQTT *event* platform parses the raw payload as
+     * JSON and takes event_type from it (and any extra keys as attributes). A
+     * value_template would be applied first and its *result* must itself be a
+     * JSON object — "{{ value_json.event_type }}" renders the bare string
+     * "press", which HA rejects ("No valid JSON event payload"). The publish
+     * already sends {"event_type":"press"} (see ha_bridge_publish_event), which
+     * is exactly what the platform wants. */
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_switch_%02u_btn_%u\",\"name\":\"Button %u\","
         "\"state_topic\":\"%s/button/%u/%u\","
-        "\"event_types\":[\"press\",\"release\",\"long_press_start\",\"long_press_repeat\"],"
-        "\"value_template\":\"{{ value_json.event_type }}\","
+        "\"event_types\":[\"press\",\"release\",\"click\",\"long_press\",\"long_press_repeat\"],"
         "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"",
         fix, btn, btn + 1, P, fix, btn, P);
     snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
@@ -427,6 +434,8 @@ static void subscribe_all(void) {
         snprintf(f, sizeof f, "%s/%s", P, filt[i]);
         mqtt_app_subscribe(f);
     }
+    /* HA birth/will (not under our prefix): lets us re-assert on an HA restart. */
+    mqtt_app_subscribe("homeassistant/status");
 }
 
 /* ── availability sweep (scan_complete -> 64 per-ballast topics) ──────────── */
@@ -524,9 +533,10 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         }
         break;
     case IC_EVT_BUTTON: {
-        static const char *const act[] = { "press", "release", "long_press_start", "long_press_repeat" };
+        static const char *const act[] = { "press", "release", "click", "long_press", "long_press_repeat" };
         snprintf(top, sizeof top, "%s/button/%u/%u", P, e->button.fixture, e->button.button);
-        snprintf(pl, sizeof pl, "{\"event_type\":\"%s\"}", act[e->button.action <= 3 ? e->button.action : 0]);
+        snprintf(pl, sizeof pl, "{\"event_type\":\"%s\"}",
+                 act[e->button.action <= 4 ? e->button.action : 0]);
         mqtt_app_publish(top, pl, strlen(pl), false);   /* momentary, not retained */
         break;
     }
@@ -662,6 +672,22 @@ static void ha_on_message(const char *topic, uint16_t tlen,
     memcpy(t, topic, tl); t[tl] = '\0';
     char pay[512]; uint16_t pn = plen < sizeof pay - 1 ? plen : sizeof pay - 1;
     memcpy(pay, payload, pn); pay[pn] = '\0';
+
+    /* Home Assistant birth message: HA publishes "online" to homeassistant/status
+     * when it (re)starts. Re-run discovery + a full state resync so HA is brought
+     * fully up to date immediately, instead of relying solely on the broker's
+     * retained copies. (Discovery stays retained, as the fallback.) Same kick as
+     * ha_on_connected; ha_bridge_tick runs the burst. */
+    if (!strcmp(t, "homeassistant/status")) {
+        if (!strcmp(pay, "online")) {
+            LOG_INFO("mqtt", "HA online — re-publishing discovery + resync");
+            s_disc_active   = true;
+            s_ph            = PH_GW_AVAIL;
+            s_i = s_j = s_k = 0;
+            s_sweep_pending = false;
+        }
+        return;
+    }
 
     const char *P = mqtt_app_prefix(); size_t pl0 = strlen(P);
     if (strncmp(t, P, pl0) != 0 || t[pl0] != '/') return;
@@ -802,12 +828,15 @@ void ha_bridge_init(void) {
 }
 
 void ha_bridge_tick(void) {
-    /* Disconnected: drop queued events (a fresh resync repopulates on reconnect). */
+    /* Disconnected: MQTT gets nothing, but still fold every event into the web
+     * read model — the config UI must stay live exactly when the broker is down
+     * (its whole point is commissioning before Home Assistant exists). The queue
+     * is drained fully each tick; web_state_on_event is cheap (no I/O). */
     if (!mqtt_app_connected()) {
         s_disc_active = false;
         s_sweep_pending = false;
         ic_event_t ev;
-        while (intercore_pop_event(&ev)) { }
+        while (intercore_pop_event(&ev)) web_state_on_event(&ev);
         return;
     }
 
@@ -836,6 +865,7 @@ void ha_bridge_tick(void) {
     for (int budget = 24; budget > 0; budget--) {
         if (mqtt_app_tx_free() < PUMP_GATE) break;
         if (!intercore_pop_event(&ev)) break;
+        web_state_on_event(&ev);   /* keep the web read model in lock-step */
         if (ev.type == IC_EVT_SCAN_COMPLETE) {
             s_sweep_pending = true;
             s_sweep_slave   = ev.scan_complete.slave;

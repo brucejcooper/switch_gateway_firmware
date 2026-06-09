@@ -40,6 +40,8 @@ void config_defaults(void) {
     g_config.mqtt_port           = 1883;
     strncpy(g_config.mqtt_prefix, "lighting", sizeof g_config.mqtt_prefix - 1);
     g_config.net_dhcp            = 1;
+    strncpy(g_config.web_user, "admin", sizeof g_config.web_user - 1);
+    strncpy(g_config.web_pass, "admin", sizeof g_config.web_pass - 1);
 }
 
 /* ── jsmn helpers ────────────────────────────────────────────────────────── */
@@ -121,7 +123,7 @@ bool config_load(void) {
     config_defaults();
 
     FILE *fp = fopen("/config.json", "r");
-    char buf[768];
+    char buf[1024];
     size_t n = 0;
     if (fp) { n = fread(buf, 1, sizeof(buf) - 1, fp); fclose(fp); }
     buf[n] = '\0';
@@ -155,6 +157,9 @@ bool config_load(void) {
             get_ip(buf, tk, nt, "net_mask", g_config.net_mask);
             get_ip(buf, tk, nt, "net_gw",   g_config.net_gw);
             get_ip(buf, tk, nt, "net_dns",  g_config.net_dns);
+
+            get_str(buf, tk, nt, "web_user", g_config.web_user, sizeof g_config.web_user);
+            get_str(buf, tk, nt, "web_pass", g_config.web_pass, sizeof g_config.web_pass);
         } else {
             LOG_WARN("config", "config.json parse failed (%d) — using defaults", nt);
         }
@@ -181,13 +186,15 @@ bool config_save(void) {
         "],\"mqtt_host\":\"%s\",\"mqtt_port\":%u,\"mqtt_user\":\"%s\","
         "\"mqtt_pass\":\"%s\",\"mqtt_prefix\":\"%s\","
         "\"net_dhcp\":%u,\"net_ip\":\"%u.%u.%u.%u\",\"net_mask\":\"%u.%u.%u.%u\","
-        "\"net_gw\":\"%u.%u.%u.%u\",\"net_dns\":\"%u.%u.%u.%u\"}\n",
+        "\"net_gw\":\"%u.%u.%u.%u\",\"net_dns\":\"%u.%u.%u.%u\","
+        "\"web_user\":\"%s\",\"web_pass\":\"%s\"}\n",
         g_config.mqtt_host, g_config.mqtt_port, g_config.mqtt_user,
         g_config.mqtt_pass, g_config.mqtt_prefix, g_config.net_dhcp,
         g_config.net_ip[0], g_config.net_ip[1], g_config.net_ip[2], g_config.net_ip[3],
         g_config.net_mask[0], g_config.net_mask[1], g_config.net_mask[2], g_config.net_mask[3],
         g_config.net_gw[0], g_config.net_gw[1], g_config.net_gw[2], g_config.net_gw[3],
-        g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3]);
+        g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3],
+        g_config.web_user, g_config.web_pass);
     fclose(fp);
     return true;
 }
