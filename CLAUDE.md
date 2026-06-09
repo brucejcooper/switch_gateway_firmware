@@ -1,7 +1,12 @@
 # Controller firmware — working notes
 
-Raspberry Pi Pico firmware that bridges a USB-CDC CLI to an RS-485 Modbus RTU bus
-of TinyModbus DALI gateways and relay boards.
+Raspberry Pi Pico firmware on a **WIZnet W5100S-EVB-Pico (RP2040)**. Core 0 owns
+the RS-485 Modbus RTU bus (TinyModbus DALI gateways + relay boards), the button
+matrix, the state cache, persistence, and a USB-CDC **text CLI**. Core 1 owns the
+on-board W5100S Ethernet + MQTT and talks to Home Assistant directly — there is no
+external bridge host. The two cores exchange **typed C structs** over two SPSC
+queues; JSON exists only at core 1's MQTT edge. See `README.md` for the full
+architecture, MQTT topics, and CLI grammar.
 
 ## Building & flashing the controller (Pico)
 
@@ -17,7 +22,73 @@ of TinyModbus DALI gateways and relay boards.
   `-f` forces the running app into BOOTSEL, `-x` executes after loading. The Pico
   re-enumerates afterwards; **sleep ~2 s** before reconnecting to the serial port.
 - After reboot the controller runs boot-time bus discovery + a full scan of each
-  DALI slave. It is ready once it emits the `hello` JSON / `serial: hello` log.
+  DALI slave. It is ready once it emits the `hello` / `serial: hello` log.
+- The board is selected in `CMakeLists.txt` (`PICO_BOARD wiznet_w5100s_evb_pico`)
+  and needs four submodules (`git submodule update --init --recursive`): pico-sdk,
+  pico-vfs, ioLibrary_Driver, coreMQTT. A bare Pico 2 / RP2350 UF2 will NOT boot
+  this board.
+
+## On-board MQTT bridge (core 1) — W5100S Ethernet (2026-06-09)
+
+The Python `bridge/mqtt_bridge.py` host was retired: its duties now run **on-board
+on core 1** over the W5100S hardwired TCP/IP chip (SPI0, GP16–21). Core 0's domain
+logic is unchanged; the seam is `src/intercore.{c,h}` (typed events up, typed
+commands down). Network code lives in `src/net/` (`netif` bring-up/DHCP/PHY,
+`mqtt_app` non-blocking TCP socket SM + coreMQTT connection manager, `ha_bridge`
+HA discovery + event↔state translation + inbound command parsing) and
+`src/core1.{c,h}` (launch + liveness). JSON is jsmn (parse) + snprintf (build);
+the whole firmware stays malloc-/float-free (coreMQTT + ioLibrary are static).
+Broker/network config is in `/config.json`, set via the `mqtt` / `net` CLI verbs
+(applied on reboot).
+
+**Launch order matters (flash lockout victim):** core 0 must `intercore_init()`
+then `core1_launch()` **before** the first core-0 flash write (`fs_init`'s
+first-boot littlefs format). Core 1 registers as the `flash_safe_execute` lockout
+victim on launch, then parks on a config-ready gate until core 0 calls
+`core1_config_ready()` (after the config snapshot is populated) before bringing up
+the network. Get this wrong and the first-boot format returns `NOT_PERMITTED` and
+the filesystem never mounts (no persistence). Core 0 feeds the watchdog only while
+core 1's heartbeat is fresh (+15 s grace), so a real core-1 wedge reboots but a
+network outage does not.
+
+**Four bugs that only showed on hardware** (all fixed): (1) `button_actions.c`
+used `PIO2_IRQ_0` (RP2350-only) → `pio_get_irq_num()` (RP2040 has 2 PIO blocks);
+(2) W5100S at 30 MHz SPI read `VER=0x00` (SPI desync) → dropped to 10 MHz + longer
+reset in `wizchip_glue.c`; (3) the `fs_init`-before-`core1_launch` ordering bug
+above; (4) the ioLibrary recv() non-block bug below.
+
+**Do NOT log in core-1 network hot paths.** A `LOG_WARN` in `transport_send`/`recv`
+during the discovery burst caused a heisenbug: USB-CDC `printf` back-pressure
+stalled core 1 mid-publish → W5100S timeout → connection churn → "0 retained".
+Removing the instrumentation fixed it. The Docker broker was never at fault.
+
+### ioLibrary recv() #173 — build-time patch
+
+ioLibrary's `recv()` returns `SOCK_BUSY` *before* checking `recvsize` on the
+non-IPv6 non-block path (upstream issue #173), so the MQTT CONNACK sits unread and
+the connection never completes. We keep the submodule pristine and fix it with a
+**build-time patch** applied idempotently at CMake configure time:
+`patches/0001-ioLibrary-recv-nonblock-issue-173.patch` (gates the early return on
+`recvsize == 0`). CMake reverse-checks to skip an already-patched tree and only
+WARNs if it can't apply (so an upstream fix that obsoletes it doesn't break the
+build). The patch dirties the submodule working tree — that's expected; the
+gitlink SHA is unchanged, so **do not commit the submodule change**. To remove
+once upstream lands #173: delete the patch file + the apply block in CMakeLists.
+
+### MQTT publish coalescing — transport writev
+
+`transport_writev` in `mqtt_app.c` implements coreMQTT's optional vectored-send
+callback: it gathers a packet's fragments (fixed header, topic-len, topic,
+payload) into one buffer and sends once. Without it, coreMQTT calls `send()` per
+fragment and each ioLibrary `send()` issues an immediate W5100S `SEND` (no Nagle),
+so one PUBLISH left as 3–4 tiny TCP segments. Verified on the wire: each PUBLISH is
+now a single segment.
+
+### CLI echo defaults ON (2026-06-09)
+
+`echo_on` defaults to **true** (`serial_protocol.c`): the CLI is now a human-only
+interface (machine clients went away with the on-board bridge), so local echo +
+backspace editing is what you want. `echo off` restores a clean byte stream.
 
 ## Building & flashing the TinyModbus gateway (attiny1604)
 

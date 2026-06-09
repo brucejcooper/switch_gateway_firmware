@@ -15,7 +15,7 @@ mapping_record_t g_mappings[MAX_FIXTURES][MAX_BUTTONS];
 #define MAPPINGS_VERSION     1
 
 /* Serialise a record's targets as a JSON array (ballast → {slave,addr},
- * group → {slave,group}).  Shared by mapping_save and mapping_serialise_all. */
+ * group → {slave,group}).  Used by mapping_save. */
 static int serialise_targets(char *buf, int size, const mapping_record_t *r) {
     int p = snprintf(buf, size, "[");
     for (int t = 0; t < r->target_count; t++) {
@@ -166,26 +166,4 @@ bool mapping_delete(uint8_t fixture, uint8_t button) {
     if (fixture >= MAX_FIXTURES || button >= MAX_BUTTONS) return false;
     memset(&g_mappings[fixture][button], 0, sizeof(mapping_record_t));
     return mapping_save();
-}
-
-int mapping_serialise_all(char *buf, int buf_len) {
-    int pos = 0;
-    for (int f = 0; f < MAX_FIXTURES; f++) {
-        for (int b = 0; b < MAX_BUTTONS; b++) {
-            const mapping_record_t *r = &g_mappings[f][b];
-            if (r->target_count == 0) continue;
-
-            char targets[256];
-            serialise_targets(targets, sizeof(targets), r);
-
-            int n = snprintf(buf + pos, buf_len - pos,
-                             "{\"t\":\"config_mapping\","
-                             "\"d\":{\"fixture\":%u,\"button\":%u},"
-                             "\"v\":{\"targets\":%s}}\n",
-                             r->fixture, r->button, targets);
-            if (n < 0 || n >= buf_len - pos) return -1;
-            pos += n;
-        }
-    }
-    return pos;
 }

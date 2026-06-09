@@ -1,8 +1,11 @@
 /*
- * serial_protocol.c — JSON line protocol over USB CDC.
+ * serial_protocol.c — text CLI over USB CDC (core 0).
  *
- * Uses stdio_getchar_timeout_us(0) to non-blockingly read USB CDC input;
- * outbound messages use printf(). Single-core; no multicore sync needed.
+ * Human-facing, line-based command interface (`help` lists the verbs). JSON
+ * lives only on core 1's MQTT edge — this seam pushes typed events to core 1
+ * and dispatches typed commands back, never JSON. Uses
+ * stdio_getchar_timeout_us(0) to non-blockingly read USB CDC input; outbound
+ * messages use printf(). Runs on core 0; no multicore sync needed here.
  */
 
 #include "serial_protocol.h"
@@ -33,10 +36,12 @@
 extern bool lighting_evt_try_pop(void *out);  /* defined in lighting_actions.c */
 
 /* When true, serial_poll() echoes received characters back to the terminal
- * and honours backspace for line editing.  Off by default; toggled with the
- * "echo on" / "echo off" command.  Useful when driving the CLI from a dumb
- * terminal (e.g. miniterm) that does not echo locally. */
-static bool echo_on = false;
+ * and honours backspace for line editing.  On by default: the CLI is now a
+ * human-only interface (machine clients went away when the on-board core-1
+ * bridge replaced the Python host), so local echo is what you almost always
+ * want.  Toggle with "echo off" if driving it from something that echoes
+ * locally or wants a clean byte stream. */
+static bool echo_on = true;
 
 /* ── Minimal JSON key extraction (identical to pico_lighting design) ─────── */
 static bool json_str(const char *json, const char *key, char *out, int out_len) {
@@ -631,6 +636,8 @@ static void cmd_help(void) {
     printf("set_slave_baud <slave> {9600|19200|38400} [relay|dali]  tell slave to switch its UART baud\n");
     printf("baud [<rate> [save]]                       show / set UART baud (live; 'save' persists)\n");
     printf("rs485 [{tx|always}]                         show / set RS485 DE mode (saved; tx=DE while transmitting)\n");
+    printf("mqtt [show | set host= port= user= pass= prefix=]  broker config (reboot to apply)\n");
+    printf("net  [show | set dhcp= ip= mask= gw= dns=]   network config (reboot to apply)\n");
     printf("ls [<path>]                                list files in path (default /)\n");
     printf("cat <path>                                 dump file contents to console\n");
     printf("map <fix> <btn> [targets=<s>:<a>,...]     bare=get; targets= deletes (a=N or gN)\n");
@@ -2047,10 +2054,11 @@ void serial_tx_hello(void) {
 
 void serial_tx_config_full(void) {
     /* Emit every populated binding as its own config_mapping line, incrementally
-     * — NOT serialised into one fixed buffer. The old 4 KB buffer made
-     * mapping_serialise_all() return -1 (and print nothing) once the table grew
-     * past ~45 bindings, so get_mappings answered empty and HA showed no bindings
-     * after every reconnect, even though the controller's table was intact. */
+     * — NOT serialised into one fixed buffer. A single 4 KB serialise buffer
+     * (the old mapping_serialise_all, since removed) overflowed once the table
+     * grew past ~45 bindings and printed nothing, so get_mappings answered empty
+     * and HA showed no bindings after every reconnect, even though the
+     * controller's table was intact. */
     for (uint8_t f = 0; f < MAX_FIXTURES; f++)
         for (uint8_t b = 0; b < MAX_BUTTONS; b++) {
             const mapping_record_t *rec = mapping_lookup(f, b);

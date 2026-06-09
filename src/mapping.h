@@ -40,7 +40,3 @@ const mapping_record_t *mapping_lookup(uint8_t fixture, uint8_t button);
 bool mapping_set(uint8_t fixture, uint8_t button,
                  const mapping_target_t *targets, uint8_t count);
 bool mapping_delete(uint8_t fixture, uint8_t button);
-
-/* Serialise all non-empty mappings as JSON lines into buf.
- * Returns bytes written, or -1 if buffer too small. */
-int mapping_serialise_all(char *buf, int buf_len);
