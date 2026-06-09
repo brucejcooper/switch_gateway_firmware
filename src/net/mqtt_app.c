@@ -61,8 +61,12 @@ static int32_t transport_recv(NetworkContext_t *ctx, void *buf, size_t len) {
     /* Work around an ioLibrary_Driver bug: on the non-IPv6 path, recv() on a
      * SF_IO_NONBLOCK socket returns SOCK_BUSY *before* checking for available
      * data, so it never delivers a received packet (the IPv6 path has the
-     * checks in the correct order). Flip to blocking just for this read — data
-     * is confirmed present, so it cannot block — then restore non-block. */
+     * checks in the correct order). Upstream issue:
+     *   https://github.com/Wiznet/ioLibrary_Driver/issues/173  (open)
+     * suggested one-line fix: `if ((sock_io_mode & (1<<sn)) && (recvsize == 0))`.
+     * We work around it here instead of patching the vendored submodule: flip to
+     * blocking just for this read — data is confirmed present, so it cannot
+     * block — then restore non-block. */
     uint8_t mode = SOCK_IO_BLOCK;
     ctlsocket(ctx->sn, CS_SET_IOMODE, &mode);
     int32_t r = recv(ctx->sn, (uint8_t *)buf, (uint16_t)len);
