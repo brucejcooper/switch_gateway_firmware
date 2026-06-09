@@ -53,8 +53,21 @@ static uint32_t rng_next(void) { s_rng = s_rng * 1664525u + 1013904223u; return 
 
 /* ── coreMQTT transport (non-blocking; SOCK_BUSY -> 0, error -> -1) ─────────── */
 static int32_t transport_recv(NetworkContext_t *ctx, void *buf, size_t len) {
+    /* Read Sn_RX_RSR until two reads agree (W5100S volatile-register quirk). */
+    uint16_t a, b;
+    do { a = getSn_RX_RSR(ctx->sn); b = getSn_RX_RSR(ctx->sn); } while (a != b);
+    if (a == 0) return 0;   /* no data yet */
+
+    /* Work around an ioLibrary_Driver bug: on the non-IPv6 path, recv() on a
+     * SF_IO_NONBLOCK socket returns SOCK_BUSY *before* checking for available
+     * data, so it never delivers a received packet (the IPv6 path has the
+     * checks in the correct order). Flip to blocking just for this read — data
+     * is confirmed present, so it cannot block — then restore non-block. */
+    uint8_t mode = SOCK_IO_BLOCK;
+    ctlsocket(ctx->sn, CS_SET_IOMODE, &mode);
     int32_t r = recv(ctx->sn, (uint8_t *)buf, (uint16_t)len);
-    if (r == SOCK_BUSY) return 0;
+    mode = SOCK_IO_NONBLOCK;
+    ctlsocket(ctx->sn, CS_SET_IOMODE, &mode);
     return r < 0 ? -1 : r;
 }
 static int32_t transport_send(NetworkContext_t *ctx, const void *buf, size_t len) {
@@ -254,7 +267,13 @@ bool mqtt_app_publish(const char *topic, const void *payload, size_t len, bool r
     pi.topicNameLength = (uint16_t)strlen(topic);
     pi.pPayload        = payload;
     pi.payloadLength   = len;
-    return MQTT_Publish(&s_mqtt, &pi, 0) == MQTTSuccess;
+    MQTTStatus_t st = MQTT_Publish(&s_mqtt, &pi, 0);
+    if (st != MQTTSuccess) {   /* DEBUG */
+        static uint32_t fails = 0;
+        if ((fails++ % 40) == 0)
+            LOG_WARN("mqtt", "publish st=%d (#%lu) %s", (int)st, (unsigned long)fails, topic);
+    }
+    return st == MQTTSuccess;
 }
 
 bool mqtt_app_subscribe(const char *filter) {
