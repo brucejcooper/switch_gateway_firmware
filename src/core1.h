@@ -35,3 +35,10 @@ void core1_config_ready(void);
  * including mid-reconnect — means "core 1's loop is alive", not "connected".
  * A single aligned 32-bit read is atomic on Cortex-M0+. */
 uint32_t core1_heartbeat_ms(void);
+
+/* Feed the hardware watchdog using the same core-1-liveness gating the main
+ * loop uses (fed only while core 1's heartbeat is fresh or during the grace
+ * window). Exposed so long-running blocking core-0 work — e.g. a multi-write
+ * DALI group-membership change waiting on an unresponsive gateway — can pet the
+ * dog without blinding the core-1-wedge detector. */
+void wd_feed(void);

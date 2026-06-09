@@ -19,6 +19,7 @@
 #include "bus_discovery.h"
 #include "modbus.h"
 #include "intercore.h"
+#include "core1.h"
 #include "log.h"
 #include <stdio.h>
 #include <string.h>
@@ -372,6 +373,11 @@ static void cli_mb_wait(cli_mb_ctx_t *c) {
     absolute_time_t deadline = make_timeout_time_ms(1500);
     while (!c->done && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         modbus_poll();
+        /* This blocks the core-0 main loop, which is the only watchdog feeder.
+         * A single transaction can stall 1.5 s, and dali_group_set_members chains
+         * up to four of these — past the 5 s watchdog against a dead gateway.
+         * Feed here (core-1-gated, so a real core-1 wedge still reboots). */
+        wd_feed();
     }
 }
 

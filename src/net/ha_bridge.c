@@ -24,6 +24,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdbool.h>
+#include <stdarg.h>
 
 #define MFR_MECH   "Mechination"
 #define MFR_WAVE   "Waveshare"
@@ -50,6 +51,22 @@
 static char s_pl[PL_CAP];
 static char s_top[112];
 
+/* Clamped accumulating snprintf into the shared s_pl payload buffer. Guards the
+ * `s_pl + n, PL_CAP - n` idiom: once a write would overflow, n saturates at
+ * PL_CAP so the next call's (PL_CAP - n) can't underflow to a huge size_t and
+ * run snprintf off the end of s_pl. Identical to a bare `n += snprintf(...)`
+ * whenever the payload fits — the only case that occurs today (~600 B vs 1536). */
+static int pcat(int n, const char *fmt, ...) {
+    if (n < 0 || n >= PL_CAP) return PL_CAP;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(s_pl + n, (size_t)(PL_CAP - n), fmt, ap);
+    va_end(ap);
+    if (w < 0) return n;
+    n += w;
+    return n > PL_CAP ? PL_CAP : n;
+}
+
 /* ── publish helpers ─────────────────────────────────────────────────────── */
 static void pub_cfg(const char *component, const char *objid) {
     snprintf(s_top, sizeof s_top, "homeassistant/%s/%s/config", component, objid);
@@ -60,11 +77,10 @@ static void pub_str(const char *topic, const char *payload, bool retain) {
 }
 static int dev(int n, const char *ids, const char *name,
                const char *mfr, const char *model, const char *via) {
-    n += snprintf(s_pl + n, PL_CAP - n,
-                  ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\","
-                  "\"manufacturer\":\"%s\",\"model\":\"%s\"", ids, name, mfr, model);
-    if (via) n += snprintf(s_pl + n, PL_CAP - n, ",\"via_device\":\"%s\"", via);
-    n += snprintf(s_pl + n, PL_CAP - n, "}}");
+    n = pcat(n, ",\"device\":{\"identifiers\":[\"%s\"],\"name\":\"%s\","
+                "\"manufacturer\":\"%s\",\"model\":\"%s\"", ids, name, mfr, model);
+    if (via) n = pcat(n, ",\"via_device\":\"%s\"", via);
+    n = pcat(n, "}}");
     return n;
 }
 
@@ -233,8 +249,7 @@ static void disc_prov(uint8_t slave, uint8_t k) {
     snprintf(status, sizeof status, "%s/provision/%u/status", P, slave);
 
     #define PROV_TAIL(cat) do { \
-        int _n = (int)strlen(s_pl); \
-        _n += snprintf(s_pl+_n, PL_CAP-_n, \
+        int _n = pcat((int)strlen(s_pl), \
             ",\"availability\":[{\"topic\":\"%s/availability\"}," \
             "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"," \
             "\"entity_category\":\"" cat "\"", P, P, slave); \
@@ -319,7 +334,7 @@ static void disc_controller(uint8_t k) {
             "\"value_template\":\"{{ value_json.%s }}\",\"min\":%d,\"max\":%d,\"step\":%d,"
             "\"mode\":\"box\",\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\"",
             N[k].key, N[k].name, P, N[k].key, P, N[k].key, N[k].lo, N[k].hi, N[k].step, P);
-        snprintf(s_pl + n, PL_CAP - n,
+        pcat(n,
             ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
             "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
             "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
@@ -335,7 +350,7 @@ static void disc_controller(uint8_t k) {
             "\"value_template\":\"{{ value_json.%s }}\",\"availability_topic\":\"%s/availability\","
             "\"entity_category\":\"diagnostic\",\"icon\":\"%s\"",
             S[b].key, S[b].name, P, S[b].key, P, S[b].icon);
-        snprintf(s_pl + n, PL_CAP - n,
+        pcat(n,
             ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
             "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
             "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");

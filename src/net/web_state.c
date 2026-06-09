@@ -11,6 +11,7 @@
 #include "version.h"       /* FW_VERSION */
 #include <string.h>
 #include <stdio.h>
+#include <stdarg.h>
 
 #define WEB_GROUPS 16u     /* DALI groups 0..15 */
 
@@ -218,16 +219,32 @@ static int slave_id_for(int idx) {
     return (sn && idx < sn->dali_count) ? sn->dali_slaves[idx] : 0;
 }
 
+/* Clamped accumulating snprintf. Returns the new offset, never past cap, so a
+ * truncation can't make (cap - n) underflow to a huge size_t on the next call
+ * and run snprintf off the end of out. Behaves identically to a bare
+ * `n += snprintf(out + n, cap - n, ...)` whenever the write fits (the only case
+ * that occurs today); the clamp is a latent-overflow guard for larger payloads. */
+static int jcat(char *out, size_t cap, int n, const char *fmt, ...) {
+    if (n < 0 || (size_t)n >= cap) return (int)cap;
+    va_list ap;
+    va_start(ap, fmt);
+    int w = vsnprintf(out + n, cap - n, fmt, ap);
+    va_end(ap);
+    if (w < 0) return n;
+    n += w;
+    return (size_t)n > cap ? (int)cap : n;
+}
+
 static int render_members(uint64_t mask, char *out, size_t cap) {
     int n = 0; bool first = true;
-    n += snprintf(out + n, cap - n, "[");
+    n = jcat(out, cap, n, "[");
     for (uint8_t a = 0; a < DALI_ADDR_COUNT && (size_t)n < cap; a++) {
         if (mask & (1ull << a)) {
-            n += snprintf(out + n, cap - n, "%s%u", first ? "" : ",", a);
+            n = jcat(out, cap, n, "%s%u", first ? "" : ",", a);
             first = false;
         }
     }
-    n += snprintf(out + n, cap - n, "]");
+    n = jcat(out, cap, n, "]");
     return n;
 }
 
@@ -235,7 +252,7 @@ static int render_members(uint64_t mask, char *out, size_t cap) {
 static int render_tail(char *out, size_t cap) {
     const ic_snapshot_t *sn = intercore_snapshot();
     int n = 0;
-    n += snprintf(out + n, cap - n,
+    n = jcat(out, cap, n,
         "],\"cfg\":{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,"
         "\"reversal_window_ms\":%u,\"baud\":%lu,\"de_mode\":%u,"
         "\"fw_version\":\"" FW_VERSION "\","
@@ -245,7 +262,7 @@ static int render_tail(char *out, size_t cap) {
         MAX_FIXTURES, MAX_BUTTONS, MAX_TARGETS_PER_BTN);
     if (sn) {
         uint8_t cur[4]; netif_get_ip(cur);   /* live address (DHCP-leased or static) */
-        n += snprintf(out + n, cap - n,
+        n = jcat(out, cap, n,
             ",\"net\":{\"dhcp\":%s,\"current_ip\":\"%u.%u.%u.%u\","
             "\"ip\":\"%u.%u.%u.%u\",\"mask\":\"%u.%u.%u.%u\","
             "\"gw\":\"%u.%u.%u.%u\",\"dns\":\"%u.%u.%u.%u\"}",
@@ -258,17 +275,17 @@ static int render_tail(char *out, size_t cap) {
         /* The broker host is stored as a dotted-quad (config supports IP only for
          * now), resolved into mqtt_ip on the snapshot. The password is never
          * disclosed — only whether one is set. */
-        n += snprintf(out + n, cap - n,
+        n = jcat(out, cap, n,
             ",\"mqtt\":{\"host\":\"%u.%u.%u.%u\",\"port\":%u,\"user\":\"%.47s\","
             "\"prefix\":\"%.23s\",\"have_pass\":%s}",
             sn->mqtt_ip[0], sn->mqtt_ip[1], sn->mqtt_ip[2], sn->mqtt_ip[3],
             sn->mqtt_port, sn->mqtt_user, sn->mqtt_prefix,
             sn->mqtt_pass[0] ? "true" : "false");
-        n += snprintf(out + n, cap - n,
+        n = jcat(out, cap, n,
             ",\"web_user\":\"%.31s\"", sn->web_user);
     }
     /* Close the cfg object, then the top-level seq, then the root object. */
-    n += snprintf(out + n, cap - n, "},\"seq\":%lu}", (unsigned long)S.seq);
+    n = jcat(out, cap, n, "},\"seq\":%lu}", (unsigned long)S.seq);
     return n;
 }
 
@@ -390,13 +407,13 @@ static int unit_at(const web_render_cursor_t *cur, char *out, size_t cap,
             for (uint8_t ti = 0; ti < cnt; ti++) {
                 mapping_target_t *t = &S.map[f][btn].t[ti];
                 if (TARGET_IS_GROUP(*t))
-                    n += snprintf(out + n, cap - n, "%s{\"slave\":%u,\"group\":%u}",
-                                  ti ? "," : "", t->slave, TARGET_GROUP_NUM(*t));
+                    n = jcat(out, cap, n, "%s{\"slave\":%u,\"group\":%u}",
+                             ti ? "," : "", t->slave, TARGET_GROUP_NUM(*t));
                 else
-                    n += snprintf(out + n, cap - n, "%s{\"slave\":%u,\"addr\":%u}",
-                                  ti ? "," : "", t->slave, TARGET_BALLAST_ADDR(*t));
+                    n = jcat(out, cap, n, "%s{\"slave\":%u,\"addr\":%u}",
+                             ti ? "," : "", t->slave, TARGET_BALLAST_ADDR(*t));
             }
-            n += snprintf(out + n, cap - n, "]}");
+            n = jcat(out, cap, n, "]}");
             next->i = k + 1; next->started = true;
             return n;
         }

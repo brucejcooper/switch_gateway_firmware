@@ -68,7 +68,7 @@ static absolute_time_t s_core1_grace_until;
  * the post-launch grace window). A network outage keeps core 1 looping and
  * beating, so it never reboots; only a genuine core-1 wedge (stuck SPI, infinite
  * loop) stops the beat and lets the 5 s watchdog fire. */
-static void wd_feed(void) {
+void wd_feed(void) {
     if (!time_reached(s_core1_grace_until) ||
         (to_ms_since_boot(get_absolute_time()) - core1_heartbeat_ms()) < CORE1_STALE_MS) {
         watchdog_update();
