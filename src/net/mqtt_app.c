@@ -67,6 +67,27 @@ static int32_t transport_send(NetworkContext_t *ctx, const void *buf, size_t len
     return r < 0 ? -1 : r;
 }
 
+/* Vectored send. coreMQTT serialises each packet as several iovec fragments
+ * (fixed header, topic-len, topic, [packet-id], payload). Without this callback
+ * it would call transport_send() once per fragment, and each ioLibrary send()
+ * issues a W5100S SEND immediately (no Nagle) — so one PUBLISH left as 3-4 tiny
+ * TCP segments. Gathering the fragments into one buffer and sending once
+ * coalesces them into a single segment (up to MSS). Partial gather/send is fine:
+ * we return the byte count accepted and coreMQTT re-calls for the remainder. */
+static uint8_t s_txvec[MQTT_NET_BUF_SIZE];
+static int32_t transport_writev(NetworkContext_t *ctx,
+                                TransportOutVector_t *vec, size_t n) {
+    size_t total = 0;
+    for (size_t i = 0; i < n && total < sizeof s_txvec; i++) {
+        size_t c = vec[i].iov_len;
+        if (c > sizeof s_txvec - total) c = sizeof s_txvec - total;
+        memcpy(s_txvec + total, vec[i].iov_base, c);
+        total += c;
+        if (c < vec[i].iov_len) break;   /* scratch full — send what we have */
+    }
+    return transport_send(ctx, s_txvec, total);
+}
+
 /* ── inbound MQTT packets ────────────────────────────────────────────────── */
 static void mqtt_event_cb(MQTTContext_t *ctx, MQTTPacketInfo_t *pkt,
                           MQTTDeserializedInfo_t *des) {
@@ -116,6 +137,7 @@ static bool mqtt_connect(void) {
     s_transport.pNetworkContext = &s_netctx;
     s_transport.recv = transport_recv;
     s_transport.send = transport_send;
+    s_transport.writev = transport_writev;
 
     if (MQTT_Init(&s_mqtt, &s_transport, now_ms, mqtt_event_cb, &s_fixedbuf) != MQTTSuccess)
         return false;
