@@ -66,8 +66,14 @@ static bool chip_bringup(void) {
     }
     uint8_t ver = getVER();
     if (ver != W5100S_VERSION) {
-        LOG_ERR("net", "bad W5100S VER 0x%02x (want 0x%02x) — SPI desync?",
-                ver, W5100S_VERSION);
+        /* Diagnostics: re-read VER, and do a register write/read-back test to
+         * distinguish a dead SPI link (reads 0x0000/0xFFFF) from an anomalous
+         * VER read (RTR reads back 0x1234 -> SPI actually works). */
+        uint8_t v2 = getVER(), v3 = getVER();
+        setRTR(0x1234);
+        uint16_t rtr = getRTR();
+        LOG_ERR("net", "bad VER 0x%02x (re-read 0x%02x 0x%02x); RTR wr=0x1234 rd=0x%04x",
+                ver, v2, v3, rtr);
         return false;
     }
     setRTR(WIZ_RTR);

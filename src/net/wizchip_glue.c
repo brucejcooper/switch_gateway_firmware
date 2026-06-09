@@ -13,7 +13,7 @@
 #include "wizchip_conf.h"
 
 #define WIZ_SPI       spi0
-#define WIZ_SPI_HZ    (30u * 1000u * 1000u)   /* conservative; W5100S handles more */
+#define WIZ_SPI_HZ    (10u * 1000u * 1000u)   /* conservative bring-up clock */
 
 #ifndef PICO_DEFAULT_SPI_SCK_PIN
 #define PICO_DEFAULT_SPI_SCK_PIN 18
@@ -86,7 +86,7 @@ void wizchip_glue_init(void) {
 
 void wizchip_glue_reset(void) {
     gpio_put(PIN_RST, 0);
-    sleep_ms(2);     /* RSTn low pulse (datasheet min ~500 us) */
+    sleep_ms(10);    /* RSTn low pulse (datasheet min ~500 us; be generous) */
     gpio_put(PIN_RST, 1);
-    sleep_ms(60);    /* PLL lock / internal boot */
+    sleep_ms(150);   /* PLL lock / internal boot before first SPI access */
 }
