@@ -49,10 +49,12 @@ static bool wait_done(disc_ctx_t *c) {
     return c->done && c->ok;
 }
 
-/* FC01 read 1 coil — universal Waveshare ping */
+/* FC01 read all 32 coils — the relay board only answers a full-bank read, not a
+ * single-coil ping (it NAKs/ignores count=1).  32 = the board's full relay bank
+ * (RELAY_COUNT); the response frame is the same one dirty_poll/state reads use. */
 static bool ping_relay(uint8_t slave_id) {
     disc_ctx_t ctx = { false, false, 0 };
-    modbus_get_coils(slave_id, 0, 1, disc_cb, &ctx);
+    modbus_get_coils(slave_id, 0, 32, disc_cb, &ctx);
     return wait_done(&ctx);
 }
 
