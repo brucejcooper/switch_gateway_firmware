@@ -224,11 +224,22 @@ static void uart_irq(void) {
 /* ── DE release alarm (identical to original) ────────────────────────────── */
 static int64_t release_de(alarm_id_t id, void *userdata) {
     while (uart_get_hw(UART_ID)->fr & UART_UARTFR_BUSY_BITS) {
-        ;
+        ;   /* wait for the final byte to clear the shift register */
     }
     if (de_mode == MODBUS_DE_WHENTX) {
-        gpio_put(UART_DE_PIN, 0);
+        gpio_put(UART_DE_PIN, 0);   /* DE/RE low -> receiver enabled */
     }
+    /* Transmit is complete and the line has settled. Discard anything the RX
+     * FIFO captured during the transmit (the controller's own frame, latched
+     * via the muted/floating receiver) and only NOW arm the receiver for the
+     * slave's reply. This is the fix for the half-duplex "rx == tx" self-echo. */
+    while (uart_is_readable(UART_ID)) uart_getc(UART_ID);
+    readptr     = buf;
+    readbuf_sz  = 0;
+    readbuf_max = sizeof(buf);
+    readbuf_crc = 0xFFFF;
+    readTimeout = make_timeout_time_ms(MODBUS_RESPONSE_TIMEOUT_MS);
+    uart_set_irqs_enabled(UART_ID, true, false);
     bus_state = MODBUS_RECEIVING;
     return 0;
 }
@@ -335,11 +346,10 @@ static void start_action_tx(void) {
         uart_get_hw(UART_ID)->dr = buf[i];
     }
 
-    readptr     = buf;
-    readbuf_sz  = 0;
-    readbuf_max = sizeof(buf);
-    readbuf_crc = 0xFFFF;
-    uart_set_irqs_enabled(UART_ID, true, false);
+    /* Do NOT enable RX here: while DE is asserted the receiver is muted (RE
+     * tracks DE), and a half-duplex transceiver's RxD pin floats during the
+     * transmit, so the controller can capacitively latch its OWN outgoing
+     * frame.  release_de() turns RX on only after the line settles. */
     bus_state = MODBUS_TRANSMITTING;
 }
 
