@@ -16,6 +16,7 @@
 #include "mqtt_app.h"
 #include "intercore.h"
 #include "web_state.h"   /* fan-out: feed the web read model from the event drain */
+#include "ping.h"        /* IC_EVT_PING_REQ is routed here, not published */
 #include "log.h"
 #include "version.h"     /* FW_VERSION */
 #include "jsmn.h"
@@ -600,6 +601,8 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         break;
     case IC_EVT_FAULT:           /* mqtt_bridge.py logs faults only — no topic */
         break;
+    case IC_EVT_PING_REQ:        /* routed to ping_submit in the drain, never published */
+        break;
     }
 }
 
@@ -851,7 +854,10 @@ void ha_bridge_tick(void) {
         s_disc_active = false;
         s_sweep_pending = false;
         ic_event_t ev;
-        while (intercore_pop_event(&ev)) web_state_on_event(&ev);
+        while (intercore_pop_event(&ev)) {
+            if (ev.type == IC_EVT_PING_REQ) { ping_submit(ev.ping_req.ip, ev.ping_req.count); continue; }
+            web_state_on_event(&ev);
+        }
         return;
     }
 
@@ -880,6 +886,7 @@ void ha_bridge_tick(void) {
     for (int budget = 24; budget > 0; budget--) {
         if (mqtt_app_tx_free() < PUMP_GATE) break;
         if (!intercore_pop_event(&ev)) break;
+        if (ev.type == IC_EVT_PING_REQ) { ping_submit(ev.ping_req.ip, ev.ping_req.count); continue; }
         web_state_on_event(&ev);   /* keep the web read model in lock-step */
         if (ev.type == IC_EVT_SCAN_COMPLETE) {
             s_sweep_pending = true;

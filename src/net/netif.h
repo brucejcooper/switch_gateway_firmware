@@ -41,3 +41,10 @@ void netif_get_dns(uint8_t dns[4]);
  * socket), and true between DHCP renewals (dropping a guard band before each T1).
  * The web server must relinquish socket 0 promptly when this returns false. */
 bool netif_web_sock0_enabled(void);
+
+/* Borrow socket 0 for a one-off CLI network ping (IPRAW/ICMP). Returns false if
+ * socket 0 isn't free right now (not ready, DHCP about to renew, or already
+ * lent to a ping). While held, netif leaves socket 0 alone and the web server
+ * backs off; the caller MUST netif_ping_release_sock0() when done. */
+bool netif_ping_acquire_sock0(void);
+void netif_ping_release_sock0(void);

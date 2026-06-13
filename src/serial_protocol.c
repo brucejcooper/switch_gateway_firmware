@@ -644,6 +644,7 @@ static void cmd_help(void) {
     printf("rs485 [{tx|always}]                         show / set RS485 DE mode (saved; tx=DE while transmitting)\n");
     printf("mqtt [show | set host= port= user= pass= prefix=]  broker config (reboot to apply)\n");
     printf("net  [show | set dhcp= ip= mask= gw= dns=]   network config (reboot to apply)\n");
+    printf("net  ping <ip> [count]                      ICMP echo from the device (default 4)\n");
     printf("ls [<path>]                                list files in path (default /)\n");
     printf("cat <path>                                 dump file contents to console\n");
     printf("map <fix> <btn> [targets=<s>:<a>,...]     bare=get; targets= deletes (a=N or gN)\n");
@@ -1632,8 +1633,78 @@ static void cmd_echo(char **saveptr) {
 static bool parse_ip4(const char *s, uint8_t ip[4]) {
     unsigned a, b, c, d;
     if (sscanf(s, "%u.%u.%u.%u", &a, &b, &c, &d) != 4) return false;
+    if (a > 255 || b > 255 || c > 255 || d > 255) return false;
     ip[0] = (uint8_t)a; ip[1] = (uint8_t)b; ip[2] = (uint8_t)c; ip[3] = (uint8_t)d;
     return true;
+}
+
+/* ── network ping (core 1 runs the ICMP echo; replies arrive asynchronously as
+ *    IC_CMD_PING_REPLY and print here). One run in flight at a time. ───────── */
+static struct {
+    bool     active;
+    uint8_t  ip[4];
+    uint8_t  count;        /* echoes requested */
+    uint8_t  seen;         /* outcomes printed (reply + timeout) */
+    uint8_t  recv;         /* successful replies */
+    uint32_t deadline_ms;  /* give up waiting on core 1 past this */
+} s_cli_ping;
+
+static void cli_ping_summary(void) {
+    int lost = (int)s_cli_ping.count - (int)s_cli_ping.recv;
+    printf("%u sent, %u received, %d lost\n",
+           s_cli_ping.count, s_cli_ping.recv, lost < 0 ? 0 : lost);
+    s_cli_ping.active = false;
+}
+
+static void cli_ping_start(const uint8_t ip[4], int count) {
+    if (s_cli_ping.active) { txt_err("ping_busy"); return; }
+    ic_event_t ev; memset(&ev, 0, sizeof ev);
+    ev.type = IC_EVT_PING_REQ;
+    memcpy(ev.ping_req.ip, ip, 4);
+    ev.ping_req.count = (uint8_t)count;
+    if (!intercore_push_event(&ev)) { txt_err("queue_full"); return; }
+    s_cli_ping.active = true;
+    memcpy(s_cli_ping.ip, ip, 4);
+    s_cli_ping.count = (uint8_t)count;
+    s_cli_ping.seen  = 0;
+    s_cli_ping.recv  = 0;
+    /* each echo waits up to ~1 s on core 1, plus slack for queue/round-trip. */
+    s_cli_ping.deadline_ms =
+        to_ms_since_boot(get_absolute_time()) + (uint32_t)count * 1200u + 2000u;
+    printf("PING %u.%u.%u.%u:\n", ip[0], ip[1], ip[2], ip[3]);
+}
+
+static void cli_ping_on_reply(const ic_cmd_t *c) {
+    if (!s_cli_ping.active) return;   /* late/duplicate after a summary */
+    switch ((ic_ping_status_t)c->ping_reply.status) {
+    case IC_PING_BUSY:
+        printf("  busy (network core couldn't borrow a socket — retry)\n");
+        s_cli_ping.active = false;
+        return;
+    case IC_PING_ERROR:
+        printf("  error (socket/send failed)\n");
+        s_cli_ping.active = false;
+        return;
+    case IC_PING_REPLY:
+        printf("  seq=%u  reply  rtt=%ums\n", c->ping_reply.seq, c->ping_reply.rtt_ms);
+        s_cli_ping.recv++;
+        s_cli_ping.seen++;
+        break;
+    case IC_PING_TIMEOUT:
+        printf("  seq=%u  timeout\n", c->ping_reply.seq);
+        s_cli_ping.seen++;
+        break;
+    }
+    if (s_cli_ping.seen >= s_cli_ping.count) cli_ping_summary();
+}
+
+/* Called from serial_poll: bail out of a stuck run if core 1 never replies. */
+static void cli_ping_poll(void) {
+    if (!s_cli_ping.active) return;
+    if ((int32_t)(to_ms_since_boot(get_absolute_time()) - s_cli_ping.deadline_ms) >= 0) {
+        printf("  (no response from network core)\n");
+        cli_ping_summary();
+    }
 }
 
 static void cmd_mqtt(char **sp) {
@@ -1670,6 +1741,16 @@ static void cmd_net(char **sp) {
                g_config.net_mask[0], g_config.net_mask[1], g_config.net_mask[2], g_config.net_mask[3],
                g_config.net_gw[0], g_config.net_gw[1], g_config.net_gw[2], g_config.net_gw[3],
                g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3]);
+        return;
+    }
+    if (strcasecmp(sub, "ping") == 0) {
+        uint8_t ip[4];
+        char *ips = strtok_r(NULL, " \t", sp);
+        if (!ips || !parse_ip4(ips, ip)) { txt_err("bad_ip"); return; }
+        int count = 4;
+        char *cs = strtok_r(NULL, " \t", sp);
+        if (cs && !parse_int_range(cs, 1, 16, &count)) { txt_err("bad_count"); return; }
+        cli_ping_start(ip, count);
         return;
     }
     if (strcasecmp(sub, "set") != 0) { txt_err("bad_arg"); return; }
@@ -2072,6 +2153,9 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         lighting_resync_emit();
         serial_tx_config_full();
         break;
+    case IC_CMD_PING_REPLY:
+        cli_ping_on_reply(c);      /* print one 'net ping' echo outcome */
+        break;
     }
 }
 
@@ -2155,4 +2239,7 @@ void serial_poll(void) {
 
     /* Push any pending provision status update to core 1. */
     serial_provision_poll();
+
+    /* Time out a network-ping run if core 1 stops replying. */
+    cli_ping_poll();
 }

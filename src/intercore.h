@@ -49,6 +49,7 @@ typedef enum {
     IC_EVT_MAPPING,
     IC_EVT_PROVISION,
     IC_EVT_CFG,
+    IC_EVT_PING_REQ,   /* CLI 'net ping' request: run an ICMP echo on core 1 */
 } ic_evt_type_t;
 
 typedef struct {
@@ -76,6 +77,8 @@ typedef struct {
         struct { uint8_t slave, state, count; char msg[IC_PROV_MSG_MAX]; } provision;
         struct { uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
                  uint32_t baud; uint8_t de_mode; } cfg;
+        /* CLI network-ping request: send `count` ICMP echoes to ip on core 1. */
+        struct { uint8_t ip[4]; uint8_t count; } ping_req;
     };
 } ic_event_t;
 
@@ -119,6 +122,14 @@ typedef struct {
 /* provision mode — mirrors prov_mode_t */
 typedef enum { IC_PROV_ALL = 0, IC_PROV_UNADDRESSED = 1, IC_PROV_ADDRESS = 2 } ic_prov_mode_t;
 
+/* network-ping per-echo outcome, carried back to core 0 for CLI printing. */
+typedef enum {
+    IC_PING_REPLY = 0,   /* echo reply received; rtt_ms valid */
+    IC_PING_TIMEOUT,     /* no reply within the per-echo deadline */
+    IC_PING_BUSY,        /* couldn't borrow a socket (e.g. DHCP renewing); run aborted */
+    IC_PING_ERROR,       /* socket/send failure; run aborted */
+} ic_ping_status_t;
+
 typedef enum {
     IC_CMD_SET_RELAY = 0,
     IC_CMD_SET_DALI,
@@ -132,6 +143,7 @@ typedef enum {
     IC_CMD_SET_NETCFG,    /* network settings — reboot to apply */
     IC_CMD_SET_MQTTCFG,   /* MQTT broker settings — reboot to apply */
     IC_CMD_SET_AUTH,      /* web UI Basic-auth credentials */
+    IC_CMD_PING_REPLY,    /* one network-ping echo outcome -> CLI (core 1 -> core 0) */
 } ic_cmd_type_t;
 
 typedef struct {
@@ -157,6 +169,10 @@ typedef struct {
         struct { uint16_t fields; uint16_t port;
                  char host[64], user[48], pass[64], prefix[24]; } set_mqttcfg;
         struct { char user[32], pass[48]; } set_auth;
+        /* One ICMP echo outcome. status is ic_ping_status_t; for the terminal
+         * BUSY/ERROR cases only one is sent (seq unused). count echoes the
+         * request total so core 0 knows when the run is done. */
+        struct { uint8_t ip[4]; uint8_t seq, count, status; uint16_t rtt_ms; } ping_reply;
     };
 } ic_cmd_t;
 

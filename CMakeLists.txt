@@ -149,6 +149,7 @@ target_sources(light_switch PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/net/ha_bridge.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/web_state.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/http_server.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/ping.c
     ${GEN_WEB_ASSETS}                  # generated: gzipped Vite UI (web/)
 )
 

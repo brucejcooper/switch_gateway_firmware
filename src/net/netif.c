@@ -32,6 +32,10 @@ static uint8_t s_dhcp_buf[DHCP_BUF_SIZE];
 #define DHCP_RENEW_GUARD_S  15u
 static volatile bool s_web_sock0 = false;   /* may the web server use socket 0 now? */
 static uint32_t      s_lease_elapsed_s = 0; /* seconds since the current lease/renew */
+/* The CLI network-ping borrows socket 0 too (IPRAW/ICMP). While it holds it,
+ * netif must not touch socket 0 (no DHCP_run, no web lend) — same invariant as
+ * the web loan, with ping taking priority for the ~1 s it runs. */
+static volatile bool s_ping_sock0 = false;  /* does the ping own socket 0 now? */
 
 typedef enum { NS_RESET, NS_LINK_WAIT, NS_DHCP, NS_READY, NS_FAULT } netif_state_t;
 
@@ -179,6 +183,17 @@ void netif_tick(void) {
 
     case NS_READY:
         if (!link_up()) { LOG_WARN("net", "PHY link down"); s_state = NS_LINK_WAIT; break; }
+        if (s_ping_sock0) {
+            /* Ping owns socket 0 for the moment: keep the DHCP lease clock
+             * ticking but do NOT call DHCP_run() or re-lend to the web server
+             * (the ping has an IPRAW socket open on 0). Released within ~1 s. */
+            if (s_cfg.dhcp && now - s_last_1s_ms >= 1000) {
+                s_last_1s_ms += 1000;
+                DHCP_time_handler();
+                s_lease_elapsed_s++;
+            }
+            break;
+        }
         if (s_cfg.dhcp) {   /* keep the lease renewed, lend socket 0 between renews */
             if (now - s_last_1s_ms >= 1000) {
                 s_last_1s_ms += 1000;
@@ -216,5 +231,22 @@ void netif_tick(void) {
 bool netif_ready(void)   { return s_state == NS_READY; }
 bool netif_link_up(void) { return link_up(); }
 bool netif_web_sock0_enabled(void) { return s_web_sock0; }
+
+bool netif_ping_acquire_sock0(void) {
+    if (s_state != NS_READY || s_ping_sock0) return false;
+    /* Only grant when socket 0 is genuinely free: static IP always, or DHCP not
+     * inside the pre-renewal guard band (mirrors the web-lend decision). */
+    if (s_cfg.dhcp) {
+        uint32_t lease = getDHCPLeasetime();
+        bool finite = lease != 0 && lease != 0xFFFFFFFFu;
+        if (finite && s_lease_elapsed_s + DHCP_RENEW_GUARD_S >= lease / 2)
+            return false;
+    }
+    s_web_sock0  = false;   /* web server backs off socket 0 next tick */
+    s_ping_sock0 = true;
+    return true;
+}
+
+void netif_ping_release_sock0(void) { s_ping_sock0 = false; }
 void netif_get_ip(uint8_t ip[4])   { memcpy(ip, s_netinfo.ip, 4); }
 void netif_get_dns(uint8_t dns[4]) { memcpy(dns, s_netinfo.dns, 4); }

@@ -168,6 +168,9 @@ void web_state_on_event(const ic_event_t *e) {
     case IC_EVT_BUTTON:
         /* Transient UI event; nothing to cache. */
         break;
+    case IC_EVT_PING_REQ:
+        /* Routed to ping_submit in the drain; never reaches the read model. */
+        break;
     }
     S.seq++;
 }

@@ -18,6 +18,7 @@
 #include "net/ha_bridge.h"
 #include "net/web_state.h"
 #include "net/http_server.h"
+#include "net/ping.h"
 #include "log.h"
 
 #include "pico/multicore.h"
@@ -101,7 +102,9 @@ static void core1_entry(void) {
 
         netif_tick();
         mqtt_app_tick();
-        ha_bridge_tick();    /* discovery + availability sweep + event->MQTT pump */
+        ha_bridge_tick();    /* discovery + availability sweep + event->MQTT pump
+                              * (also routes IC_EVT_PING_REQ to ping_submit) */
+        ping_tick();         /* CLI network ping: borrows socket 0 when idle */
         http_server_tick();  /* config web UI (sockets 2-3) */
 
         if (s_heartbeat_ms - last_log_ms >= 5000u) {
