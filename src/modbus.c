@@ -293,6 +293,13 @@ void modbus_init(void) {
     uart_init(UART_ID, s_baud);
     gpio_set_function(UART_TX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_TX_PIN));
     gpio_set_function(UART_RX_PIN, UART_FUNCSEL_NUM(UART_ID, UART_RX_PIN));
+    /* Bias RX to the UART idle level (high). In half-duplex the transceiver
+     * tri-states RxD while we transmit (RE tracks DE), leaving this pin
+     * floating; without a pull it capacitively couples from the adjacent TX pin
+     * and the UART latches our own outgoing frame as a phantom reply. The
+     * pull-up is the electrical root-cause fix; release_de()'s deferred RX-arm
+     * is the matching firmware discipline (don't listen while transmitting). */
+    gpio_pull_up(UART_RX_PIN);
 
     int UART_IRQ = UART_ID == uart0 ? UART0_IRQ : UART1_IRQ;
     irq_set_exclusive_handler(UART_IRQ, uart_irq);
