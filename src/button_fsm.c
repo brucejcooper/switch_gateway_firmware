@@ -64,14 +64,14 @@ static void do_toggle(uint8_t fixture, uint8_t button) {
     LOG_INFO("btn", "toggle F%u.B%u cached_any_on=%d -> %s",
              fixture, button, any_on, any_on ? "off" : "on");
     for (int i = 0; i < rec->target_count; i++) {
-        if (TARGET_IS_GROUP(rec->targets[i])) {
-            lighting_group_set_on_off(rec->targets[i].slave,
-                                       TARGET_GROUP_NUM(rec->targets[i]),
-                                       !any_on);
+        const mapping_target_t *t = &rec->targets[i];
+        if (TARGET_IS_GROUP(*t)) {
+            lighting_group_set_on_off(t->slave, TARGET_GROUP_NUM(*t), !any_on);
+        } else if (slave_kind(t->slave) == SLAVE_KIND_RELAY) {
+            /* a relay target is a coil, not a DALI ballast — addr is the channel */
+            lighting_set_relay(TARGET_BALLAST_ADDR(*t), !any_on);
         } else {
-            lighting_set_on_off(rec->targets[i].slave,
-                                 TARGET_BALLAST_ADDR(rec->targets[i]),
-                                 !any_on);
+            lighting_set_on_off(t->slave, TARGET_BALLAST_ADDR(*t), !any_on);
         }
     }
 }
