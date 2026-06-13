@@ -288,6 +288,21 @@ void modbus_init(void) {
     irq_set_enabled(UART_IRQ, true);
 }
 
+/* Hex-dump a frame at DEBUG level. Shared by the tx and rx paths so a request
+ * and its response are logged in the same "[AA BB ..]" format. Bounded to
+ * MODBUS_LOG_HEX_MAX bytes (well above any real frame); a longer frame is noted
+ * with a "+N" trailer rather than silently truncated. */
+#define MODBUS_LOG_HEX_MAX 64
+static void log_frame_hex(const char *dir, const uint8_t *b, size_t n) {
+    char hex[3 * MODBUS_LOG_HEX_MAX + 8];
+    int hp = 0;
+    size_t lim = n < MODBUS_LOG_HEX_MAX ? n : MODBUS_LOG_HEX_MAX;
+    for (size_t i = 0; i < lim && hp + 4 < (int)sizeof(hex); i++)
+        hp += snprintf(hex + hp, sizeof(hex) - hp, "%s%02X", i ? " " : "", b[i]);
+    if (n > lim) hp += snprintf(hex + hp, sizeof(hex) - hp, " +%u", (unsigned)(n - lim));
+    LOG_DBG("modbus", "%s [%s]", dir, hex);
+}
+
 /* Build the request frame for currentAction into buf and start transmitting it.
  * Called both for a fresh action (from MODBUS_IDLE) and for a retransmit (from
  * MODBUS_DEADTIME).  Leaves the bus in MODBUS_TRANSMITTING. */
@@ -304,13 +319,7 @@ static void start_action_tx(void) {
     append_crc16(buf, sz);
     sz += 2;
 
-    char hex[3 * 16 + 1];
-    int hp = 0;
-    for (size_t i = 0; i < sz && hp + 3 < (int)sizeof(hex); i++) {
-        hp += snprintf(hex + hp, sizeof(hex) - hp,
-                       "%s%02X", i ? " " : "", buf[i]);
-    }
-    LOG_DBG("modbus", "tx [%s]", hex);
+    log_frame_hex("tx", buf, sz);
 
     while (uart_is_readable(UART_ID)) uart_getc(UART_ID);
 
@@ -360,6 +369,10 @@ void modbus_poll(void) {
 
     case MODBUS_RECEIVED_RESPONSE: {
         uart_set_irqs_enabled(UART_ID, false, false);
+
+        /* Log the raw response bytes (mirrors the tx dump). Covers both normal
+         * and exception replies; a timeout leaves readbuf_sz == 0 (nothing). */
+        if (readbuf_sz > 0) log_frame_hex("rx", buf, readbuf_sz);
 
         bool retry = false;
         bool busy_retry = false;
