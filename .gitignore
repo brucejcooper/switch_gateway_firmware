@@ -6,3 +6,5 @@ Switch wiring.*.bak.xlsx
 # Config web UI (Vite) build artifacts — the firmware build regenerates these.
 /web/node_modules/
 /web/dist/
+.~*
+bindings.txt
