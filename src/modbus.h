@@ -34,27 +34,36 @@ void modbus_init(void);
 /* Call from main loop — advances bus state machine. Non-blocking. */
 void modbus_poll(void);
 
-/* ── Original API (unchanged) ────────────────────────────────────────────── */
-void modbus_get_coils(uint8_t device_id, uint16_t addr, uint16_t count,
+/* Total actions dropped because the action queue was full (diagnostics). */
+uint32_t modbus_drop_count(void);
+
+/* ── Enqueue API ─────────────────────────────────────────────────────────────
+ * Each returns true if the action was queued, false if the action queue was full
+ * and it was dropped (in which case the callback will NEVER fire). Stateful
+ * producers (e.g. dirty_poll) MUST check the result: a producer that advances an
+ * internal "awaiting" state before enqueuing will wedge permanently if it ignores
+ * a drop, because the completion callback that would clear the state never runs.
+ * Fire-and-forget callers (commands) may ignore it — the drop is logged. */
+bool modbus_get_coils(uint8_t device_id, uint16_t addr, uint16_t count,
                       modbus_action_cb_t cb, void *ctx);
 
-void modbus_set_coil(uint8_t device_id, uint16_t addr, bool is_on,
+bool modbus_set_coil(uint8_t device_id, uint16_t addr, bool is_on,
                      modbus_action_cb_t cb, void *ctx);
 
 /* Waveshare toggle coil (0x5500) */
-void modbus_toggle(uint8_t device_id, uint16_t addr,
+bool modbus_toggle(uint8_t device_id, uint16_t addr,
                    modbus_action_cb_t cb, void *ctx);
 
-void modbus_get_holding_registers(uint8_t device_id, uint16_t addr,
+bool modbus_get_holding_registers(uint8_t device_id, uint16_t addr,
                                    uint16_t count,
                                    modbus_action_cb_t cb, void *ctx);
 
-void modbus_set_holding_register(uint8_t device_id, uint16_t addr,
+bool modbus_set_holding_register(uint8_t device_id, uint16_t addr,
                                   uint16_t value,
                                   modbus_action_cb_t cb, void *ctx);
 
 /* ── New: FC04 Read Input Registers (for TinyModbus) ────────────────────── */
-void modbus_get_input_registers(uint8_t device_id, uint16_t addr,
+bool modbus_get_input_registers(uint8_t device_id, uint16_t addr,
                                  uint16_t count,
                                  modbus_action_cb_t cb, void *ctx);
 

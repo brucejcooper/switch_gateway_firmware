@@ -177,14 +177,15 @@ static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
         dp->pending_dirty    = mask;
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             if (mask & ((uint64_t)1 << a)) {
-                dp->state = DPOLL_AWAITING_BALLAST;
                 LOG_DBG("dirty",
                          "slave=%u: ballast %d flagged dirty — reading BLOCK0 holding reg %u for fresh arc/status",
                          slave_id, a, (unsigned)(DALI_BLOCK0_START + a));
-                /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
-                modbus_get_holding_registers(slave_id,
-                                             DALI_BLOCK0_START + (uint16_t)a, 1,
-                                             ballast_read_cb, &s_bctx[idx][a]);
+                /* BLOCK0 is now an FC03 holding-register bank (post refactor).
+                 * Only advance if queued (else stay IDLE and re-poll next tick). */
+                if (modbus_get_holding_registers(slave_id,
+                                                 DALI_BLOCK0_START + (uint16_t)a, 1,
+                                                 ballast_read_cb, &s_bctx[idx][a]))
+                    dp->state = DPOLL_AWAITING_BALLAST;
                 break;
             }
         }
@@ -240,14 +241,16 @@ static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
     dp->pending_dirty &= ~((uint64_t)1 << addr);
     for (int a = addr + 1; a < DALI_ADDR_COUNT; a++) {
         if (dp->pending_dirty & ((uint64_t)1 << a)) {
-            dp->state = DPOLL_AWAITING_BALLAST;
             LOG_DBG("dirty",
                      "slave=%u: ballast %d also dirty — reading next BLOCK0 holding reg %u",
                      slave, a, (unsigned)(DALI_BLOCK0_START + a));
-            /* BLOCK0 is now an FC03 holding-register bank (post refactor). */
-            modbus_get_holding_registers(slave,
-                                         DALI_BLOCK0_START + (uint16_t)a, 1,
-                                         ballast_read_cb, &s_bctx[idx][a]);
+            /* BLOCK0 is now an FC03 holding-register bank (post refactor).
+             * Only advance if queued; otherwise stay IDLE so the next dirty-mask
+             * poll re-detects and retries (vs. stranding state at AWAITING). */
+            if (modbus_get_holding_registers(slave,
+                                             DALI_BLOCK0_START + (uint16_t)a, 1,
+                                             ballast_read_cb, &s_bctx[idx][a]))
+                dp->state = DPOLL_AWAITING_BALLAST;
             return;
         }
     }
@@ -264,8 +267,12 @@ void dirty_poll_tick(void) {
         if (rp->awaiting) continue;
         if (now_ms - rp->last_poll_ms >= RELAY_POLL_INTERVAL_MS) {
             rp->last_poll_ms = now_ms;
-            rp->awaiting     = true;
-            modbus_get_coils(g_config.relay_slave_ids[i], 0, 32, relay_health_cb, &s_rp_idx[i]);
+            /* Only mark awaiting if the read actually queued — otherwise a dropped
+             * action (full queue) would leave awaiting stuck and we'd never poll
+             * this relay again. On a drop we just retry next interval. */
+            if (modbus_get_coils(g_config.relay_slave_ids[i], 0, 32,
+                                 relay_health_cb, &s_rp_idx[i]))
+                rp->awaiting = true;
         }
     }
 
@@ -279,10 +286,13 @@ void dirty_poll_tick(void) {
         if (dp->active && dp->state == DPOLL_IDLE) {
             if (now_ms - dp->last_poll_ms >= DIRTY_POLL_INTERVAL_MS) {
                 dp->last_poll_ms = now_ms;
-                dp->state        = DPOLL_AWAITING_DIRTY;
-                modbus_get_input_registers(slave_id, DALI_DIRTY_START, 4,
-                                           dirty_bitmask_cb,
-                                           &s_dirty_ctx_slave[i]);
+                /* Advance state only if the read queued; a dropped action never
+                 * fires its callback, which would strand state at AWAITING_* and
+                 * permanently stop polling this slave. Stay IDLE and retry. */
+                if (modbus_get_input_registers(slave_id, DALI_DIRTY_START, 4,
+                                               dirty_bitmask_cb,
+                                               &s_dirty_ctx_slave[i]))
+                    dp->state = DPOLL_AWAITING_DIRTY;
             }
         }
 
@@ -296,10 +306,10 @@ void dirty_poll_tick(void) {
                  * changes reflect within ~1s even when no command was issued. A
                  * non-zero mask re-activates fast polling (see dirty_bitmask_cb). */
                 dp->last_sweep_ms = now_ms;
-                dp->state         = DPOLL_AWAITING_DIRTY;
-                modbus_get_input_registers(slave_id, DALI_DIRTY_START, 4,
-                                           dirty_bitmask_cb,
-                                           &s_dirty_ctx_slave[i]);
+                if (modbus_get_input_registers(slave_id, DALI_DIRTY_START, 4,
+                                               dirty_bitmask_cb,
+                                               &s_dirty_ctx_slave[i]))
+                    dp->state = DPOLL_AWAITING_DIRTY;
             }
         }
     }

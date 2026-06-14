@@ -40,6 +40,14 @@
 #define DALI_BUSY_RETRY_US         10000u   /* ~avg DALI forward-frame execution */
 #define DALI_BUSY_RETRIES          6u
 
+/* Hard upper bound on a single in-flight transaction (all retries + deadtimes
+ * included; legitimate worst case is ~250 ms). If the bus SM sits in any non-IDLE
+ * state longer than this it is wedged — a missed DE-release alarm, an endless RX
+ * dribble keeping the inter-byte timeout fresh, or a torn state transition. The
+ * poll loop force-recovers to IDLE so commands resume instead of stopping
+ * forever (the failure mode that previously needed a reboot). */
+#define MODBUS_OP_MAX_MS           400u
+
 #define UART_ID      uart1
 #define UART_TX_PIN  4
 #define UART_RX_PIN  5
@@ -74,7 +82,6 @@ typedef struct {
 
 static modbus_de_mode_t      de_mode    = MODBUS_DE_WHENTX;
 static uint32_t              s_baud     = DEFAULT_BAUD_RATE;
-static volatile bool         transmitting;
 static uint8_t              *readptr;
 static size_t                readbuf_sz;
 static size_t                readbuf_max;
@@ -91,6 +98,9 @@ static queue_t               response_queue;
 static uint8_t               s_attempts_left;
 static uint8_t               s_busy_left;     /* DEVICE_BUSY retries remaining */
 static bool                  s_retry_pending;
+static absolute_time_t       s_op_deadline;   /* hard deadline for the whole in-flight op */
+static uint32_t              s_drop_count = 0;    /* actions dropped on a full queue */
+static uint32_t              s_recover_count = 0; /* forced SM recoveries (wedge watchdog) */
 
 static bool modbus_rx_valid(void) { return true; }
 
@@ -342,12 +352,15 @@ static void start_action_tx(void) {
     while (uart_is_readable(UART_ID)) uart_getc(UART_ID);
 
     gpio_put(UART_DE_PIN, 1);
-    transmitting = true;
 
-    /* Schedule DE release after all bytes transmitted */
-    alarm_pool_add_alarm_in_us(alarm_pool_get_default(),
-                               (10ULL * 1000000ULL * sz / s_baud),
-                               release_de, NULL, true);
+    /* Schedule DE release after all bytes transmitted. This alarm is the ONLY
+     * exit from MODBUS_TRANSMITTING, so a scheduling failure (e.g. alarm pool
+     * exhausted) must not be ignored — that would wedge the bus forever. If it
+     * fails, fall back to releasing inline (it busy-waits for TX to drain). */
+    bool de_scheduled =
+        alarm_pool_add_alarm_in_us(alarm_pool_get_default(),
+                                   (10ULL * 1000000ULL * sz / s_baud),
+                                   release_de, NULL, true) > 0;
     for (size_t i = 0; i < sz; i++) {
         while (!uart_is_writable(UART_ID)) {}
         uart_get_hw(UART_ID)->dr = buf[i];
@@ -358,10 +371,60 @@ static void start_action_tx(void) {
      * transmit, so the controller can capacitively latch its OWN outgoing
      * frame.  release_de() turns RX on only after the line settles. */
     bus_state = MODBUS_TRANSMITTING;
+
+    /* Fallback if the alarm couldn't be scheduled: release inline so we still
+     * leave TRANSMITTING. Done after the bus_state write above so release_de's
+     * transition to RECEIVING isn't clobbered. */
+    if (!de_scheduled) {
+        LOG_ERR("modbus", "DE-release alarm failed to schedule — releasing inline");
+        release_de(0, NULL);   /* drains TX, drops DE, arms RX, -> RECEIVING */
+    }
 }
 
 /* ── Poll loop ───────────────────────────────────────────────────────────── */
 void modbus_poll(void) {
+    /* Stuck-state watchdog: a transaction must complete within MODBUS_OP_MAX_MS.
+     * If the SM has sat in any non-IDLE state past its deadline it is wedged;
+     * force it back to IDLE so commands resume. Deliver a failure (res=0) to the
+     * in-flight callback first so the producer's own state (e.g. dirty_poll's
+     * AWAITING_*) is released too. This is the catch-all cure for the "stops
+     * sending, needs a reboot" failure. */
+    if (bus_state != MODBUS_IDLE && time_reached(s_op_deadline)) {
+        s_recover_count++;
+        LOG_ERR("modbus", "bus SM wedged in state %d >%ums — forcing recovery "
+                "(slave=%u fc=0x%02x, total recoveries=%lu)",
+                (int)bus_state, MODBUS_OP_MAX_MS,
+                currentAction.device, (unsigned)currentAction.action,
+                (unsigned long)s_recover_count);
+        uart_set_irqs_enabled(UART_ID, false, false);
+        gpio_put(UART_DE_PIN, 0);
+        modbus_action_cb_t cb = currentAction.callback;
+        currentAction.callback = NULL;          /* one-shot; don't double-fire */
+        bus_state = MODBUS_IDLE;
+        if (cb) cb(0, buf, currentAction.ctx);  /* deliver as a timeout */
+        return;
+    }
+
+    /* Periodic health summary: surface drops/recoveries even if each individual
+     * event got rate-limited away, and report queue depth so a building backlog
+     * is visible BEFORE it overflows. Only logs when something is non-zero. */
+    {
+        static uint32_t last_report_ms = 0;
+        static uint32_t last_drops = 0, last_recov = 0;
+        uint32_t now = to_ms_since_boot(get_absolute_time());
+        if (now - last_report_ms >= 10000u) {
+            last_report_ms = now;
+            uint32_t depth = (uint32_t)queue_get_level(&action_queue);
+            if (s_drop_count != last_drops || s_recover_count != last_recov || depth > 32) {
+                LOG_WARN("modbus", "health: qdepth=%lu drops=%lu recoveries=%lu",
+                         (unsigned long)depth, (unsigned long)s_drop_count,
+                         (unsigned long)s_recover_count);
+                last_drops = s_drop_count;
+                last_recov = s_recover_count;
+            }
+        }
+    }
+
     switch (bus_state) {
 
     case MODBUS_IDLE:
@@ -369,6 +432,7 @@ void modbus_poll(void) {
             s_attempts_left = MODBUS_MAX_RETRIES;
             s_busy_left     = DALI_BUSY_RETRIES;
             s_retry_pending = false;
+            s_op_deadline   = make_timeout_time_ms(MODBUS_OP_MAX_MS);
             log_action_intent(&currentAction);
             start_action_tx();
         }
@@ -464,48 +528,56 @@ void modbus_poll(void) {
 }
 
 /* ── Action enqueuers ────────────────────────────────────────────────────── */
-static inline void enqueue(modbus_action_t *act) {
-    if (!queue_try_add(&action_queue, act)) {
-        LOG_WARN("modbus", "queue full — dropped action");
-    }
+static inline bool enqueue(modbus_action_t *act) {
+    if (queue_try_add(&action_queue, act)) return true;
+    s_drop_count++;
+    /* Rate-limited so a sustained overflow can't itself flood the log / stall the
+     * CDC. The count is the real signal; surfaced via modbus_drop_count(). */
+    if ((s_drop_count & 0x3F) == 1)
+        LOG_WARN("modbus", "action queue FULL — dropped fc=0x%02x slave=%u addr=%u "
+                 "(total dropped=%lu)", (unsigned)act->action, act->device,
+                 act->address, (unsigned long)s_drop_count);
+    return false;
 }
 
-void modbus_get_coils(uint8_t dev, uint16_t addr, uint16_t count,
+uint32_t modbus_drop_count(void) { return s_drop_count; }
+
+bool modbus_get_coils(uint8_t dev, uint16_t addr, uint16_t count,
                       modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = { ACTION_GET_COILS, dev, addr, count, cb, ctx };
-    enqueue(&a);
+    return enqueue(&a);
 }
 
-void modbus_toggle(uint8_t dev, uint16_t addr,
+bool modbus_toggle(uint8_t dev, uint16_t addr,
                    modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = { ACTION_SET_COIL, dev, addr, 0x5500, cb, ctx };
-    enqueue(&a);
+    return enqueue(&a);
 }
 
-void modbus_set_coil(uint8_t dev, uint16_t addr, bool is_on,
+bool modbus_set_coil(uint8_t dev, uint16_t addr, bool is_on,
                      modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = {
         ACTION_SET_COIL, dev, addr,
         is_on ? 0xFF00u : 0x0000u, cb, ctx
     };
-    enqueue(&a);
+    return enqueue(&a);
 }
 
-void modbus_get_holding_registers(uint8_t dev, uint16_t addr, uint16_t count,
+bool modbus_get_holding_registers(uint8_t dev, uint16_t addr, uint16_t count,
                                    modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = { ACTION_GET_HOLDING_REGISTERS, dev, addr, count, cb, ctx };
-    enqueue(&a);
+    return enqueue(&a);
 }
 
-void modbus_set_holding_register(uint8_t dev, uint16_t addr, uint16_t value,
+bool modbus_set_holding_register(uint8_t dev, uint16_t addr, uint16_t value,
                                   modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = { ACTION_SET_HOLDING_REGISTER, dev, addr, value, cb, ctx };
-    enqueue(&a);
+    return enqueue(&a);
 }
 
 /* New: FC04 — same frame structure as FC03 */
-void modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
+bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
                                  modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = { ACTION_GET_INPUT_REGISTERS, dev, addr, count, cb, ctx };
-    enqueue(&a);
+    return enqueue(&a);
 }
