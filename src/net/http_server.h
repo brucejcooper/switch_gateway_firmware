@@ -1,4 +1,5 @@
 #pragma once
+#include <stdint.h>
 /*
  * http_server.h — embedded config web server on core 1.
  *
@@ -18,3 +19,8 @@
 
 void http_server_init(void);
 void http_server_tick(void);
+
+/* Count of socket()/listen() (re)arm failures — a climbing value means a web
+ * listener is dead. Counted (not logged) because arm_listen runs in the hot
+ * pump where logging would stall core 1 (USB-CDC back-pressure). */
+uint32_t http_server_arm_fail_count(void);

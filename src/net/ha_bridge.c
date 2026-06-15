@@ -435,6 +435,18 @@ static disc_res_t disc_step(void) {
     }
 }
 
+/* Inbound MQTT commands are pushed to core 0 from ha_on_message, which runs in
+ * the MQTT process pump (hot path) — so a full-queue drop must be COUNTED, never
+ * logged (USB-CDC back-pressure rule). A climbing count means HA commands are
+ * being dropped. The HTTP write path already returns 503 on the same condition. */
+static uint32_t s_cmd_drops = 0;
+uint32_t ha_bridge_cmd_drop_count(void) { return s_cmd_drops; }
+static inline bool ic_push_cmd(const ic_cmd_t *c) {
+    bool ok = intercore_push_cmd(c);
+    if (!ok) s_cmd_drops++;
+    return ok;
+}
+
 static void subscribe_all(void) {
     const char *P = mqtt_app_prefix();
     static const char *const filt[] = {
@@ -723,7 +735,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
         c.type = IC_CMD_SET_RELAY;
         c.set_relay.ch = (uint8_t)atoi(seg[1]);
         c.set_relay.on = strstr(pay, "OFF") ? IC_TRI_OFF : IC_TRI_ON;
-        intercore_push_cmd(&c);
+        ic_push_cmd(&c);
         return;
     }
     if (!strcmp(seg[0], "dali") && ns >= 4) {
@@ -731,7 +743,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
         if (!strcmp(seg[3], "set")) {
             c.type = IC_CMD_SET_DALI; c.set_dali.slave = s; c.set_dali.addr = a;
             parse_light(pay, &c.set_dali.fields, &c.set_dali.on, &c.set_dali.bri);
-            if (c.set_dali.fields) intercore_push_cmd(&c);
+            if (c.set_dali.fields) ic_push_cmd(&c);
         } else if (ns >= 6 && !strcmp(seg[3], "config") && !strcmp(seg[5], "set")) {
             c.type = IC_CMD_SET_DALI; c.set_dali.slave = s; c.set_dali.addr = a;
             uint8_t v = (uint8_t)atoi(pay); const char *f = seg[4];
@@ -741,7 +753,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             else if (!strcmp(f, "sys_fail"))  { c.set_dali.fields = IC_DALI_F_SYS_FAIL;  c.set_dali.sys_fail = v; }
             else if (!strcmp(f, "fade_rate")) { c.set_dali.fields = IC_DALI_F_FADE_RATE; c.set_dali.fade_rate = v; }
             else if (!strcmp(f, "fade_time")) { c.set_dali.fields = IC_DALI_F_FADE_TIME; c.set_dali.fade_time = v; }
-            if (c.set_dali.fields) intercore_push_cmd(&c);
+            if (c.set_dali.fields) ic_push_cmd(&c);
         }
         return;
     }
@@ -753,7 +765,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             parse_light(pay, &f, &on, &bri);
             if (f & IC_DALI_F_BRI) { c.set_group.fields |= IC_GRP_F_BRI; c.set_group.bri = bri; }
             if (f & IC_DALI_F_ON)  { c.set_group.fields |= IC_GRP_F_ON;  c.set_group.on = on; }
-            if (c.set_group.fields) intercore_push_cmd(&c);
+            if (c.set_group.fields) ic_push_cmd(&c);
         } else if (ns >= 5 && !strcmp(seg[3], "members") && !strcmp(seg[4], "set")) {
             c.type = IC_CMD_SET_GROUP; c.set_group.slave = s; c.set_group.group = g;
             c.set_group.fields = IC_GRP_F_MEMBERS;
@@ -765,14 +777,14 @@ static void ha_on_message(const char *topic, uint16_t tlen,
                 if (v >= 0 && v < 64) m |= (uint64_t)1 << v;
             }
             c.set_group.members = m;
-            intercore_push_cmd(&c);
+            ic_push_cmd(&c);
         }
         return;
     }
     if (!strcmp(seg[0], "provision") && ns >= 3) {
         uint8_t s = (uint8_t)atoi(seg[1]); int idx = slave_idx(s);
         if (!strcmp(seg[2], "abort")) {
-            c.type = IC_CMD_PROVISION_ABORT; c.provision_abort.slave = s; intercore_push_cmd(&c);
+            c.type = IC_CMD_PROVISION_ABORT; c.provision_abort.slave = s; ic_push_cmd(&c);
         } else if (!strcmp(seg[2], "start") && ns >= 4) {
             const char *m = seg[3];
             if (!strcmp(m, "target")) {
@@ -791,7 +803,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
                 c.provision_start.mode = IC_PROV_ADDRESS;
                 c.provision_start.target = idx >= 0 ? s_prov_target[idx] : 0;
             } else return;
-            intercore_push_cmd(&c);
+            ic_push_cmd(&c);
         }
         return;
     }
@@ -800,10 +812,10 @@ static void ha_on_message(const char *topic, uint16_t tlen,
         if (!strcmp(seg[3], "set")) {
             c.type = IC_CMD_SET_MAPPING; c.set_mapping.fixture = f; c.set_mapping.button = b;
             c.set_mapping.count = parse_targets_json(pay, c.set_mapping.targets, MAX_TARGETS_PER_BTN);
-            intercore_push_cmd(&c);
+            ic_push_cmd(&c);
         } else if (!strcmp(seg[3], "delete")) {
             c.type = IC_CMD_DEL_MAPPING; c.del_mapping.fixture = f; c.del_mapping.button = b;
-            intercore_push_cmd(&c);
+            ic_push_cmd(&c);
         }
         return;
     }
@@ -812,7 +824,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
         c.set_mapping.fixture = (uint8_t)atoi(seg[1]);
         c.set_mapping.button = (uint8_t)atoi(seg[2]);
         c.set_mapping.count = parse_binding(pay, c.set_mapping.targets, MAX_TARGETS_PER_BTN);
-        intercore_push_cmd(&c);
+        ic_push_cmd(&c);
         return;
     }
     if (!strcmp(seg[0], "config")) {
@@ -830,7 +842,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             else if (!strcmp(f, "dim_repeat_ms"))      { c.set_cfg.fields = IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = v; }
             else if (!strcmp(f, "reversal_window_ms")) { c.set_cfg.fields = IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = v; }
         }
-        if (c.set_cfg.fields) intercore_push_cmd(&c);
+        if (c.set_cfg.fields) ic_push_cmd(&c);
         return;
     }
 }
@@ -875,7 +887,7 @@ void ha_bridge_tick(void) {
                 LOG_INFO("mqtt", "discovery complete — subscribe + resync");
                 subscribe_all();
                 ic_cmd_t rc; memset(&rc, 0, sizeof rc); rc.type = IC_CMD_RESYNC;
-                intercore_push_cmd(&rc);
+                ic_push_cmd(&rc);
                 break;
             }
         }

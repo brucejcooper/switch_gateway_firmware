@@ -87,10 +87,18 @@ static char s_pass[48];
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 
 /* ── socket lifecycle ───────────────────────────────────────────────────────*/
+/* Count socket()/listen() failures here. arm_listen runs in the per-tick pump,
+ * so per the hot-path rule we must NOT LOG_* — bump a counter, surfaced off the
+ * hot path via http_server_arm_fail_count(). A non-zero, climbing count means a
+ * web socket failed to (re)arm and that listener is dead. */
+static uint32_t s_arm_fails = 0;
+uint32_t http_server_arm_fail_count(void) { return s_arm_fails; }
+
 static void arm_listen(conn_t *c) {
     close(c->sn);
-    socket(c->sn, Sn_MR_TCP, HTTP_PORT, SF_IO_NONBLOCK);
-    listen(c->sn);
+    int8_t s = socket(c->sn, Sn_MR_TCP, HTTP_PORT, SF_IO_NONBLOCK);
+    int8_t l = (s == c->sn) ? listen(c->sn) : (int8_t)-1;
+    if (s != c->sn || l != SOCK_OK) s_arm_fails++;
     c->st = CONN_LISTEN;
     c->rx_len = 0; c->hdr_complete = false; c->content_len = 0; c->body_start = 0;
     c->out_len = c->out_sent = 0; c->mem = NULL; c->mem_len = c->mem_sent = 0;

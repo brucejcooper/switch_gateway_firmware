@@ -36,7 +36,6 @@ void serial_provision_status_changed(void) {
  * core 1 maps it to the short state string; the free-form msg goes verbatim. */
 void serial_provision_poll(void) {
     if (!s_status_dirty) return;
-    s_status_dirty = false;
 
     const prov_status_t *ps = &g_prov_status;
     ic_event_t ev = { .type = IC_EVT_PROVISION };
@@ -44,6 +43,9 @@ void serial_provision_poll(void) {
     ev.provision.state = (uint8_t)ps->run_state;
     ev.provision.count = ps->devices_found;
     snprintf(ev.provision.msg, sizeof ev.provision.msg, "%s", ps->msg);
-    intercore_push_event(&ev);
+    /* Clear the dirty flag only once the event is actually queued — otherwise a
+     * full event queue would permanently lose the (terminal) provisioning status
+     * that HA/web shows. Leave it set to retry on the next poll. */
+    if (intercore_push_event(&ev)) s_status_dirty = false;
 }
 

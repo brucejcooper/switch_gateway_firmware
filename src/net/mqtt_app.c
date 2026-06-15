@@ -110,8 +110,15 @@ static bool tcp_open(void) {
     close(MQTT_SOCKET);
     int8_t s = socket(MQTT_SOCKET, Sn_MR_TCP, MQTT_LOCAL_PORT, SF_IO_NONBLOCK);
     if (s != MQTT_SOCKET) { LOG_WARN("mqtt", "socket() failed (%d)", s); return false; }
-    /* Non-block connect returns SOCK_BUSY immediately; progress is polled. */
-    connect(MQTT_SOCKET, s_cfg.broker_ip, s_cfg.broker_port);
+    /* Non-block connect returns SOCK_BUSY immediately; progress is polled. A real
+     * error (SOCKERR_* < 0) is not the expected async path — surface it instead of
+     * letting it masquerade as a 5 s connect timeout. Runs once per attempt, not
+     * the per-tick hot path, so logging is fine. */
+    int8_t cr = connect(MQTT_SOCKET, s_cfg.broker_ip, s_cfg.broker_port);
+    if (cr != SOCK_OK && cr != SOCK_BUSY) {
+        LOG_WARN("mqtt", "connect() failed (%d)", cr);
+        return false;
+    }
     return true;
 }
 

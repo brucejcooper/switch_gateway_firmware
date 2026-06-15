@@ -2022,7 +2022,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
     switch (c->type) {
     case IC_CMD_SET_RELAY: {
         uint8_t ch = c->set_relay.ch;
-        if (ch >= RELAY_COUNT) break;
+        if (ch >= RELAY_COUNT) { LOG_WARN("cli", "ic set_relay reject: ch=%u", ch); break; }
         bool on = (c->set_relay.on == IC_TRI_TOGGLE) ? !state_cache_get_relay_on(ch)
                                                      : (c->set_relay.on == IC_TRI_ON);
         lighting_set_relay(ch, on);
@@ -2032,7 +2032,8 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
     }
     case IC_CMD_SET_DALI: {
         uint8_t slave = c->set_dali.slave, addr = c->set_dali.addr;
-        if (state_cache_slave_idx(slave) < 0 || addr > 63) break;
+        if (state_cache_slave_idx(slave) < 0 || addr > 63) {
+            LOG_WARN("cli", "ic set_dali reject: slave=%u addr=%u", slave, addr); break; }
         char vb[12];
         bool any = false, emit_now = false;
         if (c->set_dali.fields & IC_DALI_F_ON) {
@@ -2063,7 +2064,8 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
     }
     case IC_CMD_SET_GROUP: {
         uint8_t slave = c->set_group.slave, group = c->set_group.group;
-        if (state_cache_slave_idx(slave) < 0 || group > 15) break;
+        if (state_cache_slave_idx(slave) < 0 || group > 15) {
+            LOG_WARN("cli", "ic set_group reject: slave=%u group=%u", slave, group); break; }
         bool any = false;
         if (c->set_group.fields & IC_GRP_F_MEMBERS) {
             dali_group_set_members(slave, group, c->set_group.members);
@@ -2142,11 +2144,18 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         bool valid = false;
         for (int i = 0; i < g_config.dali_slave_count; i++)
             if (g_config.dali_slave_ids[i] == c->provision_start.slave) valid = true;
-        if (!valid || dali_provision_busy()) break;
+        if (!valid || dali_provision_busy()) {
+            LOG_WARN("cli", "ic provision_start reject: slave=%u valid=%d busy=%d",
+                     c->provision_start.slave, (int)valid, (int)dali_provision_busy());
+            break;
+        }
         prov_mode_t mode = c->provision_start.mode == IC_PROV_UNADDRESSED ? PROV_UNADDRESSED
                          : c->provision_start.mode == IC_PROV_ADDRESS     ? PROV_ADDRESS
                                                                           : PROV_ALL;
-        if (mode == PROV_ADDRESS && c->provision_start.target > 63) break;
+        if (mode == PROV_ADDRESS && c->provision_start.target > 63) {
+            LOG_WARN("cli", "ic provision_start reject: target=%u", c->provision_start.target);
+            break;
+        }
         dali_provision_start(c->provision_start.slave, mode, c->provision_start.target);
         break;
     }

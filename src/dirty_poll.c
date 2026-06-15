@@ -466,14 +466,19 @@ void dirty_poll_full_scan(uint8_t slave_id) {
              slave_id, (unsigned)DALI_BLOCK1_START,
              (unsigned)(DALI_BLOCK3_START + DALI_ADDR_COUNT - 1));
     uint16_t b1[DALI_ADDR_COUNT], b2[DALI_ADDR_COUNT], b3[DALI_ADDR_COUNT];
+    bool chunk_ok[4];
     for (uint16_t chunk = 0; chunk < 4; chunk++) {
         uint16_t off = chunk * DALI_MAX_CHUNK;
-        sync_read_holding(slave_id, DALI_BLOCK1_START + off, DALI_MAX_CHUNK, b1 + off);
-        sync_read_holding(slave_id, DALI_BLOCK2_START + off, DALI_MAX_CHUNK, b2 + off);
-        sync_read_holding(slave_id, DALI_BLOCK3_START + off, DALI_MAX_CHUNK, b3 + off);
+        bool ok1 = sync_read_holding(slave_id, DALI_BLOCK1_START + off, DALI_MAX_CHUNK, b1 + off);
+        bool ok2 = sync_read_holding(slave_id, DALI_BLOCK2_START + off, DALI_MAX_CHUNK, b2 + off);
+        bool ok3 = sync_read_holding(slave_id, DALI_BLOCK3_START + off, DALI_MAX_CHUNK, b3 + off);
+        chunk_ok[chunk] = ok1 && ok2 && ok3;
+        if (!chunk_ok[chunk])
+            LOG_WARN("dirty", "block1-3 chunk %u read failed slave %u", (unsigned)chunk, slave_id);
     }
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         if (!(present_mask & ((uint64_t)1 << a))) continue;
+        if (!chunk_ok[a / DALI_MAX_CHUNK]) continue;   /* don't cache uninit/garbage config */
         /* BLOCK1 wire order is (min<<8)|max (high byte = min, low = max); the
          * cfg args are (max_l, min_l).  BLOCK2/3 high byte = power_on/fade_rate. */
         state_cache_set_dali_config((uint8_t)idx, (uint8_t)a,
@@ -553,12 +558,16 @@ void dirty_poll_background_check(uint8_t slave_id) {
             slave_id, (unsigned)DALI_BLOCK0_START,
             (unsigned)(DALI_BLOCK0_START + DALI_ADDR_COUNT - 1));
     uint16_t b0[DALI_ADDR_COUNT];
+    bool b0_ok[4];
     for (uint16_t c = 0; c < 4; c++) {
-        sync_read_holding(slave_id, DALI_BLOCK0_START + c * DALI_MAX_CHUNK,
-                          DALI_MAX_CHUNK, b0 + c * DALI_MAX_CHUNK);
+        b0_ok[c] = sync_read_holding(slave_id, DALI_BLOCK0_START + c * DALI_MAX_CHUNK,
+                                     DALI_MAX_CHUNK, b0 + c * DALI_MAX_CHUNK);
+        if (!b0_ok[c])
+            LOG_WARN("dirty", "bg block0 chunk %u read failed slave %u", (unsigned)c, slave_id);
     }
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         if (!(present_mask & ((uint64_t)1 << a))) continue;
+        if (!b0_ok[a / DALI_MAX_CHUNK]) continue;   /* skip fault check on a failed read */
         uint8_t status = (b0[a] >> 8) & 0xFF;
         if ((status & 0x02) || (status & 0x80)) {
             lighting_emit_dali_state(slave_id, (uint8_t)a, b0[a] & 0xFF, status);

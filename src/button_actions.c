@@ -15,6 +15,9 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+static volatile uint32_t s_btn_drops = 0;
+uint32_t button_raw_drop_count(void) { return s_btn_drops; }
+
 #define SER_PIN       6
 #define CLK_PIN       7
 #define COL_PIN_BASE  8
@@ -62,10 +65,11 @@ static void sample_available(void) {
                             .button  = button,
                             .time    = get_absolute_time(),
                         };
-                        /* Non-blocking push — drop if queue full.
-                         * The FSM queue is deep enough (64 slots) that this
-                         * should never happen at 200 scans/sec. */
-                        queue_try_add(&g_btn_raw_queue, &evt);
+                        /* Non-blocking push — drop if queue full. The FSM queue
+                         * is deep (64 slots) so this shouldn't happen at 200
+                         * scans/sec; count drops (no log — PIO scan path) so a
+                         * starved FSM drain is detectable rather than silent. */
+                        if (!queue_try_add(&g_btn_raw_queue, &evt)) s_btn_drops++;
                     }
                 }
                 changed >>= 1;

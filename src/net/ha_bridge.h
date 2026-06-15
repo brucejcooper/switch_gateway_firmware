@@ -20,3 +20,8 @@ void ha_bridge_tick(void);
 /* Translate one inter-core event to its retained MQTT state topic(s).
  * Called as the event queue is drained while connected. */
 void ha_bridge_publish_event(const ic_event_t *e);
+
+/* Count of inbound HA commands dropped because the core0 command queue was full.
+ * Counted, not logged (the MQTT pump is a hot path). A climbing value means HA
+ * commands are being lost. */
+uint32_t ha_bridge_cmd_drop_count(void);

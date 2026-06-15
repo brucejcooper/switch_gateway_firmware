@@ -93,7 +93,8 @@ static void core1_entry(void) {
      * the re-emit is idempotent.) */
     {
         ic_cmd_t rc; memset(&rc, 0, sizeof rc); rc.type = IC_CMD_RESYNC;
-        intercore_push_cmd(&rc);
+        if (!intercore_push_cmd(&rc))
+            LOG_WARN("core1", "boot resync push dropped — web model may start blank");
     }
 
     uint32_t last_log_ms = 0;
