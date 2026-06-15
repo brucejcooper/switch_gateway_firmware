@@ -1776,7 +1776,7 @@ static void cmd_net(char **sp) {
 
 /* ── Top-level text dispatcher ─────────────────────────────────────────── */
 static void handle_text_line(const char *original_line) {
-    LOG_INFO("cli", "rx: %s", original_line);
+    LOG_DBG("cli", "rx: %s", original_line);   /* normal traffic, not an event → DEBUG */
 
     /* strtok_r mutates the buffer, so copy. SERIAL_LINE_MAX is the upper
      * bound on the line length set by the input buffer. */

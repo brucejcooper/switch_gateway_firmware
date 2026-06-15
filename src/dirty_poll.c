@@ -83,11 +83,17 @@ static void relay_health_cb(int res, uint8_t *buf, void *ctx) {
     rp->awaiting   = false;
     if (res >= 7) {            /* a valid FC01 coil response */
         rp->fail_count = 0;
-        if (!rp->reachable) { rp->reachable = true; lighting_emit_gateway_state(slave, true); }
+        if (!rp->reachable) {
+            rp->reachable = true;
+            LOG_INFO("dirty", "relay board %u reachable again", slave);
+            lighting_emit_gateway_state(slave, true);
+        }
     } else if (rp->reachable) {
         if (rp->fail_count < 0xFF) rp->fail_count++;
         if (rp->fail_count >= GATEWAY_FAIL_THRESHOLD) {
             rp->reachable = false;
+            LOG_WARN("dirty", "relay board %u unreachable (%u consecutive read failures)",
+                     slave, GATEWAY_FAIL_THRESHOLD);
             lighting_emit_gateway_state(slave, false);
         }
     }
@@ -120,6 +126,7 @@ static void gateway_report(uint8_t slave_id, int idx, bool ok) {
         dp->fail_count = 0;
         if (!dp->reachable) {
             dp->reachable = true;
+            LOG_INFO("dirty", "gateway %u reachable again", slave_id);
             lighting_emit_gateway_state(slave_id, true);
         }
     } else if (dp->reachable) {
@@ -129,6 +136,8 @@ static void gateway_report(uint8_t slave_id, int idx, bool ok) {
             dp->active    = false;   /* stop fast-polling a dead gateway; the
                                         60s background check still probes it and
                                         recovers it (and a command re-activates) */
+            LOG_WARN("dirty", "gateway %u unreachable (%u consecutive read failures)",
+                     slave_id, GATEWAY_FAIL_THRESHOLD);
             lighting_emit_gateway_state(slave_id, false);
         }
     }

@@ -293,10 +293,12 @@ bool mqtt_app_publish(const char *topic, const void *payload, size_t len, bool r
     pi.pPayload        = payload;
     pi.payloadLength   = len;
     MQTTStatus_t st = MQTT_Publish(&s_mqtt, &pi, 0);
-    if (st != MQTTSuccess) {   /* DEBUG */
+    if (st != MQTTSuccess) {
+        /* QoS0 publish failing (offline / TX-full) is routine and recoverable —
+         * DEBUG per policy, rate-limited as the sanctioned off-hot-path mitigation. */
         static uint32_t fails = 0;
         if ((fails++ % 40) == 0)
-            LOG_WARN("mqtt", "publish st=%d (#%lu) %s", (int)st, (unsigned long)fails, topic);
+            LOG_DBG("mqtt", "publish st=%d (#%lu) %s", (int)st, (unsigned long)fails, topic);
     }
     return st == MQTTSuccess;
 }
