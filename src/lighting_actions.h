@@ -12,30 +12,37 @@
  * events to Modbus writes.
  */
 
+/* All command helpers below return true if the Modbus write was queued, false if
+ * it was dropped (action queue full) or skipped (slave being provisioned). On
+ * false they log the reason and do NOT update the predictive cache, so the cache
+ * never claims a state the hardware was never told. Callers may ignore the result
+ * (the drop is already logged) or react to it. */
+
 /* Relay: on/off */
-void lighting_set_relay(uint8_t channel, bool on);
+bool lighting_set_relay(uint8_t channel, bool on);
 
 /* Issue a raw DALI command via TinyModbus's RAW_CMD (or RAW_CMD_TWICE if
  * `twice` is true). TinyModbus rejects new raw writes only while the
  * previous command is still in flight (raw_cmd_result high byte == 0xFF —
  * PENDING); a terminal IDLE/NAK/OK/ERR is silently overwritten by the new
- * write. The slave returns MB_ERR_DEVICE_BUSY on the PENDING case. */
-void dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice);
+ * write. The slave returns MB_ERR_DEVICE_BUSY on the PENDING case. Returns the
+ * enqueue result. */
+bool dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice);
 
 /* DALI: on (goto last active) / off */
-void lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on);
+bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on);
 
 /* DALI: step up or down one level (uses ballast fade rate) */
-void lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up);
+bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up);
 
 /* DALI: explicit arc level (DAPC) */
-void lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc);
+bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc);
 
 /* DALI group helpers — single bus frame per call. State updates land via the
  * normal per-member dirty-bit polling path; no cache update on send. */
-void lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on);
-void lighting_group_step(uint8_t slave_id, uint8_t group, bool up);
-void lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc);
+bool lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on);
+bool lighting_group_step(uint8_t slave_id, uint8_t group, bool up);
+bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc);
 
 /*
  * Called from dirty_poll when a state change is confirmed by hardware.

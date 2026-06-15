@@ -950,7 +950,7 @@ static void cmd_cfg(char **saveptr) {
         else { txt_err("bad_field"); return; }
         any = true;
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
-    if (any) config_save();
+    if (any && !config_save()) { txt_err("save_failed"); return; }
     emit_state_cfg();
 }
 
@@ -1728,7 +1728,7 @@ static void cmd_mqtt(char **sp) {
         else { txt_err("bad_key"); return; }
     }
     if (!any) { txt_err("no_fields"); return; }
-    config_save();
+    if (!config_save()) { txt_err("save_failed"); return; }
     printf("ok (reboot to apply)\n");
 }
 
@@ -1770,7 +1770,7 @@ static void cmd_net(char **sp) {
         else { txt_err("bad_key"); return; }
     }
     if (!any) { txt_err("no_fields"); return; }
-    config_save();
+    if (!config_save()) { txt_err("save_failed"); return; }
     printf("ok (reboot to apply)\n");
 }
 
@@ -2085,7 +2085,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (c->set_cfg.fields & IC_CFG_F_DIM_REPEAT) { g_config.dim_repeat_ms      = c->set_cfg.dim_repeat_ms;      any = true; }
         if (c->set_cfg.fields & IC_CFG_F_REVERSAL)   { g_config.reversal_window_ms = c->set_cfg.reversal_window_ms; any = true; }
         if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
-        if (any) config_save();
+        if (any && !config_save()) LOG_ERR("cli", "config_save failed — set_cfg not persisted");
         /* de_mode applies live and self-persists; keep it out of the `any` save. */
         if ((c->set_cfg.fields & IC_CFG_F_DE_MODE) && c->set_cfg.de_mode < MODBUS_DE_MAX)
             set_modbus_de_mode((modbus_de_mode_t)c->set_cfg.de_mode);
@@ -2099,7 +2099,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (f & IC_NET_F_MASK) memcpy(g_config.net_mask, c->set_netcfg.mask, 4);
         if (f & IC_NET_F_GW)   memcpy(g_config.net_gw,   c->set_netcfg.gw,   4);
         if (f & IC_NET_F_DNS)  memcpy(g_config.net_dns,  c->set_netcfg.dns,  4);
-        if (f) config_save();   /* reboot to apply (core 1 reads net at launch) */
+        if (f && !config_save()) LOG_ERR("cli", "config_save failed — netcfg not persisted");
         break;
     }
     case IC_CMD_SET_MQTTCFG: {
@@ -2109,7 +2109,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (f & IC_MQTT_F_USER)   { strncpy(g_config.mqtt_user,   c->set_mqttcfg.user,   sizeof g_config.mqtt_user   - 1); g_config.mqtt_user[sizeof g_config.mqtt_user - 1] = '\0'; }
         if (f & IC_MQTT_F_PASS)   { strncpy(g_config.mqtt_pass,   c->set_mqttcfg.pass,   sizeof g_config.mqtt_pass   - 1); g_config.mqtt_pass[sizeof g_config.mqtt_pass - 1] = '\0'; }
         if (f & IC_MQTT_F_PREFIX) { strncpy(g_config.mqtt_prefix, c->set_mqttcfg.prefix, sizeof g_config.mqtt_prefix - 1); g_config.mqtt_prefix[sizeof g_config.mqtt_prefix - 1] = '\0'; }
-        if (f) config_save();   /* reboot to apply */
+        if (f && !config_save()) LOG_ERR("cli", "config_save failed — mqttcfg not persisted");
         break;
     }
     case IC_CMD_SET_AUTH:
@@ -2117,7 +2117,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         g_config.web_user[sizeof g_config.web_user - 1] = '\0';
         strncpy(g_config.web_pass, c->set_auth.pass, sizeof g_config.web_pass - 1);
         g_config.web_pass[sizeof g_config.web_pass - 1] = '\0';
-        config_save();
+        if (!config_save()) LOG_ERR("cli", "config_save failed — web auth not persisted");
         break;
     case IC_CMD_SET_MAPPING: {
         uint8_t count = c->set_mapping.count;
@@ -2126,11 +2126,17 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
                         c->set_mapping.targets, count))
             emit_config_mapping(c->set_mapping.fixture, c->set_mapping.button,
                                 c->set_mapping.targets, count);
+        else
+            LOG_ERR("cli", "mapping_set failed F%u.B%u — binding not saved",
+                    c->set_mapping.fixture, c->set_mapping.button);
         break;
     }
     case IC_CMD_DEL_MAPPING:
         if (mapping_delete(c->del_mapping.fixture, c->del_mapping.button))
             emit_config_mapping(c->del_mapping.fixture, c->del_mapping.button, NULL, 0);
+        else
+            LOG_ERR("cli", "mapping_delete failed F%u.B%u",
+                    c->del_mapping.fixture, c->del_mapping.button);
         break;
     case IC_CMD_PROVISION_START: {
         bool valid = false;

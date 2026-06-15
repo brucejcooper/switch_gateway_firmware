@@ -115,19 +115,25 @@ static bool tcp_open(void) {
     return true;
 }
 
-/* Returns 1 = established, 0 = pending, -1 = failed/closed. Acts on Sn_IR. */
+/* Why the last tcp_poll() returned -1. Set here (hot path — must NOT log; see
+ * CLAUDE.md), logged once off the hot path by go_backoff() at the disconnect. */
+static const char *s_tcp_disc = "tcp";
+
+/* Returns 1 = established, 0 = pending, -1 = failed/closed. Acts on Sn_IR.
+ * NOTE: runs every tick while online — no LOG_* here (USB-CDC back-pressure
+ * heisenbug). Record the reason; go_backoff() logs it once at the transition. */
 static int tcp_poll(void) {
     uint8_t ir = getSn_IR(MQTT_SOCKET);
     if (ir & Sn_IR_TIMEOUT) { setSn_IR(MQTT_SOCKET, Sn_IR_TIMEOUT);
-                              LOG_WARN("mqtt", "Sn_IR TIMEOUT (peer gone)"); return -1; }
+                              s_tcp_disc = "peer timeout"; return -1; }
     if (ir & Sn_IR_DISCON)  { setSn_IR(MQTT_SOCKET, Sn_IR_DISCON);
-                              LOG_WARN("mqtt", "Sn_IR DISCON (FIN)"); return -1; }
+                              s_tcp_disc = "FIN"; return -1; }
     if (ir & Sn_IR_CON)       setSn_IR(MQTT_SOCKET, Sn_IR_CON);
 
     switch (getSn_SR(MQTT_SOCKET)) {
     case SOCK_ESTABLISHED: return 1;
-    case SOCK_CLOSE_WAIT:  LOG_WARN("mqtt", "CLOSE_WAIT -> recycle"); tcp_close(); return -1;
-    case SOCK_CLOSED:      return -1;
+    case SOCK_CLOSE_WAIT:  s_tcp_disc = "CLOSE_WAIT"; tcp_close(); return -1;
+    case SOCK_CLOSED:      s_tcp_disc = "closed"; return -1;
     default:               return 0;   /* INIT / SYNSENT / ... */
     }
 }
@@ -177,16 +183,17 @@ static bool mqtt_connect(void) {
     return true;
 }
 
-static void go_backoff(uint32_t now) {
+static void go_backoff(uint32_t now, const char *reason) {
     /* Abrupt TCP close (no clean MQTT DISCONNECT) so the broker fires our LWT and
-     * HA sees us offline immediately. */
+     * HA sees us offline immediately. Single log per disconnect (state then sits
+     * in MA_BACKOFF), so this is safe off the per-tick hot path. */
     tcp_close();
     uint32_t base = s_backoff_ms;
     uint32_t wait = base / 2 + (rng_next() % (base / 2 + 1));   /* +/- jitter */
     s_deadline   = now + wait;
     s_backoff_ms = base * 2 > BACKOFF_MAX_MS ? BACKOFF_MAX_MS : base * 2;
     s_state      = MA_BACKOFF;
-    LOG_INFO("mqtt", "backoff ~%lu ms", (unsigned long)wait);
+    LOG_WARN("mqtt", "disconnect (%s) — backoff ~%lu ms", reason, (unsigned long)wait);
 }
 
 /* ── public ──────────────────────────────────────────────────────────────── */
@@ -221,20 +228,19 @@ void mqtt_app_tick(void) {
     switch (s_state) {
     case MA_OFFLINE:
         if (!netif_ready()) return;
-        if (!tcp_open()) { go_backoff(now); return; }
+        if (!tcp_open()) { go_backoff(now, "tcp open"); return; }
         s_deadline = now + TCP_CONNECT_TIMEOUT_MS;
         s_state    = MA_TCP_CONNECTING;
         break;
 
     case MA_TCP_CONNECTING: {
-        if (!netif_ready()) { go_backoff(now); break; }
+        if (!netif_ready()) { go_backoff(now, "link down"); break; }
         int r = tcp_poll();
         if (r == 1) {
             setSn_KPALVTR(MQTT_SOCKET, MQTT_KPALVTR_UNITS);   /* HW keepalive */
             s_state = MA_MQTT_CONNECTING;
         } else if (r < 0 || (int32_t)(now - s_deadline) >= 0) {
-            if (r >= 0) LOG_WARN("mqtt", "TCP connect timeout");
-            go_backoff(now);
+            go_backoff(now, r < 0 ? s_tcp_disc : "tcp connect timeout");
         }
         break;
     }
@@ -247,17 +253,16 @@ void mqtt_app_tick(void) {
             if (s_on_connected) s_on_connected();
             s_state = MA_ONLINE;
         } else {
-            go_backoff(now);
+            go_backoff(now, "mqtt connect");
         }
         break;
 
     case MA_ONLINE: {
-        if (!netif_ready()) { go_backoff(now); break; }
-        if (tcp_poll() < 0) { go_backoff(now); break; }
+        if (!netif_ready()) { go_backoff(now, "link down"); break; }
+        if (tcp_poll() < 0) { go_backoff(now, s_tcp_disc); break; }
         MQTTStatus_t st = MQTT_ProcessLoop(&s_mqtt);
         if (st != MQTTSuccess && st != MQTTNeedMoreBytes) {
-            LOG_WARN("mqtt", "ProcessLoop=%d -> reconnect", (int)st);
-            go_backoff(now);
+            go_backoff(now, "process loop");
         }
         break;
     }

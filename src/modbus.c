@@ -258,7 +258,8 @@ static int64_t release_de(alarm_id_t id, void *userdata) {
 void set_modbus_de_mode(modbus_de_mode_t mode) {
     de_mode = mode;
     g_config.de_mode = (uint8_t)mode;   /* persisted via the unified config.json */
-    config_save();
+    if (!config_save())
+        LOG_ERR("modbus", "config_save failed — de_mode not persisted");
 }
 
 modbus_de_mode_t modbus_get_de_mode(void) { return de_mode; }
@@ -271,7 +272,8 @@ const char *modbus_de_mode_to_str(modbus_de_mode_t mode) {
 void modbus_set_baud(uint32_t baud) {
     s_baud = baud;
     g_config.baud = baud;               /* persisted via the unified config.json */
-    config_save();
+    if (!config_save())
+        LOG_ERR("modbus", "config_save failed — baud not persisted");
 }
 
 uint32_t modbus_get_baud(void) { return s_baud; }

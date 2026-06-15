@@ -91,16 +91,20 @@ static void relay_write_cb(int res, uint8_t *buf, void *ctx) {
     }
 }
 
-void lighting_set_relay(uint8_t channel, bool on) {
+bool lighting_set_relay(uint8_t channel, bool on) {
     if (g_config.relay_slave_count == 0) {
         LOG_WARN("light", "relay write dropped — no relay slave configured");
-        return;
+        return false;
     }
     relay_ctx_t *c = &s_relay_ctx[s_relay_ctx_idx++ % RELAY_COUNT];
     c->channel = channel;
     c->on      = on;
-    modbus_set_coil(g_config.relay_slave_ids[0], channel, on, relay_write_cb, c);
+    if (!modbus_set_coil(g_config.relay_slave_ids[0], channel, on, relay_write_cb, c)) {
+        LOG_WARN("light", "relay ch=%u %s dropped — queue full", channel, on ? "on" : "off");
+        return false;
+    }
     LOG_INFO("light", "relay ch=%u %s", channel, on ? "on" : "off");
+    return true;
 }
 
 /* ── DALI callbacks — no state cache update on write; dirty_poll does that ── */
@@ -113,10 +117,10 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
     }
 }
 
-void dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice) {
-    modbus_set_holding_register(slave_id,
-                                twice ? 0x1001u : 0x1000u,
-                                value, dali_write_cb, NULL);
+bool dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice) {
+    return modbus_set_holding_register(slave_id,
+                                       twice ? 0x1001u : 0x1000u,
+                                       value, dali_write_cb, NULL);
 }
 
 /* Synchronously record the on/off intent so a follow-up toggle (e.g. a rapid
@@ -139,52 +143,81 @@ static void cache_predict_group(uint8_t slave_id, uint8_t group, bool on) {
     }
 }
 
-void lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
-    if (dali_provision_busy_slave(slave_id)) return;
+bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "dali %u.%u %s skipped — slave provisioning",
+                slave_id, dali_addr, on ? "on" : "off");
+        return false;
+    }
+    bool ok;
     if (on) {
         /* GOTO_LAST_ACTIVE (0x0A) — no per-ballast bank shortcut, use RAW_CMD.
          * Address byte: short address, command form (A0=1). */
         uint8_t  addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
         uint16_t value     = ((uint16_t)addr_byte << 8) | 0x0Au;
-        dali_raw_arm(slave_id, value, false);
+        ok = dali_raw_arm(slave_id, value, false);
     } else {
         /* OFF — write 0 to the per-ballast brightness register. High byte is
          * ignored by the gateway on write. */
         uint16_t reg = 0x0000u + (uint16_t)dali_addr;
-        modbus_set_holding_register(slave_id, reg,
-                                    0x0000u, dali_write_cb, NULL);
+        ok = modbus_set_holding_register(slave_id, reg,
+                                         0x0000u, dali_write_cb, NULL);
+    }
+    if (!ok) {
+        LOG_WARN("light", "dali %u.%u %s dropped — queue full",
+                 slave_id, dali_addr, on ? "on" : "off");
+        return false;
     }
     LOG_INFO("light", "dali %u.%u %s",
              slave_id, dali_addr, on ? "on" : "off");
     /* Reflect the change in the cache immediately so a rapid follow-up toggle
      * reads the new state, then mark the slave active so dirty-poll confirms the
-     * exact level.  Without this only the CLI (which marks active itself) stayed
-     * in sync; button presses went stale and stuck after the first toggle. */
+     * exact level.  Gated on a successful enqueue so a dropped write can't leave
+     * the cache claiming a state the hardware never received. */
     cache_predict_dali(slave_id, dali_addr, on);
     dirty_poll_mark_active(slave_id);
+    return true;
 }
 
-void lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
-    if (dali_provision_busy_slave(slave_id)) return;
+bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "dali %u.%u step skipped — slave provisioning",
+                slave_id, dali_addr);
+        return false;
+    }
     /* UP (0x01) / DOWN (0x02) via RAW_CMD with short-address command-form. */
     uint8_t  addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
     uint16_t value     = ((uint16_t)addr_byte << 8) | (up ? 0x01u : 0x02u);
-    dali_raw_arm(slave_id, value, false);
+    if (!dali_raw_arm(slave_id, value, false)) {
+        LOG_WARN("light", "dali %u.%u step %s dropped — queue full",
+                 slave_id, dali_addr, up ? "up" : "down");
+        return false;
+    }
     LOG_INFO("light", "dali %u.%u step %s",
              slave_id, dali_addr, up ? "up" : "down");
     dirty_poll_mark_active(slave_id);
+    return true;
 }
 
-void lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
-    if (dali_provision_busy_slave(slave_id)) return;
+bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "dali %u.%u bri skipped — slave provisioning",
+                slave_id, dali_addr);
+        return false;
+    }
     /* DAPC via per-ballast brightness bank. Low byte = arc level; high byte
      * ignored on write. */
     uint16_t reg = 0x0000u + (uint16_t)dali_addr;
-    modbus_set_holding_register(slave_id, reg,
-                                (uint16_t)arc, dali_write_cb, NULL);
+    if (!modbus_set_holding_register(slave_id, reg,
+                                     (uint16_t)arc, dali_write_cb, NULL)) {
+        LOG_WARN("light", "dali %u.%u bri=%u dropped — queue full",
+                 slave_id, dali_addr, arc);
+        return false;
+    }
     LOG_INFO("light", "dali %u.%u bri=%u", slave_id, dali_addr, arc);
     cache_predict_dali(slave_id, dali_addr, arc > 0);
     dirty_poll_mark_active(slave_id);
+    return true;
 }
 
 /* ── DALI group helpers ──────────────────────────────────────────────────── */
@@ -192,36 +225,60 @@ void lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
  * bit 0 = 0 → DAPC form, bit 0 = 1 → command form. All sends use RAW_CMD
  * (FC06 0x1000); per-ballast brightness bank shortcut isn't applicable. */
 
-void lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
-    if (dali_provision_busy_slave(slave_id)) return;
+bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "group %u.G%u bri skipped — slave provisioning", slave_id, group);
+        return false;
+    }
     uint8_t  addr_byte = (uint8_t)(0x80u | ((group & 0x0Fu) << 1));  /* DAPC */
     uint16_t value     = ((uint16_t)addr_byte << 8) | arc;
-    dali_raw_arm(slave_id, value, false);
+    if (!dali_raw_arm(slave_id, value, false)) {
+        LOG_WARN("light", "group %u.G%u bri=%u dropped — queue full", slave_id, group, arc);
+        return false;
+    }
     LOG_INFO("light", "group %u.G%u bri=%u", slave_id, group, arc);
     cache_predict_group(slave_id, group, arc > 0);
     dirty_poll_mark_active(slave_id);
+    return true;
 }
 
-void lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
-    if (dali_provision_busy_slave(slave_id)) return;
+bool lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "group %u.G%u %s skipped — slave provisioning",
+                slave_id, group, on ? "on" : "off");
+        return false;
+    }
     uint8_t  addr_byte = (uint8_t)(0x81u | ((group & 0x0Fu) << 1));  /* command */
     uint8_t  opcode    = on ? 0x0Au /* GOTO_LAST_ACTIVE */ : 0x00u /* OFF */;
     uint16_t value     = ((uint16_t)addr_byte << 8) | opcode;
-    dali_raw_arm(slave_id, value, false);
+    if (!dali_raw_arm(slave_id, value, false)) {
+        LOG_WARN("light", "group %u.G%u %s dropped — queue full",
+                 slave_id, group, on ? "on" : "off");
+        return false;
+    }
     LOG_INFO("light", "group %u.G%u %s",
              slave_id, group, on ? "on" : "off");
     cache_predict_group(slave_id, group, on);
     dirty_poll_mark_active(slave_id);
+    return true;
 }
 
-void lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {
-    if (dali_provision_busy_slave(slave_id)) return;
+bool lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "group %u.G%u step skipped — slave provisioning", slave_id, group);
+        return false;
+    }
     uint8_t  addr_byte = (uint8_t)(0x81u | ((group & 0x0Fu) << 1));  /* command */
     uint16_t value     = ((uint16_t)addr_byte << 8) | (up ? 0x01u : 0x02u);
-    dali_raw_arm(slave_id, value, false);
+    if (!dali_raw_arm(slave_id, value, false)) {
+        LOG_WARN("light", "group %u.G%u step %s dropped — queue full",
+                 slave_id, group, up ? "up" : "down");
+        return false;
+    }
     LOG_INFO("light", "group %u.G%u step %s",
              slave_id, group, up ? "up" : "down");
     dirty_poll_mark_active(slave_id);
+    return true;
 }
 
 /* ── Emit helpers (called by dirty_poll) ─────────────────────────────────── */

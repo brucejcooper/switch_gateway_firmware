@@ -448,10 +448,14 @@ static void subscribe_all(void) {
     char f[64];
     for (unsigned i = 0; i < sizeof filt / sizeof filt[0]; i++) {
         snprintf(f, sizeof f, "%s/%s", P, filt[i]);
-        mqtt_app_subscribe(f);
+        /* Runs once at discovery-complete (not the per-tick pump), so logging is
+         * allowed. A dropped SUBSCRIBE silently kills a whole command class. */
+        if (!mqtt_app_subscribe(f))
+            LOG_WARN("mqtt", "subscribe failed: %s", f);
     }
     /* HA birth/will (not under our prefix): lets us re-assert on an HA restart. */
-    mqtt_app_subscribe("homeassistant/status");
+    if (!mqtt_app_subscribe("homeassistant/status"))
+        LOG_WARN("mqtt", "subscribe failed: homeassistant/status");
 }
 
 /* ── availability sweep (scan_complete -> 64 per-ballast topics) ──────────── */
