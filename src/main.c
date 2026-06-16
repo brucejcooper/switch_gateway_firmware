@@ -146,11 +146,12 @@ int main(void) {
         }
         if (ctx.ok) {
             for (int ch = 0; ch < 32; ch++) {
-                bool on = (coil_bits[ch / 8] >> (ch % 8)) & 1;
+                bool on = lighting_relay_coil_on(coil_bits, 4, (uint8_t)ch);
                 state_cache_set_relay((uint8_t)ch, on);
                 lighting_emit_relay_state((uint8_t)ch, on);
             }
-            LOG_INFO("boot", "relay sync: 32 channels read");
+            LOG_INFO("boot", "relay sync: 32 channels read (byteswap=%u)",
+                     g_config.relay_byteswap ? 1u : 0u);
         } else {
             LOG_WARN("boot", "relay sync: read failed");
         }

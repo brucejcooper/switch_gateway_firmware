@@ -356,6 +356,7 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
         if (jhas(body, tk, nt, "reversal_window_ms")) { cmd.set_cfg.reversal_window_ms = (uint16_t)jint_key(body, tk, nt, "reversal_window_ms", 0); f |= IC_CFG_F_REVERSAL; }
         if (jhas(body, tk, nt, "baud"))               { cmd.set_cfg.baud               = (uint32_t)jint_key(body, tk, nt, "baud", 0);               f |= IC_CFG_F_BAUD; }
         if (jhas(body, tk, nt, "de_mode"))            { cmd.set_cfg.de_mode            = (uint8_t)jint_key(body, tk, nt, "de_mode", 0);             f |= IC_CFG_F_DE_MODE; }
+        if (jhas(body, tk, nt, "relay_byteswap"))     { cmd.set_cfg.relay_byteswap     = (uint8_t)jint_key(body, tk, nt, "relay_byteswap", 0);      f |= IC_CFG_F_RELAY_BYTESWAP; }
         cmd.set_cfg.fields = f;
         push_cmd_resp(c, &cmd); return;
     }

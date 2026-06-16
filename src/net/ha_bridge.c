@@ -318,11 +318,28 @@ static void disc_prov(uint8_t slave, uint8_t k) {
     #undef PROV_TAIL
 }
 
-/* one of the 5 controller-config entities (3 numbers + 2 sensors). No values
- * needed for discovery — the config/state topic carries them. */
+/* one of the 6 controller-config entities (3 numbers + 2 sensors + 1 switch). No
+ * values needed for discovery — the config/state topic carries them. */
 static void disc_controller(uint8_t k) {
     const char *P = mqtt_app_prefix();
     char objid[32];
+    if (k == 5) {
+        /* relay_byteswap switch — reverses Waveshare 32CH coil read-back order. */
+        int n = snprintf(s_pl, PL_CAP,
+            "{\"unique_id\":\"lighting_cfg_relay_byteswap\",\"name\":\"Relay Byte-Swap\","
+            "\"command_topic\":\"%s/config/relay_byteswap/set\",\"state_topic\":\"%s/config/state\","
+            "\"value_template\":\"{{ value_json.relay_byteswap }}\","
+            "\"payload_on\":\"1\",\"payload_off\":\"0\",\"state_on\":\"1\",\"state_off\":\"0\","
+            "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
+            "\"icon\":\"mdi:swap-horizontal\"",
+            P, P, P);
+        pcat(n,
+            ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+            "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
+            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
+        pub_cfg("switch", "lighting_cfg_relay_byteswap");
+        return;
+    }
     if (k < 3) {
         static const struct { const char *key, *name; int lo, hi, step; } N[] = {
             { "long_press_ms", "Long-Press (ms)", 100, 5000, 50 },
@@ -390,7 +407,7 @@ static disc_res_t disc_step(void) {
         return DISC_MORE;
     case PH_CONTROLLER:
         disc_controller((uint8_t)s_i);
-        if (++s_i >= 5) { s_ph = PH_PLATE_EVT; s_i = s_j = 0; }
+        if (++s_i >= 6) { s_ph = PH_PLATE_EVT; s_i = s_j = 0; }
         return DISC_MORE;
     case PH_PLATE_EVT:
         disc_plate_event((uint8_t)s_i, (uint8_t)s_j);
@@ -608,9 +625,11 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         snprintf(top, sizeof top, "%s/config/state", P);
         snprintf(pl, sizeof pl,
             "{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,\"baud\":%lu,"
+            "\"relay_byteswap\":%u,"
             "\"fw_version\":\"" FW_VERSION "\",\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u}",
             e->cfg.long_press_ms, e->cfg.dim_repeat_ms, e->cfg.reversal_window_ms,
-            (unsigned long)e->cfg.baud, MAX_FIX, MAX_BTN, MAX_TARGETS_PER_BTN);
+            (unsigned long)e->cfg.baud, e->cfg.relay_byteswap ? 1u : 0u,
+            MAX_FIX, MAX_BTN, MAX_TARGETS_PER_BTN);
         mqtt_app_publish(top, pl, strlen(pl), true);
         break;
     case IC_EVT_SCAN_COMPLETE:   /* handled by the sweep cursor, not here */
@@ -836,11 +855,13 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             if ((i = jfind(pay, tk, nt, "long_press_ms")) >= 0)      { c.set_cfg.fields |= IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = (uint16_t)jint(pay, &tk[i]); }
             if ((i = jfind(pay, tk, nt, "dim_repeat_ms")) >= 0)      { c.set_cfg.fields |= IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = (uint16_t)jint(pay, &tk[i]); }
             if ((i = jfind(pay, tk, nt, "reversal_window_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = (uint16_t)jint(pay, &tk[i]); }
+            if ((i = jfind(pay, tk, nt, "relay_byteswap")) >= 0)     { c.set_cfg.fields |= IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = jint(pay, &tk[i]) ? 1u : 0u; }
         } else if (ns >= 3 && !strcmp(seg[2], "set")) {
             uint16_t v = (uint16_t)atoi(pay); const char *f = seg[1];
             if      (!strcmp(f, "long_press_ms"))      { c.set_cfg.fields = IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = v; }
             else if (!strcmp(f, "dim_repeat_ms"))      { c.set_cfg.fields = IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = v; }
             else if (!strcmp(f, "reversal_window_ms")) { c.set_cfg.fields = IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = v; }
+            else if (!strcmp(f, "relay_byteswap"))     { c.set_cfg.fields = IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = v ? 1u : 0u; }
         }
         if (c.set_cfg.fields) ic_push_cmd(&c);
         return;

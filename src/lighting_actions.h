@@ -21,6 +21,15 @@
 /* Relay: on/off */
 bool lighting_set_relay(uint8_t channel, bool on);
 
+/* Decode one relay channel's on/off from a raw FC01 coil-status payload (the
+ * coil-data bytes that follow the Modbus byte-count field). Honors
+ * g_config.relay_byteswap: some boards (e.g. Waveshare Modbus RTU Relay 32CH)
+ * return the coil-data bytes in reversed order, contrary to the Modbus spec, so
+ * when the flag is set the byte index is mirrored within the payload. Bits
+ * within a byte are spec-standard either way (LSB = lowest channel of the byte).
+ * Returns false for channels beyond byte_count*8. */
+bool lighting_relay_coil_on(const uint8_t *coil_bytes, uint8_t byte_count, uint8_t ch);
+
 /* Issue a raw DALI command via TinyModbus's RAW_CMD (or RAW_CMD_TWICE if
  * `twice` is true). TinyModbus rejects new raw writes only while the
  * previous command is still in flight (raw_cmd_result high byte == 0xFF —

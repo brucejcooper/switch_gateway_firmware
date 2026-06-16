@@ -22,6 +22,13 @@ typedef struct {
     uint32_t baud;                 /* default 19200 */
     uint8_t  de_mode;              /* modbus_de_mode_t, default 0 (when-tx) */
 
+    /* Some Modbus relay boards (e.g. Waveshare Modbus RTU Relay 32CH) return the
+     * FC01 coil-status data field with its bytes in REVERSED order (byte0 =
+     * highest channels), contrary to the Modbus spec. When set, the firmware
+     * reverses the coil-data bytes before decoding so relay read-back matches the
+     * physical state. Default 0 (spec-compliant). */
+    bool     relay_byteswap;       /* default 0 */
+
     /* MQTT broker. host is a dotted-quad IP (hostname/DNS is a follow-up).
      * Compile defaults are placeholders only — never commit secrets. */
     char     mqtt_host[64];

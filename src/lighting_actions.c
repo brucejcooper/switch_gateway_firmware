@@ -107,6 +107,16 @@ bool lighting_set_relay(uint8_t channel, bool on) {
     return true;
 }
 
+bool lighting_relay_coil_on(const uint8_t *coil_bytes, uint8_t byte_count, uint8_t ch) {
+    uint8_t bi = ch / 8u;
+    if (bi >= byte_count) return false;
+    /* Waveshare 32CH returns the coil-data bytes in reversed order; mirror the
+     * byte index so channel `ch` reads from the byte the spec puts it in. Bit
+     * position within the byte is unchanged on this board. */
+    if (g_config.relay_byteswap) bi = (uint8_t)(byte_count - 1u - bi);
+    return (coil_bytes[bi] >> (ch % 8u)) & 1u;
+}
+
 /* ── DALI callbacks — no state cache update on write; dirty_poll does that ── */
 static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
     /* Nothing needed here — TinyModbus will set the dirty bit, and

@@ -76,7 +76,7 @@ typedef struct {
          * so HA's "Commission Status" sensor keeps its detail. */
         struct { uint8_t slave, state, count; char msg[IC_PROV_MSG_MAX]; } provision;
         struct { uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; uint8_t de_mode; } cfg;
+                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap; } cfg;
         /* CLI network-ping request: send `count` ICMP echoes to ip on core 1. */
         struct { uint8_t ip[4]; uint8_t count; } ping_req;
     };
@@ -104,6 +104,7 @@ typedef struct {
 #define IC_CFG_F_REVERSAL   (1u << 2)
 #define IC_CFG_F_BAUD       (1u << 3)
 #define IC_CFG_F_DE_MODE    (1u << 4)
+#define IC_CFG_F_RELAY_BYTESWAP (1u << 5)
 
 /* set_netcfg field-present bits */
 #define IC_NET_F_DHCP       (1u << 0)
@@ -156,7 +157,7 @@ typedef struct {
         struct { uint8_t slave, group; uint16_t fields; ic_tri_t on; uint8_t bri;
                  uint64_t members; } set_group;
         struct { uint16_t fields; uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; uint8_t de_mode; } set_cfg;
+                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap; } set_cfg;
         struct { uint8_t fixture, button, count;
                  mapping_target_t targets[MAX_TARGETS_PER_BTN]; } set_mapping;
         struct { uint8_t fixture, button; } del_mapping;

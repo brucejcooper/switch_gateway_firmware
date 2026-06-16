@@ -74,9 +74,13 @@ void dirty_poll_init(void) {
     }
 }
 
-/* Relay coil-read result → reachability, debounced like gateway_report(). */
+/* Relay coil-read result → reachability, debounced like gateway_report().
+ * Also reconciles the relay on/off cache from the actual board state: the read
+ * is authoritative, so a relay changed out-of-band (or a cache left wrong by a
+ * board quirk / missed write) self-heals here, and toggling g_config.relay_byteswap
+ * takes effect within one poll interval without a reboot. Only the first relay
+ * slave drives the channel cache (RELAY_COUNT channels live on relay_slaves[0]). */
 static void relay_health_cb(int res, uint8_t *buf, void *ctx) {
-    (void)buf;
     uint8_t  i     = *(uint8_t *)ctx;
     rpoll_t *rp    = &s_rp[i];
     uint8_t  slave = g_config.relay_slave_ids[i];
@@ -87,6 +91,17 @@ static void relay_health_cb(int res, uint8_t *buf, void *ctx) {
             rp->reachable = true;
             LOG_INFO("dirty", "relay board %u reachable again", slave);
             lighting_emit_gateway_state(slave, true);
+        }
+        /* buf[2] = byte count, buf[3..] = coil bytes (one bit per channel). */
+        if (i == 0) {
+            uint8_t bc = buf[2];
+            for (uint8_t ch = 0; ch < RELAY_COUNT; ch++) {
+                bool on = lighting_relay_coil_on(&buf[3], bc, ch);
+                if (on != state_cache_get_relay_on(ch)) {
+                    state_cache_set_relay(ch, on);
+                    lighting_emit_relay_state(ch, on);
+                }
+            }
         }
     } else if (rp->reachable) {
         if (rp->fail_count < 0xFF) rp->fail_count++;

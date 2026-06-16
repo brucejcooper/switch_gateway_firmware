@@ -46,6 +46,7 @@ static struct {
     uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
     uint32_t baud;
     uint8_t  de_mode;
+    uint8_t  relay_byteswap;
     bool     cfg_seen;
 
     uint32_t seq;
@@ -164,6 +165,7 @@ void web_state_on_event(const ic_event_t *e) {
         S.reversal_window_ms = e->cfg.reversal_window_ms;
         S.baud               = e->cfg.baud;
         S.de_mode            = e->cfg.de_mode;
+        S.relay_byteswap     = e->cfg.relay_byteswap;
         break;
     case IC_EVT_BUTTON:
         /* Transient UI event; nothing to cache. */
@@ -257,11 +259,11 @@ static int render_tail(char *out, size_t cap) {
     int n = 0;
     n = jcat(out, cap, n,
         "],\"cfg\":{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,"
-        "\"reversal_window_ms\":%u,\"baud\":%lu,\"de_mode\":%u,"
+        "\"reversal_window_ms\":%u,\"baud\":%lu,\"de_mode\":%u,\"relay_byteswap\":%u,"
         "\"fw_version\":\"" FW_VERSION "\","
         "\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u",
         S.long_press_ms, S.dim_repeat_ms, S.reversal_window_ms,
-        (unsigned long)S.baud, S.de_mode,
+        (unsigned long)S.baud, S.de_mode, S.relay_byteswap,
         MAX_FIXTURES, MAX_BUTTONS, MAX_TARGETS_PER_BTN);
     if (sn) {
         uint8_t cur[4]; netif_get_ip(cur);   /* live address (DHCP-leased or static) */

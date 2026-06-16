@@ -15,6 +15,8 @@ export function renderController(state) {
     h('option', { value: '1', selected: num(cfg.de_mode) === 1 }, 'Always on'),
   );
 
+  const byteswap = h('input', { type: 'checkbox', checked: num(cfg.relay_byteswap) === 1 });
+
   const save = h('button', { class: 'btn primary' }, 'Save controller config');
   save.addEventListener('click', saver('/api/cfg', () => ({
     long_press_ms: num(lp.input.value),
@@ -22,6 +24,7 @@ export function renderController(state) {
     reversal_window_ms: num(rw.input.value),
     baud: num(baud.input.value),
     de_mode: num(de.value),
+    relay_byteswap: byteswap.checked ? 1 : 0,
   }), { okMsg: 'Controller config saved' }));
 
   return h('div', { class: 'card' },
@@ -29,6 +32,9 @@ export function renderController(state) {
     h('div', { class: 'grid2' }, lp.wrap, dr.wrap, rw.wrap, baud.wrap),
     h('label', {}, 'DE / driver-enable mode'),
     de,
+    h('label', {}, 'Relay coil byte-swap'),
+    h('div', { class: 'row' }, byteswap,
+      h('span', { class: 'muted' }, 'Reverse coil read-back byte order (Waveshare 32CH)')),
     h('div', { class: 'note' }, 'Changing baud applies after reboot.'),
     h('div', { style: { marginTop: '12px' } }, save),
   );

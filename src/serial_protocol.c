@@ -668,11 +668,12 @@ static void cmd_show(char **saveptr) {
 
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
-               "baud=%lu rs485=%s relay_slaves=",
+               "baud=%lu rs485=%s relay_byteswap=%u relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
                (unsigned long)modbus_get_baud(),
-               modbus_de_mode_to_str(modbus_get_de_mode()));
+               modbus_de_mode_to_str(modbus_get_de_mode()),
+               g_config.relay_byteswap ? 1u : 0u);
         for (int i = 0; i < g_config.relay_slave_count; i++) {
             printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
         }
@@ -943,6 +944,8 @@ static void cmd_cfg(char **saveptr) {
         else if (strcasecmp(key, "dim_repeat_ms") == 0)      g_config.dim_repeat_ms = (uint16_t)atoi(val);
         else if (strcasecmp(key, "reversal_window_ms") == 0) g_config.reversal_window_ms = (uint16_t)atoi(val);
         else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
+        else if (strcasecmp(key, "relay_byteswap") == 0)
+            g_config.relay_byteswap = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
         else if (strcasecmp(key, "relay_slaves") == 0)
             g_config.relay_slave_count = (uint8_t)parse_csv_u8(val, g_config.relay_slave_ids, MAX_RELAY_SLAVES);
         else if (strcasecmp(key, "dali_slaves") == 0)
@@ -1104,6 +1107,7 @@ static void emit_state_cfg(void) {
     ev.cfg.reversal_window_ms = g_config.reversal_window_ms;
     ev.cfg.baud               = modbus_get_baud();
     ev.cfg.de_mode            = (uint8_t)modbus_get_de_mode();
+    ev.cfg.relay_byteswap     = g_config.relay_byteswap ? 1u : 0u;
     intercore_push_event(&ev);
 }
 
@@ -2087,6 +2091,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (c->set_cfg.fields & IC_CFG_F_DIM_REPEAT) { g_config.dim_repeat_ms      = c->set_cfg.dim_repeat_ms;      any = true; }
         if (c->set_cfg.fields & IC_CFG_F_REVERSAL)   { g_config.reversal_window_ms = c->set_cfg.reversal_window_ms; any = true; }
         if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
+        if (c->set_cfg.fields & IC_CFG_F_RELAY_BYTESWAP) { g_config.relay_byteswap = c->set_cfg.relay_byteswap ? true : false; any = true; }
         if (any && !config_save()) LOG_ERR("cli", "config_save failed — set_cfg not persisted");
         /* de_mode applies live and self-persists; keep it out of the `any` save. */
         if ((c->set_cfg.fields & IC_CFG_F_DE_MODE) && c->set_cfg.de_mode < MODBUS_DE_MAX)
