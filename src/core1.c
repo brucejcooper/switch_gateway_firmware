@@ -71,6 +71,7 @@ static void core1_entry(void) {
     memcpy(nc.sn, sn->net_mask, 4);
     memcpy(nc.gw, sn->net_gw, 4);
     memcpy(nc.dns, sn->net_dns, 4);
+    memcpy(nc.hostname, sn->net_hostname, sizeof nc.hostname);
     netif_init(&nc);
 
     mqtt_config_t mc;

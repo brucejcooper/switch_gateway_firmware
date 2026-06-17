@@ -75,6 +75,23 @@ build). The patch dirties the submodule working tree — that's expected; the
 gitlink SHA is unchanged, so **do not commit the submodule change**. To remove
 once upstream lands #173: delete the patch file + the apply block in CMakeLists.
 
+### DHCP configurable hostname — build-time patch (2026-06-16)
+
+ioLibrary's DHCP client hardcodes the option-12 hostname to `"WIZnet"` + a
+6-hex-char MAC suffix in a fixed 7-byte `HOST_NAME[]` array (`dhcp.c`). To get a
+clean, configurable name (so the router registers e.g. `lights` in its local DNS
+— the cheap "Option A" instead of a socket-consuming mDNS responder), a second
+build-time patch `patches/0002-dhcp-configurable-hostname.patch` widens
+`HOST_NAME[]` to 32 bytes and drops the MAC suffix. `netif.c` overwrites the
+global from config (`extern uint8_t HOST_NAME[]`) in `netif_init`, before the
+first DISCOVER/REQUEST; empty leaves the compiled default. The name is the
+**`net_hostname`** config field (default `lights`), settable via CLI
+`net set hostname=<label>` and the web Network tab, persisted in `/config.json`,
+carried in the launch snapshot, and **applied on reboot** (like the rest of
+`net`). Validated as a single RFC-1123 label (letters/digits/hyphen, ≤31).
+Applied + idempotency-checked exactly like the recv patch above; same
+**do-not-commit-the-submodule** rule.
+
 ### MQTT publish coalescing — transport writev
 
 `transport_writev` in `mqtt_app.c` implements coreMQTT's optional vectored-send
@@ -248,10 +265,40 @@ excluded) · `reg3 frames_ok` (denominator) · `reg4 last_fail_len` · `reg5..12
 the bytes of the last CRC-failed frame. Counters are zeroed on gateway reset.
 Use them to confirm any RX fix keeps `crc_error`/`frame_error` flat under load.
 
+### Gateway sysinfo / reboot diagnostics (FC04 `0x0310`, 4-register read) — 2026-06-16
+
+Read with `get_input <slave> 0x0310 4` (all big-endian):
+`reg0..1 uptime_s` (32-bit seconds since boot) · `reg2 boot_count` (reboots since
+the last cold power-on) · `reg3 reset_reason` (low byte = ATtiny `RSTCTRL.RSTFR`:
+bit0 PORF, 1 BORF, 2 EXTRF, 3 WDRF, 4 SWRF, 5 UPDIRF). **No
+EEPROM is used** (it would wear out under a watchdog crash-loop at ~8.2 s/reboot):
+reset_reason is the hardware-latched RSTFR (read + write-1-to-clear at boot),
+uptime is a RAM counter in the RTC PIT ISR, and boot_count lives in `.noinit`
+SRAM guarded by a magic word — it survives warm resets (WDT/`SWRR`/external RESET)
+and restarts on a true power-on. The master spots a gateway reboot when
+`uptime_s` drops or `boot_count` changes.
+
+### DALI scan reads settings AND level (2026-06-16)
+
+The gateway's `SYNC_READ_FULL` flag was **renamed `SYNC_READ_SETTINGS`** — it only
+re-fetches the 7 config fields (min/max/fade/power/fail/groups), NOT the live arc
+level (that's `SYNC_READ_LEVEL` = QUERY STATUS + QUERY ACTUAL LEVEL). The boot
+scan (`main.c`) and the master `SCAN_TRIGGER` (`0x1010`) now arm **both** flags;
+previously they armed settings only. Symptom that drove this: after a gateway
+reboot `regs_init()` zeroes block0, the settings scan leaves `brightness=0`, and a
+physically-ON ballast reported OFF until a command or the slow periodic re-poll
+cursor happened to touch it ("2:6 shows 0 while on"). Arming the level read makes
+a freshly-booted/rescanned gateway converge to true state on its own. The
+controller side also got a fix: `dirty_poll_full_scan` BLOCK0 (arc/status) reads
+are now guarded by a per-chunk `b0_chunk_ok[]` flag (matching BLOCK1-3), so a
+failed Modbus chunk read never emits uninitialised stack data as a brightness.
+
 ## Gateway recovery
 
 `gw_reboot <slave>` (CLI) software-resets a gateway via its `MBREG_SYSTEM_RESET`
 register (`set_holding <slave> 0x1015 0xA5A5`). Handy if a gateway ever wedges.
+After it reboots, read `get_input <slave> 0x0310 4` — `reset_reason` bit4 (SWRF)
+confirms the software reset, and `boot_count` increments.
 
 ## DALI commissioning, collisions & device identity (2026-06-06)
 

@@ -40,6 +40,10 @@ typedef struct {
     /* Network. dhcp default on; static fields used only when dhcp == 0. */
     uint8_t  net_dhcp;             /* default 1 */
     uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
+    /* DHCP option-12 hostname (default "lights"). Sent in DISCOVER/REQUEST so the
+     * router registers it in local DNS — e.g. reach the board as "lights". DNS
+     * label charset (letters/digits/hyphen); reboot to apply. */
+    char     net_hostname[32];     /* default "lights" */
 
     /* Embedded config web UI (core 1). Basic-auth credentials; default
      * admin/admin. Plain HTTP (no TLS on the W5100S) — LAN-only fallback. */

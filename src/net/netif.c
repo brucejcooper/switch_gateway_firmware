@@ -22,6 +22,11 @@
 #define DHCP_BUF_SIZE   1024
 static uint8_t s_dhcp_buf[DHCP_BUF_SIZE];
 
+/* ioLibrary's DHCP client reads its option-12 hostname from this global (defined
+ * in Internet/DHCP/dhcp.c; our build-time patch 0002 widens it to 32 bytes and
+ * drops the MAC-hex suffix, so the wire hostname is exactly what we copy here). */
+extern uint8_t HOST_NAME[];
+
 /* Socket-0 lending: the W5100S has only 4 sockets (0=DHCP, 1=MQTT), leaving 2
  * for the web server. Between DHCP renewals the DHCP socket sits idle, so we
  * lend it to the web LISTEN pool as an opportunistic 3rd socket and reclaim it a
@@ -124,6 +129,14 @@ void netif_init(const netif_config_t *cfg) {
     } else {
         memset(&s_cfg, 0, sizeof s_cfg);
         s_cfg.dhcp = true;
+    }
+    /* Publish the DHCP hostname before any DISCOVER/REQUEST is built. Empty =>
+     * leave dhcp.c's compiled-in default ("WIZnet") untouched. */
+    if (s_cfg.hostname[0]) {
+        size_t i = 0;
+        for (; i < sizeof s_cfg.hostname - 1 && s_cfg.hostname[i]; i++)
+            HOST_NAME[i] = (uint8_t)s_cfg.hostname[i];
+        HOST_NAME[i] = 0;
     }
     memset(&s_netinfo, 0, sizeof s_netinfo);
     build_mac(s_netinfo.mac);

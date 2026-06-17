@@ -1736,15 +1736,32 @@ static void cmd_mqtt(char **sp) {
     printf("ok (reboot to apply)\n");
 }
 
+/* A DHCP/DNS hostname is one label: 1..31 chars, letters/digits/hyphen, and not
+ * leading/trailing a hyphen (RFC 1123). Reject anything else so we never put an
+ * illegal label on the wire (which some DHCP servers drop silently). */
+static bool hostname_ok(const char *s) {
+    size_t n = strlen(s);
+    if (n < 1 || n > 31) return false;
+    if (s[0] == '-' || s[n - 1] == '-') return false;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        bool good = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') || ch == '-';
+        if (!good) return false;
+    }
+    return true;
+}
+
 static void cmd_net(char **sp) {
     char *sub = strtok_r(NULL, " \t", sp);
     if (!sub || strcasecmp(sub, "show") == 0) {
-        printf("net dhcp=%s ip=%u.%u.%u.%u mask=%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u\n",
+        printf("net dhcp=%s ip=%u.%u.%u.%u mask=%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u hostname=%s\n",
                g_config.net_dhcp ? "on" : "off",
                g_config.net_ip[0], g_config.net_ip[1], g_config.net_ip[2], g_config.net_ip[3],
                g_config.net_mask[0], g_config.net_mask[1], g_config.net_mask[2], g_config.net_mask[3],
                g_config.net_gw[0], g_config.net_gw[1], g_config.net_gw[2], g_config.net_gw[3],
-               g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3]);
+               g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3],
+               g_config.net_hostname);
         return;
     }
     if (strcasecmp(sub, "ping") == 0) {
@@ -1771,6 +1788,12 @@ static void cmd_net(char **sp) {
         else if (!strcasecmp(k, "mask")) { if (!parse_ip4(v, g_config.net_mask)) { txt_err("bad_ip"); return; } any = true; }
         else if (!strcasecmp(k, "gw"))   { if (!parse_ip4(v, g_config.net_gw))   { txt_err("bad_ip"); return; } any = true; }
         else if (!strcasecmp(k, "dns"))  { if (!parse_ip4(v, g_config.net_dns))  { txt_err("bad_ip"); return; } any = true; }
+        else if (!strcasecmp(k, "hostname")) {
+            if (!hostname_ok(v)) { txt_err("bad_hostname"); return; }
+            strncpy(g_config.net_hostname, v, sizeof g_config.net_hostname - 1);
+            g_config.net_hostname[sizeof g_config.net_hostname - 1] = '\0';
+            any = true;
+        }
         else { txt_err("bad_key"); return; }
     }
     if (!any) { txt_err("no_fields"); return; }
@@ -2106,6 +2129,10 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (f & IC_NET_F_MASK) memcpy(g_config.net_mask, c->set_netcfg.mask, 4);
         if (f & IC_NET_F_GW)   memcpy(g_config.net_gw,   c->set_netcfg.gw,   4);
         if (f & IC_NET_F_DNS)  memcpy(g_config.net_dns,  c->set_netcfg.dns,  4);
+        if ((f & IC_NET_F_HOSTNAME) && hostname_ok(c->set_netcfg.hostname)) {
+            strncpy(g_config.net_hostname, c->set_netcfg.hostname, sizeof g_config.net_hostname - 1);
+            g_config.net_hostname[sizeof g_config.net_hostname - 1] = '\0';
+        }
         if (f && !config_save()) LOG_ERR("cli", "config_save failed — netcfg not persisted");
         break;
     }

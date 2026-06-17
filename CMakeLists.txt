@@ -138,6 +138,33 @@ else()
     endif()
 endif()
 
+# Build-time patch: ioLibrary's DHCP client hardcodes the option-12 hostname to
+# "WIZnet" + a 6-hex-char MAC suffix in a fixed 7-byte array. We want a clean,
+# configurable hostname (so the router registers e.g. "lights" in local DNS), so
+# this patch widens HOST_NAME[] to 32 bytes (netif.c overwrites it from config)
+# and drops the MAC suffix. Same pristine-submodule + idempotent-apply approach
+# as the recv patch above; remove both the patch file and this block to revert.
+set(IOLIB_HOSTNAME_PATCH ${CMAKE_CURRENT_LIST_DIR}/patches/0002-dhcp-configurable-hostname.patch)
+execute_process(
+    COMMAND git apply --reverse --check ${IOLIB_HOSTNAME_PATCH}
+    WORKING_DIRECTORY ${IOLIB}
+    RESULT_VARIABLE _iolib_host_rev ERROR_QUIET OUTPUT_QUIET)
+if(_iolib_host_rev EQUAL 0)
+    message(STATUS "ioLibrary DHCP hostname patch: already applied")
+else()
+    execute_process(
+        COMMAND git apply ${IOLIB_HOSTNAME_PATCH}
+        WORKING_DIRECTORY ${IOLIB}
+        RESULT_VARIABLE _iolib_host_app ERROR_QUIET OUTPUT_QUIET)
+    if(_iolib_host_app EQUAL 0)
+        message(STATUS "ioLibrary DHCP hostname patch: applied")
+    else()
+        message(WARNING "ioLibrary DHCP hostname patch did not apply — verify "
+            "Internet/DHCP/dhcp.c HOST_NAME handling and "
+            "patches/0002-dhcp-configurable-hostname.patch.")
+    endif()
+endif()
+
 target_sources(light_switch PRIVATE
     ${IOLIB}/Ethernet/wizchip_conf.c
     ${IOLIB}/Ethernet/socket.c

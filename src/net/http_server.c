@@ -367,6 +367,7 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
         if (jip(body, tk, nt, "mask", cmd.set_netcfg.mask)) f |= IC_NET_F_MASK;
         if (jip(body, tk, nt, "gw",   cmd.set_netcfg.gw))   f |= IC_NET_F_GW;
         if (jip(body, tk, nt, "dns",  cmd.set_netcfg.dns))  f |= IC_NET_F_DNS;
+        if (jhas(body, tk, nt, "hostname")) { jstr_key(body, tk, nt, "hostname", cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname); f |= IC_NET_F_HOSTNAME; }
         cmd.set_netcfg.fields = f;
         push_cmd_resp(c, &cmd); return;
     }

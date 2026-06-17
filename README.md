@@ -334,7 +334,9 @@ new contract:
 - **Presence + dirty bitmaps (FC04) at `0x0100–0x0107`** — one 8-register
   read fetches both. The dirty range is read-clears.
 - **Gateway recovery:** `0x1015` (write `0xA5A5`) software-resets a wedged
-  gateway (CLI `gw_reboot`). RX error counters live at FC04 `0x0300`.
+  gateway (CLI `gw_reboot`). RX error counters live at FC04 `0x0300`; uptime /
+  boot-count / reset-reason at FC04 `0x0310` (read `get_input <slave> 0x0310 4`
+  — a reboot shows as uptime dropping or boot-count incrementing).
 
 The canonical specification for the gateway is
 [`../TinyModbus/README.md`](../TinyModbus/README.md).
@@ -522,6 +524,8 @@ map F3.B1 -> 2:G5,2:G7
 > mqtt set host=192.168.1.10 port=1883 prefix=lighting
 ok (reboot to apply)
 > net set dhcp=off ip=192.168.1.50 mask=255.255.255.0 gw=192.168.1.1 dns=192.168.1.1
+ok (reboot to apply)
+> net set hostname=lights    # DHCP option-12 name -> router DNS registers "lights"
 ok (reboot to apply)
 
 > provision 2 all            # full commissioning of slave 2

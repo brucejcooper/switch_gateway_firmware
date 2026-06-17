@@ -41,6 +41,7 @@ void config_defaults(void) {
     g_config.mqtt_port           = 1883;
     strncpy(g_config.mqtt_prefix, "lighting", sizeof g_config.mqtt_prefix - 1);
     g_config.net_dhcp            = 1;
+    strncpy(g_config.net_hostname, "lights", sizeof g_config.net_hostname - 1);
     strncpy(g_config.web_user, "admin", sizeof g_config.web_user - 1);
     strncpy(g_config.web_pass, "admin", sizeof g_config.web_pass - 1);
 }
@@ -159,6 +160,7 @@ bool config_load(void) {
             get_ip(buf, tk, nt, "net_mask", g_config.net_mask);
             get_ip(buf, tk, nt, "net_gw",   g_config.net_gw);
             get_ip(buf, tk, nt, "net_dns",  g_config.net_dns);
+            get_str(buf, tk, nt, "net_hostname", g_config.net_hostname, sizeof g_config.net_hostname);
 
             get_str(buf, tk, nt, "web_user", g_config.web_user, sizeof g_config.web_user);
             get_str(buf, tk, nt, "web_pass", g_config.web_pass, sizeof g_config.web_pass);
@@ -189,6 +191,7 @@ bool config_save(void) {
         "\"mqtt_pass\":\"%s\",\"mqtt_prefix\":\"%s\","
         "\"net_dhcp\":%u,\"net_ip\":\"%u.%u.%u.%u\",\"net_mask\":\"%u.%u.%u.%u\","
         "\"net_gw\":\"%u.%u.%u.%u\",\"net_dns\":\"%u.%u.%u.%u\","
+        "\"net_hostname\":\"%s\","
         "\"web_user\":\"%s\",\"web_pass\":\"%s\"}\n",
         g_config.mqtt_host, g_config.mqtt_port, g_config.mqtt_user,
         g_config.mqtt_pass, g_config.mqtt_prefix, g_config.net_dhcp,
@@ -196,6 +199,7 @@ bool config_save(void) {
         g_config.net_mask[0], g_config.net_mask[1], g_config.net_mask[2], g_config.net_mask[3],
         g_config.net_gw[0], g_config.net_gw[1], g_config.net_gw[2], g_config.net_gw[3],
         g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3],
+        g_config.net_hostname,
         g_config.web_user, g_config.web_pass);
     fclose(fp);
     return true;

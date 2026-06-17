@@ -112,6 +112,7 @@ typedef struct {
 #define IC_NET_F_MASK       (1u << 2)
 #define IC_NET_F_GW         (1u << 3)
 #define IC_NET_F_DNS        (1u << 4)
+#define IC_NET_F_HOSTNAME   (1u << 5)
 
 /* set_mqttcfg field-present bits */
 #define IC_MQTT_F_HOST      (1u << 0)
@@ -166,7 +167,8 @@ typedef struct {
         /* Network + MQTT settings persisted by core 0 (reboot to apply, since
          * core 1 reads them from the launch snapshot). */
         struct { uint16_t fields; uint8_t dhcp;
-                 uint8_t ip[4], mask[4], gw[4], dns[4]; } set_netcfg;
+                 uint8_t ip[4], mask[4], gw[4], dns[4];
+                 char hostname[32]; } set_netcfg;
         struct { uint16_t fields; uint16_t port;
                  char host[64], user[48], pass[64], prefix[24]; } set_mqttcfg;
         struct { char user[32], pass[48]; } set_auth;
@@ -215,6 +217,7 @@ typedef struct {
     /* Network. */
     bool     net_dhcp;
     uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
+    char     net_hostname[32];
 
     /* Config web UI Basic-auth credentials (core 1 checks these). */
     char     web_user[32];

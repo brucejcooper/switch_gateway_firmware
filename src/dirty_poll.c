@@ -470,15 +470,19 @@ void dirty_poll_full_scan(uint8_t slave_id) {
              slave_id, DALI_ADDR_COUNT, (unsigned)DALI_BLOCK0_START,
              (unsigned)(DALI_BLOCK0_START + DALI_ADDR_COUNT - 1));
     uint16_t regs[DALI_ADDR_COUNT];
+    bool b0_chunk_ok[4];
     for (uint16_t chunk = 0; chunk < 4; chunk++) {
         uint16_t off = chunk * DALI_MAX_CHUNK;
-        if (!sync_read_holding(slave_id, DALI_BLOCK0_START + off, DALI_MAX_CHUNK, regs + off))
+        b0_chunk_ok[chunk] =
+            sync_read_holding(slave_id, DALI_BLOCK0_START + off, DALI_MAX_CHUNK, regs + off);
+        if (!b0_chunk_ok[chunk])
             LOG_WARN("dirty", "block0 chunk %u failed", chunk);
     }
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         bool present = (present_mask & ((uint64_t)1 << a)) != 0;
         state_cache_set_dali_present((uint8_t)idx, (uint8_t)a, present);
         if (!present) continue;
+        if (!b0_chunk_ok[a / DALI_MAX_CHUNK]) continue;   /* don't cache uninit/garbage arc */
         state_cache_set_dali_arc((uint8_t)idx, (uint8_t)a,
                                   regs[a] & 0xFF,
                                   (regs[a] >> 8) & 0xFF);
@@ -522,6 +526,7 @@ void dirty_poll_full_scan(uint8_t slave_id) {
      * are now loaded. */
     for (int a = 0; a < DALI_ADDR_COUNT; a++) {
         if (!(present_mask & ((uint64_t)1 << a))) continue;
+        if (!b0_chunk_ok[a / DALI_MAX_CHUNK]) continue;   /* don't emit uninit/garbage arc */
         uint8_t arc    = regs[a] & 0xFF;
         uint8_t status = (regs[a] >> 8) & 0xFF;
         lighting_emit_dali_state(slave_id, (uint8_t)a, arc, status);

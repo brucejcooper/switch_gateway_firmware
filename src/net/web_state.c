@@ -270,13 +270,15 @@ static int render_tail(char *out, size_t cap) {
         n = jcat(out, cap, n,
             ",\"net\":{\"dhcp\":%s,\"current_ip\":\"%u.%u.%u.%u\","
             "\"ip\":\"%u.%u.%u.%u\",\"mask\":\"%u.%u.%u.%u\","
-            "\"gw\":\"%u.%u.%u.%u\",\"dns\":\"%u.%u.%u.%u\"}",
+            "\"gw\":\"%u.%u.%u.%u\",\"dns\":\"%u.%u.%u.%u\","
+            "\"hostname\":\"%.31s\"}",
             sn->net_dhcp ? "true" : "false",
             cur[0], cur[1], cur[2], cur[3],
             sn->net_ip[0], sn->net_ip[1], sn->net_ip[2], sn->net_ip[3],
             sn->net_mask[0], sn->net_mask[1], sn->net_mask[2], sn->net_mask[3],
             sn->net_gw[0], sn->net_gw[1], sn->net_gw[2], sn->net_gw[3],
-            sn->net_dns[0], sn->net_dns[1], sn->net_dns[2], sn->net_dns[3]);
+            sn->net_dns[0], sn->net_dns[1], sn->net_dns[2], sn->net_dns[3],
+            sn->net_hostname);
         /* The broker host is stored as a dotted-quad (config supports IP only for
          * now), resolved into mqtt_ip on the snapshot. The password is never
          * disclosed — only whether one is set. */

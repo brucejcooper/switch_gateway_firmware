@@ -15,6 +15,7 @@
 typedef struct {
     bool    dhcp;                       /* true: DHCP (default); false: static */
     uint8_t ip[4], sn[4], gw[4], dns[4];/* used only when dhcp == false */
+    char    hostname[32];               /* DHCP option-12 hostname (empty => leave default) */
 } netif_config_t;
 
 /* Configure SPI glue + addressing mode. cfg NULL => DHCP. Does not touch the
