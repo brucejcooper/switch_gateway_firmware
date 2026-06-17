@@ -121,7 +121,7 @@ class Harness:
         import os
         if preferred and os.path.exists(preferred):
             return preferred
-        cands = sorted(glob.glob("/dev/tty.usbmodem*"))
+        cands = sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))
         return cands[0] if cands else preferred
 
     def open(self, timeout=25.0):

@@ -53,7 +53,7 @@ def main():
     ap.add_argument("--saleae-port", type=int, default=10430)
     cfg = ap.parse_args()
 
-    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*"))[0]
+    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))[0]
     ser = serial.Serial(port, 115200, timeout=0.1)
     lock = threading.Lock()
 

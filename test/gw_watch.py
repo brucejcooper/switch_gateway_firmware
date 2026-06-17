@@ -39,7 +39,7 @@ def main():
     ap.add_argument("--interval", type=float, default=1.0, help="poll interval seconds")
     cfg = ap.parse_args()
 
-    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*"))[0]
+    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))[0]
     ser = serial.Serial(port, 115200, timeout=0.3)
     time.sleep(0.4)
     ser.reset_input_buffer()

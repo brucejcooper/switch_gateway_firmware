@@ -118,7 +118,7 @@ def main():
     c_ser = ensure_col(ws, "Serial")
     c_gtin = ensure_col(ws, "GTIN")
 
-    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*"))[0]
+    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))[0]
     ser = serial.Serial(port, 115200, timeout=0.2)
     time.sleep(0.5)
     ser.reset_input_buffer()

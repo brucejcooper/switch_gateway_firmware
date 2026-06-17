@@ -68,7 +68,7 @@ def decode_frame(trans, fr, n_data):
     return val
 
 # ---- run capture while driving off->on cycles ----
-port = sorted(glob.glob("/dev/tty.usbmodem*"))[0]
+port = sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))[0]
 ser = serial.Serial(port, 115200, timeout=0.1); time.sleep(1.5); ser.reset_input_buffer()
 def sc(c, w):
     ser.write((c+"\n").encode()); ser.flush(); time.sleep(w)

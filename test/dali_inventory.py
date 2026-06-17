@@ -30,7 +30,7 @@ def main():
     ap.add_argument("--all", action="store_true", help="probe all 64 addresses, not just present")
     cfg = ap.parse_args()
 
-    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*"))[0]
+    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))[0]
     ser = serial.Serial(port, 115200, timeout=0.2)
     time.sleep(0.5)
     ser.reset_input_buffer()

@@ -1,0 +1,17 @@
+# Python dependencies for the test/ scripts (controller-side tooling).
+# Install into the project venv:
+#   python3 -m venv .venv
+#   .venv/bin/python -m pip install -r test/requirements.txt
+#
+# Direct dependencies only; pip resolves transitives (logic2-automation pulls in
+# grpcio + protobuf). Versions pinned to the known-good set (Python 3.9).
+
+# USB-CDC serial to the controller CLI — dali_inventory.py, run_tests.py, etc.
+pyserial==3.5
+
+# Spreadsheet sync (Lights sheet of "Switch wiring.xlsx") — dali_xlsx_sync.py
+openpyxl==3.1.5
+
+# Saleae Logic 2 automation (gRPC) — saleae_capture.py, dali_tx_probe.py,
+# run_tests.py --capture. Not needed for the DALI inventory/collision scan.
+logic2-automation==1.0.11
