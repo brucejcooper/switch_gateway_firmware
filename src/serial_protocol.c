@@ -456,11 +456,18 @@ static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
     return true;
 }
 
+/* A garbled DALI backward frame can mean two gear answering at once (a real
+ * collision, which garbles on every read) OR a one-off line glitch (which reads
+ * clean on retry). Re-read a garbled byte up to this many times and only call it
+ * a collision if it never comes back clean — kills transient false collisions. */
+#define DALI_READ_RETRIES 3
+
 /* Read `count` bytes from DALI memory `bank` starting at `offset`, from the
  * gear at short address `addr`.  Sequence: SET DTR1=bank, SET DTR0=offset, then
  * `count` READ MEMORY LOCATION (opcode 0xC5) — the gear auto-increments DTR0.
- * Sets *collision if any read garbles (two+ gear answering differently) and
- * *absent if a read NAKs (no gear there).  Returns false on transport failure. */
+ * Sets *collision if a read garbles on every retry (two+ gear answering
+ * differently) and *absent if a read NAKs (no gear there).  Returns false on
+ * transport failure. */
 static bool dali_read_mem(uint8_t slave, uint8_t addr, uint8_t bank,
                           uint8_t offset, uint8_t count, uint8_t *out,
                           bool *collision, bool *absent) {
@@ -470,16 +477,24 @@ static bool dali_read_mem(uint8_t slave, uint8_t addr, uint8_t bank,
     if (!dali_raw_result(slave, (uint16_t)(0xC300u | bank), false, &r)) return false; /* SET DTR1 */
     uint8_t addr_byte = (uint8_t)((addr << 1) | 0x01u);   /* short-address command form */
     for (uint8_t i = 0; i < count; i++) {
-        /* Re-set DTR0 before every read: not all gear auto-increment, and some
-         * have unreadable holes (e.g. bank-0 offset 0x01) that desync a run. */
-        if (!dali_raw_result(slave, (uint16_t)(0xA300u | (uint8_t)(offset + i)), false, &r))
-            return false;
-        uint16_t frame = (uint16_t)(((uint16_t)addr_byte << 8) | 0xC5u); /* READ MEMORY LOCATION */
-        if (!dali_raw_result(slave, frame, false, &r)) return false;
-        if      ((r >> 8) == 0x00u) out[i] = (uint8_t)(r & 0xFFu);   /* byte read */
-        else if ((r >> 8) == 0x02u) { *collision = true; out[i] = 0xFFu; }  /* garbled = 2+ gear */
-        else if (r == 0x0100u)      { if (i == 0) *absent = true; out[i] = 0xFFu; } /* NAK: no gear / hole */
-        else                        out[i] = 0xFFu;
+        bool got = false, nak = false, any_garble = false;
+        for (uint8_t attempt = 0; attempt < DALI_READ_RETRIES; attempt++) {
+            /* Re-set DTR0 before every read: not all gear auto-increment, some
+             * have unreadable holes (e.g. bank-0 offset 0x01), and a retry must
+             * re-point at the same offset. */
+            if (!dali_raw_result(slave, (uint16_t)(0xA300u | (uint8_t)(offset + i)), false, &r))
+                return false;
+            uint16_t frame = (uint16_t)(((uint16_t)addr_byte << 8) | 0xC5u); /* READ MEMORY LOCATION */
+            if (!dali_raw_result(slave, frame, false, &r)) return false;
+            if      ((r >> 8) == 0x00u) { got = true; break; }       /* clean byte — done, not a collision */
+            else if (r == 0x0100u)      { nak = true; break; }       /* NAK: no gear / hole — definitive */
+            else if ((r >> 8) == 0x02u) any_garble = true;           /* garbled — retry to rule out a glitch */
+            /* any other unexpected result: fall through and retry too */
+        }
+        if      (got)        out[i] = (uint8_t)(r & 0xFFu);
+        else if (any_garble) { *collision = true; out[i] = 0xFFu; }  /* garbled every attempt = 2+ gear */
+        else if (nak)        { if (i == 0) *absent = true; out[i] = 0xFFu; }
+        else                 out[i] = 0xFFu;
     }
     return true;
 }
