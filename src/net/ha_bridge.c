@@ -318,12 +318,67 @@ static void disc_prov(uint8_t slave, uint8_t k) {
     #undef PROV_TAIL
 }
 
-/* one of the 6 controller-config entities (3 numbers + 2 sensors + 1 switch). No
+/* Per-gateway diagnostic sensors (uptime / reboots / reset reason), grouped
+ * under the EXISTING gateway device (lighting_dali_gw_<slave>, the same device
+ * disc_prov creates) — they're attributes of that gateway, not a new device.
+ * k 0..2 = the three sensors, k 3 = seed an initial retained state. */
+static void disc_gw_diag(uint8_t slave, uint8_t k) {
+    const char *P = mqtt_app_prefix();
+    char gwids[32], gwname[24], objid[48], diag[48];
+    snprintf(gwids, sizeof gwids, "lighting_dali_gw_%u", slave);
+    snprintf(gwname, sizeof gwname, "DALI Gateway %u", slave);
+    snprintf(diag, sizeof diag, "%s/gateway/%u/diag", P, slave);
+
+    #define GWD_TAIL() do { \
+        int _n = pcat((int)strlen(s_pl), \
+            ",\"availability\":[{\"topic\":\"%s/availability\"}," \
+            "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"," \
+            "\"entity_category\":\"diagnostic\"", P, P, slave); \
+        dev(_n, gwids, gwname, MFR_MECH, "TinyModbus ATtiny1604 DALI Gateway", NULL); \
+    } while (0)
+
+    switch (k) {
+    case 0:
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_gwdiag_%u_uptime\","
+            "\"name\":\"Uptime\",\"state_topic\":\"%s\","
+            "\"value_template\":\"{{ value_json.uptime }}\","
+            "\"unit_of_measurement\":\"s\",\"device_class\":\"duration\","
+            "\"icon\":\"mdi:timer-outline\"", slave, diag);
+        GWD_TAIL();
+        snprintf(objid, sizeof objid, "lighting_gwdiag_%u_uptime", slave); pub_cfg("sensor", objid);
+        break;
+    case 1:
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_gwdiag_%u_reboots\","
+            "\"name\":\"Reboots\",\"state_topic\":\"%s\","
+            "\"value_template\":\"{{ value_json.reboots }}\","
+            "\"icon\":\"mdi:restart\"", slave, diag);
+        GWD_TAIL();
+        snprintf(objid, sizeof objid, "lighting_gwdiag_%u_reboots", slave); pub_cfg("sensor", objid);
+        break;
+    case 2:
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_gwdiag_%u_reset\","
+            "\"name\":\"Reset Reason\",\"state_topic\":\"%s\","
+            "\"value_template\":\"{{ value_json.reset_reason }}\","
+            "\"icon\":\"mdi:information-outline\"", slave, diag);
+        GWD_TAIL();
+        snprintf(objid, sizeof objid, "lighting_gwdiag_%u_reset", slave); pub_cfg("sensor", objid);
+        break;
+    case 3:
+        /* Seed a retained state so the entities populate before the first
+         * gw_diag poll (≤ gw_diag_interval_ms) lands. */
+        snprintf(s_top, sizeof s_top, "%s/gateway/%u/diag", P, slave);
+        pub_str(s_top, "{\"uptime\":0,\"reboots\":0,\"reset_reason\":\"unknown\"}", true);
+        break;
+    }
+    #undef GWD_TAIL
+}
+
+/* one of the 7 controller-config entities (4 numbers + 2 sensors + 1 switch). No
  * values needed for discovery — the config/state topic carries them. */
 static void disc_controller(uint8_t k) {
     const char *P = mqtt_app_prefix();
     char objid[32];
-    if (k == 5) {
+    if (k == 6) {
         /* relay_byteswap switch — reverses Waveshare 32CH coil read-back order. */
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"lighting_cfg_relay_byteswap\",\"name\":\"Relay Byte-Swap\","
@@ -340,11 +395,12 @@ static void disc_controller(uint8_t k) {
         pub_cfg("switch", "lighting_cfg_relay_byteswap");
         return;
     }
-    if (k < 3) {
+    if (k < 4) {
         static const struct { const char *key, *name; int lo, hi, step; } N[] = {
             { "long_press_ms", "Long-Press (ms)", 100, 5000, 50 },
             { "dim_repeat_ms", "Dim Repeat (ms)", 50, 2000, 10 },
             { "reversal_window_ms", "Reversal Window (ms)", 50, 2000, 10 },
+            { "gw_diag_interval_ms", "Gateway Diag Poll (ms)", 0, 600000, 1000 },
         };
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\","
@@ -362,7 +418,7 @@ static void disc_controller(uint8_t k) {
             { "fw_version", "Firmware", "mdi:chip" },
             { "baud", "Modbus Baud", "mdi:speedometer" },
         };
-        int b = k - 3;
+        int b = k - 4;
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\",\"state_topic\":\"%s/config/state\","
             "\"value_template\":\"{{ value_json.%s }}\",\"availability_topic\":\"%s/availability\","
@@ -384,7 +440,7 @@ static void seed_gateway_avail(uint8_t slave) {
 /* ── incremental discovery cursor ────────────────────────────────────────── */
 typedef enum {
     PH_GW_AVAIL, PH_CONTROLLER, PH_PLATE_EVT, PH_PLATE_BIND, PH_RELAY,
-    PH_BALLAST, PH_BALLAST_CFG, PH_GROUP_L, PH_GROUP_M, PH_PROV, PH_DONE
+    PH_BALLAST, PH_BALLAST_CFG, PH_GROUP_L, PH_GROUP_M, PH_PROV, PH_GW_DIAG, PH_DONE
 } disc_phase_t;
 
 static bool         s_disc_active;
@@ -407,7 +463,7 @@ static disc_res_t disc_step(void) {
         return DISC_MORE;
     case PH_CONTROLLER:
         disc_controller((uint8_t)s_i);
-        if (++s_i >= 6) { s_ph = PH_PLATE_EVT; s_i = s_j = 0; }
+        if (++s_i >= 7) { s_ph = PH_PLATE_EVT; s_i = s_j = 0; }
         return DISC_MORE;
     case PH_PLATE_EVT:
         disc_plate_event((uint8_t)s_i, (uint8_t)s_j);
@@ -442,9 +498,14 @@ static disc_res_t disc_step(void) {
         if (++s_j >= DALI_GROUPS) { s_j = 0; s_i++; }
         return DISC_MORE;
     case PH_PROV:
-        if (s_i >= sn->dali_count) { s_ph = PH_DONE; return DISC_MORE; }
+        if (s_i >= sn->dali_count) { s_ph = PH_GW_DIAG; s_i = s_j = 0; return DISC_MORE; }
         disc_prov(sn->dali_slaves[s_i], (uint8_t)s_j);
         if (++s_j >= 10) { s_j = 0; s_i++; }
+        return DISC_MORE;
+    case PH_GW_DIAG:
+        if (s_i >= sn->dali_count) { s_ph = PH_DONE; return DISC_MORE; }
+        disc_gw_diag(sn->dali_slaves[s_i], (uint8_t)s_j);
+        if (++s_j >= 4) { s_j = 0; s_i++; }
         return DISC_MORE;
     case PH_DONE:
     default:
@@ -512,6 +573,20 @@ static const char *const PROV_STATE_STR[] = {
 };
 static const char *prov_state_str(uint8_t s) {
     return s < sizeof PROV_STATE_STR / sizeof PROV_STATE_STR[0] ? PROV_STATE_STR[s] : "unknown";
+}
+
+/* Decode the gateway's RSTCTRL.RSTFR byte (FC04 0x0310 reg3) to a short string.
+ * A cold boot sets several flags at once, so report the most diagnostic one. */
+static const char *reset_reason_str(uint8_t rr) {
+    if (rr & (1u << 3)) return "watchdog";   /* WDRF — flags a wedge/crash */
+    if (rr & (1u << 4)) return "software";    /* SWRF — gw_reboot / MBREG_SYSTEM_RESET */
+    if (rr & (1u << 2)) return "external";    /* EXTRF — reset pin */
+    /* PORF before BORF: a real power-up sets both (BOD trips as the rail rises),
+     * so PORF means a full power cycle; BORF *without* PORF is a true brownout dip. */
+    if (rr & (1u << 0)) return "power-on";    /* PORF */
+    if (rr & (1u << 1)) return "brownout";    /* BORF (dip, no full power loss) */
+    if (rr & (1u << 5)) return "updi";        /* UPDIRF — programmer */
+    return "unknown";
 }
 
 static void json_escape(const char *in, char *out, size_t cap) {
@@ -625,11 +700,20 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         snprintf(top, sizeof top, "%s/config/state", P);
         snprintf(pl, sizeof pl,
             "{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,\"baud\":%lu,"
-            "\"relay_byteswap\":%u,"
+            "\"relay_byteswap\":%u,\"gw_diag_interval_ms\":%lu,"
             "\"fw_version\":\"" FW_VERSION "\",\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u}",
             e->cfg.long_press_ms, e->cfg.dim_repeat_ms, e->cfg.reversal_window_ms,
             (unsigned long)e->cfg.baud, e->cfg.relay_byteswap ? 1u : 0u,
+            (unsigned long)e->cfg.gw_diag_interval_ms,
             MAX_FIX, MAX_BTN, MAX_TARGETS_PER_BTN);
+        mqtt_app_publish(top, pl, strlen(pl), true);
+        break;
+    case IC_EVT_GW_DIAG:
+        snprintf(top, sizeof top, "%s/gateway/%u/diag", P, e->gw_diag.slave);
+        snprintf(pl, sizeof pl,
+            "{\"uptime\":%lu,\"reboots\":%u,\"reset_reason\":\"%s\"}",
+            (unsigned long)e->gw_diag.uptime_s, e->gw_diag.boot_count,
+            reset_reason_str(e->gw_diag.reset_reason));
         mqtt_app_publish(top, pl, strlen(pl), true);
         break;
     case IC_EVT_SCAN_COMPLETE:   /* handled by the sweep cursor, not here */
@@ -856,12 +940,14 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             if ((i = jfind(pay, tk, nt, "dim_repeat_ms")) >= 0)      { c.set_cfg.fields |= IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = (uint16_t)jint(pay, &tk[i]); }
             if ((i = jfind(pay, tk, nt, "reversal_window_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = (uint16_t)jint(pay, &tk[i]); }
             if ((i = jfind(pay, tk, nt, "relay_byteswap")) >= 0)     { c.set_cfg.fields |= IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = jint(pay, &tk[i]) ? 1u : 0u; }
+            if ((i = jfind(pay, tk, nt, "gw_diag_interval_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_GW_DIAG; c.set_cfg.gw_diag_interval_ms = (uint32_t)jint(pay, &tk[i]); }
         } else if (ns >= 3 && !strcmp(seg[2], "set")) {
             uint16_t v = (uint16_t)atoi(pay); const char *f = seg[1];
             if      (!strcmp(f, "long_press_ms"))      { c.set_cfg.fields = IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = v; }
             else if (!strcmp(f, "dim_repeat_ms"))      { c.set_cfg.fields = IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = v; }
             else if (!strcmp(f, "reversal_window_ms")) { c.set_cfg.fields = IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = v; }
             else if (!strcmp(f, "relay_byteswap"))     { c.set_cfg.fields = IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = v ? 1u : 0u; }
+            else if (!strcmp(f, "gw_diag_interval_ms")) { c.set_cfg.fields = IC_CFG_F_GW_DIAG; c.set_cfg.gw_diag_interval_ms = (uint32_t)strtoul(pay, NULL, 10); }
         }
         if (c.set_cfg.fields) ic_push_cmd(&c);
         return;

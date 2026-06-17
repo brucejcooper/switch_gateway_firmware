@@ -8,6 +8,7 @@ export function renderController(state) {
   const lp = numField('Long-press (ms)', cfg.long_press_ms, { min: '0' });
   const dr = numField('Dim repeat (ms)', cfg.dim_repeat_ms, { min: '0' });
   const rw = numField('Reversal window (ms)', cfg.reversal_window_ms, { min: '0' });
+  const gd = numField('Gateway diag poll (ms, 0=off)', cfg.gw_diag_interval_ms, { min: '0' });
   const baud = numField('RS-485 baud', cfg.baud, { min: '0' });
 
   const de = h('select', {},
@@ -22,6 +23,7 @@ export function renderController(state) {
     long_press_ms: num(lp.input.value),
     dim_repeat_ms: num(dr.input.value),
     reversal_window_ms: num(rw.input.value),
+    gw_diag_interval_ms: num(gd.input.value),
     baud: num(baud.input.value),
     de_mode: num(de.value),
     relay_byteswap: byteswap.checked ? 1 : 0,
@@ -29,7 +31,7 @@ export function renderController(state) {
 
   return h('div', { class: 'card' },
     h('h3', {}, 'Controller'),
-    h('div', { class: 'grid2' }, lp.wrap, dr.wrap, rw.wrap, baud.wrap),
+    h('div', { class: 'grid2' }, lp.wrap, dr.wrap, rw.wrap, gd.wrap, baud.wrap),
     h('label', {}, 'DE / driver-enable mode'),
     de,
     h('label', {}, 'Relay coil byte-swap'),

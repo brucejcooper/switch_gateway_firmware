@@ -44,6 +44,7 @@ static struct {
         prov[MAX_DALI_SLAVES];
 
     uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
+    uint32_t gw_diag_interval_ms;
     uint32_t baud;
     uint8_t  de_mode;
     uint8_t  relay_byteswap;
@@ -163,6 +164,7 @@ void web_state_on_event(const ic_event_t *e) {
         S.long_press_ms      = e->cfg.long_press_ms;
         S.dim_repeat_ms      = e->cfg.dim_repeat_ms;
         S.reversal_window_ms = e->cfg.reversal_window_ms;
+        S.gw_diag_interval_ms = e->cfg.gw_diag_interval_ms;
         S.baud               = e->cfg.baud;
         S.de_mode            = e->cfg.de_mode;
         S.relay_byteswap     = e->cfg.relay_byteswap;
@@ -172,6 +174,9 @@ void web_state_on_event(const ic_event_t *e) {
         break;
     case IC_EVT_PING_REQ:
         /* Routed to ping_submit in the drain; never reaches the read model. */
+        break;
+    case IC_EVT_GW_DIAG:
+        /* Gateway sysinfo is published to HA only; the web UI doesn't surface it. */
         break;
     }
     S.seq++;
@@ -259,10 +264,12 @@ static int render_tail(char *out, size_t cap) {
     int n = 0;
     n = jcat(out, cap, n,
         "],\"cfg\":{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,"
-        "\"reversal_window_ms\":%u,\"baud\":%lu,\"de_mode\":%u,\"relay_byteswap\":%u,"
+        "\"reversal_window_ms\":%u,\"gw_diag_interval_ms\":%lu,"
+        "\"baud\":%lu,\"de_mode\":%u,\"relay_byteswap\":%u,"
         "\"fw_version\":\"" FW_VERSION "\","
         "\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u",
         S.long_press_ms, S.dim_repeat_ms, S.reversal_window_ms,
+        (unsigned long)S.gw_diag_interval_ms,
         (unsigned long)S.baud, S.de_mode, S.relay_byteswap,
         MAX_FIXTURES, MAX_BUTTONS, MAX_TARGETS_PER_BTN);
     if (sn) {

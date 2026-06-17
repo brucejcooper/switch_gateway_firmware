@@ -72,6 +72,12 @@ void lighting_emit_scan_complete(uint8_t slave_id, uint64_t present_mask);
  * availability in the bridge. */
 void lighting_emit_gateway_state(uint8_t slave_id, bool online);
 
+/* Emitted by dirty_poll's periodic gateway-sysinfo read (FC04 0x0310): uptime
+ * seconds, reboot count, and the raw RSTCTRL.RSTFR reset-reason byte. Published
+ * as per-gateway diagnostic sensors in HA. */
+void lighting_emit_gw_diag(uint8_t slave_id, uint32_t uptime_s,
+                           uint16_t boot_count, uint8_t reset_reason);
+
 /* Recompute a group's derived (on, bri) from its present members and emit
  * a state_group event if it differs from the last emitted value. Called
  * automatically from lighting_emit_dali_state for every group containing

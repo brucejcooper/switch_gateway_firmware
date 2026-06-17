@@ -50,6 +50,7 @@ typedef enum {
     IC_EVT_PROVISION,
     IC_EVT_CFG,
     IC_EVT_PING_REQ,   /* CLI 'net ping' request: run an ICMP echo on core 1 */
+    IC_EVT_GW_DIAG,    /* periodic DALI-gateway sysinfo: uptime / boot count / reset reason */
 } ic_evt_type_t;
 
 typedef struct {
@@ -76,9 +77,14 @@ typedef struct {
          * so HA's "Commission Status" sensor keeps its detail. */
         struct { uint8_t slave, state, count; char msg[IC_PROV_MSG_MAX]; } provision;
         struct { uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap; } cfg;
+                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap;
+                 uint32_t gw_diag_interval_ms; } cfg;
         /* CLI network-ping request: send `count` ICMP echoes to ip on core 1. */
         struct { uint8_t ip[4]; uint8_t count; } ping_req;
+        /* DALI-gateway sysinfo (FC04 0x0310): seconds of uptime, reboots since
+         * cold power-on, and the latched reset-reason flags (RSTCTRL.RSTFR). */
+        struct { uint8_t slave; uint32_t uptime_s; uint16_t boot_count;
+                 uint8_t reset_reason; } gw_diag;
     };
 } ic_event_t;
 
@@ -105,6 +111,7 @@ typedef struct {
 #define IC_CFG_F_BAUD       (1u << 3)
 #define IC_CFG_F_DE_MODE    (1u << 4)
 #define IC_CFG_F_RELAY_BYTESWAP (1u << 5)
+#define IC_CFG_F_GW_DIAG    (1u << 6)
 
 /* set_netcfg field-present bits */
 #define IC_NET_F_DHCP       (1u << 0)
@@ -158,7 +165,8 @@ typedef struct {
         struct { uint8_t slave, group; uint16_t fields; ic_tri_t on; uint8_t bri;
                  uint64_t members; } set_group;
         struct { uint16_t fields; uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap; } set_cfg;
+                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap;
+                 uint32_t gw_diag_interval_ms; } set_cfg;
         struct { uint8_t fixture, button, count;
                  mapping_target_t targets[MAX_TARGETS_PER_BTN]; } set_mapping;
         struct { uint8_t fixture, button; } del_mapping;

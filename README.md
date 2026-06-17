@@ -252,6 +252,7 @@ is controlled by the ballast hardware.
 | `long_press_ms` | 500 ms | Hold threshold before dimming begins |
 | `dim_repeat_ms` | 200 ms | Interval between DALI Up/Down commands |
 | `reversal_window_ms` | 400 ms | Window after release to trigger direction reversal |
+| `gw_diag_interval_ms` | 30000 ms | How often each DALI gateway's sysinfo (uptime/reboots/reset reason) is polled and published to HA; 0 disables |
 
 ### Button events sent to HA
 
@@ -384,7 +385,7 @@ describe what core 1 publishes/consumes on the wire.
 | dali   | `{slave,addr}` | `on`(true/false/toggle) `bri` `min` `max` `power_on` `sys_fail` `fade_rate` `fade_time` | `state_dali` (+ `config`) |
 | relay  | `{ch}` | `on`(true/false/toggle) | `state_relay` |
 | group  | `{slave,group}` | `on` `bri` · `members`[] (replace) / `add`[] / `remove`[] | `state_group` (incl. members) |
-| cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` `baud`(reboot to apply) `relay_slaves`[] `dali_slaves`[] | `state_cfg` (also read-only `fw_version`, grid dims) |
+| cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` `gw_diag_interval_ms` `baud`(reboot to apply) `relay_slaves`[] `dali_slaves`[] | `state_cfg` (also read-only `fw_version`, grid dims) |
 | mapping| `{fixture,button}` | `targets` (array; empty deletes) | `config_mapping` |
 
 **DALI groups are first-class.** Membership is editable like any other value —
@@ -608,7 +609,8 @@ All topics live under the prefix (default `lighting`).
 | `lighting/mapping/<fixture>/<button>` | board → HA | Yes | binding as JSON targets (legacy form) |
 | `lighting/mapping/<fixture>/<button>/set` | HA → board | No | JSON targets array (legacy, still subscribed) |
 | `lighting/mapping/<fixture>/<button>/delete` | HA → board | No | any payload (legacy, still subscribed) |
-| `lighting/config/state` | board → HA | Yes | `{long_press_ms,dim_repeat_ms,reversal_window_ms,baud,fw_version,max_*}` |
+| `lighting/gateway/<slave>/diag` | board → HA | Yes | `{uptime,reboots,reset_reason}` — per-gateway diagnostics, polled every `gw_diag_interval_ms` |
+| `lighting/config/state` | board → HA | Yes | `{long_press_ms,dim_repeat_ms,reversal_window_ms,gw_diag_interval_ms,baud,fw_version,max_*}` |
 | `lighting/config/set` | HA → board | No | `{"long_press_ms":..,...}` (whole-object) |
 | `lighting/config/<field>/set` | HA → board | No | integer for one config field |
 | `lighting/provision/<slave>/status` | board → HA | Yes | `{"state":"..","msg":"..","devices_found":N}` |
@@ -825,6 +827,7 @@ Switch Gateway Controller
 ├── Long-Press (ms)        (config number)
 ├── Dim Repeat (ms)        (config number)
 ├── Reversal Window (ms)   (config number)
+├── Gateway Diag Poll (ms) (config number — 0 disables)
 ├── Firmware               (diagnostic sensor — fw_version)
 └── Modbus Baud            (diagnostic sensor)
 

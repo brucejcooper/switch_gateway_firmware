@@ -37,6 +37,7 @@ void dirty_poll_emit_gateway_states(void);
 #define DALI_BLOCK3_START     0x00C0u  /* FC03 holding */
 #define DALI_PRESENT_START    0x0100u  /* FC04 input, 4 regs */
 #define DALI_DIRTY_START      0x0104u  /* FC04 input, 4 regs, read-clears */
+#define DALI_SYSINFO_START    0x0310u  /* FC04 input, 4 regs: uptime(2) boot_count reset_reason */
 #define DALI_GROUP_MASK_START 0x0110u  /* FC03 holding, 4 regs/group * 16 groups = 64 regs */
 #define DALI_SCAN_TRIGGER_REG 0x1010u
 #define DALI_MAX_CHUNK        16u

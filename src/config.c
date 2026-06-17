@@ -30,6 +30,7 @@ void config_defaults(void) {
     g_config.long_press_ms       = 500;
     g_config.dim_repeat_ms       = 200;
     g_config.reversal_window_ms  = 400;
+    g_config.gw_diag_interval_ms = 30000;
     g_config.relay_slave_ids[0]  = 1;
     g_config.relay_slave_count   = 1;
     g_config.dali_slave_ids[0]   = 2;
@@ -138,6 +139,7 @@ bool config_load(void) {
             if (get_uint(buf, tk, nt, "long_press_ms", &u))      g_config.long_press_ms      = (uint16_t)u;
             if (get_uint(buf, tk, nt, "dim_repeat_ms", &u))      g_config.dim_repeat_ms      = (uint16_t)u;
             if (get_uint(buf, tk, nt, "reversal_window_ms", &u)) g_config.reversal_window_ms = (uint16_t)u;
+            if (get_uint(buf, tk, nt, "gw_diag_interval_ms", &u)) g_config.gw_diag_interval_ms = u;
             if (get_uint(buf, tk, nt, "baud", &u) && u > 0)      g_config.baud               = u;
             if (get_uint(buf, tk, nt, "de_mode", &u))            g_config.de_mode            = (uint8_t)u;
             if (get_uint(buf, tk, nt, "relay_byteswap", &u))     g_config.relay_byteswap     = u ? true : false;
@@ -178,8 +180,10 @@ bool config_save(void) {
     if (!fp) return false;
     fprintf(fp,
         "{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,"
+        "\"gw_diag_interval_ms\":%lu,"
         "\"baud\":%lu,\"de_mode\":%u,\"relay_byteswap\":%u,\"relay_slaves\":[",
         g_config.long_press_ms, g_config.dim_repeat_ms, g_config.reversal_window_ms,
+        (unsigned long)g_config.gw_diag_interval_ms,
         (unsigned long)g_config.baud, g_config.de_mode, g_config.relay_byteswap ? 1u : 0u);
     for (int i = 0; i < g_config.relay_slave_count; i++)
         fprintf(fp, "%s%u", i ? "," : "", g_config.relay_slave_ids[i]);

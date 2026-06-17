@@ -278,6 +278,16 @@ SRAM guarded by a magic word — it survives warm resets (WDT/`SWRR`/external RE
 and restarts on a true power-on. The master spots a gateway reboot when
 `uptime_s` drops or `boot_count` changes.
 
+**Controller poll + HA sensors (2026-06-17):** `dirty_poll.c` reads this block for
+each DALI gateway every `gw_diag_interval_ms` (cfg key, default 30000, 0=off),
+piggybacked on the existing per-gateway dirty-poll loop (not a separate poller),
+and emits `IC_EVT_GW_DIAG`. `ha_bridge` publishes JSON to
+`<prefix>/gateway/<slave>/diag` and discovers three **diagnostic sensors**
+(Uptime/Reboots/Reset Reason) grouped under the *existing* gateway device
+`lighting_dali_gw_<slave>`. `reset_reason` is decoded to text
+(watchdog/software/external/brownout/power-on/updi) via `reset_reason_str`,
+priority-ordered so a multi-flag cold boot reports the most diagnostic cause.
+
 ### DALI scan reads settings AND level (2026-06-16)
 
 The gateway's `SYNC_READ_FULL` flag was **renamed `SYNC_READ_SETTINGS`** — it only
@@ -390,7 +400,7 @@ emitted `state_*` is the value confirmation.
 | dali   | `{slave,addr}` | `on`(true/false/toggle) `bri` `min` `max` `power_on` `sys_fail` `fade_rate` `fade_time` | `state_dali` |
 | relay  | `{ch}` | `on`(true/false/toggle) | `state_relay` |
 | group  | `{slave,group}` | `on` `bri` · `members`[] (replace) / `add`[] / `remove`[] | `state_group` (incl. `members`) |
-| cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` `baud`(reboot to apply) `relay_slaves`[] `dali_slaves`[] | `state_cfg` |
+| cfg    | – | `long_press_ms` `dim_repeat_ms` `reversal_window_ms` `gw_diag_interval_ms` `baud`(reboot to apply) `relay_slaves`[] `dali_slaves`[] | `state_cfg` |
 | mapping| `{fixture,button}` | `targets`(array) — empty deletes | `config_mapping` |
 
 **DALI groups** are first-class entities: `state_group` reports `on/bri/members`

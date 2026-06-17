@@ -669,9 +669,11 @@ static void cmd_show(char **saveptr) {
 
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
+               "gw_diag_interval_ms=%lu "
                "baud=%lu rs485=%s relay_byteswap=%u relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
+               (unsigned long)g_config.gw_diag_interval_ms,
                (unsigned long)modbus_get_baud(),
                modbus_de_mode_to_str(modbus_get_de_mode()),
                g_config.relay_byteswap ? 1u : 0u);
@@ -944,6 +946,7 @@ static void cmd_cfg(char **saveptr) {
         if      (strcasecmp(key, "long_press_ms") == 0)      g_config.long_press_ms = (uint16_t)atoi(val);
         else if (strcasecmp(key, "dim_repeat_ms") == 0)      g_config.dim_repeat_ms = (uint16_t)atoi(val);
         else if (strcasecmp(key, "reversal_window_ms") == 0) g_config.reversal_window_ms = (uint16_t)atoi(val);
+        else if (strcasecmp(key, "gw_diag_interval_ms") == 0) g_config.gw_diag_interval_ms = (uint32_t)strtoul(val, NULL, 10);
         else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
         else if (strcasecmp(key, "relay_byteswap") == 0)
             g_config.relay_byteswap = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
@@ -1109,6 +1112,7 @@ static void emit_state_cfg(void) {
     ev.cfg.baud               = modbus_get_baud();
     ev.cfg.de_mode            = (uint8_t)modbus_get_de_mode();
     ev.cfg.relay_byteswap     = g_config.relay_byteswap ? 1u : 0u;
+    ev.cfg.gw_diag_interval_ms = g_config.gw_diag_interval_ms;
     intercore_push_event(&ev);
 }
 
@@ -1961,7 +1965,7 @@ static void handle_text_line(const char *original_line) {
 /* lighting_actions.c defines levt_t internally; we replicate the minimal
  * struct here for serialisation.  In a real project these would share a header. */
 typedef enum { LEVT_RELAY, LEVT_DALI, LEVT_PRESENCE, LEVT_FAULT,
-               LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY } levt_type_t;
+               LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY, LEVT_GW_DIAG } levt_type_t;
 typedef struct {
     levt_type_t type;
     union {
@@ -1972,6 +1976,8 @@ typedef struct {
         struct { uint8_t slave_id; uint64_t present_mask; } scan_complete;
         struct { uint8_t slave_id; uint8_t group; uint8_t bri; bool on; } group;
         struct { uint8_t slave_id; bool online; } gateway;
+        struct { uint8_t slave_id; uint32_t uptime_s;
+                 uint16_t boot_count; uint8_t reset_reason; } gw_diag;
     };
 } levt_t;
 
@@ -2037,6 +2043,13 @@ static bool levt_to_ic(const levt_t *e, ic_event_t *ic) {
         ic->type = IC_EVT_GATEWAY;
         ic->gateway.slave  = e->gateway.slave_id;
         ic->gateway.online = e->gateway.online;
+        return true;
+    case LEVT_GW_DIAG:
+        ic->type = IC_EVT_GW_DIAG;
+        ic->gw_diag.slave        = e->gw_diag.slave_id;
+        ic->gw_diag.uptime_s     = e->gw_diag.uptime_s;
+        ic->gw_diag.boot_count   = e->gw_diag.boot_count;
+        ic->gw_diag.reset_reason = e->gw_diag.reset_reason;
         return true;
     }
     return false;
@@ -2116,6 +2129,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (c->set_cfg.fields & IC_CFG_F_REVERSAL)   { g_config.reversal_window_ms = c->set_cfg.reversal_window_ms; any = true; }
         if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
         if (c->set_cfg.fields & IC_CFG_F_RELAY_BYTESWAP) { g_config.relay_byteswap = c->set_cfg.relay_byteswap ? true : false; any = true; }
+        if (c->set_cfg.fields & IC_CFG_F_GW_DIAG)    { g_config.gw_diag_interval_ms = c->set_cfg.gw_diag_interval_ms; any = true; }
         if (any && !config_save()) LOG_ERR("cli", "config_save failed — set_cfg not persisted");
         /* de_mode applies live and self-persists; keep it out of the `any` save. */
         if ((c->set_cfg.fields & IC_CFG_F_DE_MODE) && c->set_cfg.de_mode < MODBUS_DE_MAX)

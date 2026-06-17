@@ -57,6 +57,14 @@ typedef struct { bool reachable; uint8_t fail_count; uint32_t last_poll_ms; bool
 static rpoll_t s_rp[MAX_RELAY_SLAVES];
 static uint8_t s_rp_idx[MAX_RELAY_SLAVES];   /* callback ctx → relay-slave index */
 
+/* Gateway sysinfo (FC04 0x0310: uptime / boot count / reset reason). Polled at
+ * g_config.gw_diag_interval_ms and published to HA as per-gateway diagnostic
+ * sensors. Piggybacks on the per-gateway DALI loop below (no separate poller)
+ * and fires independently of the dirty-poll state machine, like the relay poll. */
+typedef struct { uint32_t last_poll_ms; bool awaiting; } gwdiag_t;
+static gwdiag_t s_gd[MAX_DALI_SLAVES];
+static uint8_t  s_gd_idx[MAX_DALI_SLAVES];   /* callback ctx → dali-slave index */
+
 void dirty_poll_init(void) {
     memset(s_dp, 0, sizeof(s_dp));
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
@@ -72,6 +80,8 @@ void dirty_poll_init(void) {
         s_rp[i].reachable = true;   /* optimistic, same as DALI gateways */
         s_rp_idx[i]       = (uint8_t)i;
     }
+    memset(s_gd, 0, sizeof(s_gd));
+    for (int i = 0; i < MAX_DALI_SLAVES; i++) s_gd_idx[i] = (uint8_t)i;
 }
 
 /* Relay coil-read result → reachability, debounced like gateway_report().
@@ -156,6 +166,29 @@ static void gateway_report(uint8_t slave_id, int idx, bool ok) {
             lighting_emit_gateway_state(slave_id, false);
         }
     }
+}
+
+/* ── Gateway sysinfo (FC04 0x0310) callback ──────────────────────────────── */
+/* Decodes uptime / boot count / reset reason and emits a gw_diag event. A
+ * failed read is ignored here (the dirty sweep owns reachability); a good read
+ * also reinforces reachability via gateway_report(). */
+static void gwdiag_cb(int res, uint8_t *buf, void *ctx) {
+    uint8_t i     = *(uint8_t *)ctx;
+    s_gd[i].awaiting = false;
+    uint8_t slave = g_config.dali_slave_ids[i];
+
+    /* FC04 4-register frame = slave+FC+bytecount+8data+CRC = 13 bytes. */
+    if (res < 13) return;
+
+    uint8_t *p = buf + 3;                       /* big-endian, one word per reg */
+    uint32_t uptime = ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+                      ((uint32_t)p[2] << 8)  |  (uint32_t)p[3];
+    uint16_t boot   = (uint16_t)(((uint16_t)p[4] << 8) | p[5]);
+    uint8_t  reason = p[7];                     /* reg3 low byte = RSTCTRL.RSTFR */
+
+    int idx = state_cache_slave_idx(slave);
+    if (idx >= 0) gateway_report(slave, idx, true);
+    lighting_emit_gw_diag(slave, uptime, boot, reason);
 }
 
 /* ── Dirty bitmask callback ──────────────────────────────────────────────── */
@@ -306,6 +339,17 @@ void dirty_poll_tick(void) {
 
         /* fix #7: do not poll slaves being provisioned */
         if (dali_provision_busy_slave(slave_id)) continue;
+
+        /* Low-frequency gateway sysinfo read (uptime / reboots / reset reason),
+         * gated by the configurable interval (0 = disabled). Fires independently
+         * of the dirty-poll SM — the modbus action queue serialises it. */
+        if (g_config.gw_diag_interval_ms && !s_gd[i].awaiting
+            && now_ms - s_gd[i].last_poll_ms >= g_config.gw_diag_interval_ms) {
+            s_gd[i].last_poll_ms = now_ms;
+            if (modbus_get_input_registers(slave_id, DALI_SYSINFO_START, 4,
+                                           gwdiag_cb, &s_gd_idx[i]))
+                s_gd[i].awaiting = true;
+        }
 
         if (dp->active && dp->state == DPOLL_IDLE) {
             if (now_ms - dp->last_poll_ms >= DIRTY_POLL_INTERVAL_MS) {

@@ -13,6 +13,10 @@ typedef struct {
     uint16_t long_press_ms;        /* default 500 */
     uint16_t dim_repeat_ms;        /* default 200 */
     uint16_t reversal_window_ms;   /* default 400 */
+    /* How often the controller reads each DALI gateway's FC04 0x0310 sysinfo
+     * block (uptime / boot count / reset reason) and publishes it to HA as
+     * diagnostic sensors. Piggybacks on the existing dirty-poll loop. 0 = off. */
+    uint32_t gw_diag_interval_ms;  /* default 30000 */
     uint8_t  relay_slave_ids[MAX_RELAY_SLAVES];
     uint8_t  relay_slave_count;
     uint8_t  dali_slave_ids[MAX_DALI_SLAVES];

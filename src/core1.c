@@ -111,7 +111,7 @@ static void core1_entry(void) {
 
         if (s_heartbeat_ms - last_log_ms >= 5000u) {
             last_log_ms = s_heartbeat_ms;
-            LOG_INFO("core1", "alive: link=%d ready=%d mqtt=%d evt_drops=%lu",
+            LOG_DBG("core1", "alive: link=%d ready=%d mqtt=%d evt_drops=%lu",
                      (int)netif_link_up(), (int)netif_ready(),
                      (int)mqtt_app_connected(),
                      (unsigned long)intercore_event_drops());
