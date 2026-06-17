@@ -1,0 +1,34 @@
+#pragma once
+#include <stdint.h>
+
+/*
+ * cdc_out — non-blocking, core-safe output ring for the USB-CDC console.
+ *
+ * Why this exists: log_emit() (and core-1 net code) used to printf() straight to
+ * the USB-CDC stdout, which BLOCKS the calling core when the host isn't draining
+ * the FIFO fast enough.  Under a `log dbg` firehose that stall tripped the 5 s
+ * watchdog and rebooted the controller (see CLAUDE.md / the Jun-16 reboots).
+ *
+ * Model: producers (either core, ISR or main) format a whole line and hand it to
+ * cdc_out_write(), which copies it into a ring under a brief critical section and
+ * returns immediately — it NEVER blocks on the host.  If the line doesn't fit,
+ * the whole line is dropped and a counter is bumped.  A single consumer
+ * (cdc_out_drain(), called from core-0's serial_poll) pushes ring bytes to the
+ * CDC only as far as tud_cdc_write_available() allows, so the drain never blocks
+ * either, and emits a "<N> log msgs dropped" notice when space frees up.
+ */
+
+/* Initialise the ring's critical section. Call once at the very start of main(),
+ * before the first LOG_* / cdc_out_write() and before core 1 launches. */
+void cdc_out_init(void);
+
+/* Enqueue a complete message (typically one formatted log line). Non-blocking and
+ * safe from either core / ISR context. If the ring lacks room for the whole
+ * buffer it is dropped wholesale and the drop counter is incremented (so lines
+ * are never half-written). */
+void cdc_out_write(const char *buf, int len);
+
+/* Push as many queued bytes to the USB-CDC as the TX FIFO can accept right now,
+ * then return — never blocks. Emits a dropped-count notice first when one is
+ * pending and there is room. Call from core-0's main loop (serial_poll). */
+void cdc_out_drain(void);

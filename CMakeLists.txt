@@ -32,6 +32,7 @@ add_executable(light_switch
     src/dali_provision.c
     src/button_fsm_emit.c
     src/log.c
+    src/cdc_out.c
 )
 
 add_subdirectory(lib/pico-vfs)
@@ -204,6 +205,14 @@ set_source_files_properties(
 # USB CDC for serial protocol (replaces Lua REPL)
 pico_enable_stdio_usb(light_switch 1)
 pico_enable_stdio_uart(light_switch 0)
+
+# Make stdout non-blocking: with the timeout at 0, stdio_usb_out_chars writes
+# only what the CDC TX FIFO can take and returns immediately instead of spinning
+# until the host drains it. This is what stops a full FIFO (e.g. a `log dbg`
+# firehose with a slow/absent reader) from stalling a core past the 5 s watchdog.
+# Log output is additionally buffered + dropped-with-a-count via src/cdc_out.c;
+# this define also covers the CLI's direct printf responses.
+target_compile_definitions(light_switch PRIVATE PICO_STDIO_USB_STDOUT_TIMEOUT_US=0)
 
 # Filesystem — same config as original
 pico_enable_filesystem(light_switch

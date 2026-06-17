@@ -21,6 +21,7 @@
 #include "intercore.h"
 #include "core1.h"
 #include "log.h"
+#include "cdc_out.h"
 #include <stdio.h>
 #include <string.h>
 #include <strings.h>
@@ -2289,4 +2290,9 @@ void serial_poll(void) {
 
     /* Time out a network-ping run if core 1 stops replying. */
     cli_ping_poll();
+
+    /* Push queued log output to the USB-CDC, non-blocking (writes only what the
+     * TX FIFO can take this instant). Producers on either core enqueue lines into
+     * the ring without ever blocking; this is the sole drain. */
+    cdc_out_drain();
 }

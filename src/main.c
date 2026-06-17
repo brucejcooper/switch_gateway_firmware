@@ -29,6 +29,7 @@
 #include "core1.h"
 #include "intercore.h"
 #include "log.h"
+#include "cdc_out.h"
 #include <string.h>
 
 #include <hardware/timer.h>
@@ -76,6 +77,7 @@ void wd_feed(void) {
 }
 
 int main(void) {
+    cdc_out_init();     /* before any LOG_* / core 1 launch: arms the output ring */
     stdio_init_all();
     alarm_pool_init_default();
 
