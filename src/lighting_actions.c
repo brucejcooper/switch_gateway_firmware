@@ -656,6 +656,54 @@ void lighting_cfg_query_tick(void) {
     }
 }
 
+/* ── Config write via raw DTR0-load + SET pair (task 03, Phase B) ────────────
+ * The DTR0-load special command (addr byte 0xA3, data byte = value, sent once)
+ * followed by the field's SET command (short-address command form, sent twice)
+ * stores `value` as that field on the ballast. The two frames are armed
+ * consecutively so they occupy adjacent FIFO slots with nothing between them —
+ * the indivisible unit the design requires (SET stores whatever DTR0 currently
+ * holds, so no other DTR-touching frame may interleave). SET opcodes verified
+ * against IEC 62386-102 / TinyModbus dali.h: MIN 0x2B, MAX 0x2A, POWER ON 0x2D,
+ * SYS FAIL 0x2C, FADE RATE 0x2F, FADE TIME 0x2E. */
+#define DALI_DTR0_LOAD_ADDR  0xA3u   /* special command: load DTR0 with data byte */
+
+bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
+                             dali_cfg_field_t field, uint8_t value) {
+    static const uint8_t SET_OPCODE[DALI_CFG_FIELD_COUNT] = {
+        [DALI_CFG_MIN]       = 0x2Bu,
+        [DALI_CFG_MAX]       = 0x2Au,
+        [DALI_CFG_POWER_ON]  = 0x2Du,
+        [DALI_CFG_SYS_FAIL]  = 0x2Cu,
+        [DALI_CFG_FADE_RATE] = 0x2Fu,
+        [DALI_CFG_FADE_TIME] = 0x2Eu,
+    };
+    if (field >= DALI_CFG_FIELD_COUNT) return false;
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "dali %u.%u cfg write skipped — slave provisioning",
+                slave_id, addr);
+        return false;
+    }
+    /* All-or-nothing: only proceed if BOTH frames fit, so the pair is never
+     * split across a full-queue rejection. */
+    if ((uint8_t)(s_rawq.count + 2) > RAWQ_DEPTH) {
+        LOG_WARN("light", "dali %u.%u cfg write dropped — raw queue full",
+                 slave_id, addr);
+        return false;
+    }
+    uint8_t  addr_byte = (uint8_t)((addr & 0x3Fu) << 1) | 0x01u;
+    uint16_t dtr0_load = ((uint16_t)DALI_DTR0_LOAD_ADDR << 8) | value;
+    uint16_t set_cmd   = ((uint16_t)addr_byte << 8) | SET_OPCODE[field];
+    dali_raw_arm(slave_id, dtr0_load, false);   /* DTR0 = value (once) */
+    dali_raw_arm(slave_id, set_cmd,   true);    /* SET field (twice) */
+    /* Verify + write-through: schedule a raw query-back of this ballast. The
+     * config-query SM runs once the FIFO (incl. our SET) drains, reads the
+     * actual stored value, updates state_cache and re-emits state_dali. */
+    lighting_cfg_query_mark(slave_id, addr);
+    LOG_INFO("light", "dali %u.%u cfg field=%d set=%u (raw DTR0+SET, verify queued)",
+             slave_id, addr, (int)field, value);
+    return true;
+}
+
 /* Synchronously record the on/off intent so a follow-up toggle (e.g. a rapid
  * button press) reads the commanded state immediately, before — and regardless
  * of — the async dirty-poll refresh.  The dirty-poll re-syncs the intent from

@@ -77,6 +77,29 @@ void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask); /* boot swee
 void lighting_cfg_query_tick(void);
 bool lighting_cfg_query_busy(void);   /* pending work or a sequence in flight */
 
+/* Per-ballast config fields writable over raw DALI (task 03, Phase B). */
+typedef enum {
+    DALI_CFG_MIN = 0,
+    DALI_CFG_MAX,
+    DALI_CFG_POWER_ON,
+    DALI_CFG_SYS_FAIL,
+    DALI_CFG_FADE_RATE,
+    DALI_CFG_FADE_TIME,
+    DALI_CFG_FIELD_COUNT,
+} dali_cfg_field_t;
+
+/* Config write via raw DTR0-load + SET pair (task 03, Phase B). Enqueues the two
+ * frames back-to-back on the raw FIFO as an indivisible unit (nothing else can
+ * take the slot between them — the FIFO is strictly ordered and the probe /
+ * config-query SMs both wait while it is non-empty), then schedules a query-back
+ * of the ballast so state_cache + the retained HA config reflect the ACTUAL
+ * stored value (the ballast clamps out-of-range settings). Does NOT touch the
+ * cache itself — the verifying query-back writes it through and re-emits
+ * state_dali. Returns false if the FIFO can't hold both frames (nothing is
+ * enqueued — all-or-nothing) or the slave is provisioning. */
+bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
+                             dali_cfg_field_t field, uint8_t value);
+
 /* DALI: on (goto last active) / off */
 bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on);
 

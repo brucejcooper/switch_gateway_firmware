@@ -1034,6 +1034,18 @@ static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t 
     int idx = state_cache_slave_idx(slave);
     dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
     if (!b) return -1;
+
+    /* Phase B (task 03): when dali_raw_cfg is on, the controller owns the write
+     * as a raw DTR0-load + SET pair, verified by a query-back that write-throughs
+     * the cache. No predictive cache update here — the retained value only changes
+     * on verify. dali_cfg_field's (base,high) maps 1:1 onto the field enum. */
+    if (g_config.dali_raw_cfg) {
+        dali_cfg_field_t f = base == 0x0040u ? (high ? DALI_CFG_MIN       : DALI_CFG_MAX)
+                           : base == 0x0080u ? (high ? DALI_CFG_POWER_ON  : DALI_CFG_SYS_FAIL)
+                           :                    (high ? DALI_CFG_FADE_RATE : DALI_CFG_FADE_TIME);
+        return lighting_dali_cfg_write(slave, addr, f, value) ? 1 : -2;
+    }
+
     uint8_t mn = b->min_level, mx = b->max_level, po = b->power_on_level,
             sf = b->sys_fail_level, fr = b->fade_rate, ft = b->fade_time;
     if      (base == 0x0040u) { if (high) mn = value; else mx = value; }
