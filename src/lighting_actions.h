@@ -30,13 +30,36 @@ bool lighting_set_relay(uint8_t channel, bool on);
  * Returns false for channels beyond byte_count*8. */
 bool lighting_relay_coil_on(const uint8_t *coil_bytes, uint8_t byte_count, uint8_t ch);
 
-/* Issue a raw DALI command via TinyModbus's RAW_CMD (or RAW_CMD_TWICE if
- * `twice` is true). TinyModbus rejects new raw writes only while the
- * previous command is still in flight (raw_cmd_result high byte == 0xFF —
- * PENDING); a terminal IDLE/NAK/OK/ERR is silently overwritten by the new
- * write. The slave returns MB_ERR_DEVICE_BUSY on the PENDING case. Returns the
- * enqueue result. */
+/* Queue a raw DALI command for TinyModbus's RAW_CMD (or RAW_CMD_TWICE if
+ * `twice` is true). The gateway executes ONE raw command at a time and rejects
+ * an overlapping write with MB_ERR_DEVICE_BUSY, so sends go through an
+ * internal FIFO (lighting_raw_tick): one in flight, ~25 ms pacing between
+ * sends, busy/timeout retried with back-off. Returns false only if the FIFO is
+ * full (logged). */
 bool dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice);
+
+/* Drives the RAW_CMD send queue — call every main-loop iteration. */
+void lighting_raw_tick(void);
+
+/* ── Any-on probe ────────────────────────────────────────────────────────────
+ * Ground-truth "is any light in this binding on?" for button toggles. Started
+ * at press time so the answer is usually in hand by release (click) or by the
+ * long-press deadline (dim direction). Sends QUERY LAMP POWER ON to each DALI
+ * target of the binding (group targets query the group address — a native
+ * any-on, since only gear that is on answers). Fully async: rides the modbus
+ * action queue, advanced by lighting_any_on_probe_tick() from the main loop.
+ * Single probe slot: if a probe is already running for a different button the
+ * new press simply gets UNKNOWN (callers fall back). */
+typedef enum {
+    ANY_ON_PROBE_PENDING = -1,   /* still in flight */
+    ANY_ON_PROBE_OFF     = 0,    /* every DALI target NAKed: nothing on */
+    ANY_ON_PROBE_ON      = 1,    /* ≥1 target answered: something is on */
+    ANY_ON_PROBE_UNKNOWN = 2,    /* no probe for this button / failed / timed out */
+} any_on_probe_res_t;
+
+void               lighting_any_on_probe_start(uint8_t fixture, uint8_t button);
+any_on_probe_res_t lighting_any_on_probe_get(uint8_t fixture, uint8_t button);
+void               lighting_any_on_probe_tick(void);
 
 /* DALI: on (goto last active) / off */
 bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on);

@@ -4,7 +4,10 @@
 #include "state_cache.h"
 #include "dirty_poll.h"
 #include "config.h"
+#include "mapping.h"
 #include "log.h"
+#include "pico/time.h"
+#include <string.h>
 
 /* TinyModbus holding register addresses (post-refactor):
  *   0x0000 + addr  per-ballast brightness bank (FC06 low byte = DAPC level,
@@ -129,10 +132,284 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
     }
 }
 
+/* ── RAW_CMD send queue ──────────────────────────────────────────────────────
+ * The gateway has a single raw-command slot: a RAW_CMD write while the
+ * previous raw command is still executing on the DALI bus (~25 ms) is rejected
+ * with DEVICE_BUSY — and callers legitimately fire several raws back-to-back
+ * (a multi-target toggle turning every light on, HA bursts). Without this
+ * queue the 2nd..Nth write would land inside the 1st's execution window and be
+ * silently dropped. So: FIFO the sends, keep exactly one in flight, pace
+ * successive sends by about one DALI frame time, and retry busy/timeout with
+ * back-off instead of dropping. */
+#define RAWQ_DEPTH        16
+#define RAWQ_GAP_MS       25   /* ≈ forward frame (16.7 ms) + bus settling */
+#define RAWQ_RETRY_MS     15
+#define RAWQ_RETRIES_MAX  8
+
+typedef struct { uint8_t slave; uint16_t value; bool twice; } rawq_ent_t;
+
+static struct {
+    rawq_ent_t      q[RAWQ_DEPTH];
+    uint8_t         head, count;
+    uint8_t         retries;
+    bool            in_flight;   /* head's Modbus write awaiting its callback */
+    absolute_time_t next_at;     /* pacing gap / retry back-off */
+} s_rawq;
+
+static void rawq_pop(void) {
+    s_rawq.head    = (uint8_t)((s_rawq.head + 1) % RAWQ_DEPTH);
+    s_rawq.count--;
+    s_rawq.retries = 0;
+    s_rawq.next_at = make_timeout_time_ms(RAWQ_GAP_MS);
+}
+
+static void rawq_write_cb(int res, uint8_t *buf, void *ctx) {
+    (void)ctx;
+    s_rawq.in_flight = false;
+    if (res > 0) {                        /* accepted — gateway is executing it */
+        rawq_pop();
+        return;
+    }
+    uint8_t excep = (res < 0 && buf) ? buf[2] : 0;
+    bool retryable = (res == 0) || excep == 0x06;   /* timeout or DEVICE_BUSY */
+    if (retryable && ++s_rawq.retries <= RAWQ_RETRIES_MAX) {
+        s_rawq.next_at = make_timeout_time_ms(RAWQ_RETRY_MS);
+    } else {
+        const rawq_ent_t *e = &s_rawq.q[s_rawq.head];
+        LOG_ERR("light", "raw cmd 0x%04X slave %u dropped (%s)",
+                e->value, e->slave,
+                res == 0 ? "timeout" : (excep == 0x06 ? "busy" : "error"));
+        rawq_pop();
+    }
+}
+
+/* True while the any-on probe has a query committed to the gateway and hasn't
+ * read its terminal result yet — the raw queue must hold off in that window or
+ * its command would overwrite the result register the probe is polling. */
+static bool probe_query_in_flight(void);
+
+void lighting_raw_tick(void) {
+    if (s_rawq.in_flight || s_rawq.count == 0) return;
+    if (probe_query_in_flight()) return;
+    if (!time_reached(s_rawq.next_at)) return;
+    const rawq_ent_t *e = &s_rawq.q[s_rawq.head];
+    if (modbus_set_holding_register(e->slave,
+                                    e->twice ? 0x1001u : 0x1000u,
+                                    e->value, rawq_write_cb, NULL))
+        s_rawq.in_flight = true;
+    else   /* modbus action queue full — try again shortly */
+        s_rawq.next_at = make_timeout_time_ms(RAWQ_RETRY_MS);
+}
+
 bool dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice) {
-    return modbus_set_holding_register(slave_id,
-                                       twice ? 0x1001u : 0x1000u,
-                                       value, dali_write_cb, NULL);
+    if (s_rawq.count >= RAWQ_DEPTH) {
+        LOG_WARN("light", "raw cmd 0x%04X slave %u dropped — raw queue full",
+                 value, slave_id);
+        return false;
+    }
+    uint8_t tail = (uint8_t)((s_rawq.head + s_rawq.count) % RAWQ_DEPTH);
+    s_rawq.q[tail] = (rawq_ent_t){ .slave = slave_id, .value = value,
+                                   .twice = twice };
+    s_rawq.count++;
+    return true;
+}
+
+/* ── Any-on probe ────────────────────────────────────────────────────────────
+ * QUERY LAMP POWER ON (0x93): gear that is on answers 0xFF, gear that is off
+ * stays silent. Sent to a group address every on-member answers the identical
+ * frame, so a clean answer OR a collision-garbled one both mean "≥1 on" and a
+ * NAK means "none on" — the ballasts themselves are the ground truth, immune
+ * to the group-mask cache going stale across gateway reboots.
+ *
+ * Targets are queried sequentially through the modbus action queue,
+ * short-circuiting on the first "on". Known benign race: another RAW_CMD user
+ * (HA / CLI) firing between our write and our result read can garble the
+ * result; bounded by the deadline, worst case the toggle assumes off, which
+ * the next press self-corrects. */
+
+#define PROBE_RESULT_REG        0x0108u
+#define PROBE_QUERY_OPCODE      0x93u    /* QUERY LAMP POWER ON */
+#define PROBE_POLL_MS           10       /* result-poll pacing (DALI cmd ~25 ms) */
+#define PROBE_WRITE_RETRY_MS    15       /* RAW_CMD busy back-off */
+#define PROBE_WRITE_RETRIES_MAX 5
+#define PROBE_DEADLINE_MS       600      /* whole probe, all targets */
+
+typedef struct { uint8_t slave; uint8_t addr_byte; } probe_tgt_t;
+
+static struct {
+    bool            active;      /* slot owned (running or holding a result) */
+    bool            done;
+    bool            valid;       /* done with a definitive answer */
+    bool            any_on;
+    uint8_t         fixture, button;
+    probe_tgt_t     tgt[MAX_TARGETS_PER_BTN];
+    uint8_t         tgt_count, tgt_ix;
+    uint8_t         write_retries;
+    enum { PST_SEND, PST_AWAIT_WRITE, PST_POLL_DELAY, PST_AWAIT_READ } st;
+    absolute_time_t next_at;     /* pacing for send retries / result polls */
+    absolute_time_t started_at;  /* probe start (button press) — for the log */
+    absolute_time_t deadline;
+    bool            cb_fired;
+    int             cb_res;
+    uint8_t         cb_excep;    /* modbus exception code when cb_res < 0 */
+    uint16_t        cb_word;     /* raw_cmd_result word from the result read */
+} s_probe;
+
+static bool probe_query_in_flight(void) {
+    return s_probe.active && !s_probe.done && s_probe.st != PST_SEND;
+}
+
+static void probe_write_cb(int res, uint8_t *buf, void *ctx) {
+    (void)ctx;
+    s_probe.cb_res   = res;
+    s_probe.cb_excep = (res < 0 && buf) ? buf[2] : 0;
+    s_probe.cb_fired = true;
+}
+
+static void probe_read_cb(int res, uint8_t *buf, void *ctx) {
+    (void)ctx;
+    s_probe.cb_res  = res;
+    /* FC04 1-reg response: slave, fc, bytecount, hi, lo, crc… */
+    if (res >= 5) s_probe.cb_word = (uint16_t)((buf[3] << 8) | buf[4]);
+    s_probe.cb_fired = true;
+}
+
+/* Logged at INFO the moment the outcome is known (i.e. when the gateway's
+ * answer arrives, usually mid-hold) — the toggle log at release then shows
+ * where the decision came from. Elapsed is measured from the button press. */
+static void probe_finish(bool valid, bool any_on, const char *why) {
+    s_probe.done   = true;
+    s_probe.valid  = valid;
+    s_probe.any_on = any_on;
+    LOG_INFO("light", "any-on probe F%u.B%u: %s (%s, %lu ms)",
+             s_probe.fixture, s_probe.button,
+             valid ? (any_on ? "on" : "off") : "unresolved", why,
+             (unsigned long)(absolute_time_diff_us(s_probe.started_at,
+                                                   get_absolute_time()) / 1000));
+}
+
+void lighting_any_on_probe_start(uint8_t fixture, uint8_t button) {
+    const mapping_record_t *rec = mapping_lookup(fixture, button);
+    if (!rec) return;
+    /* Single slot: keep a probe that's still running for a different button;
+     * that button's decision matters more than this one's fallback. */
+    if (s_probe.active && !s_probe.done &&
+        !(s_probe.fixture == fixture && s_probe.button == button))
+        return;
+
+    memset(&s_probe, 0, sizeof s_probe);
+    s_probe.fixture = fixture;
+    s_probe.button  = button;
+    for (int i = 0; i < rec->target_count; i++) {
+        const mapping_target_t *t = &rec->targets[i];
+        if (slave_kind(t->slave) != SLAVE_KIND_DALI) continue;
+        if (dali_provision_busy_slave(t->slave))     continue;
+        probe_tgt_t *p = &s_probe.tgt[s_probe.tgt_count++];
+        p->slave     = t->slave;
+        /* command-form address byte: group 100GGGG1, short address 0AAAAAA1 */
+        p->addr_byte = TARGET_IS_GROUP(*t)
+                           ? (uint8_t)(0x81u | (TARGET_GROUP_NUM(*t) << 1))
+                           : (uint8_t)((TARGET_BALLAST_ADDR(*t) << 1) | 1u);
+    }
+    if (s_probe.tgt_count == 0) return;   /* nothing to ask (relay-only binding) */
+
+    s_probe.active     = true;
+    s_probe.st         = PST_SEND;
+    s_probe.started_at = get_absolute_time();
+    s_probe.next_at    = s_probe.started_at;
+    s_probe.deadline   = make_timeout_time_ms(PROBE_DEADLINE_MS);
+}
+
+any_on_probe_res_t lighting_any_on_probe_get(uint8_t fixture, uint8_t button) {
+    if (!s_probe.active ||
+        s_probe.fixture != fixture || s_probe.button != button)
+        return ANY_ON_PROBE_UNKNOWN;
+    if (!s_probe.done)   return ANY_ON_PROBE_PENDING;
+    if (!s_probe.valid)  return ANY_ON_PROBE_UNKNOWN;
+    return s_probe.any_on ? ANY_ON_PROBE_ON : ANY_ON_PROBE_OFF;
+}
+
+void lighting_any_on_probe_tick(void) {
+    if (!s_probe.active || s_probe.done) return;
+    if (time_reached(s_probe.deadline)) {
+        probe_finish(false, false, "deadline");
+        return;
+    }
+    const probe_tgt_t *t = &s_probe.tgt[s_probe.tgt_ix];
+
+    switch (s_probe.st) {
+    case PST_SEND:
+        if (!time_reached(s_probe.next_at)) return;
+        /* Let queued raw commands drain first — the gateway's single raw slot
+         * and result register can only serve one master at a time. If the
+         * queue never drains, the probe deadline aborts us and the click
+         * falls back to assume-off (warned). No deadlock: the raw queue only
+         * pauses for a probe once the query is committed (not in PST_SEND). */
+        if (s_rawq.count || s_rawq.in_flight) return;
+        s_probe.cb_fired = false;
+        if (modbus_set_holding_register(t->slave, 0x1000u,
+                                        (uint16_t)((t->addr_byte << 8) | PROBE_QUERY_OPCODE),
+                                        probe_write_cb, NULL))
+            s_probe.st = PST_AWAIT_WRITE;
+        else  /* action queue full — retry until the deadline */
+            s_probe.next_at = make_timeout_time_ms(PROBE_WRITE_RETRY_MS);
+        break;
+
+    case PST_AWAIT_WRITE:
+        if (!s_probe.cb_fired) return;
+        if (s_probe.cb_res > 0) {
+            s_probe.st      = PST_POLL_DELAY;
+            s_probe.next_at = make_timeout_time_ms(PROBE_POLL_MS);
+        } else if (s_probe.cb_res < 0 && s_probe.cb_excep == 0x06 &&
+                   ++s_probe.write_retries <= PROBE_WRITE_RETRIES_MAX) {
+            /* gateway busy with a previous raw command — back off and resend */
+            s_probe.st      = PST_SEND;
+            s_probe.next_at = make_timeout_time_ms(PROBE_WRITE_RETRY_MS);
+        } else {
+            probe_finish(false, false, "write failed");
+        }
+        break;
+
+    case PST_POLL_DELAY:
+        if (!time_reached(s_probe.next_at)) return;
+        s_probe.cb_fired = false;
+        if (modbus_get_input_registers(t->slave, PROBE_RESULT_REG, 1,
+                                       probe_read_cb, NULL))
+            s_probe.st = PST_AWAIT_READ;
+        else
+            s_probe.next_at = make_timeout_time_ms(PROBE_POLL_MS);
+        break;
+
+    case PST_AWAIT_READ:
+        if (!s_probe.cb_fired) return;
+        if (s_probe.cb_res < 5) {
+            probe_finish(false, false, "result read failed");
+            return;
+        }
+        switch (s_probe.cb_word >> 8) {
+        case 0xFF:   /* still pending on the gateway */
+            s_probe.st      = PST_POLL_DELAY;
+            s_probe.next_at = make_timeout_time_ms(PROBE_POLL_MS);
+            break;
+        case 0x00:   /* clean answer — something is on */
+        case 0x02:   /* garbled backward frame = collision of answers — ≥1 on */
+            probe_finish(true, true, "answered");
+            break;
+        case 0x01:   /* NAK: nothing at this target is on — next target */
+            if (++s_probe.tgt_ix >= s_probe.tgt_count) {
+                probe_finish(true, false, "all nak");
+            } else {
+                s_probe.write_retries = 0;
+                s_probe.st            = PST_SEND;
+                s_probe.next_at       = get_absolute_time();
+            }
+            break;
+        default:
+            probe_finish(false, false, "unexpected result");
+            break;
+        }
+        break;
+    }
 }
 
 /* Synchronously record the on/off intent so a follow-up toggle (e.g. a rapid

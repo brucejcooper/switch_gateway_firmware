@@ -31,6 +31,8 @@ void emit_button_event(uint8_t fixture, uint8_t button, const char *action) {
                       : strcmp(action, "click") == 0              ? IC_BTN_CLICK
                       : strcmp(action, "long_press") == 0         ? IC_BTN_LONG_PRESS
                       : strcmp(action, "long_press_repeat") == 0  ? IC_BTN_LONG_PRESS_REPEAT
+                      : strcmp(action, "stuck") == 0              ? IC_BTN_STUCK
+                      : strcmp(action, "unstuck") == 0            ? IC_BTN_UNSTUCK
                                                                   : IC_BTN_PRESS;
     /* Log every emitted event so the USB CLI mirrors exactly what reaches HA
      * (the repeat tick is high-frequency, so keep it at debug level). */

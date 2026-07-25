@@ -17,6 +17,8 @@
 #include "intercore.h"
 #include "web_state.h"   /* fan-out: feed the web read model from the event drain */
 #include "ping.h"        /* IC_EVT_PING_REQ is routed here, not published */
+#include "ota.h"         /* IC_EVT_OTA_ACK/OTA_STATUS are routed here, not published */
+#include "fwupdate.h"    /* HA 'update' entity: manifest check + install trigger */
 #include "log.h"
 #include "version.h"     /* FW_VERSION */
 #include "jsmn.h"
@@ -105,7 +107,7 @@ static void disc_plate_event(uint8_t fix, uint8_t btn) {
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_switch_%02u_btn_%u\",\"name\":\"Button %u\","
         "\"state_topic\":\"%s/button/%u/%u\","
-        "\"event_types\":[\"press\",\"release\",\"click\",\"long_press\",\"long_press_repeat\"],"
+        "\"event_types\":[\"press\",\"release\",\"click\",\"long_press\",\"long_press_repeat\",\"stuck\",\"unstuck\"],"
         "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"",
         fix, btn, btn + 1, P, fix, btn, P);
     snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
@@ -131,6 +133,30 @@ static void disc_plate_binding(uint8_t fix, uint8_t btn) {
     pub_cfg("text", objid);
     snprintf(s_top, sizeof s_top, "%s/binding/%u/%u/state", P, fix, btn);
     pub_str(s_top, "", true);
+}
+
+/* Per-fixture "Button Stuck" diagnostic: ON while any button on the plate has
+ * been held past the FSM's stuck threshold (commands suppressed until release).
+ * State topic is retained and re-seeded from the live mask at discovery so a
+ * reconnect doesn't hide an ongoing stuck condition. */
+static uint8_t s_stuck_mask[MAX_FIX];
+
+static void disc_plate_stuck(uint8_t fix) {
+    const char *P = mqtt_app_prefix();
+    char ids[40], name[24], objid[40];
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_switch_%02u_stuck\",\"name\":\"Button Stuck\","
+        "\"state_topic\":\"%s/plate/%u/stuck\","
+        "\"device_class\":\"problem\",\"entity_category\":\"diagnostic\","
+        "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-hold\"",
+        fix, P, fix, P);
+    snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
+    snprintf(name, sizeof name, "Fixture %02u", fix + 1);
+    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", "lighting_controller");
+    snprintf(objid, sizeof objid, "lighting_switch_%02u_stuck", fix);
+    pub_cfg("binary_sensor", objid);
+    snprintf(s_top, sizeof s_top, "%s/plate/%u/stuck", P, fix);
+    pub_str(s_top, s_stuck_mask[fix] ? "ON" : "OFF", true);
 }
 
 static void disc_relay(uint8_t slave, uint8_t ch) {
@@ -439,7 +465,7 @@ static void seed_gateway_avail(uint8_t slave) {
 
 /* ── incremental discovery cursor ────────────────────────────────────────── */
 typedef enum {
-    PH_GW_AVAIL, PH_CONTROLLER, PH_PLATE_EVT, PH_PLATE_BIND, PH_RELAY,
+    PH_GW_AVAIL, PH_CONTROLLER, PH_PLATE_EVT, PH_PLATE_BIND, PH_PLATE_STUCK, PH_RELAY,
     PH_BALLAST, PH_BALLAST_CFG, PH_GROUP_L, PH_GROUP_M, PH_PROV, PH_GW_DIAG, PH_DONE
 } disc_phase_t;
 
@@ -471,7 +497,11 @@ static disc_res_t disc_step(void) {
         return DISC_MORE;
     case PH_PLATE_BIND:
         disc_plate_binding((uint8_t)s_i, (uint8_t)s_j);
-        if (++s_j >= MAX_BTN) { s_j = 0; if (++s_i >= MAX_FIX) { s_ph = PH_RELAY; s_i = 0; } }
+        if (++s_j >= MAX_BTN) { s_j = 0; if (++s_i >= MAX_FIX) { s_ph = PH_PLATE_STUCK; s_i = 0; } }
+        return DISC_MORE;
+    case PH_PLATE_STUCK:
+        disc_plate_stuck((uint8_t)s_i);
+        if (++s_i >= MAX_FIX) { s_ph = PH_RELAY; s_i = 0; }
         return DISC_MORE;
     case PH_RELAY:
         if (sn->relay_count > 0) disc_relay(sn->relay_slaves[0], (uint8_t)s_i);
@@ -525,6 +555,65 @@ static inline bool ic_push_cmd(const ic_cmd_t *c) {
     return ok;
 }
 
+/* Reboot button on the controller device. Published once at discovery-complete
+ * (re-run on every reconnect, like subscribe_all) rather than through the phase
+ * machine — it's a single static entity with no per-slave iteration. */
+static void disc_system_reboot(void) {
+    const char *P = mqtt_app_prefix();
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_reboot\",\"name\":\"Reboot\","
+        "\"command_topic\":\"%s/system/reboot\",\"payload_press\":\"PRESS\","
+        "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
+        "\"device_class\":\"restart\",\"icon\":\"mdi:restart\"",
+        P, P);
+    pcat(n,
+        ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+        "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
+        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
+    pub_cfg("button", "lighting_reboot");
+}
+
+/* Firmware 'update' entity on the controller device — mirrors the brewery
+ * fleet's HA update entity, backed by fwupdate.c's manifest checker. Single
+ * static entity, published once at discovery-complete (like disc_system_
+ * reboot) rather than through the phase machine. HA's mqtt update platform
+ * parses a JSON object on state_topic directly (installed_version/
+ * latest_version/release_url/release_summary — the documented "JSON state
+ * message" form); value_template here is a pass-through, present so the
+ * field names are explicit rather than implicit. */
+static void disc_fw_update(void) {
+    const char *P = mqtt_app_prefix();
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_fw_update\",\"name\":\"Firmware\","
+        "\"state_topic\":\"%s/update/state\",\"command_topic\":\"%s/update/install\","
+        "\"payload_install\":\"INSTALL\",\"device_class\":\"firmware\","
+        "\"entity_category\":\"config\",\"value_template\":\"{{ value_json | tojson }}\"",
+        P, P);
+    pcat(n,
+        ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+        "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
+        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
+    pub_cfg("update", "lighting_fw_update");
+}
+
+/* "Check for Updates" button on the controller device — forces an immediate
+ * manifest re-check (fwupdate_announce) rather than waiting out the periodic
+ * FWCHECK_INTERVAL_S. Mirrors disc_system_reboot; published at discovery-complete. */
+static void disc_fw_check(void) {
+    const char *P = mqtt_app_prefix();
+    int n = snprintf(s_pl, PL_CAP,
+        "{\"unique_id\":\"lighting_fw_check\",\"name\":\"Check for Updates\","
+        "\"command_topic\":\"%s/update/check\",\"payload_press\":\"CHECK\","
+        "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
+        "\"icon\":\"mdi:cloud-refresh\"",
+        P, P);
+    pcat(n,
+        ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+        "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
+        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
+    pub_cfg("button", "lighting_fw_check");
+}
+
 static void subscribe_all(void) {
     const char *P = mqtt_app_prefix();
     static const char *const filt[] = {
@@ -534,6 +623,7 @@ static void subscribe_all(void) {
         "provision/+/start/address", "provision/+/start/target", "provision/+/abort",
         "mapping/+/+/set", "mapping/+/+/delete", "binding/+/+/set",
         "config/set", "config/+/set",
+        "system/reboot", "update/install", "update/check",
     };
     char f[64];
     for (unsigned i = 0; i < sizeof filt / sizeof filt[0]; i++) {
@@ -600,6 +690,50 @@ static void json_escape(const char *in, char *out, size_t cap) {
     out[o] = '\0';
 }
 
+/* Last-published snapshot, so ha_bridge_tick only republishes update/state
+ * when fwupdate's view actually changed (a fresh manifest check landed) —
+ * keeps this off the byte-path without needing a queue. Seeded false so the
+ * very first fw_state_tick() (right after disc_fw_update at discovery-
+ * complete) always publishes once, even before any manifest check lands. */
+static bool s_fw_pub_valid;
+static char s_fw_pub_latest[48];
+static char s_fw_pub_release[128];
+static char s_fw_pub_notes[256];
+
+static void pub_fw_state(void) {
+    const char *P = mqtt_app_prefix();
+    char rel[256], notes[512];
+    json_escape(fwupdate_release_url(), rel, sizeof rel);
+    json_escape(fwupdate_notes(), notes, sizeof notes);
+    snprintf(s_pl, PL_CAP,
+        "{\"installed_version\":\"%s\",\"latest_version\":\"%s\","
+        "\"release_url\":\"%s\",\"release_summary\":\"%s\"}",
+        fwupdate_installed(), fwupdate_latest(), rel, notes);
+    snprintf(s_top, sizeof s_top, "%s/update/state", P);
+    pub_str(s_top, s_pl, true);
+
+    strncpy(s_fw_pub_latest, fwupdate_latest(), sizeof s_fw_pub_latest - 1);
+    s_fw_pub_latest[sizeof s_fw_pub_latest - 1] = '\0';
+    strncpy(s_fw_pub_release, fwupdate_release_url(), sizeof s_fw_pub_release - 1);
+    s_fw_pub_release[sizeof s_fw_pub_release - 1] = '\0';
+    strncpy(s_fw_pub_notes, fwupdate_notes(), sizeof s_fw_pub_notes - 1);
+    s_fw_pub_notes[sizeof s_fw_pub_notes - 1] = '\0';
+    s_fw_pub_valid = true;
+}
+
+/* Called every connected ha_bridge_tick (outside discovery/sweep): cheap
+ * string compares against the last-published snapshot, so a normal tick with
+ * no fresh manifest data costs three strcmp()s and no publish. */
+static void fw_state_tick(void) {
+    if (mqtt_app_tx_free() < PUMP_GATE) return;
+    if (s_fw_pub_valid &&
+        !strcmp(s_fw_pub_latest, fwupdate_latest()) &&
+        !strcmp(s_fw_pub_release, fwupdate_release_url()) &&
+        !strcmp(s_fw_pub_notes, fwupdate_notes()))
+        return;
+    pub_fw_state();
+}
+
 static void members_csv(uint64_t mask, char *out, size_t cap) {
     int n = 0; bool first = true;
     for (int a = 0; a < 64 && n < (int)cap - 4; a++)
@@ -657,11 +791,25 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         }
         break;
     case IC_EVT_BUTTON: {
-        static const char *const act[] = { "press", "release", "click", "long_press", "long_press_repeat" };
+        static const char *const act[] = { "press", "release", "click", "long_press",
+                                           "long_press_repeat", "stuck", "unstuck" };
         snprintf(top, sizeof top, "%s/button/%u/%u", P, e->button.fixture, e->button.button);
         snprintf(pl, sizeof pl, "{\"event_type\":\"%s\"}",
-                 act[e->button.action <= 4 ? e->button.action : 0]);
+                 act[e->button.action <= 6 ? e->button.action : 0]);
         mqtt_app_publish(top, pl, strlen(pl), false);   /* momentary, not retained */
+        /* stuck/unstuck also drive the fixture's retained Button Stuck
+         * diagnostic (ON while any button on the plate is stuck) */
+        if (e->button.action == IC_BTN_STUCK || e->button.action == IC_BTN_UNSTUCK) {
+            uint8_t f = e->button.fixture;
+            if (f < MAX_FIX && e->button.button < 8) {
+                if (e->button.action == IC_BTN_STUCK)
+                    s_stuck_mask[f] |=  (uint8_t)(1u << e->button.button);
+                else
+                    s_stuck_mask[f] &= (uint8_t)~(1u << e->button.button);
+                snprintf(top, sizeof top, "%s/plate/%u/stuck", P, f);
+                pub_str(top, s_stuck_mask[f] ? "ON" : "OFF", true);
+            }
+        }
         break;
     }
     case IC_EVT_MAPPING: {
@@ -721,6 +869,9 @@ void ha_bridge_publish_event(const ic_event_t *e) {
     case IC_EVT_FAULT:           /* mqtt_bridge.py logs faults only — no topic */
         break;
     case IC_EVT_PING_REQ:        /* routed to ping_submit in the drain, never published */
+        break;
+    case IC_EVT_OTA_ACK:         /* routed to ota_on_event in the drain, never published */
+    case IC_EVT_OTA_STATUS:      /* routed to ota_on_event in the drain, never published */
         break;
     }
 }
@@ -834,6 +985,34 @@ static void ha_on_message(const char *topic, uint16_t tlen,
 
     ic_cmd_t c; memset(&c, 0, sizeof c);
 
+    /* Out-of-band reboot. Payload-gated ("PRESS"/"REBOOT") so a stray retained or
+     * empty message can't reset the controller. This is the remote recovery for a
+     * wedged USB stack — core 0 reboots via the watchdog, no USB involved. */
+    if (!strcmp(seg[0], "system") && ns >= 2 && !strcmp(seg[1], "reboot")) {
+        if (!strcmp(pay, "PRESS") || !strcmp(pay, "REBOOT")) {
+            c.type = IC_CMD_REBOOT;
+            ic_push_cmd(&c);
+        }
+        return;
+    }
+
+    /* HA update entity's Install button. Payload-gated ("INSTALL") like the
+     * reboot command above. fwupdate_install() is a no-op until a manifest
+     * has been fetched successfully (fwupdate_latest_url() empty) and
+     * ota_trigger() itself no-ops while an OTA is already RUNNING, so a
+     * stray/duplicate press here is harmless. This never touches intercore —
+     * fwupdate/ota run entirely on core 1. */
+    if (!strcmp(seg[0], "update") && ns >= 2 && !strcmp(seg[1], "install")) {
+        if (!strcmp(pay, "INSTALL")) fwupdate_install();
+        return;
+    }
+    /* "Check for Updates" button — force an immediate manifest re-check.
+     * Payload-gated ("CHECK") like the others; fwupdate_announce() just sets a
+     * flag consumed by the next fwupdate_poll(), so a stray press is harmless. */
+    if (!strcmp(seg[0], "update") && ns >= 2 && !strcmp(seg[1], "check")) {
+        if (!strcmp(pay, "CHECK")) fwupdate_announce();
+        return;
+    }
     if (!strcmp(seg[0], "relay") && ns >= 3 && !strcmp(seg[2], "set")) {
         c.type = IC_CMD_SET_RELAY;
         c.set_relay.ch = (uint8_t)atoi(seg[1]);
@@ -961,6 +1140,7 @@ static void ha_on_connected(void) {
     s_ph = PH_GW_AVAIL;
     s_i = s_j = s_k = 0;
     s_sweep_pending = false;
+    fwupdate_announce();   /* force a manifest check + state publish this connect */
 }
 
 void ha_bridge_init(void) {
@@ -979,6 +1159,7 @@ void ha_bridge_tick(void) {
         ic_event_t ev;
         while (intercore_pop_event(&ev)) {
             if (ev.type == IC_EVT_PING_REQ) { ping_submit(ev.ping_req.ip, ev.ping_req.count); continue; }
+            if (ev.type == IC_EVT_OTA_ACK || ev.type == IC_EVT_OTA_STATUS) { ota_on_event(&ev); continue; }
             web_state_on_event(&ev);
         }
         return;
@@ -993,6 +1174,10 @@ void ha_bridge_tick(void) {
                 s_disc_active = false;
                 LOG_INFO("mqtt", "discovery complete — subscribe + resync");
                 subscribe_all();
+                disc_system_reboot();
+                disc_fw_update();
+                disc_fw_check();
+                pub_fw_state();
                 ic_cmd_t rc; memset(&rc, 0, sizeof rc); rc.type = IC_CMD_RESYNC;
                 ic_push_cmd(&rc);
                 break;
@@ -1004,12 +1189,19 @@ void ha_bridge_tick(void) {
     /* Finish an availability sweep before draining more events. */
     if (s_sweep_pending) { sweep_step(); return; }
 
+    /* Cheap dirty-check against fwupdate's last-known manifest data; only
+     * actually publishes when something changed (or on the very first call,
+     * as a fallback if discovery-complete's seed publish above was skipped
+     * by a stall). Off the hot byte-path — normal MQTT publish cadence. */
+    fw_state_tick();
+
     /* Pump state events to MQTT, TX-flow-controlled and bounded per tick. */
     ic_event_t ev;
     for (int budget = 24; budget > 0; budget--) {
         if (mqtt_app_tx_free() < PUMP_GATE) break;
         if (!intercore_pop_event(&ev)) break;
         if (ev.type == IC_EVT_PING_REQ) { ping_submit(ev.ping_req.ip, ev.ping_req.count); continue; }
+        if (ev.type == IC_EVT_OTA_ACK || ev.type == IC_EVT_OTA_STATUS) { ota_on_event(&ev); continue; }
         web_state_on_event(&ev);   /* keep the web read model in lock-step */
         if (ev.type == IC_EVT_SCAN_COMPLETE) {
             s_sweep_pending = true;

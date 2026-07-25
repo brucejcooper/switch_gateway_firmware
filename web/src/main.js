@@ -4,11 +4,13 @@ import { getState } from './api.js';
 import { renderDashboard } from './tabs/dashboard.js';
 import { renderLights } from './tabs/lights.js';
 import { renderGroups } from './tabs/groups.js';
+import { renderRelays } from './tabs/relays.js';
 import { renderBindings } from './tabs/bindings.js';
 import { renderController } from './tabs/controller.js';
 import { renderNetwork } from './tabs/network.js';
 import { renderMqtt } from './tabs/mqtt.js';
 import { renderProvision } from './tabs/provision.js';
+import { renderFirmware } from './tabs/firmware.js';
 import { renderPassword } from './tabs/password.js';
 
 const POLL_MS = 1500;
@@ -20,11 +22,13 @@ const TABS = [
   { id: 'dashboard', label: 'Dashboard', render: renderDashboard, live: true },
   { id: 'lights', label: 'Lights', render: renderLights, live: true },
   { id: 'groups', label: 'Groups', render: renderGroups, live: true },
+  { id: 'relays', label: 'Relays', render: renderRelays, live: true },
   { id: 'bindings', label: 'Bindings', render: renderBindings, live: false },
   { id: 'controller', label: 'Controller', render: renderController, live: false },
   { id: 'network', label: 'Network', render: renderNetwork, live: false },
   { id: 'mqtt', label: 'MQTT', render: renderMqtt, live: false },
   { id: 'provision', label: 'Provision', render: renderProvision, live: true },
+  { id: 'firmware', label: 'Firmware', render: renderFirmware, live: false },
   { id: 'password', label: 'Password', render: renderPassword, live: false },
 ];
 

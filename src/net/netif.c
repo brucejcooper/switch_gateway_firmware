@@ -50,6 +50,7 @@ static wiz_NetInfo    s_netinfo;
 static uint32_t       s_last_1s_ms   = 0;
 static uint32_t       s_fault_until   = 0;
 static uint8_t        s_fault_count   = 0;
+static volatile bool  s_recovery_req  = false;  /* set by netif_request_recovery() */
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 static void build_mac(uint8_t mac[6]) {
@@ -157,6 +158,17 @@ void netif_tick(void) {
      * it to the web server when it is genuinely idle. */
     s_web_sock0 = false;
 
+    /* Honour an externally-requested full recovery (e.g. wedged web sockets):
+     * drop to NS_RESET for a clean chip re-init. Not via enter_fault() — this is
+     * a deliberate, targeted reset, not a cascading fault, so don't inflate the
+     * fault backoff. */
+    if (s_recovery_req) {
+        s_recovery_req = false;
+        LOG_WARN("net", "recovery requested — full W5100S reset");
+        s_state = NS_RESET;
+        return;
+    }
+
     switch (s_state) {
     case NS_RESET:
         if (!chip_bringup()) { enter_fault(now); break; }
@@ -240,6 +252,8 @@ void netif_tick(void) {
         break;
     }
 }
+
+void netif_request_recovery(void) { s_recovery_req = true; }
 
 bool netif_ready(void)   { return s_state == NS_READY; }
 bool netif_link_up(void) { return link_up(); }

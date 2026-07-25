@@ -19,6 +19,8 @@
 #include "net/web_state.h"
 #include "net/http_server.h"
 #include "net/ping.h"
+#include "net/ota.h"
+#include "net/fwupdate.h"
 #include "log.h"
 
 #include "pico/multicore.h"
@@ -87,6 +89,8 @@ static void core1_entry(void) {
     web_state_init();
     ha_bridge_init();
     http_server_init();
+    ota_init();
+    fwupdate_init();
 
     /* Hydrate the web read model independent of MQTT: ask core 0 to re-emit all
      * cached state now, so the config UI is fully populated even when no broker
@@ -108,6 +112,8 @@ static void core1_entry(void) {
                               * (also routes IC_EVT_PING_REQ to ping_submit) */
         ping_tick();         /* CLI network ping: borrows socket 0 when idle */
         http_server_tick();  /* config web UI (sockets 2-3) */
+        ota_poll();          /* pull-based OTA: borrows socket 0 when running */
+        fwupdate_poll();     /* manifest check: borrows socket 0; never overlaps ota_poll() */
 
         if (s_heartbeat_ms - last_log_ms >= 5000u) {
             last_log_ms = s_heartbeat_ms;

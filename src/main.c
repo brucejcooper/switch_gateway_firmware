@@ -77,6 +77,15 @@ void wd_feed(void) {
 }
 
 int main(void) {
+    /* If the OTA bootloader launched us with its watchdog-armed jump
+     * (bootloader/main.c "HARDENING #2"), prove we're alive: clear the
+     * attempt marker and disable its 8 s watchdog before anything slow
+     * (discovery takes far longer than 8 s). Harmless in the standalone
+     * build — the watchdog isn't enabled yet and scratch[2] is unused.
+     * Our own watchdog is armed at main-loop entry as before. */
+    watchdog_hw->scratch[2] = 0;
+    hw_clear_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_ENABLE_BITS);
+
     cdc_out_init();     /* before any LOG_* / core 1 launch: arms the output ring */
     stdio_init_all();
     alarm_pool_init_default();
@@ -194,6 +203,7 @@ int main(void) {
     memcpy(snap.net_hostname, g_config.net_hostname, sizeof snap.net_hostname);
     memcpy(snap.web_user, g_config.web_user, sizeof snap.web_user);
     memcpy(snap.web_pass, g_config.web_pass, sizeof snap.web_pass);
+    memcpy(snap.fw_url,   g_config.fw_url,   sizeof snap.fw_url);
     intercore_set_snapshot(&snap);
     core1_config_ready();   /* core 1 may now bring up netif + MQTT */
 
@@ -212,6 +222,8 @@ int main(void) {
         modbus_poll();
         wd_feed();
 
+        lighting_raw_tick();
+        lighting_any_on_probe_tick();
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();

@@ -1,4 +1,6 @@
 /build/
+/build_ota/
+/bootloader/build/
 /.cache/
 /.venv/
 Switch wiring.*.bak.xlsx
@@ -8,3 +10,6 @@ Switch wiring.*.bak.xlsx
 /web/dist/
 .~*
 bindings.txt
+
+# OTA signing key — NEVER commit a private key.
+/tools/dev_privkey.bin

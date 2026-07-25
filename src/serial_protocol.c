@@ -20,6 +20,7 @@
 #include "modbus.h"
 #include "intercore.h"
 #include "core1.h"
+#include "ota_stage.h"
 #include "log.h"
 #include "cdc_out.h"
 #include <stdio.h>
@@ -640,7 +641,7 @@ static void cmd_help(void) {
     printf("dali <slave> <addr|gN> [key=val ...]       bare=get; keys: on bri min max\n");
     printf("                                           power_on sys_fail fade_rate fade_time\n");
     printf("                                           group (gN) also: members=0,1  add=2  remove=1\n");
-    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms\n");
+    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms fw_url\n");
     printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
@@ -685,13 +686,14 @@ static void cmd_show(char **saveptr) {
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
                "gw_diag_interval_ms=%lu "
-               "baud=%lu rs485=%s relay_byteswap=%u relay_slaves=",
+               "baud=%lu rs485=%s relay_byteswap=%u fw_url=%s relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
                (unsigned long)g_config.gw_diag_interval_ms,
                (unsigned long)modbus_get_baud(),
                modbus_de_mode_to_str(modbus_get_de_mode()),
-               g_config.relay_byteswap ? 1u : 0u);
+               g_config.relay_byteswap ? 1u : 0u,
+               g_config.fw_url[0] ? g_config.fw_url : "(default)");
         for (int i = 0; i < g_config.relay_slave_count; i++) {
             printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
         }
@@ -969,6 +971,11 @@ static void cmd_cfg(char **saveptr) {
             g_config.relay_slave_count = (uint8_t)parse_csv_u8(val, g_config.relay_slave_ids, MAX_RELAY_SLAVES);
         else if (strcasecmp(key, "dali_slaves") == 0)
             g_config.dali_slave_count  = (uint8_t)parse_csv_u8(val, g_config.dali_slave_ids, MAX_DALI_SLAVES);
+        else if (strcasecmp(key, "fw_url") == 0) {
+            /* empty value clears the override (compiled-in default applies) */
+            strncpy(g_config.fw_url, val, sizeof g_config.fw_url - 1);
+            g_config.fw_url[sizeof g_config.fw_url - 1] = '\0';
+        }
         else { txt_err("bad_field"); return; }
         any = true;
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
@@ -1630,13 +1637,22 @@ static void cmd_map(char **saveptr) {
 }
 
 /* ── reboot ────────────────────────────────────────────────────────────── */
-static void cmd_reboot(void) {
-    LOG_INFO("cli", "reboot");
+/* Shared reboot path: the local `reboot` CLI command and a remote IC_CMD_REBOOT
+ * (MQTT/web) both land here. `src` names the trigger for the log. The short
+ * sleep lets the USB CDC line drain and gives core 1 time to flush its network
+ * ack (HTTP 200 / MQTT) before the watchdog resets the whole chip. Never returns.
+ * This is the out-of-band recovery for a wedged USB stack: it does not touch USB,
+ * so it works even when the CLI/picotool reset are dead. */
+static void controller_reboot(const char *src) {
+    LOG_INFO("cli", "reboot (%s)", src);
     printf("rebooting...\n");
-    /* Give the line a moment to drain the USB CDC buffer */
-    sleep_ms(50);
+    sleep_ms(150);
     watchdog_enable(200, 0);
     while (1) { ; }
+}
+
+static void cmd_reboot(void) {
+    controller_reboot("cli");
 }
 
 /* ── echo ──────────────────────────────────────────────────────────────── */
@@ -2232,6 +2248,43 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         break;
     case IC_CMD_PING_REPLY:
         cli_ping_on_reply(c);      /* print one 'net ping' echo outcome */
+        break;
+    case IC_CMD_REBOOT:
+        controller_reboot("remote");   /* never returns */
+        break;
+    case IC_CMD_OTA_BEGIN:
+        ota_stage_begin();
+        break;
+    case IC_CMD_OTA_DATA: {
+        ic_event_t evt = { 0 };
+        /* Clamp against g_ota_buf's size before the flash write: len is a
+         * uint16_t (<=65535) but the shared buffer is only OTA_BUF_SZ; a corrupt
+         * or future-buggy core-1 len must never make ota_stage_write read past
+         * the buffer into adjacent memory. Over-length is treated as a fault. */
+        if (c->ota_data.len <= OTA_BUF_SZ && ota_stage_write(g_ota_buf, c->ota_data.len)) {
+            evt.type = IC_EVT_OTA_ACK;
+        } else {
+            evt.type = IC_EVT_OTA_STATUS;
+            evt.ota_status.code = OTA_FLASH_FAIL;
+            LOG_ERR("ota", "ota_stage_write failed (len=%u)", c->ota_data.len);
+        }
+        intercore_push_event(&evt);
+        break;
+    }
+    case IC_CMD_OTA_END: {
+        bool ok = ota_stage_finish(c->ota_end.total_len);
+        ic_event_t evt = { .type = IC_EVT_OTA_STATUS };
+        evt.ota_status.code = ok ? OTA_OK : OTA_VERIFY_FAIL;
+        if (!ok) LOG_ERR("ota", "ota_stage_finish failed (total_len=%lu)",
+                          (unsigned long)c->ota_end.total_len);
+        intercore_push_event(&evt);
+        break;
+    }
+    case IC_CMD_OTA_ABORT:
+        ota_stage_abort();
+        break;
+    case IC_CMD_OTA_CONFIRM:
+        ota_stage_confirm();
         break;
     }
 }

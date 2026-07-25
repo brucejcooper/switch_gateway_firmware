@@ -17,6 +17,18 @@ export async function getState() {
   return decodeState(await res.json());
 }
 
+// Firmware/OTA status (GET /api/ota) — installed/latest/available/state/pct.
+export async function getOta() {
+  const res = await fetch('/api/ota', { headers: { Accept: 'application/json' } });
+  if (res.status === 401) {
+    const e = new Error('unauthorized');
+    e.unauthorized = true;
+    throw e;
+  }
+  if (!res.ok) throw new Error('HTTP ' + res.status);
+  return res.json();
+}
+
 // POST a JSON body to `path`. Resolves to the parsed response (or {ok:true}
 // when the body is empty) and rejects on non-2xx / 401.
 export async function post(path, obj) {

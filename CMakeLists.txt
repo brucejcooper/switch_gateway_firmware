@@ -33,14 +33,26 @@ add_executable(light_switch
     src/button_fsm_emit.c
     src/log.c
     src/cdc_out.c
+    src/boot_control.c
+    src/fw_image.c
+    src/ota_stage.c
+    ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
+    ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
 )
 
 add_subdirectory(lib/pico-vfs)
 
 target_include_directories(light_switch PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src
+    ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher   # SHA-512/ed25519 for OTA image verify (fw_image.c)
     ${CMAKE_BINARY_DIR}/generated      # version.h (git-derived FW_VERSION)
 )
+
+# Vendored third-party: don't subject Monocypher to our -Wall -Wextra.
+set_source_files_properties(
+    ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
+    ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
+    PROPERTIES COMPILE_OPTIONS "-w")
 
 # ── FW_VERSION = base + git describe (tag/hash + -dirty), refreshed each build ──
 set(FW_BASE_VERSION "2.0.0")
@@ -178,6 +190,10 @@ target_sources(light_switch PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/net/web_state.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/http_server.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/ping.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/dns_resolve.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/http_client.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/ota.c
+    ${CMAKE_CURRENT_LIST_DIR}/src/net/fwupdate.c
     ${GEN_WEB_ASSETS}                  # generated: gzipped Vite UI (web/)
 )
 
@@ -228,3 +244,162 @@ pico_generate_pio_header(light_switch ${CMAKE_CURRENT_LIST_DIR}/src/buttongrid.p
 pico_add_extra_outputs(light_switch)
 
 target_compile_options(light_switch PRIVATE -Wall -Wextra -Wno-unused-parameter)
+
+# ═══════════════════════════════════════════════════════════════════════════
+# OPT-IN: 'light_switch_ota' — the SAME app, relinked to run relocated at the
+# OTA active-app flash offset (src/partition_map.h: APP_OFF, XIP 0x10010000),
+# for bootloader/main.c to jump to. Off by default; -DOTA_APP_LAYOUT=ON to
+# build it. This block is purely additive (appended after the default
+# 'light_switch' target is fully defined above) and duplicates that target's
+# source list into a second executable rather than touching a single line of
+# it, so the default `make -C build light_switch` is byte-for-byte unaffected
+# whether or not this option is set. See bootloader/app_ota.ld's header
+# comment for the relocation/no-boot2 story, and bootloader/README.md's "OTA
+# artifact vs. this target" section for how a signed OTA image relates to it.
+# ═══════════════════════════════════════════════════════════════════════════
+option(OTA_APP_LAYOUT "Also build 'light_switch_ota': the same app sources linked to run at the OTA active-app flash offset (APP_OFF/APP_SIZE, src/partition_map.h) instead of the standalone default flash origin. Opt-in; never affects the 'light_switch' target." OFF)
+
+if(OTA_APP_LAYOUT)
+    add_executable(light_switch_ota
+        src/main.c
+        src/intercore.c
+        src/core1.c
+        src/modbus.c
+        src/button_actions.c
+        src/button_fsm.c
+        src/state_cache.c
+        src/config.c
+        src/mapping.c
+        src/lighting_actions.c
+        src/dirty_poll.c
+        src/bus_discovery.c
+        src/serial_protocol.c
+        src/serial_protocol_provision.c
+        src/dali_provision.c
+        src/button_fsm_emit.c
+        src/log.c
+        src/cdc_out.c
+        src/boot_control.c
+        src/fw_image.c
+        src/ota_stage.c
+        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
+        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
+    )
+
+    target_include_directories(light_switch_ota PRIVATE
+        ${CMAKE_CURRENT_LIST_DIR}/src
+        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher
+        ${CMAKE_BINARY_DIR}/generated      # version.h — shares gen_version's output with light_switch
+    )
+
+    set_source_files_properties(
+        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
+        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
+        PROPERTIES COMPILE_OPTIONS "-w")
+
+    # Reuse gen_version (already an ALL target above) rather than re-running
+    # the same execute_process()/custom command a second time.
+    add_dependencies(light_switch_ota gen_version)
+
+    # Reuse the already-built Vite web UI blob (${GEN_WEB_ASSETS}, defined
+    # above for light_switch) as a source here too — same generated file,
+    # built once, consumed by both executables.
+    target_sources(light_switch_ota PRIVATE ${GEN_WEB_ASSETS})
+
+    target_link_libraries(light_switch_ota PRIVATE
+        pico_stdlib
+        hardware_pio
+        hardware_uart
+        hardware_gpio
+        hardware_timer
+        hardware_watchdog
+        hardware_flash
+        pico_flash
+        pico_multicore
+        pico_util
+        pico_time
+    )
+
+    target_include_directories(light_switch_ota PRIVATE ${CMAKE_CURRENT_LIST_DIR}/lib/jsmn)
+    target_compile_definitions(light_switch_ota PRIVATE JSMN_STATIC)
+
+    target_sources(light_switch_ota PRIVATE
+        ${IOLIB}/Ethernet/wizchip_conf.c
+        ${IOLIB}/Ethernet/socket.c
+        ${IOLIB}/Ethernet/W5100S/w5100s.c
+        ${IOLIB}/Internet/DHCP/dhcp.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/wizchip_glue.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/mqtt_app.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/ha_bridge.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/web_state.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/http_server.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/ping.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/dns_resolve.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/http_client.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/ota.c
+        ${CMAKE_CURRENT_LIST_DIR}/src/net/fwupdate.c
+    )
+
+    target_sources(light_switch_ota PRIVATE ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES})
+    target_include_directories(light_switch_ota PRIVATE ${MQTT_INCLUDE_PUBLIC_DIRS})
+    target_include_directories(light_switch_ota PRIVATE
+        ${IOLIB}/Ethernet
+        ${IOLIB}/Ethernet/W5100S
+        ${IOLIB}/Internet/DHCP
+        ${CMAKE_CURRENT_LIST_DIR}/src/net
+    )
+    target_compile_definitions(light_switch_ota PRIVATE _WIZCHIP_=W5100S)
+    target_link_libraries(light_switch_ota PRIVATE hardware_spi pico_unique_id)
+
+    set_source_files_properties(
+        ${IOLIB}/Ethernet/wizchip_conf.c
+        ${IOLIB}/Ethernet/socket.c
+        ${IOLIB}/Ethernet/W5100S/w5100s.c
+        ${IOLIB}/Internet/DHCP/dhcp.c
+        PROPERTIES COMPILE_OPTIONS "-w")
+
+    pico_enable_stdio_usb(light_switch_ota 1)
+    pico_enable_stdio_uart(light_switch_ota 0)
+    target_compile_definitions(light_switch_ota PRIVATE PICO_STDIO_USB_STDOUT_TIMEOUT_US=0)
+
+    pico_enable_filesystem(light_switch_ota
+        SIZE 262144
+        AUTO_INIT 0
+        MAX_FAT_VOLUME 1
+        MAX_MOUNTPOINT 2
+    )
+
+    # Distinct OUTPUT_DIR from light_switch's default (CMAKE_CURRENT_BINARY_DIR)
+    # — pico_generate_pio_header() names its custom TARGET based on the
+    # executable, but the generated header PATH defaults to the same shared
+    # build dir for every caller, and CMake rejects two add_custom_command()s
+    # with the same OUTPUT in one directory. Giving this target its own
+    # subdirectory sidesteps that collision; the generated header content is
+    # identical either way (same .pio input).
+    pico_generate_pio_header(light_switch_ota ${CMAKE_CURRENT_LIST_DIR}/src/buttongrid.pio
+        OUTPUT_DIR ${CMAKE_BINARY_DIR}/generated_ota)
+
+    # ── The relocation itself ────────────────────────────────────────────
+    # No boot2: this image is never the first thing the boot ROM runs (the
+    # OTA bootloader is, and it carries its own boot2 at real flash offset
+    # 0) — see bootloader/app_ota.ld's header comment for the full "why".
+    # Point PICO_TARGET_BOOT_STAGE2 at an empty stand-in so pico_standard_link
+    # links a no-op '..._library' instead of the default 'bs2_default_library'
+    # (which would otherwise contribute a real 256-byte .boot2 input section
+    # with nowhere to go, since app_ota.ld defines no .boot2 output section).
+    if(NOT TARGET bs2_none_library)
+        add_library(bs2_none_library INTERFACE)   # deliberately empty: no .boot2 content at all
+    endif()
+    pico_set_boot_stage2(light_switch_ota bs2_none)
+
+    # Constrain this executable's own code+data to APP_OFF..+APP_SIZE
+    # (0x10010000..+0x90000) with the app's vector table at the very start —
+    # see bootloader/app_ota.ld's header comment. KEEP that file's FLASH
+    # LENGTH in sync with APP_SIZE in src/partition_map.h.
+    pico_set_linker_script(light_switch_ota ${CMAKE_CURRENT_LIST_DIR}/bootloader/app_ota.ld)
+
+    pico_add_extra_outputs(light_switch_ota)
+
+    target_compile_options(light_switch_ota PRIVATE -Wall -Wextra -Wno-unused-parameter)
+endif()

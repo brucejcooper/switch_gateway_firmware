@@ -34,6 +34,8 @@ typedef enum {
     IC_BTN_CLICK,             /* completed short tap (down->up before long-press) */
     IC_BTN_LONG_PRESS,        /* held past the long-press threshold */
     IC_BTN_LONG_PRESS_REPEAT, /* repeats while held */
+    IC_BTN_STUCK,             /* held past the stuck threshold — commands suppressed */
+    IC_BTN_UNSTUCK,           /* stuck button finally released */
 } ic_btn_action_t;
 
 /* ── core0 -> core1 : events ─────────────────────────────────────────────── */
@@ -51,7 +53,16 @@ typedef enum {
     IC_EVT_CFG,
     IC_EVT_PING_REQ,   /* CLI 'net ping' request: run an ICMP echo on core 1 */
     IC_EVT_GW_DIAG,    /* periodic DALI-gateway sysinfo: uptime / boot count / reset reason */
+    IC_EVT_OTA_ACK,    /* core0 finished the last IC_CMD_OTA_DATA chunk; core1 may refill g_ota_buf */
+    IC_EVT_OTA_STATUS, /* core0's ota_stage_finish() outcome (see ota_status_t below) */
 } ic_evt_type_t;
+
+/* IC_EVT_OTA_STATUS payload codes. */
+typedef enum {
+    OTA_OK          = 0,
+    OTA_VERIFY_FAIL = 1,
+    OTA_FLASH_FAIL  = 2,
+} ota_status_t;
 
 typedef struct {
     ic_evt_type_t type;
@@ -85,6 +96,9 @@ typedef struct {
          * cold power-on, and the latched reset-reason flags (RSTCTRL.RSTFR). */
         struct { uint8_t slave; uint32_t uptime_s; uint16_t boot_count;
                  uint8_t reset_reason; } gw_diag;
+        /* IC_EVT_OTA_STATUS payload: ota_stage_finish() outcome (ota_status_t). */
+        struct { uint8_t code; } ota_status;
+        /* IC_EVT_OTA_ACK carries no payload — its type alone is the signal. */
     };
 } ic_event_t;
 
@@ -153,6 +167,12 @@ typedef enum {
     IC_CMD_SET_MQTTCFG,   /* MQTT broker settings — reboot to apply */
     IC_CMD_SET_AUTH,      /* web UI Basic-auth credentials */
     IC_CMD_PING_REPLY,    /* one network-ping echo outcome -> CLI (core 1 -> core 0) */
+    IC_CMD_REBOOT,        /* remote reboot request (MQTT/web -> core 0 watchdog reset) */
+    IC_CMD_OTA_BEGIN,     /* start a new OTA staging session -> ota_stage_begin() */
+    IC_CMD_OTA_DATA,      /* g_ota_buf holds `len` fresh bytes -> ota_stage_write(); replies IC_EVT_OTA_ACK */
+    IC_CMD_OTA_END,       /* download complete at `total_len` -> ota_stage_finish(); replies IC_EVT_OTA_STATUS */
+    IC_CMD_OTA_ABORT,     /* discard the in-flight staging session -> ota_stage_abort() */
+    IC_CMD_OTA_CONFIRM,   /* mark the active image good -> ota_stage_confirm() */
 } ic_cmd_type_t;
 
 typedef struct {
@@ -184,6 +204,14 @@ typedef struct {
          * BUSY/ERROR cases only one is sent (seq unused). count echoes the
          * request total so core 0 knows when the run is done. */
         struct { uint8_t ip[4]; uint8_t seq, count, status; uint16_t rtt_ms; } ping_reply;
+        /* IC_CMD_OTA_DATA: g_ota_buf[0..len) is the chunk to stage (len <=
+         * OTA_BUF_SZ, ota_stage.h). core1 must not touch g_ota_buf again
+         * until it sees IC_EVT_OTA_ACK. */
+        struct { uint16_t len; } ota_data;
+        /* IC_CMD_OTA_END: total byte length of the complete staged artifact
+         * (image + fw_trailer), for ota_stage_finish(). */
+        struct { uint32_t total_len; } ota_end;
+        /* IC_CMD_OTA_BEGIN/OTA_ABORT/OTA_CONFIRM carry no payload. */
     };
 } ic_cmd_t;
 
@@ -230,6 +258,9 @@ typedef struct {
     /* Config web UI Basic-auth credentials (core 1 checks these). */
     char     web_user[32];
     char     web_pass[48];
+
+    /* OTA manifest URL override; empty = fwupdate.c's compiled-in default. */
+    char     fw_url[128];
 } ic_snapshot_t;
 
 void intercore_set_snapshot(const ic_snapshot_t *s);

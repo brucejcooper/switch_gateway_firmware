@@ -28,6 +28,88 @@ architecture, MQTT topics, and CLI grammar.
   pico-vfs, ioLibrary_Driver, coreMQTT. A bare Pico 2 / RP2350 UF2 will NOT boot
   this board.
 
+## OTA firmware updates (pull-based, 2026-07)
+
+The controller can pull signed firmware from `ota.8bitcloud.com` over plain HTTP,
+stage it, verify an **ed25519 signature** (Monocypher, `lib/monocypher/`), and let
+a custom **bootloader** commit it with crash-loop **rollback**. Modelled on the
+brewery fleet (`git.8bitcloud.com/bruce/brewery`, `brewery_common`). Full detail:
+**`tools/README.md`** (signing/release) and **`bootloader/README.md`** (boot flow,
+flash map, rollback). Design lives in `src/{partition_map.h,boot_control.*,
+fw_image.*,ota_stage.*}` and `src/net/{dns_resolve,http_client,ota,fwupdate}.*`.
+
+**Status:** implemented + host-tested; the **bootloader flash-copy/jump and the
+first real OTA are NOT yet validated on hardware** — do the on-device bring-up with
+SWD/BOOTSEL recovery ready before trusting it in the field.
+
+### Flash layout (OTA build only — the default build is unaffected)
+
+`partition_map.h`: bootloader 56K @0x0 · boot-control A/B 2×4K · **active 576K
+@0x10010000** · staging 576K · backup 576K · littlefs 256K @0x1C0000 (unchanged, so
+existing config survives the switch). The default `light_switch` target stays a
+standalone image linked at 0x10000000; the OTA image is a **separate opt-in target**
+`light_switch_ota` (`-DOTA_APP_LAYOUT=ON`) linked at 0x10010000 for the bootloader
+to host. **Always OTA the `light_switch_ota` build, never plain `light_switch`.**
+
+### One-time: convert a device to the OTA layout (physical flash, pending HW bring-up)
+
+A device must be running the bootloader + a relocated app before OTA works. First
+time only, over USB/SWD: flash `bootloader/build/bootloader.uf2` (loads at 0x0) and
+the signed relocated app at `APP_OFF`. See `bootloader/README.md`. After that,
+updates are over-the-air.
+
+### Ongoing: release an update (do this whenever you ship a change)
+
+Build the tools once (`tools/README.md`), then per release:
+
+```sh
+# 0. COMMIT first — FW_VERSION embeds `git describe`; a dirty tree yields an
+#    unstable "...-dirty" version. A clean commit gives e.g. 2.0.0+abc1234.
+# 1. Build the RELOCATED app + raw .bin
+cmake -S . -B build_ota -DOTA_APP_LAYOUT=ON && make -C build_ota light_switch_ota
+arm-none-eabi-objcopy -O binary build_ota/light_switch_ota.elf build_ota/light_switch_ota.bin
+# 2. Sign it (dev key is tools/dev_privkey.bin — gitignored; rotate for prod)
+tools/fw_sign build_ota/light_switch_ota.bin tools/dev_privkey.bin build_ota/light_switch_ota.signed.bin
+# 3. Manifest — version MUST equal the NEW image's FW_VERSION (see gotcha below)
+VER=$(sed -n 's/.*FW_VERSION "\(.*\)".*/\1/p' build_ota/generated/version.h)
+tools/fw_manifest.sh "$VER" build_ota/light_switch_ota.signed.bin \
+    http://ota.8bitcloud.com/light_switch.bin "Light Switch $VER" "" "notes" \
+    > build_ota/light_switch.json
+# 4. Publish BOTH at the URLs fwupdate.c polls:
+#      http://ota.8bitcloud.com/light_switch.bin   <- light_switch_ota.signed.bin
+#      http://ota.8bitcloud.com/light_switch.json  <- light_switch.json
+```
+
+**Version gotcha (the #1 footgun):** the device compares the manifest `version`
+against its own `FW_VERSION` by **string inequality** (any difference = "update
+available"). Set the manifest `version` to the *new image's* `FW_VERSION` (step 3
+extracts it) so it (a) differs from what's installed → HA offers the update, and (b)
+after install, `installed == latest` → HA reads "up to date". A hand-picked version
+that never matches leaves a phantom update forever.
+
+### On the device / in Home Assistant
+
+`fwupdate.c` polls `light_switch.json` **hourly** (`FWCHECK_INTERVAL_S`, `fwupdate.h`)
+plus on every MQTT (re)connect. On the **Switch Gateway Controller** HA device:
+- **Firmware** (`update` entity) — installed vs latest + release notes; **Install**
+  pulls → stages → verifies → reboots into the bootloader (which commits + can roll
+  back a crash-looper).
+- **Check for Updates** (button) — forces an immediate manifest re-check.
+
+**Triggering a deploy programmatically** (agent/CI, no HA needed): after publishing
+the files, poke the device directly over its HTTP API (Basic-auth, same as the rest):
+`GET /api/ota` (status: installed/latest/available/state/pct), `POST /api/ota/check`
+(force a re-check), `POST /api/ota/install` (start the pull+flash). Typical flow:
+`POST /api/ota/check` → poll `GET /api/ota` until `latest` updates → `POST
+/api/ota/install` → poll `GET /api/ota`/`GET /api/log` through the reboot. The same
+triggers exist over MQTT (`<prefix>/update/check|install`, payloads `CHECK`/`INSTALL`).
+The web UI's **Firmware** tab wraps these (`web/src/tabs/firmware.js`).
+
+Trust is the ed25519 signature in the image trailer (baked-in `FW_PUBKEY`), verified
+on-device and again by the bootloader — the manifest `sha256` is informational only.
+**Caveats:** the *first* OTA over the factory image has no rollback fallback; rotate
+the dev signing key before production (`tools/README.md`).
+
 ## On-board MQTT bridge (core 1) — W5100S Ethernet (2026-06-09)
 
 The Python `bridge/mqtt_bridge.py` host was retired: its duties now run **on-board

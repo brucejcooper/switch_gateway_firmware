@@ -49,3 +49,10 @@ bool netif_web_sock0_enabled(void);
  * backs off; the caller MUST netif_ping_release_sock0() when done. */
 bool netif_ping_acquire_sock0(void);
 void netif_ping_release_sock0(void);
+
+/* Force a full W5100S recovery (chip reset + re-init + re-DHCP). Used when a
+ * higher layer detects the socket subsystem is wedged in a way it can't clear
+ * itself — e.g. the web server's listen sockets won't re-arm (port refuses while
+ * the link is otherwise up). Honoured at the top of the next netif_tick(); safe
+ * to call from core-1 context (it just sets a flag). */
+void netif_request_recovery(void);

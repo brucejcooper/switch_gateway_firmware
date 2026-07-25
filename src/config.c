@@ -166,6 +166,8 @@ bool config_load(void) {
 
             get_str(buf, tk, nt, "web_user", g_config.web_user, sizeof g_config.web_user);
             get_str(buf, tk, nt, "web_pass", g_config.web_pass, sizeof g_config.web_pass);
+
+            get_str(buf, tk, nt, "fw_url", g_config.fw_url, sizeof g_config.fw_url);
         } else {
             LOG_WARN("config", "config.json parse failed (%d) — using defaults", nt);
         }
@@ -196,7 +198,7 @@ bool config_save(void) {
         "\"net_dhcp\":%u,\"net_ip\":\"%u.%u.%u.%u\",\"net_mask\":\"%u.%u.%u.%u\","
         "\"net_gw\":\"%u.%u.%u.%u\",\"net_dns\":\"%u.%u.%u.%u\","
         "\"net_hostname\":\"%s\","
-        "\"web_user\":\"%s\",\"web_pass\":\"%s\"}\n",
+        "\"web_user\":\"%s\",\"web_pass\":\"%s\",\"fw_url\":\"%s\"}\n",
         g_config.mqtt_host, g_config.mqtt_port, g_config.mqtt_user,
         g_config.mqtt_pass, g_config.mqtt_prefix, g_config.net_dhcp,
         g_config.net_ip[0], g_config.net_ip[1], g_config.net_ip[2], g_config.net_ip[3],
@@ -204,7 +206,7 @@ bool config_save(void) {
         g_config.net_gw[0], g_config.net_gw[1], g_config.net_gw[2], g_config.net_gw[3],
         g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3],
         g_config.net_hostname,
-        g_config.web_user, g_config.web_pass);
+        g_config.web_user, g_config.web_pass, g_config.fw_url);
     fclose(fp);
     return true;
 }

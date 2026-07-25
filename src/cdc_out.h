@@ -32,3 +32,10 @@ void cdc_out_write(const char *buf, int len);
  * then return — never blocks. Emits a dropped-count notice first when one is
  * pending and there is room. Call from core-0's main loop (serial_poll). */
 void cdc_out_drain(void);
+
+/* Copy the most recent log scrollback (oldest→newest) into dst, up to cap bytes,
+ * and return the byte count. This is a SEPARATE retained ring from the delivery
+ * ring above: it is never consumed (new bytes overwrite the oldest), so recent
+ * logs stay readable over the network (GET /api/log) even when USB has no reader
+ * or is wedged. Safe to call from either core. */
+int cdc_out_history(char *dst, int cap);

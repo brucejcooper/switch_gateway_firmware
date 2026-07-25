@@ -23,11 +23,22 @@ queue_t g_btn_raw_queue;
 
 typedef enum { DIM_UP, DIM_DOWN } dim_dir_t;
 
+/* How long a click will wait for the press-time any-on probe before giving up
+ * and assuming the DALI targets are off. The probe starts at press, so by
+ * release it has usually already resolved; this only pads slow/queued cases. */
+#define CLICK_PROBE_GRACE_MS 150
+
+/* A hold longer than this is a physically stuck button, not a person dimming
+ * (a full min→max dim sweep takes a few seconds). The FSM stops issuing dim
+ * commands, warns, and reports the fixture stuck to HA until release. */
+#define BTN_STUCK_MS 30000
+
 typedef enum {
     BTN_STATE_IDLE,
     BTN_STATE_PRESSED,
     BTN_STATE_HOLDING,
     BTN_STATE_RELEASED_AFTER_HOLD,
+    BTN_STATE_STUCK,           /* held past BTN_STUCK_MS — waiting for release */
 } btn_state_t;
 
 typedef struct {
@@ -38,6 +49,8 @@ typedef struct {
     absolute_time_t reversal_window_end;   /* RELEASED_AFTER_HOLD timeout */
     dim_dir_t       last_dir;
     bool            dir_locked;
+    bool            click_pending;         /* click released, waiting on probe */
+    absolute_time_t click_deadline;        /* stop waiting and assume off here */
 } btn_fsm_state_t;
 
 static btn_fsm_state_t s_fsm[MAX_FIXTURES][MAX_BUTTONS];
@@ -47,8 +60,41 @@ void button_fsm_init(void) {
     memset(s_fsm, 0, sizeof(s_fsm));
 }
 
+/* Decide the binding's current "any on?" for a toggle / dim-direction call.
+ * DALI targets use the press-time any-on probe (ground truth straight from the
+ * ballasts, immune to the group-mask cache going stale across gateway
+ * reboots). If the probe never resolved — gateway slow, queue congestion,
+ * probe slot taken — assume the DALI side is OFF so the press turns lights on
+ * (never leaves them stuck), and WARN so the fallback is visible. Relay
+ * targets always use the cache: the controller is the relays' only writer. */
+static bool resolve_any_on(uint8_t fixture, uint8_t button, const char **src) {
+    const mapping_record_t *rec = mapping_lookup(fixture, button);
+    bool relay_on = false, has_dali = false;
+    if (rec) {
+        for (int i = 0; i < rec->target_count; i++) {
+            const mapping_target_t *t = &rec->targets[i];
+            if (slave_kind(t->slave) == SLAVE_KIND_RELAY)
+                relay_on = relay_on ||
+                           state_cache_get_relay_on(TARGET_BALLAST_ADDR(*t));
+            else if (slave_kind(t->slave) == SLAVE_KIND_DALI)
+                has_dali = true;
+        }
+    }
+    if (!has_dali) { *src = "cache"; return relay_on; }
+    switch (lighting_any_on_probe_get(fixture, button)) {
+    case ANY_ON_PROBE_ON:  *src = "probe"; return true;
+    case ANY_ON_PROBE_OFF: *src = "probe"; return relay_on;
+    default:
+        LOG_WARN("btn", "F%u.B%u any-on probe unresolved — assuming DALI off",
+                 fixture, button);
+        *src = "assumed-off";
+        return relay_on;
+    }
+}
+
 static dim_dir_t initial_dir(uint8_t fixture, uint8_t button) {
-    return state_cache_any_on(fixture, button) ? DIM_DOWN : DIM_UP;
+    const char *src;
+    return resolve_any_on(fixture, button, &src) ? DIM_DOWN : DIM_UP;
 }
 
 void button_fsm_inject(uint8_t fixture, uint8_t button, btn_raw_type_t type) {
@@ -60,9 +106,10 @@ void button_fsm_inject(uint8_t fixture, uint8_t button, btn_raw_type_t type) {
 static void do_toggle(uint8_t fixture, uint8_t button) {
     const mapping_record_t *rec = mapping_lookup(fixture, button);
     if (!rec) return;
-    bool any_on = state_cache_any_on(fixture, button);
-    LOG_INFO("btn", "toggle F%u.B%u cached_any_on=%d -> %s",
-             fixture, button, any_on, any_on ? "off" : "on");
+    const char *src;
+    bool any_on = resolve_any_on(fixture, button, &src);
+    LOG_INFO("btn", "toggle F%u.B%u any_on=%d (%s) -> %s",
+             fixture, button, any_on, src, any_on ? "off" : "on");
     for (int i = 0; i < rec->target_count; i++) {
         const mapping_target_t *t = &rec->targets[i];
         if (TARGET_IS_GROUP(*t)) {
@@ -100,11 +147,18 @@ static void process_raw(uint8_t fixture, uint8_t button,
     switch (fsm->state) {
     case BTN_STATE_IDLE:
         if (raw == BTN_RAW_PRESS) {
+            /* a previous click still waiting on its probe? dispatch it before
+             * this press restarts the probe slot underneath it */
+            if (fsm->click_pending) {
+                fsm->click_pending = false;
+                do_toggle(fixture, button);
+            }
             emit_button_event(fixture, button, "press");   /* physical down (logged in emit) */
             fsm->press_time          = event_time;
             fsm->long_press_deadline = delayed_by_ms(event_time,
                                                      g_config.long_press_ms);
             fsm->dir_locked          = false;
+            lighting_any_on_probe_start(fixture, button);
             fsm->state               = BTN_STATE_PRESSED;
         }
         break;
@@ -114,7 +168,14 @@ static void process_raw(uint8_t fixture, uint8_t button,
             /* short tap: down->up before the long-press threshold = a click */
             emit_button_event(fixture, button, "click");
             emit_button_event(fixture, button, "release");
-            do_toggle(fixture, button);
+            if (lighting_any_on_probe_get(fixture, button) == ANY_ON_PROBE_PENDING) {
+                /* answer still in flight — give it a short grace before acting */
+                fsm->click_pending  = true;
+                fsm->click_deadline = delayed_by_ms(event_time,
+                                                    CLICK_PROBE_GRACE_MS);
+            } else {
+                do_toggle(fixture, button);
+            }
             fsm->state = BTN_STATE_IDLE;
         }
         break;
@@ -128,6 +189,18 @@ static void process_raw(uint8_t fixture, uint8_t button,
             fsm->reversal_window_end = delayed_by_ms(event_time,
                                                      g_config.reversal_window_ms);
             fsm->state               = BTN_STATE_RELEASED_AFTER_HOLD;
+        }
+        break;
+
+    case BTN_STATE_STUCK:
+        if (raw == BTN_RAW_RELEASE) {
+            int64_t held_us = absolute_time_diff_us(fsm->press_time, event_time);
+            LOG_INFO("btn", "F%u.B%u stuck button released after %lu ms",
+                     fixture, button, (unsigned long)(held_us / 1000));
+            emit_button_event(fixture, button, "unstuck");
+            emit_button_event(fixture, button, "release");
+            /* no click/toggle — the hold was never a user intent */
+            fsm->state = BTN_STATE_IDLE;
         }
         break;
 
@@ -154,6 +227,7 @@ static void process_raw(uint8_t fixture, uint8_t button,
                 fsm->long_press_deadline = delayed_by_ms(event_time,
                                                          g_config.long_press_ms);
                 fsm->dir_locked          = false;
+                lighting_any_on_probe_start(fixture, button);
                 fsm->state               = BTN_STATE_PRESSED;
             }
         }
@@ -175,6 +249,17 @@ void button_fsm_tick(void) {
         for (int b = 0; b < MAX_BUTTONS; b++) {
             btn_fsm_state_t *fsm = &s_fsm[f][b];
 
+            /* deferred click: act as soon as the probe resolves, or when the
+             * grace window closes (resolve_any_on then assumes off + WARNs) */
+            if (fsm->click_pending) {
+                if (lighting_any_on_probe_get((uint8_t)f, (uint8_t)b)
+                        != ANY_ON_PROBE_PENDING ||
+                    time_reached(fsm->click_deadline)) {
+                    fsm->click_pending = false;
+                    do_toggle((uint8_t)f, (uint8_t)b);
+                }
+            }
+
             switch (fsm->state) {
             case BTN_STATE_PRESSED:
                 if (time_reached(fsm->long_press_deadline)) {
@@ -192,6 +277,16 @@ void button_fsm_tick(void) {
                 break;
 
             case BTN_STATE_HOLDING:
+                if (absolute_time_diff_us(fsm->press_time, get_absolute_time())
+                        >= (int64_t)BTN_STUCK_MS * 1000) {
+                    LOG_WARN("btn",
+                             "F%u.B%u held >%u ms — button stuck, suppressing "
+                             "commands until release", (unsigned)f, (unsigned)b,
+                             (unsigned)BTN_STUCK_MS);
+                    emit_button_event((uint8_t)f, (uint8_t)b, "stuck");
+                    fsm->state = BTN_STATE_STUCK;
+                    break;
+                }
                 if (time_reached(fsm->next_repeat_at)) {
                     emit_button_event(f, b, "long_press_repeat");
                     do_dim_step(f, b, fsm->last_dir);

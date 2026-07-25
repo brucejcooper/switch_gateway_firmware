@@ -19,6 +19,8 @@
 #include "netif.h"
 #include "intercore.h"
 #include "log.h"
+#include "cdc_out.h"       /* cdc_out_history() — GET /api/log */
+#include "fwupdate.h"      /* fwupdate_status_json/announce/install — /api/ota */
 
 #include "socket.h"
 #include "wizchip_conf.h"   /* getSn_SR / getSn_RX_RSR / getSn_TX_FSR / Sn_* */
@@ -94,7 +96,25 @@ static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 static uint32_t s_arm_fails = 0;
 uint32_t http_server_arm_fail_count(void) { return s_arm_fails; }
 
+/* Self-heal watchdog: if NEITHER base socket reaches LISTEN/ESTABLISHED for this
+ * long while netif is otherwise up, the W5100S socket layer is wedged (arm_listen
+ * keeps failing, so port 80 refuses) and only a full chip reset clears it — ask
+ * netif to recover. s_last_listen_ms tracks the last tick a base socket was
+ * healthy; it's also reset whenever netif isn't ready so the window only counts
+ * contiguous wedged-while-up time. */
+#define WEB_WEDGE_TIMEOUT_MS 30000u
+static uint32_t s_last_listen_ms = 0;
+
+/* GET /api/log snapshot. cdc_out_history() must be linearised into a stable buffer
+ * because RESP_MEM streams the body pointer across many ticks while the live ring
+ * keeps moving. One shared buffer → one /api/log stream at a time; a second
+ * concurrent request gets 503 until the first connection is re-armed. */
+#define LOG_SNAP_CAP 8192
+static char    s_logbuf[LOG_SNAP_CAP];
+static conn_t *s_logbuf_owner = NULL;
+
 static void arm_listen(conn_t *c) {
+    if (s_logbuf_owner == c) s_logbuf_owner = NULL;   /* release the log snapshot */
     close(c->sn);
     int8_t s = socket(c->sn, Sn_MR_TCP, HTTP_PORT, SF_IO_NONBLOCK);
     int8_t l = (s == c->sn) ? listen(c->sn) : (int8_t)-1;
@@ -112,6 +132,7 @@ void http_server_init(void) {
     for (size_t i = 0; i < N_SOCK; i++) s_conn[i].sn = k_socks[i];
     /* Arm the always-ours sockets now; socket 0 is armed on demand by the tick. */
     for (size_t i = 0; i < N_BASE; i++) arm_listen(&s_conn[i]);
+    s_last_listen_ms = now_ms();
     LOG_INFO("http", "config web server on :%d (sockets 2-3 +0 when DHCP idle)", HTTP_PORT);
 }
 
@@ -193,6 +214,51 @@ static void resp_mem(conn_t *c, const char *status, const char *extra_hdr,
 /* Small fixed text/JSON reply (body is a string literal in flash). */
 static void resp_text(conn_t *c, const char *status, const char *mime, const char *body) {
     resp_mem(c, status, NULL, mime, (const uint8_t *)body, (uint32_t)strlen(body), false);
+}
+
+/* Dump the retained log scrollback (GET /api/log). Network path to the logs that
+ * otherwise live only on USB-CDC — works even when USB has no reader or is wedged.
+ * Snapshots under cdc_out's lock into s_logbuf, then streams it like any RESP_MEM
+ * body. Auth is already enforced by route() before we get here. */
+static void resp_log(conn_t *c) {
+    if (s_logbuf_owner && s_logbuf_owner != c) {
+        resp_text(c, "503 Service Unavailable", "text/plain", "log busy, retry\n");
+        return;
+    }
+    int n = cdc_out_history(s_logbuf, sizeof s_logbuf);
+    s_logbuf_owner = c;
+    resp_mem(c, "200 OK", "Cache-Control: no-store\r\n", "text/plain; charset=utf-8",
+             (const uint8_t *)s_logbuf, (uint32_t)n, false);
+}
+
+/* Small dynamic JSON reply. Unlike resp_text (whose body must be a stable
+ * pointer valid across the multi-tick send), this copies the body INTO the
+ * connection's own buf right after the header, so mem points at per-connection
+ * storage — safe with concurrent connections, no shared buffer/owner guard. */
+static void resp_json(conn_t *c, const char *status, const char *body, int blen) {
+    int hlen = snprintf(c->buf, sizeof c->buf,
+        "HTTP/1.1 %s\r\n"
+        "Content-Type: application/json\r\n"
+        "Content-Length: %d\r\n"
+        "Cache-Control: no-store\r\n"
+        "Connection: close\r\n\r\n",
+        status, blen);
+    if (hlen < 0) hlen = 0;
+    if (hlen > (int)sizeof c->buf) hlen = (int)sizeof c->buf;
+    if (blen > (int)sizeof c->buf - hlen) blen = (int)sizeof c->buf - hlen;
+    memcpy(c->buf + hlen, body, (size_t)blen);
+    c->out_len = (uint16_t)hlen; c->out_sent = 0;
+    c->resp = RESP_MEM; c->phase = PH_HDR;
+    c->mem = (const uint8_t *)(c->buf + hlen); c->mem_len = (uint32_t)blen; c->mem_sent = 0;
+    c->st = CONN_SEND; c->t_ms = now_ms();
+}
+
+/* GET /api/ota — firmware/update status for the web Firmware tab and for
+ * scripted/agent polling. Auth is already enforced by route(). */
+static void resp_ota(conn_t *c) {
+    char body[900];
+    int n = fwupdate_status_json(body, sizeof body);
+    resp_json(c, "200 OK", body, n);
 }
 
 static void resp_401(conn_t *c) {
@@ -314,6 +380,19 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
     }
     ic_cmd_t cmd; memset(&cmd, 0, sizeof cmd);
 
+    if (strcmp(path, "/api/reboot") == 0) {
+        /* Out-of-band reboot: core 0 answers this via the watchdog, without
+         * touching USB — the recovery path when the USB CLI/picotool are wedged.
+         * The 200 goes out before core 0 acts; the socket then drops on reset. */
+        cmd.type = IC_CMD_REBOOT;
+        push_cmd_resp(c, &cmd); return;
+    }
+    /* OTA triggers. fwupdate lives on core 1 (same core as this server), so these
+     * call it directly — no intercore. check = force a manifest re-check;
+     * install = start the pull+flash of the last-known manifest (no-op until a
+     * manifest has been fetched, and while an OTA is already running). */
+    if (strcmp(path, "/api/ota/check") == 0)   { fwupdate_announce(); resp_ok(c); return; }
+    if (strcmp(path, "/api/ota/install") == 0) { fwupdate_install();  resp_ok(c); return; }
     if (strcmp(path, "/api/relay") == 0) {
         cmd.type = IC_CMD_SET_RELAY;
         cmd.set_relay.ch = (uint8_t)jint_key(body, tk, nt, "ch", 0);
@@ -461,6 +540,8 @@ static void route(conn_t *c) {
     bool is_post = strcmp(method, "POST") == 0;
 
     if (is_get && strcmp(path, "/api/state") == 0) { resp_state(c); return; }
+    if (is_get && strcmp(path, "/api/log") == 0)   { resp_log(c);   return; }
+    if (is_get && strcmp(path, "/api/ota") == 0)   { resp_ota(c);   return; }
 
     if (is_post && strncmp(path, "/api/", 5) == 0) {
         int blen = c->content_len;
@@ -625,4 +706,25 @@ void http_server_tick(void) {
 
     for (size_t i = 0; i < N_BASE; i++) pump(&s_conn[i]);
     if (s_sock0_active) pump(&s_conn[N_BASE]);
+
+    /* Self-heal: detect a wedged web-socket layer and ask netif for a chip reset.
+     * Only count time while netif is ready (don't fight its own bring-up/recovery),
+     * and treat any base socket in LISTEN or ESTABLISHED as healthy. No LOG here —
+     * hot path; netif logs the recovery. */
+    uint32_t now = now_ms();
+    if (!netif_ready()) {
+        s_last_listen_ms = now;
+    } else {
+        bool healthy = false;
+        for (size_t i = 0; i < N_BASE; i++) {
+            uint8_t sr = getSn_SR(s_conn[i].sn);
+            if (sr == SOCK_LISTEN || sr == SOCK_ESTABLISHED) { healthy = true; break; }
+        }
+        if (healthy) {
+            s_last_listen_ms = now;
+        } else if (now - s_last_listen_ms > WEB_WEDGE_TIMEOUT_MS) {
+            netif_request_recovery();
+            s_last_listen_ms = now;   /* give the reset time before re-checking */
+        }
+    }
 }

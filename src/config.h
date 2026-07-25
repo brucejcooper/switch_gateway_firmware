@@ -53,6 +53,12 @@ typedef struct {
      * admin/admin. Plain HTTP (no TLS on the W5100S) — LAN-only fallback. */
     char     web_user[32];         /* default "admin" */
     char     web_pass[48];         /* default "admin" */
+
+    /* OTA manifest URL override. Empty = the compiled-in default
+     * (FWUPDATE_MANIFEST_URL, fwupdate.c). Settable via CLI `cfg fw_url=…`
+     * — lets a bench device poll a local HTTP server instead of the
+     * production host, and production point at a staging server. */
+    char     fw_url[128];
 } global_config_t;
 
 extern global_config_t g_config;

@@ -178,6 +178,10 @@ void web_state_on_event(const ic_event_t *e) {
     case IC_EVT_GW_DIAG:
         /* Gateway sysinfo is published to HA only; the web UI doesn't surface it. */
         break;
+    case IC_EVT_OTA_ACK:
+    case IC_EVT_OTA_STATUS:
+        /* Routed to ota_on_event in the drain; never reaches the read model. */
+        break;
     }
     S.seq++;
 }
