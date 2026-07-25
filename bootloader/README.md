@@ -353,10 +353,36 @@ on-device, in this order:**
    "hang" with no USB and no network. The jump now hands the app
    reset-faithful state (VTOR → app table, MSP → app stack, **PRIMASK
    clear**, then branch).
-3. **The flash-copy paths** (`try_commit_staging()` / backup / restore) remain
-   the one thing never exercised on hardware — first real OTA will cover the
-   staging→active + active→backup copies; a deliberate crash-loop test covers
-   backup→active restore.
+3. ~~The flash-copy paths~~ **ALL VALIDATED on hardware 2026-07-25** on the
+   bench device, via a full OTA cycle and a deliberate crash-loop:
+   - staging→active commit + active→BACKUP copy: exercised by a real OTA
+     (`2.0.0+a9a853a` → `2.0.0+2a2f7c9`, manifest served by the dev HA at
+     `/local/`, install triggered over the dev broker's `update/install`).
+     The backup copy also proves the app-side `ota_mark_valid()` confirm
+     one-shot ran (only a CONFIRMED outgoing image gets backed up).
+   - BACKUP→active restore: a signed crash-loop image (blinks ~3 s, then
+     `watchdog_reboot`, never confirms) was installed the same way; the
+     bootloader exhausted `MAX_BOOT_ATTEMPTS` (3) and restored the previous
+     image, which booted, reconnected, and re-polled the manifest.
+
+## Re-running the bench OTA test
+
+1. Dev stack up (`mapper/dev/docker-compose.yml`): mosquitto :1883, HA :8123.
+   HA serves `ha-config/www/` at `http://<host>:8123/local/` (no auth) — no
+   dedicated file server needed.
+2. Device: `cfg fw_url=http://<host>:8123/local/light_switch.json` (CLI,
+   persisted; reboot to apply — core 1 reads it from the launch snapshot).
+3. Release per `../tools/README.md` (commit first — version must be clean),
+   stage `light_switch_ota.signed.bin` as `www/light_switch.bin` +
+   `fw_manifest.sh` output as `www/light_switch.json`.
+4. Trigger: `mosquitto_pub -t 'lighting/update/check' -m CHECK` then
+   `… 'lighting/update/install' -m INSTALL` (or the HA update entity's
+   button). Success = retained `lighting/update/state` shows the new
+   `installed_version`.
+5. Rollback drill: sign a crash-loop image (`sleep ~3 s; watchdog_reboot`,
+   no confirm), serve it as the update, install, and wait for
+   `installed_version` to return to the pre-update version. RESTORE THE REAL
+   MANIFEST AFTERWARD — never leave a crash manifest being served.
 
 ## Hardware bring-up findings (bench, 2026-07-25)
 
