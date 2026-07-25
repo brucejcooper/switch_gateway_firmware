@@ -7,6 +7,7 @@
 [submodule "lib/ioLibrary_Driver"]
 	path = lib/ioLibrary_Driver
 	url = https://github.com/Wiznet/ioLibrary_Driver.git
+	ignore = dirty
 [submodule "lib/coreMQTT"]
 	path = lib/coreMQTT
 	url = https://github.com/FreeRTOS/coreMQTT.git
