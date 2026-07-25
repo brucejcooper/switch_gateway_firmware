@@ -38,9 +38,20 @@ brewery fleet (`git.8bitcloud.com/bruce/brewery`, `brewery_common`). Full detail
 flash map, rollback). Design lives in `src/{partition_map.h,boot_control.*,
 fw_image.*,ota_stage.*}` and `src/net/{dns_resolve,http_client,ota,fwupdate}.*`.
 
-**Status:** implemented + host-tested; the **bootloader flash-copy/jump and the
-first real OTA are NOT yet validated on hardware** — do the on-device bring-up with
-SWD/BOOTSEL recovery ready before trusting it in the field.
+**Status (2026-07-25):** the **bootloader→relocated-app boot chain is validated
+on the bench device** (after fixing a PRIMASK-masked-interrupts bug in the
+handoff and adding two hardenings: vector-table sanity check + watchdog-armed
+factory jump, every dead-end lands in BOOTSEL — see
+`bootloader/README.md` "Hardware bring-up findings"). The flash-copy commit and
+rollback paths are exercised by the bench OTA cycle. Flashing procedure gotcha:
+**park the device in BOOTSEL first** (`picotool reboot -f -u`), load both
+images, then one reboot — `picotool load -f` alone auto-reboots into a
+half-converted flash.
+
+**`cfg fw_url=<manifest-url>`** (CLI, persisted) overrides the compiled-in
+manifest URL — a bench device polls a local server (e.g.
+`http://<mac-ip>:8000/light_switch.json`) instead of `ota.8bitcloud.com`;
+empty value reverts to the default.
 
 ### Flash layout (OTA build only — the default build is unaffected)
 
