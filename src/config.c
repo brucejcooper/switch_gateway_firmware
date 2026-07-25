@@ -39,6 +39,7 @@ void config_defaults(void) {
     g_config.baud                = 19200;
     g_config.de_mode             = 0;
     g_config.relay_byteswap      = false;
+    g_config.dali_raw_cfg        = false;
     g_config.mqtt_port           = 1883;
     strncpy(g_config.mqtt_prefix, "lighting", sizeof g_config.mqtt_prefix - 1);
     g_config.net_dhcp            = 1;
@@ -143,6 +144,7 @@ bool config_load(void) {
             if (get_uint(buf, tk, nt, "baud", &u) && u > 0)      g_config.baud               = u;
             if (get_uint(buf, tk, nt, "de_mode", &u))            g_config.de_mode            = (uint8_t)u;
             if (get_uint(buf, tk, nt, "relay_byteswap", &u))     g_config.relay_byteswap     = u ? true : false;
+            if (get_uint(buf, tk, nt, "dali_raw_cfg", &u))       g_config.dali_raw_cfg       = u ? true : false;
 
             uint8_t rs[MAX_RELAY_SLAVES];
             uint8_t rc = get_u8_array(buf, tk, nt, "relay_slaves", rs, MAX_RELAY_SLAVES);
@@ -183,10 +185,12 @@ bool config_save(void) {
     fprintf(fp,
         "{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,"
         "\"gw_diag_interval_ms\":%lu,"
-        "\"baud\":%lu,\"de_mode\":%u,\"relay_byteswap\":%u,\"relay_slaves\":[",
+        "\"baud\":%lu,\"de_mode\":%u,\"relay_byteswap\":%u,\"dali_raw_cfg\":%u,"
+        "\"relay_slaves\":[",
         g_config.long_press_ms, g_config.dim_repeat_ms, g_config.reversal_window_ms,
         (unsigned long)g_config.gw_diag_interval_ms,
-        (unsigned long)g_config.baud, g_config.de_mode, g_config.relay_byteswap ? 1u : 0u);
+        (unsigned long)g_config.baud, g_config.de_mode, g_config.relay_byteswap ? 1u : 0u,
+        g_config.dali_raw_cfg ? 1u : 0u);
     for (int i = 0; i < g_config.relay_slave_count; i++)
         fprintf(fp, "%s%u", i ? "," : "", g_config.relay_slave_ids[i]);
     fprintf(fp, "],\"dali_slaves\":[");

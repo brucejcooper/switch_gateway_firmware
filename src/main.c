@@ -224,6 +224,7 @@ int main(void) {
 
         lighting_raw_tick();
         lighting_any_on_probe_tick();
+        lighting_cfg_query_tick();
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();

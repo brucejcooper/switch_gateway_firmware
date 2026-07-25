@@ -27,6 +27,11 @@ void dirty_poll_emit_gateway_states(void);
 #define DIRTY_ACTIVE_WINDOW_MS   2000u   /* stay active this long after the last command/change */
 #define DIRTY_SWEEP_MS           1000u   /* regular cheap dirty-mask sweep while idle */
 #define BACKGROUND_CHECK_MS      60000u  /* heavy presence/group/fault scan */
+/* Steady-state config-over-raw rotation (task 03, only when g_config.dali_raw_cfg):
+ * mark one present ballast per gateway for a background raw config re-read this
+ * often. ~14 s × 64 ballasts ≈ 15 min for full coverage — enough to catch an
+ * external recommissioning without loading the bus. */
+#define DALI_CFG_ROTATE_MS       14000u
 
 /* TinyModbus register addresses (post task-1-flag-driven refactor).
  * Per-ballast banks (BLOCK0..BLOCK3) are FC03 holding registers; the

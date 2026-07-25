@@ -187,10 +187,13 @@ static void rawq_write_cb(int res, uint8_t *buf, void *ctx) {
  * read its terminal result yet — the raw queue must hold off in that window or
  * its command would overwrite the result register the probe is polling. */
 static bool probe_query_in_flight(void);
+/* Same, for the lowest-priority config-over-raw query SM (task 03): the FIFO
+ * holds off while a config query's result is outstanding. */
+static bool cfgq_query_in_flight(void);
 
 void lighting_raw_tick(void) {
     if (s_rawq.in_flight || s_rawq.count == 0) return;
-    if (probe_query_in_flight()) return;
+    if (probe_query_in_flight() || cfgq_query_in_flight()) return;
     if (!time_reached(s_rawq.next_at)) return;
     const rawq_ent_t *e = &s_rawq.q[s_rawq.head];
     if (modbus_set_holding_register(e->slave,
@@ -346,6 +349,10 @@ void lighting_any_on_probe_tick(void) {
          * falls back to assume-off (warned). No deadlock: the raw queue only
          * pauses for a probe once the query is committed (not in PST_SEND). */
         if (s_rawq.count || s_rawq.in_flight) return;
+        /* A config query already committed to the slot must finish its result
+         * read first (it yields to us before committing, so this waits at most
+         * one query ~30 ms — well inside the probe deadline). */
+        if (cfgq_query_in_flight()) return;
         s_probe.cb_fired = false;
         if (modbus_set_holding_register(t->slave, 0x1000u,
                                         (uint16_t)((t->addr_byte << 8) | PROBE_QUERY_OPCODE),
@@ -406,6 +413,243 @@ void lighting_any_on_probe_tick(void) {
             break;
         default:
             probe_finish(false, false, "unexpected result");
+            break;
+        }
+        break;
+    }
+}
+
+/* ── Config-over-raw query state machine (task 03, Phase A) ──────────────────
+ * Fills the per-ballast config cache with raw DALI queries instead of reading
+ * the gateway's BLOCK1-3 banks. Mirrors the any-on probe's write-then-poll
+ * against the single raw slot (0x1000 write / 0x0108 result), but at strictly
+ * lower priority: it only commits a query when the raw FIFO is drained and no
+ * probe is pending, and both the FIFO and the probe wait on a query already in
+ * flight (cfgq_query_in_flight). Ballasts to (re)read are held in a per-slave
+ * pending bitmap; each ballast runs a 5-query sequence, then the accumulated
+ * fields are written to the cache and re-emitted as state_dali.
+ *
+ * The FIFO (dali_raw_arm) can't carry these: it is fire-and-forget and never
+ * reads a backward frame, whereas every config query needs the response byte
+ * from 0x0108 — hence this separate SM sharing the same slot. */
+#define CFGQ_RESULT_REG        0x0108u   /* raw-cmd result register (as the probe) */
+#define CFGQ_POLL_MS           10        /* result-poll pacing (DALI query ~25 ms) */
+#define CFGQ_WRITE_RETRY_MS    15        /* RAW_CMD busy back-off */
+#define CFGQ_WRITE_RETRIES_MAX 5
+#define CFGQ_FIELD_DEADLINE_MS 250       /* per-field guard (write + result polls) */
+
+/* DALI-16 query opcodes (low byte of the forward frame). Verified against
+ * IEC 62386-102 and the gateway's TinyModbus/src/dali.h: 0xA1 QUERY MAX LEVEL,
+ * 0xA2 QUERY MIN LEVEL (these two sit the IEC way round after the 2026-06-06
+ * gateway opcode fix — see controller/CLAUDE.md), 0xA3 QUERY POWER ON LEVEL,
+ * 0xA4 QUERY SYSTEM FAILURE LEVEL, 0xA5 QUERY FADE TIME / FADE RATE (returns one
+ * byte: high nibble = fade time, low nibble = fade rate). */
+enum { CFGQ_MIN = 0, CFGQ_MAX, CFGQ_POWER_ON, CFGQ_SYS_FAIL, CFGQ_FADE, CFGQ_NFIELDS };
+static const uint8_t CFGQ_OPCODE[CFGQ_NFIELDS] = {
+    0xA2u,  /* MIN */
+    0xA1u,  /* MAX */
+    0xA3u,  /* POWER ON */
+    0xA4u,  /* SYS FAIL */
+    0xA5u,  /* FADE TIME / RATE */
+};
+
+static uint64_t s_cfgq_pending[MAX_DALI_SLAVES];  /* ballasts awaiting read, by slave index */
+
+static struct {
+    bool     active;                  /* a per-ballast sequence is running */
+    uint8_t  slave_idx;               /* index into g_config.dali_slave_ids */
+    uint8_t  slave_id;
+    uint8_t  addr;
+    uint8_t  field;                   /* CFGQ_MIN..CFGQ_NFIELDS-1 */
+    uint8_t  vals[CFGQ_NFIELDS];      /* accumulated response bytes */
+    bool     field_ok[CFGQ_NFIELDS];  /* which fields answered cleanly */
+    uint8_t  write_retries;
+    enum { CQ_SEND, CQ_AWAIT_WRITE, CQ_POLL_DELAY, CQ_AWAIT_READ } st;
+    absolute_time_t next_at;
+    absolute_time_t deadline;         /* per-field */
+    bool     cb_fired;
+    int      cb_res;
+    uint8_t  cb_excep;
+    uint16_t cb_word;
+} s_cfgq;
+
+/* True once a query has been committed to the gateway and its result not yet
+ * read — the FIFO and the probe leave the shared result register alone in this
+ * window (symmetric with probe_query_in_flight). */
+static bool cfgq_query_in_flight(void) {
+    return s_cfgq.active && s_cfgq.st != CQ_SEND;
+}
+
+void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr) {
+    int idx = state_cache_slave_idx(slave_id);
+    if (idx < 0 || addr >= DALI_ADDR_COUNT) return;
+    s_cfgq_pending[idx] |= ((uint64_t)1 << addr);
+}
+
+void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask) {
+    int idx = state_cache_slave_idx(slave_id);
+    if (idx < 0) return;
+    s_cfgq_pending[idx] |= mask;
+}
+
+bool lighting_cfg_query_busy(void) {
+    if (s_cfgq.active) return true;
+    for (int i = 0; i < MAX_DALI_SLAVES; i++)
+        if (s_cfgq_pending[i]) return true;
+    return false;
+}
+
+static void cfgq_write_cb(int res, uint8_t *buf, void *ctx) {
+    (void)ctx;
+    s_cfgq.cb_res   = res;
+    s_cfgq.cb_excep = (res < 0 && buf) ? buf[2] : 0;
+    s_cfgq.cb_fired = true;
+}
+
+static void cfgq_read_cb(int res, uint8_t *buf, void *ctx) {
+    (void)ctx;
+    s_cfgq.cb_res = res;
+    /* FC04 1-reg response: slave, fc, bytecount, hi, lo, crc… */
+    if (res >= 5) s_cfgq.cb_word = (uint16_t)((buf[3] << 8) | buf[4]);
+    s_cfgq.cb_fired = true;
+}
+
+/* Write the accumulated fields into the cache and re-emit state_dali. A field
+ * that didn't answer keeps its cached value (a partial read never zeroes good
+ * config). Called once all CFGQ_NFIELDS have been attempted for one ballast. */
+static void cfgq_commit_ballast(void) {
+    uint8_t idx = s_cfgq.slave_idx;
+    dali_ballast_state_t *b = state_cache_get_dali(idx, s_cfgq.addr);
+    uint8_t mn = s_cfgq.field_ok[CFGQ_MIN]      ? s_cfgq.vals[CFGQ_MIN]      : (b ? b->min_level      : 0);
+    uint8_t mx = s_cfgq.field_ok[CFGQ_MAX]      ? s_cfgq.vals[CFGQ_MAX]      : (b ? b->max_level      : 0);
+    uint8_t po = s_cfgq.field_ok[CFGQ_POWER_ON] ? s_cfgq.vals[CFGQ_POWER_ON] : (b ? b->power_on_level : 0);
+    uint8_t sf = s_cfgq.field_ok[CFGQ_SYS_FAIL] ? s_cfgq.vals[CFGQ_SYS_FAIL] : (b ? b->sys_fail_level : 0);
+    uint8_t fade = s_cfgq.vals[CFGQ_FADE];
+    uint8_t fr = s_cfgq.field_ok[CFGQ_FADE] ? (uint8_t)(fade & 0x0Fu)        : (b ? b->fade_rate : 0);
+    uint8_t ft = s_cfgq.field_ok[CFGQ_FADE] ? (uint8_t)((fade >> 4) & 0x0Fu) : (b ? b->fade_time : 0);
+
+    state_cache_set_dali_config(idx, s_cfgq.addr, mx, mn, po, sf, fr, ft);
+
+    /* Re-emit so HA sees the refreshed config (levt→ic pulls config from the
+     * cache). This path only touched config — carry the cached arc/status. */
+    b = state_cache_get_dali(idx, s_cfgq.addr);
+    lighting_emit_dali_state(s_cfgq.slave_id, s_cfgq.addr,
+                             b ? b->arc_level : 0, b ? b->status_byte : 0);
+    LOG_DBG("light", "cfg-query %u.%u min=%u max=%u pon=%u sf=%u fr=%u ft=%u",
+            s_cfgq.slave_id, s_cfgq.addr, mn, mx, po, sf, fr, ft);
+    s_cfgq.active = false;
+}
+
+/* Pick the next pending ballast (lowest slave index, lowest address) and start
+ * its sequence. Returns false if nothing is pending. */
+static bool cfgq_start_next(void) {
+    for (int i = 0; i < g_config.dali_slave_count; i++) {
+        if (!s_cfgq_pending[i]) continue;
+        uint8_t addr = (uint8_t)__builtin_ctzll(s_cfgq_pending[i]);
+        s_cfgq_pending[i] &= ~((uint64_t)1 << addr);
+        memset(&s_cfgq, 0, sizeof s_cfgq);
+        s_cfgq.active    = true;
+        s_cfgq.slave_idx = (uint8_t)i;
+        s_cfgq.slave_id  = g_config.dali_slave_ids[i];
+        s_cfgq.addr      = addr;
+        s_cfgq.st        = CQ_SEND;
+        s_cfgq.next_at   = get_absolute_time();
+        return true;
+    }
+    return false;
+}
+
+/* Record the current field's outcome and advance; commit the ballast when the
+ * last field is done. */
+static void cfgq_field_done(bool ok, uint8_t value) {
+    s_cfgq.field_ok[s_cfgq.field] = ok;
+    if (ok) s_cfgq.vals[s_cfgq.field] = value;
+    if (++s_cfgq.field >= CFGQ_NFIELDS) {
+        cfgq_commit_ballast();
+    } else {
+        s_cfgq.write_retries = 0;
+        s_cfgq.st            = CQ_SEND;
+        s_cfgq.next_at       = get_absolute_time();
+    }
+}
+
+void lighting_cfg_query_tick(void) {
+    if (!g_config.dali_raw_cfg) return;
+
+    if (!s_cfgq.active && !cfgq_start_next()) return;
+
+    /* A slave mid-provisioning owns its bus — defer this ballast and retry. */
+    if (dali_provision_busy_slave(s_cfgq.slave_id)) {
+        lighting_cfg_query_mark(s_cfgq.slave_id, s_cfgq.addr);
+        s_cfgq.active = false;
+        return;
+    }
+
+    switch (s_cfgq.st) {
+    case CQ_SEND:
+        /* Lowest priority: yield the slot to the raw FIFO and to a pending
+         * probe. cfgq_query_in_flight() is false here, so nothing waits on us. */
+        if (s_rawq.count || s_rawq.in_flight)  return;
+        if (s_probe.active && !s_probe.done)   return;
+        if (!time_reached(s_cfgq.next_at))     return;
+        {
+            uint8_t  addr_byte = (uint8_t)((s_cfgq.addr & 0x3Fu) << 1) | 0x01u;
+            uint16_t value     = ((uint16_t)addr_byte << 8) | CFGQ_OPCODE[s_cfgq.field];
+            s_cfgq.cb_fired = false;
+            if (modbus_set_holding_register(s_cfgq.slave_id, 0x1000u, value,
+                                            cfgq_write_cb, NULL)) {
+                s_cfgq.st       = CQ_AWAIT_WRITE;
+                s_cfgq.deadline = make_timeout_time_ms(CFGQ_FIELD_DEADLINE_MS);
+            } else {  /* action queue full — retry shortly */
+                s_cfgq.next_at = make_timeout_time_ms(CFGQ_WRITE_RETRY_MS);
+            }
+        }
+        break;
+
+    case CQ_AWAIT_WRITE:
+        if (!s_cfgq.cb_fired) {
+            if (time_reached(s_cfgq.deadline)) cfgq_field_done(false, 0);
+            return;
+        }
+        if (s_cfgq.cb_res > 0) {
+            s_cfgq.st      = CQ_POLL_DELAY;
+            s_cfgq.next_at = make_timeout_time_ms(CFGQ_POLL_MS);
+        } else if (s_cfgq.cb_res < 0 && s_cfgq.cb_excep == 0x06 &&
+                   ++s_cfgq.write_retries <= CFGQ_WRITE_RETRIES_MAX) {
+            s_cfgq.st      = CQ_SEND;   /* gateway busy — back off and resend */
+            s_cfgq.next_at = make_timeout_time_ms(CFGQ_WRITE_RETRY_MS);
+        } else {
+            cfgq_field_done(false, 0);  /* write failed — skip this field */
+        }
+        break;
+
+    case CQ_POLL_DELAY:
+        if (time_reached(s_cfgq.deadline)) { cfgq_field_done(false, 0); return; }
+        if (!time_reached(s_cfgq.next_at)) return;
+        s_cfgq.cb_fired = false;
+        if (modbus_get_input_registers(s_cfgq.slave_id, CFGQ_RESULT_REG, 1,
+                                       cfgq_read_cb, NULL))
+            s_cfgq.st = CQ_AWAIT_READ;
+        else
+            s_cfgq.next_at = make_timeout_time_ms(CFGQ_POLL_MS);
+        break;
+
+    case CQ_AWAIT_READ:
+        if (!s_cfgq.cb_fired) {
+            if (time_reached(s_cfgq.deadline)) cfgq_field_done(false, 0);
+            return;
+        }
+        if (s_cfgq.cb_res < 5) { cfgq_field_done(false, 0); return; }
+        switch (s_cfgq.cb_word >> 8) {
+        case 0xFF:   /* still pending on the gateway — keep polling */
+            s_cfgq.st      = CQ_POLL_DELAY;
+            s_cfgq.next_at = make_timeout_time_ms(CFGQ_POLL_MS);
+            break;
+        case 0x00:   /* answered — low byte is the queried value */
+            cfgq_field_done(true, (uint8_t)(s_cfgq.cb_word & 0xFFu));
+            break;
+        default:     /* 0x01 NAK / 0x02 error — no value for this field */
+            cfgq_field_done(false, 0);
             break;
         }
         break;

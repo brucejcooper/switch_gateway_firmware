@@ -61,6 +61,22 @@ void               lighting_any_on_probe_start(uint8_t fixture, uint8_t button);
 any_on_probe_res_t lighting_any_on_probe_get(uint8_t fixture, uint8_t button);
 void               lighting_any_on_probe_tick(void);
 
+/* ── Config-over-raw queries (task 03, Phase A) ───────────────────────────────
+ * Fill the controller's per-ballast config cache (min/max/power-on/sys-fail/
+ * fade) from raw DALI queries instead of the gateway's BLOCK1-3 register banks,
+ * so those banks can eventually be retired from the ATtiny. This is the LOWEST-
+ * priority user of the gateway's single raw slot (0x1000 write / 0x0108 result):
+ * it only commits a query when the raw-command FIFO is drained and the any-on
+ * probe is idle, and the probe yields the slot back to a query already in
+ * flight. Ballasts are marked via a per-slave pending bitmap; the tick walks it,
+ * runs the 5-query sequence per ballast, writes state_cache_set_dali_config, and
+ * re-emits state_dali so HA sees the refreshed config. Only active when
+ * g_config.dali_raw_cfg is set (dual-path). */
+void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr);   /* one ballast */
+void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask); /* boot sweep */
+void lighting_cfg_query_tick(void);
+bool lighting_cfg_query_busy(void);   /* pending work or a sequence in flight */
+
 /* DALI: on (goto last active) / off */
 bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on);
 

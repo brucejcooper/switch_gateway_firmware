@@ -41,6 +41,8 @@ typedef struct {
     uint8_t       next_ballast;
     bool          reachable;     /* gateway responding to Modbus */
     uint8_t       fail_count;    /* consecutive read failures */
+    uint32_t      last_cfg_ms;   /* last steady-state config-rotation mark (task 03) */
+    uint8_t       cfg_cursor;    /* round-robin ballast for config re-reads */
 } dpoll_t;
 
 static dpoll_t s_dp[MAX_DALI_SLAVES];
@@ -351,6 +353,24 @@ void dirty_poll_tick(void) {
                 s_gd[i].awaiting = true;
         }
 
+        /* Steady-state config refresh (task 03): while dali_raw_cfg is on,
+         * rotate one present ballast per DALI_CFG_ROTATE_MS into the lowest-
+         * priority raw config sweep so an external recommissioning is picked up
+         * within ~15 min. Independent of the dirty-poll SM (like the gw-diag
+         * read); the sweep itself only runs when the bus is otherwise idle. */
+        if (g_config.dali_raw_cfg && dp->reachable && dp->last_present &&
+            now_ms - dp->last_cfg_ms >= DALI_CFG_ROTATE_MS) {
+            dp->last_cfg_ms = now_ms;
+            for (int n = 0; n < DALI_ADDR_COUNT; n++) {
+                uint8_t a = (uint8_t)((dp->cfg_cursor + n) % DALI_ADDR_COUNT);
+                if (dp->last_present & ((uint64_t)1 << a)) {
+                    lighting_cfg_query_mark(slave_id, a);
+                    dp->cfg_cursor = (uint8_t)((a + 1) % DALI_ADDR_COUNT);
+                    break;
+                }
+            }
+        }
+
         if (dp->active && dp->state == DPOLL_IDLE) {
             if (now_ms - dp->last_poll_ms >= DIRTY_POLL_INTERVAL_MS) {
                 dp->last_poll_ms = now_ms;
@@ -532,31 +552,45 @@ void dirty_poll_full_scan(uint8_t slave_id) {
                                   (regs[a] >> 8) & 0xFF);
     }
 
-    /* BLOCK1..3 are FC03 holding regs post refactor. */
-    LOG_DBG("dirty",
-             "slave=%u: full scan reading BLOCK1-3 config (holding regs %u..%u) for all ballasts",
-             slave_id, (unsigned)DALI_BLOCK1_START,
-             (unsigned)(DALI_BLOCK3_START + DALI_ADDR_COUNT - 1));
-    uint16_t b1[DALI_ADDR_COUNT], b2[DALI_ADDR_COUNT], b3[DALI_ADDR_COUNT];
-    bool chunk_ok[4];
-    for (uint16_t chunk = 0; chunk < 4; chunk++) {
-        uint16_t off = chunk * DALI_MAX_CHUNK;
-        bool ok1 = sync_read_holding(slave_id, DALI_BLOCK1_START + off, DALI_MAX_CHUNK, b1 + off);
-        bool ok2 = sync_read_holding(slave_id, DALI_BLOCK2_START + off, DALI_MAX_CHUNK, b2 + off);
-        bool ok3 = sync_read_holding(slave_id, DALI_BLOCK3_START + off, DALI_MAX_CHUNK, b3 + off);
-        chunk_ok[chunk] = ok1 && ok2 && ok3;
-        if (!chunk_ok[chunk])
-            LOG_WARN("dirty", "block1-3 chunk %u read failed slave %u", (unsigned)chunk, slave_id);
-    }
-    for (int a = 0; a < DALI_ADDR_COUNT; a++) {
-        if (!(present_mask & ((uint64_t)1 << a))) continue;
-        if (!chunk_ok[a / DALI_MAX_CHUNK]) continue;   /* don't cache uninit/garbage config */
-        /* BLOCK1 wire order is (min<<8)|max (high byte = min, low = max); the
-         * cfg args are (max_l, min_l).  BLOCK2/3 high byte = power_on/fade_rate. */
-        state_cache_set_dali_config((uint8_t)idx, (uint8_t)a,
-                                    b1[a] & 0xFF, (b1[a] >> 8) & 0xFF,
-                                    (b2[a] >> 8) & 0xFF, b2[a] & 0xFF,
-                                    (b3[a] >> 8) & 0xFF, b3[a] & 0xFF);
+    /* Per-ballast config (min/max/power-on/sys-fail/fade). Two paths (task 03):
+     *  - dali_raw_cfg OFF (default): read the gateway BLOCK1-3 register banks in
+     *    bulk, as before.
+     *  - dali_raw_cfg ON: don't touch the banks; queue every present ballast for
+     *    a background raw-DALI config sweep (lighting_cfg_query_*). The cache
+     *    fills over the next few seconds and each ballast re-emits state_dali as
+     *    its config lands. */
+    if (!g_config.dali_raw_cfg) {
+        /* BLOCK1..3 are FC03 holding regs post refactor. */
+        LOG_DBG("dirty",
+                 "slave=%u: full scan reading BLOCK1-3 config (holding regs %u..%u) for all ballasts",
+                 slave_id, (unsigned)DALI_BLOCK1_START,
+                 (unsigned)(DALI_BLOCK3_START + DALI_ADDR_COUNT - 1));
+        uint16_t b1[DALI_ADDR_COUNT], b2[DALI_ADDR_COUNT], b3[DALI_ADDR_COUNT];
+        bool chunk_ok[4];
+        for (uint16_t chunk = 0; chunk < 4; chunk++) {
+            uint16_t off = chunk * DALI_MAX_CHUNK;
+            bool ok1 = sync_read_holding(slave_id, DALI_BLOCK1_START + off, DALI_MAX_CHUNK, b1 + off);
+            bool ok2 = sync_read_holding(slave_id, DALI_BLOCK2_START + off, DALI_MAX_CHUNK, b2 + off);
+            bool ok3 = sync_read_holding(slave_id, DALI_BLOCK3_START + off, DALI_MAX_CHUNK, b3 + off);
+            chunk_ok[chunk] = ok1 && ok2 && ok3;
+            if (!chunk_ok[chunk])
+                LOG_WARN("dirty", "block1-3 chunk %u read failed slave %u", (unsigned)chunk, slave_id);
+        }
+        for (int a = 0; a < DALI_ADDR_COUNT; a++) {
+            if (!(present_mask & ((uint64_t)1 << a))) continue;
+            if (!chunk_ok[a / DALI_MAX_CHUNK]) continue;   /* don't cache uninit/garbage config */
+            /* BLOCK1 wire order is (min<<8)|max (high byte = min, low = max); the
+             * cfg args are (max_l, min_l).  BLOCK2/3 high byte = power_on/fade_rate. */
+            state_cache_set_dali_config((uint8_t)idx, (uint8_t)a,
+                                        b1[a] & 0xFF, (b1[a] >> 8) & 0xFF,
+                                        (b2[a] >> 8) & 0xFF, b2[a] & 0xFF,
+                                        (b3[a] >> 8) & 0xFF, b3[a] & 0xFF);
+        }
+    } else {
+        LOG_INFO("dirty",
+                 "slave=%u: config-over-raw enabled — queueing %d present ballasts for background config sweep",
+                 slave_id, DALI_ADDR_COUNT);
+        lighting_cfg_query_mark_mask(slave_id, present_mask);
     }
 
     /* Group membership masks (FC03 0x0110-0x014F). Must be read before the

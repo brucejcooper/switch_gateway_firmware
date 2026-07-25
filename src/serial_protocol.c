@@ -686,13 +686,14 @@ static void cmd_show(char **saveptr) {
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
                "gw_diag_interval_ms=%lu "
-               "baud=%lu rs485=%s relay_byteswap=%u fw_url=%s relay_slaves=",
+               "baud=%lu rs485=%s relay_byteswap=%u dali_raw_cfg=%u fw_url=%s relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
                (unsigned long)g_config.gw_diag_interval_ms,
                (unsigned long)modbus_get_baud(),
                modbus_de_mode_to_str(modbus_get_de_mode()),
                g_config.relay_byteswap ? 1u : 0u,
+               g_config.dali_raw_cfg ? 1u : 0u,
                g_config.fw_url[0] ? g_config.fw_url : "(default)");
         for (int i = 0; i < g_config.relay_slave_count; i++) {
             printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
@@ -967,6 +968,8 @@ static void cmd_cfg(char **saveptr) {
         else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
         else if (strcasecmp(key, "relay_byteswap") == 0)
             g_config.relay_byteswap = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
+        else if (strcasecmp(key, "dali_raw_cfg") == 0)
+            g_config.dali_raw_cfg = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
         else if (strcasecmp(key, "relay_slaves") == 0)
             g_config.relay_slave_count = (uint8_t)parse_csv_u8(val, g_config.relay_slave_ids, MAX_RELAY_SLAVES);
         else if (strcasecmp(key, "dali_slaves") == 0)
