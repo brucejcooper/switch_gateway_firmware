@@ -76,7 +76,9 @@ typedef struct {
     uint32_t c_resubmits;    /* records rolled back to pending (did-not-land / busy) */
     uint32_t c_busy;         /* SLAVE_DEVICE_BUSY (0x06) exceptions */
     uint32_t c_adopts;       /* boot-time id adoptions */
-    uint32_t c_resyncs;      /* gateway-reboot resyncs performed */
+    uint32_t c_resyncs;      /* gateway-reboot resyncs performed (total) */
+    uint32_t c_resync_boot;  /* ...of which triggered by a boot_count change */
+    uint32_t c_resync_anom;  /* ...of which triggered by a status anomaly / verify-exhaust */
 
     uint16_t boot_count;
     bool     boot_valid;
@@ -186,12 +188,47 @@ static void dq_pop_front(dq_slave_t *s) {
     if (s->outstanding > 0) s->outstanding--;
 }
 
-/* Rebuild the backlog after a detected gateway reboot: drop non-idempotent
- * in-flight commands (their result is unknowable and replaying a step would
- * double it), keep idempotent in-flight (re-pended) and all pending, and resync
- * the id sequence. The survivors are re-sorted by priority. */
-static void dq_resync(dq_slave_t *s) {
+/* What tripped a resync, for counters + the log line (the bench drill needed
+ * archaeology to tell an anomaly-triggered resync from a boot_count-triggered
+ * one). */
+typedef enum {
+    DQ_RSN_ANOMALY,   /* status block showed a fresh/empty queue while we had work */
+    DQ_RSN_BOOTCOUNT, /* sysinfo poll observed the gateway's boot_count change */
+    DQ_RSN_VERIFY,    /* transport recovery exhausted its status-read retries */
+} dq_resync_reason_t;
+
+static const char *dq_reason_name(dq_resync_reason_t r) {
+    switch (r) {
+        case DQ_RSN_BOOTCOUNT: return "boot-count";
+        case DQ_RSN_VERIFY:    return "verify-exhausted";
+        default:               return "status-anomaly";
+    }
+}
+
+/* Rebuild the backlog after a (suspected) gateway reboot, then re-baseline the
+ * id sequence via the SAME adoption read a fresh boot uses — never by assuming
+ * the gateway is at id 0. This is load-bearing: a resync can fire against a
+ * gateway that did NOT actually reboot (e.g. the boot_count poll double-firing
+ * for a reboot the status-anomaly detector already consumed). Hardcoding
+ * next_id=1 / last_completed=0 there desynced the ledger against the gateway's
+ * real accepted/completed ids and mis-attributed every subsequent result by one
+ * ring slot. Converging resync with adoption makes a spurious resync harmless:
+ * it adopts whatever ids the gateway actually holds.
+ *
+ * Command bookkeeping: drop non-idempotent in-flight commands (their result is
+ * unknowable and replaying a step would double it), re-pend idempotent in-flight
+ * and keep all pending, re-sorted by priority. Then clear `adopted` so dq_tick
+ * issues a read-only adoption before the next submit — dq_handle_adopt sets
+ * next_id/last_completed/free_hint from the gateway's live status.
+ *
+ * `boot_valid` is cleared so the boot_count detector re-baselines to the
+ * gateway's current value on its next sysinfo poll rather than reading the same
+ * change as a second reboot (the double-fire this whole path guards against). */
+static void dq_resync(dq_slave_t *s, dq_resync_reason_t reason) {
     s->c_resyncs++;
+    if (reason == DQ_RSN_BOOTCOUNT) s->c_resync_boot++; else s->c_resync_anom++;
+    LOG_WARN("dq", "slave %u resync (%s) — re-adopting gateway ids", s->slave_id,
+             dq_reason_name(reason));
     dq_cmd_t keep[DQ_BACKLOG];
     uint8_t  nkeep = 0;
     for (uint8_t i = 0; i < s->count; i++) {
@@ -212,7 +249,9 @@ static void dq_resync(dq_slave_t *s) {
     }
     memcpy(s->bl, keep, (size_t)nkeep * sizeof(dq_cmd_t));
     s->count = nkeep; s->outstanding = 0; s->submit_n = 0;
-    s->next_id = 1u; s->free_hint = DQ_GW_DEPTH; s->last_completed = 0;
+    s->free_hint = DQ_GW_DEPTH;
+    s->adopted = false;      /* force an adoption read to re-baseline next_id/last_completed */
+    s->boot_valid = false;   /* re-baseline boot_count next poll — don't double-fire */
     s->reboot_flag = false;
     s->st = DQ_IDLE; s->next_at = get_absolute_time();
 }
@@ -359,7 +398,10 @@ static void dq_handle_await(dq_slave_t *s) {
     uint8_t accepted_id = (uint8_t)(cb_reg(s, 0) & 0xFF);
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
     s->last_accepted = accepted_id;
-    if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) { dq_resync(s); return; }
+    if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) {
+        dq_resync(s, s->reboot_flag ? DQ_RSN_BOOTCOUNT : DQ_RSN_ANOMALY);
+        return;
+    }
     dq_promote_submit(s);
     s->free_hint = free_slots;
     dq_collect(s, completed);
@@ -371,14 +413,17 @@ static void dq_handle_verify(dq_slave_t *s) {
     if (res <= 0) {
         if (s->verify_left > 0) { s->verify_left--; dq_issue_read_only(s, DQ_VERIFY); return; }
         LOG_WARN("dq", "slave %u verify exhausted — rebuilding in-flight set", s->slave_id);
-        dq_resync(s);
+        dq_resync(s, DQ_RSN_VERIFY);
         return;
     }
     uint8_t free_slots  = (uint8_t)(cb_reg(s, 0) >> 8);
     uint8_t accepted_id = (uint8_t)(cb_reg(s, 0) & 0xFF);
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
     s->last_accepted = accepted_id;
-    if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) { dq_resync(s); return; }
+    if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) {
+        dq_resync(s, s->reboot_flag ? DQ_RSN_BOOTCOUNT : DQ_RSN_ANOMALY);
+        return;
+    }
     /* Did the timed-out submit land? accepted_id equals submit_last_id iff so. */
     if (accepted_id == s->submit_last_id) dq_promote_submit(s);
     else                                  dq_rollback_submit(s);
@@ -420,7 +465,7 @@ void dq_tick(void) {
             continue;
         }
 
-        if (s->reboot_flag) { dq_resync(s); continue; }
+        if (s->reboot_flag) { dq_resync(s, DQ_RSN_BOOTCOUNT); continue; }
         if (!time_reached(s->next_at)) continue;
 
         /* Provisioning is highest priority AND bus-exclusive: while a slave is
@@ -527,11 +572,12 @@ void dq_debug_print(int slave_id) {
                cls[DQ_PRIO_PROVISION], cls[DQ_PRIO_USER], cls[DQ_PRIO_GROUP_WRITE],
                cls[DQ_PRIO_CONFIG_WRITE], cls[DQ_PRIO_LEVEL_READ], cls[DQ_PRIO_BACKGROUND]);
         printf("  counters: submitted=%lu collected=%lu timeouts=%lu resubmits=%lu "
-               "busy=%lu adopts=%lu resyncs=%lu\n",
+               "busy=%lu adopts=%lu resyncs=%lu(boot=%lu,anom=%lu)\n",
                (unsigned long)s->c_submitted, (unsigned long)s->c_collected,
                (unsigned long)s->c_timeouts, (unsigned long)s->c_resubmits,
                (unsigned long)s->c_busy, (unsigned long)s->c_adopts,
-               (unsigned long)s->c_resyncs);
+               (unsigned long)s->c_resyncs, (unsigned long)s->c_resync_boot,
+               (unsigned long)s->c_resync_anom);
     }
     if (!any) printf("dq: no matching DALI slave\n");
 }

@@ -20,7 +20,12 @@
  * timeout the driver reads status before resubmitting, so a landed-but-unacked
  * submit is never blind-resubmitted (UP/DOWN steps are not idempotent). Gateway
  * reboot (boot_count change / status anomaly): non-idempotent in-flight commands
- * are dropped, idempotent ones resubmitted, and the id sequence resynced.
+ * are dropped, idempotent ones resubmitted, and the id sequence re-baselined via
+ * the same read-only adoption a fresh boot uses (never assumed to be id 0) — so a
+ * resync that fires against a gateway that did NOT actually reboot (a duplicate
+ * detection) adopts the gateway's real ids and stays consistent instead of
+ * corrupting the ledger. A resync also clears the stored boot_count so the
+ * sysinfo poll re-baselines rather than reading the same reboot as a second one.
  */
 
 #include <stdbool.h>
@@ -112,6 +117,8 @@ bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
 /* Dump per-slave queue-client state to the console (CLI `dq [slave]`): scheduler
  * state, ids (next/accepted/completed), in-flight (id:class) list, per-class
  * queued depths, and the diagnostic counters (submitted/collected/timeouts/
- * resubmits/busy/adopts/resyncs) the bench fault drills read. slave_id < 0 dumps
- * all configured DALI slaves. Dev-grade; no MQTT surface. */
+ * resubmits/busy/adopts/resyncs) the bench fault drills read — resyncs breaks
+ * out as boot=<boot_count-triggered>,anom=<status-anomaly/verify-triggered> so a
+ * drill can tell the two detectors apart. slave_id < 0 dumps all configured DALI
+ * slaves. Dev-grade; no MQTT surface. */
 void dq_debug_print(int slave_id);
