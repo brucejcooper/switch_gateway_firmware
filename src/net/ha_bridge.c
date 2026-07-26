@@ -618,6 +618,7 @@ static void subscribe_all(void) {
     const char *P = mqtt_app_prefix();
     static const char *const filt[] = {
         "relay/+/set", "dali/+/+/config/+/set", "dali/+/+/set",
+        "dali/+/+/config",   /* warm start: adopt retained per-ballast config at boot */
         "group/+/+/members/set", "group/+/+/set",
         "provision/+/start/all", "provision/+/start/unaddressed",
         "provision/+/start/address", "provision/+/start/target", "provision/+/abort",
@@ -739,6 +740,50 @@ static void members_csv(uint64_t mask, char *out, size_t cap) {
     for (int a = 0; a < 64 && n < (int)cap - 4; a++)
         if (mask & ((uint64_t)1 << a)) { n += snprintf(out + n, cap - n, "%s%d", first ? "" : ",", a); first = false; }
     out[n] = '\0';
+}
+
+/* ── Tombstones (task 03, Phase C) ────────────────────────────────────────────
+ * Retire a removed device by publishing empty retained payloads to its discovery
+ * and data topics: HA drops the entity and the broker keeps no stale retained
+ * state. Operator-triggered only (CLI `tombstone …` -> IC_EVT_TOMBSTONE) — never
+ * automatic, since a transient DALI dropout is availability (offline), not
+ * removal. Each device's topic set is small and bounded, so one publish burst
+ * stays within the socket TX budget. A whole-gateway retirement clears only the
+ * gateway-scoped topics here; its ballasts/groups are retired individually
+ * (`tombstone dali <slave> <addr>` / `tombstone group <slave> <g>`). */
+static void tomb(const char *topic) { mqtt_app_publish(topic, "", 0, true); }
+
+static void tombstone_ballast(uint8_t slave, uint8_t addr) {
+    const char *P = mqtt_app_prefix();
+    static const char *const F[] = { "min","max","power_on","sys_fail","fade_rate","fade_time" };
+    char tp[96];
+    snprintf(tp, sizeof tp, "homeassistant/light/lighting_dali_%u_%u/config", slave, addr); tomb(tp);
+    for (unsigned i = 0; i < 6; i++) {
+        snprintf(tp, sizeof tp, "homeassistant/number/lighting_dali_%u_%u_%s/config", slave, addr, F[i]);
+        tomb(tp);
+    }
+    snprintf(tp, sizeof tp, "%s/dali/%u/%u/state", P, slave, addr);        tomb(tp);
+    snprintf(tp, sizeof tp, "%s/dali/%u/%u/config", P, slave, addr);       tomb(tp);
+    snprintf(tp, sizeof tp, "%s/dali/%u/%u/availability", P, slave, addr); tomb(tp);
+    LOG_INFO("mqtt", "tombstoned ballast %u.%u", slave, addr);
+}
+
+static void tombstone_group(uint8_t slave, uint8_t grp) {
+    const char *P = mqtt_app_prefix();
+    char tp[96];
+    snprintf(tp, sizeof tp, "homeassistant/light/lighting_group_%u_%u/config", slave, grp);        tomb(tp);
+    snprintf(tp, sizeof tp, "homeassistant/text/lighting_group_%u_%u_members/config", slave, grp); tomb(tp);
+    snprintf(tp, sizeof tp, "%s/group/%u/%u/state", P, slave, grp);         tomb(tp);
+    snprintf(tp, sizeof tp, "%s/group/%u/%u/members/state", P, slave, grp); tomb(tp);
+    LOG_INFO("mqtt", "tombstoned group %u.%u", slave, grp);
+}
+
+static void tombstone_gateway(uint8_t slave) {
+    const char *P = mqtt_app_prefix();
+    char tp[96];
+    snprintf(tp, sizeof tp, "%s/gateway/%u/availability", P, slave); tomb(tp);
+    snprintf(tp, sizeof tp, "%s/gateway/%u/diag", P, slave);         tomb(tp);
+    LOG_INFO("mqtt", "tombstoned gateway %u (avail+diag; ballasts/groups retire individually)", slave);
 }
 
 void ha_bridge_publish_event(const ic_event_t *e) {
@@ -873,6 +918,14 @@ void ha_bridge_publish_event(const ic_event_t *e) {
     case IC_EVT_OTA_ACK:         /* routed to ota_on_event in the drain, never published */
     case IC_EVT_OTA_STATUS:      /* routed to ota_on_event in the drain, never published */
         break;
+    case IC_EVT_TOMBSTONE:
+        switch (e->tombstone.kind) {
+        case IC_TOMB_BALLAST: tombstone_ballast(e->tombstone.slave, e->tombstone.addr); break;
+        case IC_TOMB_GROUP:   tombstone_group(e->tombstone.slave, e->tombstone.addr);   break;
+        case IC_TOMB_GATEWAY: tombstone_gateway(e->tombstone.slave);                    break;
+        default: break;
+        }
+        break;
     }
 }
 
@@ -990,6 +1043,12 @@ static void ha_on_message(const char *topic, uint16_t tlen,
      * wedged USB stack — core 0 reboots via the watchdog, no USB involved. */
     if (!strcmp(seg[0], "system") && ns >= 2 && !strcmp(seg[1], "reboot")) {
         if (!strcmp(pay, "PRESS") || !strcmp(pay, "REBOOT")) {
+            /* Clean shutdown: publish a retained offline now so HA greys us out
+             * immediately, rather than waiting for the broker to notice the LWT
+             * after the reboot drops the TCP link (task 03, Phase C). */
+            char av[48];
+            snprintf(av, sizeof av, "%s/availability", mqtt_app_prefix());
+            pub_str(av, "offline", true);
             c.type = IC_CMD_REBOOT;
             ic_push_cmd(&c);
         }
@@ -1036,6 +1095,26 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             else if (!strcmp(f, "fade_rate")) { c.set_dali.fields = IC_DALI_F_FADE_RATE; c.set_dali.fade_rate = v; }
             else if (!strcmp(f, "fade_time")) { c.set_dali.fields = IC_DALI_F_FADE_TIME; c.set_dali.fade_time = v; }
             if (c.set_dali.fields) ic_push_cmd(&c);
+        } else if (ns == 4 && !strcmp(seg[3], "config")) {
+            /* Warm start (task 03): adopt the retained per-ballast config back into
+             * core 0's cache so HA's config numbers stay populated before the raw
+             * sweep confirms. Core 0 ignores this once its cache is filled, so the
+             * echo of our own re-publishes is a harmless no-op. An empty payload
+             * (a tombstone) carries nothing to adopt. */
+            if (pn == 0) return;
+            jsmn_parser jp; jsmntok_t tk[24]; jsmn_init(&jp);
+            int nt = jsmn_parse(&jp, pay, strlen(pay), tk, 24);
+            if (nt < 1) return;
+            c.type = IC_CMD_SEED_DALI_CFG;
+            c.seed_dali_cfg.slave = s; c.seed_dali_cfg.addr = a;
+            int i;
+            if ((i = jfind(pay, tk, nt, "min"))       >= 0) c.seed_dali_cfg.min       = (uint8_t)jint(pay, &tk[i]);
+            if ((i = jfind(pay, tk, nt, "max"))       >= 0) c.seed_dali_cfg.max       = (uint8_t)jint(pay, &tk[i]);
+            if ((i = jfind(pay, tk, nt, "power_on"))  >= 0) c.seed_dali_cfg.power_on  = (uint8_t)jint(pay, &tk[i]);
+            if ((i = jfind(pay, tk, nt, "sys_fail"))  >= 0) c.seed_dali_cfg.sys_fail  = (uint8_t)jint(pay, &tk[i]);
+            if ((i = jfind(pay, tk, nt, "fade_rate")) >= 0) c.seed_dali_cfg.fade_rate = (uint8_t)jint(pay, &tk[i]);
+            if ((i = jfind(pay, tk, nt, "fade_time")) >= 0) c.seed_dali_cfg.fade_time = (uint8_t)jint(pay, &tk[i]);
+            ic_push_cmd(&c);
         }
         return;
     }

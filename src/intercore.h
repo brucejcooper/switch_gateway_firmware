@@ -55,7 +55,15 @@ typedef enum {
     IC_EVT_GW_DIAG,    /* periodic DALI-gateway sysinfo: uptime / boot count / reset reason */
     IC_EVT_OTA_ACK,    /* core0 finished the last IC_CMD_OTA_DATA chunk; core1 may refill g_ota_buf */
     IC_EVT_OTA_STATUS, /* core0's ota_stage_finish() outcome (see ota_status_t below) */
+    IC_EVT_TOMBSTONE,  /* retire a removed device: empty retained discovery/state/config topics */
 } ic_evt_type_t;
+
+/* IC_EVT_TOMBSTONE kind — which device's retained topics to clear. */
+typedef enum {
+    IC_TOMB_BALLAST = 0,   /* one DALI ballast (slave, addr) */
+    IC_TOMB_GROUP   = 1,   /* one DALI group (slave, addr = group #) */
+    IC_TOMB_GATEWAY = 2,   /* a whole DALI gateway (slave): its avail + all 64 ballasts + 16 groups */
+} ic_tomb_kind_t;
 
 /* IC_EVT_OTA_STATUS payload codes. */
 typedef enum {
@@ -99,6 +107,9 @@ typedef struct {
         /* IC_EVT_OTA_STATUS payload: ota_stage_finish() outcome (ota_status_t). */
         struct { uint8_t code; } ota_status;
         /* IC_EVT_OTA_ACK carries no payload — its type alone is the signal. */
+        /* IC_EVT_TOMBSTONE: kind is ic_tomb_kind_t; addr is the ballast short
+         * address or group number (unused for a whole-gateway tombstone). */
+        struct { uint8_t slave, addr, kind; } tombstone;
     };
 } ic_event_t;
 
@@ -173,6 +184,7 @@ typedef enum {
     IC_CMD_OTA_END,       /* download complete at `total_len` -> ota_stage_finish(); replies IC_EVT_OTA_STATUS */
     IC_CMD_OTA_ABORT,     /* discard the in-flight staging session -> ota_stage_abort() */
     IC_CMD_OTA_CONFIRM,   /* mark the active image good -> ota_stage_confirm() */
+    IC_CMD_SEED_DALI_CFG, /* warm start: adopt a retained per-ballast config into the cache */
 } ic_cmd_type_t;
 
 typedef struct {
@@ -212,6 +224,11 @@ typedef struct {
          * (image + fw_trailer), for ota_stage_finish(). */
         struct { uint32_t total_len; } ota_end;
         /* IC_CMD_OTA_BEGIN/OTA_ABORT/OTA_CONFIRM carry no payload. */
+        /* IC_CMD_SEED_DALI_CFG: a retained per-ballast config read back from MQTT
+         * at boot (warm start). Core 0 adopts it only while its own cache is still
+         * unread (all-zero) — the raw config sweep's measured values then win. */
+        struct { uint8_t slave, addr, min, max, power_on, sys_fail,
+                 fade_rate, fade_time; } seed_dali_cfg;
     };
 } ic_cmd_t;
 

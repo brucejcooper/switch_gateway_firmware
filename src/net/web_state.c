@@ -182,6 +182,10 @@ void web_state_on_event(const ic_event_t *e) {
     case IC_EVT_OTA_STATUS:
         /* Routed to ota_on_event in the drain; never reaches the read model. */
         break;
+    case IC_EVT_TOMBSTONE:
+        /* Retires a removed device's MQTT topics only; the web read model keeps
+         * no per-device retained state to clear. */
+        break;
     }
     S.seq++;
 }

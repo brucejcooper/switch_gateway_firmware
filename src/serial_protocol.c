@@ -643,6 +643,8 @@ static void cmd_help(void) {
     printf("                                           group (gN) also: members=0,1  add=2  remove=1\n");
     printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms fw_url\n");
     printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
+    printf("                                           dali_raw_cfg=0|1 (config via raw DALI vs gateway banks)\n");
+    printf("tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
@@ -947,6 +949,34 @@ static void cmd_dali(char **saveptr) {
     dirty_poll_mark_active((uint8_t)slave);
     if (is_group) emit_state_group((uint8_t)slave, (uint8_t)group);
     else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
+}
+
+/* tombstone dali <slave> <addr> | group <slave> <grp> | gw <slave>
+ * Retire a removed device: core 1 publishes empty retained payloads to its
+ * discovery + data topics so HA drops the entity and the broker holds no stale
+ * retained state (task 03, Phase C). Operator-driven — removal is a deliberate
+ * decommission, not a transient DALI dropout (which is availability). */
+static void cmd_tombstone(char **saveptr) {
+    char *kind = strtok_r(NULL, " \t", saveptr);
+    char *ss   = strtok_r(NULL, " \t", saveptr);
+    if (!kind || !ss) { txt_err("bad_arg"); return; }
+    int slave;
+    if (!parse_int_range(ss, 1, 247, &slave)) { txt_err("invalid_slave"); return; }
+    ic_event_t ev = { .type = IC_EVT_TOMBSTONE };
+    ev.tombstone.slave = (uint8_t)slave;
+    if (strcasecmp(kind, "dali") == 0 || strcasecmp(kind, "group") == 0) {
+        bool grp = strcasecmp(kind, "group") == 0;
+        char *as = strtok_r(NULL, " \t", saveptr);
+        int a;
+        if (!parse_int_range(as, 0, grp ? 15 : 63, &a)) { txt_err("out_of_range"); return; }
+        ev.tombstone.addr = (uint8_t)a;
+        ev.tombstone.kind = grp ? IC_TOMB_GROUP : IC_TOMB_BALLAST;
+    } else if (strcasecmp(kind, "gw") == 0) {
+        ev.tombstone.kind = IC_TOMB_GATEWAY;
+    } else { txt_err("bad_arg expected dali|group|gw"); return; }
+    intercore_push_event(&ev);
+    LOG_INFO("cli", "tombstone %s slave %d queued", kind, slave);
+    txt_ok();
 }
 
 /* cfg [key=value ...] — controller device config; bare = get (emit state_cfg).
@@ -1890,6 +1920,10 @@ static void handle_text_line(const char *original_line) {
         cmd_cfg(&saveptr);
         return;
     }
+    if (strcasecmp(cmd, "tombstone") == 0) {
+        cmd_tombstone(&saveptr);
+        return;
+    }
     if (strcasecmp(cmd, "mqtt") == 0) {
         cmd_mqtt(&saveptr);
         return;
@@ -2146,6 +2180,32 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (any) {
             dirty_poll_mark_active(slave);
             if (emit_now) emit_state_dali(slave, addr);
+        }
+        break;
+    }
+    case IC_CMD_SEED_DALI_CFG: {
+        /* Warm start (task 03, Phase C): adopt a per-ballast config read back
+         * from its retained MQTT topic at boot, so HA's numbers stay populated
+         * before the raw config sweep confirms them. Adopt ONLY while our cache
+         * is still unread (all config fields zero); once the sweep, dirty-poll
+         * or a set fills it, the measured value is authoritative. An all-zero
+         * seed is ignored (nothing to warm — and this breaks any
+         * publish->echo->seed loop, since our own re-emit makes the cache
+         * non-zero). */
+        uint8_t slave = c->seed_dali_cfg.slave, addr = c->seed_dali_cfg.addr;
+        int idx = state_cache_slave_idx(slave);
+        if (idx < 0 || addr > 63) break;
+        dali_ballast_state_t *b = state_cache_get_dali((uint8_t)idx, addr);
+        if (!b || !b->present) break;
+        bool cache_unread = (b->min_level | b->max_level | b->power_on_level |
+                             b->sys_fail_level | b->fade_rate | b->fade_time) == 0;
+        uint8_t mn = c->seed_dali_cfg.min,      mx = c->seed_dali_cfg.max,
+                po = c->seed_dali_cfg.power_on, sf = c->seed_dali_cfg.sys_fail,
+                fr = c->seed_dali_cfg.fade_rate, ft = c->seed_dali_cfg.fade_time;
+        if (cache_unread && (mn | mx | po | sf | fr | ft) != 0) {
+            state_cache_set_dali_config((uint8_t)idx, addr, mx, mn, po, sf, fr, ft);
+            emit_state_dali(slave, addr);
+            LOG_DBG("cli", "warm-start seed dali %u.%u min=%u max=%u", slave, addr, mn, mx);
         }
         break;
     }

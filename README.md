@@ -643,6 +643,44 @@ for back-compat). Core 1 subscribes to both `binding/+/+/set` and the legacy
 
 DALI lights use `"availability_mode":"all"` over the system, gateway, and
 per-ballast topics — a ballast is shown available only when all three are online.
+DALI groups gate on system + gateway only (a group is deliverable whenever the
+gateway is up).
+
+### Per-ballast config source + warm start (task 03)
+
+The per-ballast config (`min`/`max`/`power_on`/`sys_fail`/`fade_rate`/`fade_time`)
+has two source paths, selected by the runtime flag **`cfg dali_raw_cfg=0|1`**
+(persisted; default `0`):
+
+- **`0` (default):** config is read in bulk from the gateway's BLOCK1–3 register
+  banks during the boot scan, as before.
+- **`1`:** the controller owns the config — it is read with raw DALI queries
+  (`QUERY MIN/MAX/POWER-ON/SYSTEM-FAILURE LEVEL`, `QUERY FADE TIME/FADE RATE`) at
+  the lowest raw-bus priority (boot sweep + a slow background rotation), and
+  written with controller-driven `DTR0`-load + `SET` sequences that are verified
+  by a query-back before the cache and the retained `.../config` topic update.
+
+The `.../config` topic is published **retained**, so it doubles as the **warm
+start**: on boot the controller subscribes to `dali/+/+/config` and adopts the
+retained values into its cache (only while the cache is still unread — the swept
+measured values then win), keeping HA's config numbers populated during the few
+seconds the raw sweep takes. **This requires broker persistence** (retained
+messages survive a broker restart): for Mosquitto set `persistence true` and a
+`persistence_location` in `mosquitto.conf` (the default HA add-on config already
+does). Without it the warm start is simply a no-op — the sweep still fills the
+cache within seconds.
+
+### Retiring a removed device (tombstones)
+
+When a ballast, group, or gateway is physically removed, its retained discovery
+and state topics would otherwise linger in HA and on the broker forever. The CLI
+**`tombstone dali <slave> <addr>` / `tombstone group <slave> <g>` / `tombstone gw
+<slave>`** publishes empty retained payloads to that device's discovery + data
+topics, so HA drops the entity and the broker keeps no stale state. It is a
+deliberate operator action (a transient DALI dropout is *availability*, not
+removal, and is handled by the per-ballast availability topic). A whole-gateway
+tombstone clears the gateway-scoped topics; its ballasts/groups are tombstoned
+individually.
 
 ### Discovery
 
