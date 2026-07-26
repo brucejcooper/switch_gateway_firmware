@@ -97,6 +97,12 @@ typedef struct {
     int      cb_res;
     uint8_t  cb_buf[32];
     uint8_t  cb_len;
+
+    /* TEMP A/B instrumentation for the fresh-rebuild phantom (STRIP). dbg_trace_on
+     * latches at the first rebuild and stays on so EVERY subsequent collect —
+     * burst drain AND the post-recovery probe window — is logged. */
+    bool     dbg_trace_on;
+    bool     dbg_log_resubmit;
 } dq_slave_t;
 
 static dq_slave_t s_dq[MAX_DALI_SLAVES];
@@ -221,6 +227,15 @@ static const char *dq_reason_name(dq_resync_reason_t r) {
  * gateway is exactly the ledger corruption this path exists to avoid. */
 static void dq_rebuild_fresh(dq_slave_t *s) {
     uint8_t inflight = (uint8_t)(s->outstanding + s->submit_n);
+    /* TEMP instrumentation: the in-flight prefix ids being dropped/re-pended. */
+    LOG_WARN("dqdbg", "slave %u rebuild: inflight=%u (outstanding=%u submit_n=%u) count=%u",
+             s->slave_id, inflight, s->outstanding, s->submit_n, s->count);
+    for (uint8_t i = 0; i < s->count; i++) {
+        dq_cmd_t *e = &s->bl[i];
+        const char *fate = (i < inflight) ? (e->idempotent ? "repend" : "DROP") : "pending";
+        LOG_WARN("dqdbg", "slave %u   entry[%u] id=%u prio=%u idem=%u -> %s",
+                 s->slave_id, i, e->id, e->prio, (unsigned)e->idempotent, fate);
+    }
     dq_cmd_t keep[DQ_BACKLOG];
     uint8_t  nkeep = 0;
     for (uint8_t i = 0; i < s->count; i++) {
@@ -256,6 +271,13 @@ static void dq_collect(dq_slave_t *s, uint8_t completed_id) {
         uint16_t r  = cb_reg(s, (uint8_t)(2u + (rid & 0x07u)));  /* QRES[rid&7] */
         dq_result_t res = (dq_result_t)((r >> 8) & 0xFFu);
         uint8_t     ans = (uint8_t)(r & 0xFFu);
+        if (s->dbg_trace_on) {   /* TEMP: every post-rebuild collect — STRUCTURAL offset check */
+            LOG_WARN("dqdbg", "slave %u collect: front_id=%u completed_id=%u (front-comp=%d) ring_slot=%u ans=%02X | count=%u outstanding=%u accepted=%u span=%d",
+                     s->slave_id, rid, completed_id, (int)rid - (int)completed_id,
+                     (unsigned)(rid & 0x07u), ans,
+                     s->count, s->outstanding, s->last_accepted,
+                     (int)s->last_accepted - (int)completed_id);
+        }
         if (h->cb) h->cb(s->slave_id, res, ans, h->ctx);
         s->c_collected++;
         if (rid == completed_id) done = true;
@@ -306,6 +328,11 @@ static void dq_issue(dq_slave_t *s, uint8_t n) {
     s->submit_last_id = last_id;
     s->c_submitted   += n;
     s->st             = DQ_AWAIT;
+    if (s->dbg_log_resubmit && n > 0) {   /* TEMP: ids on the first post-rebuild submit */
+        LOG_WARN("dqdbg", "slave %u first-resubmit: n=%u ids %u..%u next_id=%u free_hint=%u",
+                 s->slave_id, n, s->bl[s->outstanding].id, last_id, s->next_id, s->free_hint);
+        s->dbg_log_resubmit = false;
+    }
 }
 
 /* Transport-recovery / adoption read: status block only, no write. */
@@ -374,28 +401,66 @@ static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
                             uint8_t free_slots) {
     s->c_resyncs++;
     if (reason == DQ_RSN_BOOTCOUNT) s->c_resync_boot++; else s->c_resync_anom++;
+    /* A boot_count delta that survived the boot_valid=false suppression is
+     * AUTHORITATIVE proof the gateway rebooted and LOST its queue — even when the
+     * controller's own post-reboot submits have since made accepted_id!=0 (exactly
+     * why the accepted==0 anomaly detector never fired in a busy burst, leaving the
+     * lost pre-reboot in-flight commands stuck at the front of the backlog). Captured
+     * from reboot_flag (or the BOOTCOUNT reason on the deferred path, where the flag
+     * was already consumed by dq_defer_resync) BEFORE reboot_flag is cleared below, so
+     * a verify-exhaust whose adopt read coincides with a boot_count change is also
+     * treated as confirmed. A boot_count-confirmed trigger ALWAYS fresh-rebuilds
+     * (re-pend the lost in-flight set), never alive-reconciles (which would keep those
+     * stale entries and desync the ring by one slot permanently). The accepted==0 gate
+     * only decides the UNCONFIRMED triggers: a verify-exhaust against a genuinely-live
+     * gateway (accepted!=0, boot_count unchanged) must alive-reconcile so real
+     * in-flight commands are not torn down. The boot_valid=false suppression already
+     * prevents a boot_count poll from double-firing for a reboot the anomaly detector
+     * consumed, so treating a surviving boot_count trigger as authoritative does not
+     * reintroduce the spurious-double-detection teardown. */
+    bool confirmed_reboot = (reason == DQ_RSN_BOOTCOUNT) || s->reboot_flag;
+
     s->boot_valid     = false;
     s->reboot_flag    = false;
     s->resync_pending = false;
 
-    if (accepted_id == 0) {
-        LOG_WARN("dq", "slave %u resync (%s): gateway fresh — rebuilding in-flight set",
-                 s->slave_id, dq_reason_name(reason));
+    if (confirmed_reboot || accepted_id == 0) {
+        LOG_WARN("dq", "slave %u resync (%s): queue lost (accepted=%u) — rebuilding in-flight set",
+                 s->slave_id, dq_reason_name(reason), accepted_id);
+        /* TEMP instrumentation: which branch + raw classifying read + pre-resync ledger. */
+        LOG_WARN("dqdbg", "slave %u RESYNC-entry: branch=FRESH confirmed_reboot=%u reason=%s read{accepted=%u completed=%u free=%u} "
+                 "ledger{last_completed=%u last_accepted=%u next_id=%u} inflight{outstanding=%u submit_n=%u}",
+                 s->slave_id, (unsigned)confirmed_reboot, dq_reason_name(reason), accepted_id, completed_id, free_slots,
+                 s->last_completed, s->last_accepted, s->next_id, s->outstanding, s->submit_n);
         dq_rebuild_fresh(s);
+        s->dbg_trace_on     = true;
+        s->dbg_log_resubmit = true;
     } else {
         LOG_WARN("dq", "slave %u resync (%s): gateway alive (accepted=%u) — reconciling ids",
                  s->slave_id, dq_reason_name(reason), accepted_id);
+        /* TEMP instrumentation: the ALIVE branch is reviewer-04's suspected failing
+         * path (gate misclassification / papered-over reboot). Enable tracing BEFORE
+         * the shared dq_collect so the alive-branch collects are logged too. */
+        LOG_WARN("dqdbg", "slave %u RESYNC-entry: branch=ALIVE reason=%s read{accepted=%u completed=%u free=%u} "
+                 "ledger{last_completed=%u last_accepted=%u next_id=%u} inflight{outstanding=%u submit_n=%u submit_last_id=%u}",
+                 s->slave_id, dq_reason_name(reason), accepted_id, completed_id, free_slots,
+                 s->last_completed, s->last_accepted, s->next_id, s->outstanding, s->submit_n, s->submit_last_id);
+        s->dbg_trace_on     = true;
+        s->dbg_log_resubmit = true;
         if (s->submit_n > 0) {   /* resolve any tentative submit before adopting the ledger */
             if (accepted_id == s->submit_last_id) dq_promote_submit(s);
             else                                  dq_rollback_submit(s);
         }
     }
 
-    /* Unified id-baseline from the live status — identical to dq_handle_adopt. */
+    /* Unified id-baseline from the live status — identical to dq_handle_adopt. next_id
+     * continues from the gateway's live accepted_id (or 1 if truly fresh). After a
+     * fresh-rebuild the in-flight set is empty, so last_completed is set directly; only
+     * a genuine alive-reconcile has kept in-flight entries to collect the delta for. */
     s->next_id   = (accepted_id == 0) ? 1u : next_gw_id(accepted_id);
     s->free_hint = free_slots;
-    if (accepted_id == 0) s->last_completed = completed_id;   /* fresh: nothing in flight to collect */
-    else                  dq_collect(s, completed_id);        /* alive: collect the kept in-flight delta */
+    if (confirmed_reboot || accepted_id == 0) s->last_completed = completed_id;
+    else                                      dq_collect(s, completed_id);
     s->adopted   = true;
 
     s->st = DQ_IDLE; s->next_at = get_absolute_time();
