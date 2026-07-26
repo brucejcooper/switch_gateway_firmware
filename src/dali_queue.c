@@ -462,13 +462,10 @@ static void dq_sync_cb(uint8_t slave, dq_result_t res, uint8_t ans, void *ctx) {
 }
 
 bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
-                    uint8_t dtr0, uint32_t timeout_ms,
+                    uint8_t dtr0, bool idempotent, uint32_t timeout_ms,
                     dq_result_t *result, uint8_t *answer) {
     s_sync_have = false;
-    /* idempotent=true: the driver's read-status-before-resubmit recovery never
-     * double-applies on a transport timeout; only a reboot mid-command could
-     * (debug-only CLI, accepted — see dq_submit_sync docs in the header). */
-    if (!dq_submit(slave_id, DQ_PRIO_USER, addr, data, flags, dtr0, true,
+    if (!dq_submit(slave_id, DQ_PRIO_USER, addr, data, flags, dtr0, idempotent,
                    dq_sync_cb, NULL))
         return false;   /* backlog full */
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);

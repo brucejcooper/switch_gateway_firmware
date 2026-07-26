@@ -429,15 +429,18 @@ static uint16_t dq_result_word(dq_result_t res, uint8_t answer) {
 /* Send a raw DALI frame through the gateway command queue and wait (blocking,
  * CLI only) for its result.  A single send opens the backward-frame window
  * (DQ_ANSWER) so a query's response byte is returned; a twice-send does not
- * (no answer, reports nak).  Sets *result to the legacy result word and returns
- * true; on backlog-full/timeout prints an error and returns false. */
+ * (no answer, reports nak).  `idempotent` is passed to the queue: pass false for
+ * the arbitrary-frame `dali_raw` command (a human may send an UP/DOWN step, which
+ * must never auto-resubmit on a fault), true for known-idempotent internal uses
+ * (SET DTR, DAPC).  Sets *result to the legacy result word and returns true; on
+ * backlog-full/timeout prints an error and returns false. */
 static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
-                            uint16_t *result) {
+                            bool idempotent, uint16_t *result) {
     dq_result_t res;
     uint8_t     ans   = 0;
     uint8_t     flags = twice ? DQ_TWICE : DQ_ANSWER;
     if (!dq_submit_sync(slave, (uint8_t)(frame >> 8), (uint8_t)frame,
-                        flags, 0, 300, &res, &ans)) {
+                        flags, 0, idempotent, 300, &res, &ans)) {
         txt_err("timeout"); return false;
     }
     *result = dq_result_word(res, ans);
@@ -446,13 +449,14 @@ static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
 
 /* As dali_raw_result, but preloads DTR0 = `dtr0` back-to-back before the frame
  * as ONE atomic queue entry (immune to a DTR0-clobbering command interleaving) —
- * used by read_mem's per-byte SET-DTR0 + READ-MEMORY pair. */
+ * used by read_mem's per-byte SET-DTR0 + READ-MEMORY pair.  READ MEMORY is a
+ * query, so this is idempotent. */
 static bool dali_raw_dtr0_result(uint8_t slave, uint16_t frame, uint8_t dtr0,
                                  uint16_t *result) {
     dq_result_t res;
     uint8_t     ans = 0;
     if (!dq_submit_sync(slave, (uint8_t)(frame >> 8), (uint8_t)frame,
-                        DQ_ANSWER | DQ_DTR0, dtr0, 300, &res, &ans)) {
+                        DQ_ANSWER | DQ_DTR0, dtr0, true, 300, &res, &ans)) {
         txt_err("timeout"); return false;
     }
     *result = dq_result_word(res, ans);
@@ -477,7 +481,7 @@ static bool dali_read_mem(uint8_t slave, uint8_t addr, uint8_t bank,
     uint16_t r;
     *collision = false;
     *absent    = false;
-    if (!dali_raw_result(slave, (uint16_t)(0xC300u | bank), false, &r)) return false; /* SET DTR1 */
+    if (!dali_raw_result(slave, (uint16_t)(0xC300u | bank), false, true, &r)) return false; /* SET DTR1 (idempotent) */
     uint8_t addr_byte = (uint8_t)((addr << 1) | 0x01u);   /* short-address command form */
     for (uint8_t i = 0; i < count; i++) {
         bool got = false, nak = false, any_garble = false;
@@ -647,7 +651,7 @@ static void cmd_help(void) {
     printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
     printf("tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
-    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
+    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result (no auto-retry on fault)\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
     printf("identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n");
     printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
@@ -1225,7 +1229,10 @@ static void cmd_dali_raw(char **saveptr) {
     uint16_t result;
     LOG_INFO("cli", "dali_raw slave=%ld frame=0x%04x%s",
              slave, value, twice ? " twice" : "");
-    if (!dali_raw_result((uint8_t)slave, value, twice, &result)) return;
+    /* Arbitrary human-supplied frame (could be a non-idempotent UP/DOWN step):
+     * pass idempotent=false so a transport fault fails-and-reports rather than
+     * auto-resubmitting and risking a double-apply. */
+    if (!dali_raw_result((uint8_t)slave, value, twice, false, &result)) return;
     /* Let dirty-poll pick up any resulting ballast state change. */
     dirty_poll_mark_active((uint8_t)slave);
     if ((result >> 8) == 0x00u)
@@ -1305,10 +1312,11 @@ static void cmd_blink(char **saveptr) {
     LOG_INFO("cli", "blink slave=%ld addr=%ld", slave, addr);
     for (int i = 0; i < 8; i++) {
         uint8_t level = (i & 1) ? 0x00u : 0xFEu;
-        if (!dali_raw_result((uint8_t)slave, (uint16_t)(dapc | level), false, &r)) return;
+        /* DAPC is idempotent (re-sending sets the same level). */
+        if (!dali_raw_result((uint8_t)slave, (uint16_t)(dapc | level), false, true, &r)) return;
         sleep_ms(300);
     }
-    dali_raw_result((uint8_t)slave, (uint16_t)(dapc | 0xFEu), false, &r);  // leave on
+    dali_raw_result((uint8_t)slave, (uint16_t)(dapc | 0xFEu), false, true, &r);  // leave on (DAPC, idempotent)
     dirty_poll_mark_active((uint8_t)slave);
     txt_ok();
 }
