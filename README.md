@@ -194,7 +194,8 @@ Each boot, before the main loop starts, the firmware runs:
 | `config.c/h` | Global config, persisted to `/config.json` (timing, slaves, modbus baud, RS485 DE mode, MQTT, net) |
 | `mapping.c/h` | Button-to-light mappings, persisted to `/mappings.json` |
 | `state_cache.c/h` | In-memory cache of relay + DALI ballast + group state |
-| `lighting_actions.c/h` | Modbus command dispatch, state event queue |
+| `lighting_actions.c/h` | Command dispatch, any-on probe + config-query state machines, state event queue |
+| `dali_queue.c/h` | Per-gateway command-queue client (FC23 submit/collect, credits, recovery, reboot resync) |
 | `dirty_poll.c/h` | TinyModbus dirty-bit polling, background scans |
 | `serial_protocol.c/h` | USB-CDC text CLI + the core-0/core-1 inter-core seam |
 | `serial_protocol_provision.c` | Provision status → core-1 event forwarding |
@@ -211,12 +212,15 @@ Each boot, before the main loop starts, the firmware runs:
 
 ```c
 while (true) {
-    modbus_poll();          // advance Modbus state machine (ISR-driven, non-blocking)
-    wd_feed();              // feed watchdog iff core 1's heartbeat is fresh
-    button_fsm_tick();      // classify raw button events, dispatch commands
-    dirty_poll_tick();      // check dirty bits, read changed ballast state
-    dali_provision_tick();  // advance commissioning state machine if active
-    serial_poll();          // read text CLI; drain core-1 cmds; forward state events to core 1
+    modbus_poll();               // advance Modbus state machine (ISR-driven, non-blocking)
+    wd_feed();                   // feed watchdog iff core 1's heartbeat is fresh
+    lighting_any_on_probe_tick();// submit any-on probe queries into the gateway queue
+    lighting_cfg_query_tick();   // submit config queries into the gateway queue
+    dq_tick();                   // drive the gateway command queue (FC23 submit/collect)
+    button_fsm_tick();           // classify raw button events, dispatch commands
+    dirty_poll_tick();           // check dirty bits, read changed ballast state
+    dali_provision_tick();       // advance commissioning state machine if active
+    serial_poll();               // read text CLI; drain core-1 cmds; forward state events to core 1
     wd_feed();
 }
 ```
@@ -299,8 +303,10 @@ The Pico's polling loop:
 2. Every **60 s** (background): read the present bitmask and all block-0
    status bytes. Queue presence events for any changes. Queue fault events
    for ballasts with lamp-failure or power-cycle bits set.
-3. At **boot**: trigger a TinyModbus bus scan, then blocking-read all four
-   data blocks (block 0–3) and the present bitmask for each slave.
+3. At **boot**: trigger a TinyModbus bus scan, then blocking-read block 0
+   (arc/status) and the present bitmask for each slave, and queue every present
+   ballast for the background raw-DALI **config sweep** (the gateway no longer
+   stores per-ballast config — see below).
 
 The Pico never caches a DALI arc level from the command it sent — it always
 waits for the dirty bit and reads the hardware. This correctly handles:
@@ -315,19 +321,22 @@ per-ballast cache from input registers to holding registers and retired
 several action / DTR-setter registers. The Pico's master code follows the
 new contract:
 
-- **Per-ballast cache (FC03 read, FC06/FC10 write) at `0x0000–0x00FF`.**
-  Block 0 (status | brightness) is `0x0000–0x003F`; min/max, power-on/
-  sys-fail, and fade rate/time follow as register pairs at
-  `0x0040+addr=(min<<8)|max`, `0x0080+addr=(power_on<<8)|sys_fail`,
-  `0x00C0+addr=(fade_rate<<8)|fade_time`. Writing the brightness register's
-  low byte (DAPC level 0–254) is how the Pico drives ballast level changes —
-  the firmware caches predictively and dispatches the DAPC asynchronously.
-  A config-pair write arms the gateway's DALI `STORE DTR AS …` sequence.
-- **Raw DALI commands (FC06) at `0x1000` (single send) or `0x1001` (sent
-  twice, for SET / INITIALISE / RANDOMISE).** The Pico uses these for
-  GOTO_LAST_ACTIVE, UP, DOWN, group, broadcast, and commissioning frames.
-  The asynchronous result is polled at FC04 `0x0108` (terminal-state read
-  clears it). Exposed to the CLI as `dali_raw`.
+- **Live arc-level bank (FC03 read, FC06/FC10 write) at `0x0000–0x003F`**
+  (status | brightness). Writing the low byte (DAPC level 0–254) is how the
+  Pico drives per-ballast level changes and OFF — the firmware caches
+  predictively and dispatches the DAPC asynchronously.
+- **Per-ballast config banks at `0x0040–0x00FF` are RETIRED (task 04).** The
+  gateway no longer stores min/max/power-on/sys-fail/fade — FC03 reads and
+  writes there return ILLEGAL DATA ADDRESS. The controller owns config: it
+  **reads** each field with raw DALI queries (the config-query state machine in
+  `lighting_actions.c`, routed through the command queue) and **writes** it with
+  a DTR0+SET pair submitted as one queue command. Requires a raw-config
+  controller ↔ retired-bank gateway as a matched pair; deploy controller-first.
+- **DALI command queue** — the primary path for group/broadcast/specialty sends
+  and all raw queries. Submit window (FC10/FC23 write) at `0x1100`, status block
+  (FC04 `0x0400` / holding alias `0x1180`), FC23 (`0x17`). See "DALI command
+  queue client" below and `../TinyModbus/README.md`. The legacy single-slot
+  `0x1000/0x1001/0x0108` channel still works but is deprecated (CLI `dali_raw`).
 - **Group masks (FC03 read / FC06 write) at `0x0110+`** — four 16-bit words
   per group covering bits 0–63, byte-swapped per word. The controller writes
   the desired mask; the gateway diffs old↔new and issues the per-bit DALI
@@ -341,6 +350,66 @@ new contract:
 
 The canonical specification for the gateway is
 [`../TinyModbus/README.md`](../TinyModbus/README.md).
+
+### DALI command queue client (`dali_queue.c`)
+
+Every group/broadcast/specialty DALI send and every raw query goes through a
+per-gateway **command-queue client** that drives the gateway's 8-deep id-tagged
+queue over FC23. It replaced the old single-slot "write `0x1000`, poll `0x0108`,
+back off on DEVICE_BUSY" path and the three separate producers that contended
+for it.
+
+**Model.** Each gateway has a local FIFO backlog — the priority queue that sits
+in front of the gateway's queue. Producers (`dq_submit`) drop commands into it;
+`dq_tick()` ships them. Each shipped command gets a controller-assigned **id**
+(cycling 1–31, 0 reserved), and its result is routed back to the command's
+completion callback when collected. A command carries an **idempotency** flag:
+idempotent commands (GOTO_LAST_ACTIVE, group on/off/level, config re-store, all
+queries) may be resubmitted after a fault; UP/DOWN step frames may not.
+
+**One transaction = one FC23:** write up to 4 new records into the submit window
+(`0x1100`) and read the 10-register status block back through the holding alias
+(`0x1180`) in the same round trip. Because the gateway executes the write before
+the read, one FC23 both submits new work and collects the results of earlier
+commands (submit-N / collect-N−1). A command's result lives in `QRES[id mod 8]`
+and is valid once the status block's `completed_id` has reached that id.
+
+**Credit policy (baud-derived, one place).** The client submits
+`min(pending, free_slots, 4)` per transaction, tracking `free_slots` from every
+response. Since `free_slots` only decreases when the client submits (the gateway
+frees slots as it executes, learned on the next response), it is a conservative
+lower bound — the client never over-submits, so at **19200 the gateway never
+answers SLAVE_DEVICE_BUSY** (strict credits). The FC23 round-trip (~28–30 ms at
+19200) is the natural pacing; the only baud-adjacent constant is the collect-only
+drain pace (`DQ_DRAIN_POLL_MS`). At 38400 the same path stays correct (just
+conservative); relaxing to optimistic pacing there is a future knob.
+
+**Transport recovery.** On an FC23 timeout the write may or may not have landed.
+The client does not blind-resubmit (UP/DOWN steps aren't idempotent): it first
+issues a status-only read and compares the gateway's `accepted_id` to the id of
+the timed-out submit. Match → the write landed, promote it; mismatch → it did
+not, roll the records back to pending (ids un-assigned, sequence rewound) and
+resubmit.
+
+**Gateway reboot resync.** A reboot empties the gateway's queue. The client
+detects it two ways: the sysinfo **boot-count** (fed in via `dq_note_boot_count`
+from the gw-diag poll) changing, or a status **anomaly** (free_slots back to 8
+and `accepted_id` 0 while the client still holds in-flight commands). Either way
+it rebuilds the in-flight set — **drop** non-idempotent commands, **re-pend**
+idempotent ones — and resyncs the id sequence. On a controller-only reboot it
+adopts the gateway's `accepted_id`/`completed_id` on first contact before
+submitting, so fresh commands are never mis-collected against retained gateway
+state.
+
+**Subsystems on the queue.** All three former single-slot producers ride it now:
+the raw command path (button on/off/step, group commands, config DTR0+SET), the
+**any-on probe**, and the **config-query** state machine. The probe and the
+config queries are ordinary expects-answer commands with their own ids, so the
+shared-result-register interlocks and the post-drain settle-gate the single-slot
+path needed are gone — **id-tagging is what retired them**. The click-grace
+guarantee still holds: a probe query resolves in ~1–2 FC23 round-trips
+(~30–90 ms), inside the button FSM's 150 ms grace; a rare overflow lands on the
+pre-existing assume-off fallback, bounded by the 600 ms probe deadline.
 
 ### State event flow to HA
 
@@ -646,19 +715,18 @@ per-ballast topics — a ballast is shown available only when all three are onli
 DALI groups gate on system + gateway only (a group is deliverable whenever the
 gateway is up).
 
-### Per-ballast config source + warm start (task 03)
+### Per-ballast config source + warm start
 
 The per-ballast config (`min`/`max`/`power_on`/`sys_fail`/`fade_rate`/`fade_time`)
-has two source paths, selected by the runtime flag **`cfg dali_raw_cfg=0|1`**
-(persisted; default `0`):
-
-- **`0` (default):** config is read in bulk from the gateway's BLOCK1–3 register
-  banks during the boot scan, as before.
-- **`1`:** the controller owns the config — it is read with raw DALI queries
-  (`QUERY MIN/MAX/POWER-ON/SYSTEM-FAILURE LEVEL`, `QUERY FADE TIME/FADE RATE`) at
-  the lowest raw-bus priority (boot sweep + a slow background rotation), and
-  written with controller-driven `DTR0`-load + `SET` sequences that are verified
-  by a query-back before the cache and the retained `.../config` topic update.
+is **owned by the controller over raw DALI** — the gateway's config banks were
+retired in task 04, so this is the only path (the `dali_raw_cfg` dual-path flag
+was removed). Config is **read** with raw DALI queries (`QUERY
+MIN/MAX/POWER-ON/SYSTEM-FAILURE LEVEL`, `QUERY FADE TIME/FADE RATE`) at boot (a
+sweep of every present ballast) and refreshed by a slow background rotation, and
+**written** with `DTR0`-load + `SET` sequences that are verified by a query-back
+before the cache and the retained `.../config` topic update. Both the reads and
+the writes ride the DALI command queue client (see "DALI command queue client"
+above).
 
 The `.../config` topic is published **retained**, so it doubles as the **warm
 start**: on boot the controller subscribes to `dali/+/+/config` and adopts the
