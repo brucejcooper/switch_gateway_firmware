@@ -74,7 +74,7 @@ typedef enum {
 } modbus_action_type_t;
 
 /* Largest register block any FC16/FC23 write carries here is the gateway's
- * 4-command submit window (0x1100-0x1107) = 8 registers = 16 bytes.  Sized to
+ * 4-command submit window (0x1000-0x1007) = 8 registers = 16 bytes.  Sized to
  * that; a longer write is rejected at enqueue time. */
 #define MODBUS_WR_PAYLOAD_MAX 16u
 

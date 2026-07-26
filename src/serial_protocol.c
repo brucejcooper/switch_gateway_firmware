@@ -11,6 +11,7 @@
 #include "serial_protocol.h"
 #include "dali_provision.h"
 #include "lighting_actions.h"
+#include "dali_queue.h"
 #include "mapping.h"
 #include "button_fsm.h"
 #include "config.h"
@@ -396,14 +397,16 @@ static bool cli_mb_report_fail(const cli_mb_ctx_t *c) {
     return false;
 }
 
-/* ── Raw DALI command + async result helpers (FC06 0x1000/0x1001 -> FC04 0x0108) ── */
+/* ── Raw DALI command + result helpers (via the gateway command queue) ──────── */
 
-/* Decode a raw_cmd_result word (FC04 0x0108) into a short label. */
+/* Decode a queue result word into a short label. Callers build the word as
+ * 0x00<answer> (ok), 0x0100 (nak), or 0x02<subtype> (err) — the same shape the
+ * old FC04 0x0108 register used, so downstream code (read_mem, identify) is
+ * unchanged. */
 static const char *dali_result_str(uint16_t r) {
     switch (r >> 8) {
         case 0x00: return "ok";
         case 0x01: return "nak";
-        case 0xFF: return "pending";
         case 0x02:
             switch (r & 0xFFu) {
                 case 1:  return "malformed";    /* garbled backward frame = collision */
@@ -416,44 +419,43 @@ static const char *dali_result_str(uint16_t r) {
     }
 }
 
-/* Send a raw DALI frame (single, or twice when `twice`) and poll FC04 0x0108
- * for the asynchronous outcome.  Retries the write on DEVICE_BUSY (0x06).  On
- * success sets *result to the raw_cmd_result word and returns true; on a
- * Modbus transport failure prints the error and returns false. */
+/* Map a dq_result_t + answer byte to the legacy 0x00xx/0x0100/0x02xx word. */
+static uint16_t dq_result_word(dq_result_t res, uint8_t answer) {
+    if (res == DQ_RES_OK)  return answer;               /* 0x00 | answer */
+    if (res == DQ_RES_NAK) return 0x0100u;
+    return (uint16_t)(0x0200u | answer);                /* err subtype (or DROPPED->0x0203) */
+}
+
+/* Send a raw DALI frame through the gateway command queue and wait (blocking,
+ * CLI only) for its result.  A single send opens the backward-frame window
+ * (DQ_ANSWER) so a query's response byte is returned; a twice-send does not
+ * (no answer, reports nak).  Sets *result to the legacy result word and returns
+ * true; on backlog-full/timeout prints an error and returns false. */
 static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
                             uint16_t *result) {
-    static cli_mb_ctx_t ctx;
-    uint16_t reg = twice ? 0x1001u : 0x1000u;
-
-    bool acked = false;
-    for (int attempt = 0; attempt < 6 && !acked; attempt++) {
-        memset(&ctx, 0, sizeof(ctx));
-        modbus_set_holding_register(slave, reg, frame, cli_mb_cb, &ctx);
-        cli_mb_wait(&ctx);
-        if (!ctx.done) { txt_err("internal"); return false; }
-        if (ctx.res > 0) { acked = true; break; }
-        if (ctx.res < 0) {
-            uint8_t code = ctx.frame_len >= 3 ? ctx.frame[2] : 0xFFu;
-            if (code == 0x06) { sleep_ms(15); continue; }   /* busy: retry */
-            printf("err: exception 0x%02X (%s)\n", code, modbus_exception_str(code));
-            return false;
-        }
+    dq_result_t res;
+    uint8_t     ans   = 0;
+    uint8_t     flags = twice ? DQ_TWICE : DQ_ANSWER;
+    if (!dq_submit_sync(slave, (uint8_t)(frame >> 8), (uint8_t)frame,
+                        flags, 0, 300, &res, &ans)) {
         txt_err("timeout"); return false;
     }
-    if (!acked) { txt_err("device_busy"); return false; }
+    *result = dq_result_word(res, ans);
+    return true;
+}
 
-    /* A single DALI command completes in ~25 ms; poll until it leaves PENDING. */
-    absolute_time_t deadline = make_timeout_time_ms(300);
-    uint16_t r = 0xFF00u;
-    do {
-        memset(&ctx, 0, sizeof(ctx));
-        modbus_get_input_registers(slave, 0x0108u, 1, cli_mb_cb, &ctx);
-        cli_mb_wait(&ctx);
-        if (cli_mb_report_fail(&ctx)) return false;
-        if (ctx.res >= 5) r = ((uint16_t)ctx.frame[3] << 8) | ctx.frame[4];
-    } while ((r >> 8) == 0xFFu &&
-             absolute_time_diff_us(get_absolute_time(), deadline) > 0);
-    *result = r;
+/* As dali_raw_result, but preloads DTR0 = `dtr0` back-to-back before the frame
+ * as ONE atomic queue entry (immune to a DTR0-clobbering command interleaving) —
+ * used by read_mem's per-byte SET-DTR0 + READ-MEMORY pair. */
+static bool dali_raw_dtr0_result(uint8_t slave, uint16_t frame, uint8_t dtr0,
+                                 uint16_t *result) {
+    dq_result_t res;
+    uint8_t     ans = 0;
+    if (!dq_submit_sync(slave, (uint8_t)(frame >> 8), (uint8_t)frame,
+                        DQ_ANSWER | DQ_DTR0, dtr0, 300, &res, &ans)) {
+        txt_err("timeout"); return false;
+    }
+    *result = dq_result_word(res, ans);
     return true;
 }
 
@@ -480,13 +482,13 @@ static bool dali_read_mem(uint8_t slave, uint8_t addr, uint8_t bank,
     for (uint8_t i = 0; i < count; i++) {
         bool got = false, nak = false, any_garble = false;
         for (uint8_t attempt = 0; attempt < DALI_READ_RETRIES; attempt++) {
-            /* Re-set DTR0 before every read: not all gear auto-increment, some
-             * have unreadable holes (e.g. bank-0 offset 0x01), and a retry must
-             * re-point at the same offset. */
-            if (!dali_raw_result(slave, (uint16_t)(0xA300u | (uint8_t)(offset + i)), false, &r))
-                return false;
-            uint16_t frame = (uint16_t)(((uint16_t)addr_byte << 8) | 0xC5u); /* READ MEMORY LOCATION */
-            if (!dali_raw_result(slave, frame, false, &r)) return false;
+            /* Re-set DTR0 before every read (not all gear auto-increment; some
+             * have unreadable holes, e.g. bank-0 offset 0x01; a retry must
+             * re-point at the same offset) — as ONE atomic queue entry so no
+             * other DTR-touching command can slip between the DTR0 load and the
+             * READ.  READ MEMORY LOCATION opcode 0xC5, backward frame expected. */
+            uint16_t frame = (uint16_t)(((uint16_t)addr_byte << 8) | 0xC5u);
+            if (!dali_raw_dtr0_result(slave, frame, (uint8_t)(offset + i), &r)) return false;
             if      ((r >> 8) == 0x00u) { got = true; break; }       /* clean byte — done, not a collision */
             else if (r == 0x0100u)      { nak = true; break; }       /* NAK: no gear / hole — definitive */
             else if ((r >> 8) == 0x02u) any_garble = true;           /* garbled — retry to rule out a glitch */
@@ -1196,11 +1198,11 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
 /* ── dali_raw <slave> <cmd16> [twice] ──────────────────────────────────────
  * Send an arbitrary 16-bit DALI forward frame to a gateway. cmd16 is the full
  * frame — address/selector byte in the high 8 bits, opcode/data in the low 8
- * bits — and accepts decimal or 0x-hex. It is written to the gateway RAW_CMD
- * holding register (0x1000 single send, 0x1001 send-twice). Append "twice" (or
- * "2x") for config commands that DALI requires be repeated within 100 ms (e.g.
- * STORE_DTR_AS_*, SET_SCENE). Reports the Modbus-level ack/exception, not the
- * DALI backward frame. */
+ * bits — and accepts decimal or 0x-hex. It is submitted through the gateway
+ * command queue (dali_queue.c) and blocks for the DALI result. Append "twice"
+ * (or "2x") for config commands that DALI requires be repeated within 100 ms
+ * (e.g. STORE_DTR_AS_*, SET_SCENE); a single send opens the backward-frame
+ * window and reports the DALI response (ok/nak/err). */
 static void cmd_dali_raw(char **saveptr) {
     char *ss = strtok_r(NULL, " \t", saveptr);
     char *cs = strtok_r(NULL, " \t", saveptr);
@@ -1311,7 +1313,7 @@ static void cmd_blink(char **saveptr) {
 
 /* ── gw_reboot <slave> ─────────────────────────────────────────────────────
  * Force a TinyModbus gateway to perform a software reset by writing the magic
- * value 0xA5A5 to its SYSTEM_RESET register (0x1015). Recovery hatch for a
+ * value 0xA5A5 to its SYSTEM_RESET register (0x1F05). Recovery hatch for a
  * gateway wedged in a stuck-busy DALI state (raw channel returning exception
  * 0x06 for every command). The gateway ACKs, then reboots and is unresponsive
  * for ~1 s before it re-runs its own bus scan. */
@@ -1323,7 +1325,7 @@ static void cmd_gw_reboot(char **saveptr) {
     memset(&ctx, 0, sizeof(ctx));
     LOG_INFO("cli", "gw_reboot slave=%ld", slave);
     /* TinyModbus MBREG_SYSTEM_RESET / MBREG_SYSTEM_RESET_MAGIC (registers.h). */
-    modbus_set_holding_register((uint8_t)slave, 0x1015u, 0xA5A5u, cli_mb_cb, &ctx);
+    modbus_set_holding_register((uint8_t)slave, 0x1F05u, 0xA5A5u, cli_mb_cb, &ctx);
     cli_mb_wait(&ctx);
     if (cli_mb_report_fail(&ctx)) return;
     txt_ok();

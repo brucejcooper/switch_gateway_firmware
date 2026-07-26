@@ -35,7 +35,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MBREG_COMMISSION  0x1014u
+#define MBREG_COMMISSION  0x1F04u   /* relocated in task 04 (was 0x1014) */
 
 #define POLL_INTERVAL_MS  500u
 #define POST_SCAN_WAIT_MS 200u

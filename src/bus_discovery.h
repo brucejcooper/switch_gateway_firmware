@@ -19,7 +19,7 @@ bool bus_discover_slave(uint8_t slave_id, slave_kind_t kind);
 bool bus_ping_slave(uint8_t slave_id, slave_kind_t kind);
 
 /* Tell a slave to switch its own UART baud via an FC06 write to its baud
- * register (relay 0x2000, DALI 0x1013). Only 9600, 19200 and 38400 are
+ * register (relay 0x2000, DALI 0x1F03). Only 9600, 19200 and 38400 are
  * supported; any other rate returns false without sending anything. The master UART is
  * left unchanged — the caller must match baud afterwards. Returns true on the
  * slave's ACK. Blocking (up to ~1 s). */

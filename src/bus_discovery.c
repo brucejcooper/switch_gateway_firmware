@@ -58,10 +58,10 @@ static bool ping_relay(uint8_t slave_id) {
     return wait_done(&ctx);
 }
 
-/* FC03 read 1 reg — TinyModbus slave_addr */
+/* FC03 read 1 reg — TinyModbus slave_addr (SLAVE_ADDR relocated to 0x1F02 in task 04) */
 static bool ping_dali(uint8_t slave_id) {
     disc_ctx_t ctx = { false, false, 0 };
-    modbus_get_holding_registers(slave_id, 0x1012, 1, disc_cb, &ctx);
+    modbus_get_holding_registers(slave_id, 0x1F02, 1, disc_cb, &ctx);
     return wait_done(&ctx);
 }
 
@@ -78,7 +78,7 @@ bool bus_ping_slave(uint8_t slave_id, slave_kind_t kind) {
 /* Map a target baud to the slave's baud register + register value. The register
  * and the encoding differ by kind:
  *   relay (Waveshare 0x2000): 9600=0x0001, 19200=0x0002, 38400=0x0003
- *   dali  (TinyModbus BAUD_INDEX 0x1013): 9600=0x0000, 19200=0x0001, 38400=0x0002
+ *   dali  (TinyModbus BAUD_INDEX 0x1F03): 9600=0x0000, 19200=0x0001, 38400=0x0002
  * Returns false for an unsupported baud. */
 static bool baud_reg_value(slave_kind_t kind, uint32_t baud,
                            uint16_t *reg, uint16_t *val) {
@@ -90,7 +90,7 @@ static bool baud_reg_value(slave_kind_t kind, uint32_t baud,
             case 38400u: *val = 0x0003; return true;
         }
     } else {
-        *reg = 0x1013;
+        *reg = 0x1F03;   /* TinyModbus BAUD_INDEX, relocated in task 04 (was 0x1013) */
         switch (baud) {
             case 9600u:  *val = 0x0000; return true;
             case 19200u: *val = 0x0001; return true;

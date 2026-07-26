@@ -10,15 +10,15 @@
 #include "pico/time.h"
 #include <string.h>
 
-/* TinyModbus holding register addresses (post-refactor):
+/* TinyModbus register addresses (task 04):
  *   0x0000 + addr  per-ballast brightness bank (FC06 low byte = DAPC level,
  *                  0 = off, 1–254 proportional, 255 = no change)
- *   0x1000         RAW_CMD — single DALI send, value = (addr_byte<<8) | opcode
+ *   0x1000-0x1007  command-queue submit window (FC10/FC23; see dali_queue.c)
  *
- * The action registers 0x1002–0x100A no longer exist. GOTO_LAST_ACTIVE / UP /
- * DOWN are issued via 0x1000 with a short-address command-form address byte
- * (A0=1). DAPC and OFF go through the per-ballast brightness bank, which arms
- * the same async work selector as raw sends. */
+ * DAPC and OFF go through the per-ballast brightness bank. Everything else
+ * (GOTO_LAST_ACTIVE / UP / DOWN, group commands, config DTR0+SET, raw queries)
+ * is submitted through the id-tagged command queue (dali_queue.c). The legacy
+ * single-slot 0x1000/0x1001/0x0108 channel was removed in task 04. */
 
 /* ── State event queue — written here, drained by serial_poll() ──────────── */
 /* We use a simple ring buffer rather than the pico queue_t here because all
@@ -147,9 +147,9 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
  * completion callback: a NAK is the normal outcome of a no-answer send); the
  * driver logs backlog-full drops. Id-tagging retired the shared-result-register
  * interlocks and settle-gate the single-slot path needed. */
-static bool raw_submit(uint8_t slave, uint8_t addr, uint8_t data, uint8_t flags,
-                       uint8_t dtr0, bool idempotent) {
-    return dq_submit(slave, addr, data, flags, dtr0, idempotent, NULL, NULL);
+static bool raw_submit(uint8_t slave, dq_prio_t prio, uint8_t addr, uint8_t data,
+                       uint8_t flags, uint8_t dtr0, bool idempotent) {
+    return dq_submit(slave, prio, addr, data, flags, dtr0, idempotent, NULL, NULL);
 }
 
 /* ── Any-on probe ────────────────────────────────────────────────────────────
@@ -299,7 +299,7 @@ void lighting_any_on_probe_tick(void) {
      * backlog-full false just retries next tick until the deadline. */
     const probe_tgt_t *t = &s_probe.tgt[s_probe.tgt_ix];
     uint16_t g = next_query_gen();
-    if (dq_submit(t->slave, t->addr_byte, PROBE_QUERY_OPCODE,
+    if (dq_submit(t->slave, DQ_PRIO_USER, t->addr_byte, PROBE_QUERY_OPCODE,
                   DQ_ANSWER, 0, true, probe_result_cb, (void *)(uintptr_t)g)) {
         s_probe.exp_gen   = g;
         s_probe.have      = false;
@@ -468,7 +468,7 @@ void lighting_cfg_query_tick(void) {
      * keeps its cached value. */
     uint8_t  addr_byte = (uint8_t)((s_cfgq.addr & 0x3Fu) << 1) | 0x01u;
     uint16_t g         = next_query_gen();
-    if (dq_submit(s_cfgq.slave_id, addr_byte, CFGQ_OPCODE[s_cfgq.field],
+    if (dq_submit(s_cfgq.slave_id, DQ_PRIO_BACKGROUND, addr_byte, CFGQ_OPCODE[s_cfgq.field],
                   DQ_ANSWER, 0, true, cfgq_result_cb, (void *)(uintptr_t)g)) {
         s_cfgq.exp_gen   = g;
         s_cfgq.have      = false;
@@ -505,7 +505,7 @@ bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
     uint8_t addr_byte = (uint8_t)((addr & 0x3Fu) << 1) | 0x01u;
     /* One queue entry: DTR0=value preloaded, then SET (twice). Idempotent
      * (re-storing the same value is safe to resubmit). */
-    if (!raw_submit(slave_id, addr_byte, SET_OPCODE[field],
+    if (!raw_submit(slave_id, DQ_PRIO_CONFIG_WRITE, addr_byte, SET_OPCODE[field],
                     DQ_DTR0 | DQ_TWICE, value, true)) {
         LOG_WARN("light", "dali %u.%u cfg write dropped — queue full",
                  slave_id, addr);
@@ -551,7 +551,7 @@ bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
         /* GOTO_LAST_ACTIVE (0x0A) — no per-ballast bank shortcut, use the queue.
          * Address byte: short address, command form (A0=1). Idempotent. */
         uint8_t addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
-        ok = raw_submit(slave_id, addr_byte, 0x0Au, 0, 0, true);
+        ok = raw_submit(slave_id, DQ_PRIO_USER, addr_byte, 0x0Au, 0, 0, true);
     } else {
         /* OFF — write 0 to the per-ballast brightness register. High byte is
          * ignored by the gateway on write. */
@@ -584,7 +584,7 @@ bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
     /* UP (0x01) / DOWN (0x02) via the queue, short-address command-form.
      * NON-idempotent: replaying a step double-steps the level. */
     uint8_t addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
-    if (!raw_submit(slave_id, addr_byte, up ? 0x01u : 0x02u, 0, 0, false)) {
+    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, up ? 0x01u : 0x02u, 0, 0, false)) {
         LOG_WARN("light", "dali %u.%u step %s dropped — queue full",
                  slave_id, dali_addr, up ? "up" : "down");
         return false;
@@ -627,7 +627,7 @@ bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
         return false;
     }
     uint8_t addr_byte = (uint8_t)(0x80u | ((group & 0x0Fu) << 1));  /* DAPC, idempotent */
-    if (!raw_submit(slave_id, addr_byte, arc, 0, 0, true)) {
+    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, arc, 0, 0, true)) {
         LOG_WARN("light", "group %u.G%u bri=%u dropped — queue full", slave_id, group, arc);
         return false;
     }
@@ -645,7 +645,7 @@ bool lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
     }
     uint8_t addr_byte = (uint8_t)(0x81u | ((group & 0x0Fu) << 1));  /* command, idempotent */
     uint8_t opcode    = on ? 0x0Au /* GOTO_LAST_ACTIVE */ : 0x00u /* OFF */;
-    if (!raw_submit(slave_id, addr_byte, opcode, 0, 0, true)) {
+    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, opcode, 0, 0, true)) {
         LOG_WARN("light", "group %u.G%u %s dropped — queue full",
                  slave_id, group, on ? "on" : "off");
         return false;
@@ -664,7 +664,7 @@ bool lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {
     }
     uint8_t addr_byte = (uint8_t)(0x81u | ((group & 0x0Fu) << 1));  /* command */
     /* group UP/DOWN — NON-idempotent (double-steps on replay). */
-    if (!raw_submit(slave_id, addr_byte, up ? 0x01u : 0x02u, 0, 0, false)) {
+    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, up ? 0x01u : 0x02u, 0, 0, false)) {
         LOG_WARN("light", "group %u.G%u step %s dropped — queue full",
                  slave_id, group, up ? "up" : "down");
         return false;

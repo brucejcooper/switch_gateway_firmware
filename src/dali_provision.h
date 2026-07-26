@@ -5,8 +5,9 @@
 /*
  * dali_provision.h — DALI commissioning state machine.
  *
- * Orchestrates the DALI binary-search address assignment protocol using
- * TinyModbus RAW_CMD (0x1000) and RAW_CMD_TWICE (0x1001) registers.
+ * Orchestrates the DALI binary-search address assignment protocol via the
+ * gateway's commission register (MBREG_COMMISSION 0x1F04): the controller writes
+ * a start/abort command and polls it until terminal.
  * Runs cooperatively with the main loop — never blocks.
  *
  * Three modes matching the original Lua implementation:

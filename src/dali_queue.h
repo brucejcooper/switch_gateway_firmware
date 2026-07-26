@@ -31,6 +31,23 @@
 #define DQ_DTR0    0x02u   /* preload DTR0 (0xA3<dtr0>) back-to-back before the frame */
 #define DQ_ANSWER  0x04u   /* expects a backward frame; deliver the 8-bit answer */
 
+/* Priority classes, highest first — an ordered table so re-ordering the ladder
+ * is a one-line change. Mirrors the gateway's own work selector (commissioning →
+ * raw → group bit → writes → reads → scans). The per-slave scheduler always
+ * submits the highest-priority pending command first; within a class it is FIFO.
+ * Classes marked "reserved" have no queue client yet (that transport still lives
+ * elsewhere — group masks via FC03, level reads via dirty_poll, provisioning via
+ * the commission register) and are placeholders for task 05. */
+typedef enum {
+    DQ_PRIO_PROVISION = 0,  /* reserved: provisioning is bus-exclusive via the busy-gate */
+    DQ_PRIO_USER,           /* brightness/on-off/step + group commands + the any-on probe */
+    DQ_PRIO_GROUP_WRITE,    /* reserved (group-membership writes go via FC03 today) */
+    DQ_PRIO_CONFIG_WRITE,   /* DTR0+SET config-write pairs */
+    DQ_PRIO_LEVEL_READ,     /* reserved (level/status reads go via dirty_poll today) */
+    DQ_PRIO_BACKGROUND,     /* config-rotation queries (cfgq) and other background sweeps */
+    DQ_PRIO_COUNT
+} dq_prio_t;
+
 /* Result codes delivered to a command's completion callback. */
 typedef enum {
     DQ_RES_OK  = 0,   /* backward frame received; `answer` is the response byte */
@@ -56,8 +73,9 @@ void dq_init(void);
  * DAPC level, group on/off/level are idempotent; UP/DOWN step frames are NOT).
  * `cb`/`ctx` receive the result (cb may be NULL). Returns false (and does not
  * enqueue) if the local backlog is full. */
-bool dq_submit(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
-               uint8_t dtr0, bool idempotent, dq_result_cb_t cb, void *ctx);
+bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
+               uint8_t flags, uint8_t dtr0, bool idempotent,
+               dq_result_cb_t cb, void *ctx);
 
 /* Per-loop driver: ship FC23 transactions, collect results, run recovery. Call
  * every main-loop iteration. */
@@ -72,3 +90,14 @@ void dq_note_boot_count(uint8_t slave_id, uint16_t boot_count);
  * gateway. Producers that must serialise against the queue (e.g. a probe that
  * needs the bus quiet) can gate on this. */
 bool dq_busy(uint8_t slave_id);
+
+/* Blocking submit-and-wait, for the text CLI (dali_raw / read_mem). Submits one
+ * command and spins the bus (modbus_poll + dq_tick) until its result is
+ * collected or `timeout_ms` elapses. Returns true on a result (fills *result /
+ * *answer), false on backlog-full or timeout. Marked idempotent — a CLI debug
+ * frame is safe to have the driver retry across a transport hiccup. Do NOT call
+ * from the non-CLI main-loop path (it blocks the loop like the other cli_mb_wait
+ * helpers). */
+bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
+                    uint8_t dtr0, uint32_t timeout_ms,
+                    dq_result_t *result, uint8_t *answer);
