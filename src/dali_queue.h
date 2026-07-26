@@ -34,16 +34,32 @@
  * A resync also clears the stored boot_count so the sysinfo poll re-baselines rather
  * than reading the same reboot as a second one.
  *
- * KNOWN LIMITATION (tracked: tasks/06-dq-collect-hardening.md): a gateway reboot
- * mid-burst has a brief reboot-recovery window (~2s of transport-recovery timeouts)
- * during which normal collection can attribute a stale ring slot to a lost in-flight
- * command — a TRANSIENT, self-healing wrong-answer window. If a boot-count poll fires
- * INSIDE that window it USED to make the desync permanent; the fresh-rebuild above
- * removes the permanent case. The permanent case needs the gw-diag poll to land in
- * the ~2s window, so it is unreachable at the 30 s production `gw_diag_interval_ms`
- * default (recovery always drains first) and only reproduces at aggressive poll
- * intervals (≤2 s). Fully closing the residual transient needs dq_collect to drop
- * entries whose ids the gateway can no longer complete — the tracked follow-up.
+ * KNOWN LIMITATIONS on a gateway reboot mid-burst (tracked: one unified kept-vs-lost
+ * fix in tasks/06-dq-collect-hardening.md). Two residual result-ATTRIBUTION offsets
+ * remain — both are controller-side only: the gateway executes every command
+ * correctly and neither corrupts gateway or ballast state; they mis-map ANSWERS to
+ * commands (a one-command answer lag) and both self-heal on a controller reboot.
+ *
+ *   (i) Fast-poll transient: within the ~2 s transport-recovery window normal
+ *   collection can momentarily attribute a stale ring slot to a lost in-flight
+ *   command. A boot-count poll landing INSIDE that window USED to make it permanent;
+ *   the fresh-rebuild above removes that permanent case, so this is now transient and
+ *   UNREACHABLE at the 30 s production `gw_diag_interval_ms` default (recovery drains
+ *   first) — it only shows at aggressive poll intervals (≤2 s).
+ *
+ *   (ii) Transport-glitch submit_n rollback (PROD-REACHABLE, independent of poll
+ *   rate): a verify-exhaust against a genuinely-live gateway takes the alive-reconcile
+ *   branch; if the status read driving it predates the gateway's accept of the just-
+ *   sent submit, accepted_id != submit_last_id, so dq_rollback_submit re-pends a
+ *   command the gateway actually accepted → a persistent inflight-vs-gateway id offset.
+ *   This is on the transport-recovery path, NOT gated by the gw-diag poll, so it is
+ *   reachable at the production poll interval. It is rare (transport-glitch drills at
+ *   the 30 s poll came back clean 6/6) and self-heals on controller reboot.
+ *
+ * The tracked follow-up is ONE unified fix (re-pend/drop only genuinely-lost commands,
+ * verify-before-drop, keep-on-ambiguity) spanning the dq_resync_apply submit_n
+ * resolution AND dq_collect (drop entries whose ids the gateway can no longer
+ * complete), not two separate patches.
  */
 
 #include <stdbool.h>
