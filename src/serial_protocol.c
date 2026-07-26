@@ -652,6 +652,7 @@ static void cmd_help(void) {
     printf("identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n");
     printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
+    printf("dq [slave]                                 dump command-queue client state + counters\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
     printf("provision <slave> {all|new|<addr>}         commission: all / incremental / re-provision collided <addr>\n");
@@ -1331,6 +1332,15 @@ static void cmd_gw_reboot(char **saveptr) {
     txt_ok();
 }
 
+/* `dq [slave]` — dump the command-queue client's per-slave state + counters
+ * (dev-grade; for the bench fault drills). Bare = all DALI slaves. */
+static void cmd_dq(char **saveptr) {
+    char *ss = strtok_r(NULL, " \t", saveptr);
+    long slave = -1;
+    if (ss && !parse_int_range_auto(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    dq_debug_print((int)slave);
+}
+
 /* ── dim <slave> <addr|gN> {up|down} ───────────────────────────────────── */
 static void cmd_dim(char **saveptr) {
     char *ss = strtok_r(NULL, " \t", saveptr);
@@ -1930,6 +1940,10 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "gw_reboot") == 0) {
         cmd_gw_reboot(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "dq") == 0) {
+        cmd_dq(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "dim") == 0) {

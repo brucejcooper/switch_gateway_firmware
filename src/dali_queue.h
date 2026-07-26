@@ -101,3 +101,10 @@ bool dq_busy(uint8_t slave_id);
 bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
                     uint8_t dtr0, uint32_t timeout_ms,
                     dq_result_t *result, uint8_t *answer);
+
+/* Dump per-slave queue-client state to the console (CLI `dq [slave]`): scheduler
+ * state, ids (next/accepted/completed), in-flight (id:class) list, per-class
+ * queued depths, and the diagnostic counters (submitted/collected/timeouts/
+ * resubmits/busy/adopts/resyncs) the bench fault drills read. slave_id < 0 dumps
+ * all configured DALI slaves. Dev-grade; no MQTT surface. */
+void dq_debug_print(int slave_id);

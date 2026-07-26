@@ -30,6 +30,7 @@
 #include "log.h"
 #include "pico/time.h"
 #include <string.h>
+#include <stdio.h>
 
 /* Gateway register map (task 04, round 0x1000 base). */
 #define DQ_SUBMIT_WINDOW  0x1000u   /* QCMD base — FC23/FC16 write range */
@@ -66,6 +67,16 @@ typedef struct {
     uint8_t  next_id;        /* next gateway id to assign (1..31) */
     uint8_t  free_hint;      /* gateway free slots from last status (credit) */
     uint8_t  last_completed; /* completed_id seen last response (0 = none) */
+    uint8_t  last_accepted;  /* accepted_id seen last response (for `dq` dump) */
+
+    /* Diagnostic counters (for the `dq` CLI command / bench fault drills). */
+    uint32_t c_submitted;    /* records shipped */
+    uint32_t c_collected;    /* results routed to callbacks */
+    uint32_t c_timeouts;     /* FC23 transactions that timed out */
+    uint32_t c_resubmits;    /* records rolled back to pending (did-not-land / busy) */
+    uint32_t c_busy;         /* SLAVE_DEVICE_BUSY (0x06) exceptions */
+    uint32_t c_adopts;       /* boot-time id adoptions */
+    uint32_t c_resyncs;      /* gateway-reboot resyncs performed */
 
     uint16_t boot_count;
     bool     boot_valid;
@@ -180,6 +191,7 @@ static void dq_pop_front(dq_slave_t *s) {
  * double it), keep idempotent in-flight (re-pended) and all pending, and resync
  * the id sequence. The survivors are re-sorted by priority. */
 static void dq_resync(dq_slave_t *s) {
+    s->c_resyncs++;
     dq_cmd_t keep[DQ_BACKLOG];
     uint8_t  nkeep = 0;
     for (uint8_t i = 0; i < s->count; i++) {
@@ -219,6 +231,7 @@ static void dq_collect(dq_slave_t *s, uint8_t completed_id) {
         dq_result_t res = (dq_result_t)((r >> 8) & 0xFFu);
         uint8_t     ans = (uint8_t)(r & 0xFFu);
         if (h->cb) h->cb(s->slave_id, res, ans, h->ctx);
+        s->c_collected++;
         if (rid == completed_id) done = true;
         dq_pop_front(s);
     }
@@ -265,6 +278,7 @@ static void dq_issue(dq_slave_t *s, uint8_t n) {
     }
     s->submit_n       = n;
     s->submit_last_id = last_id;
+    s->c_submitted   += n;
     s->st             = DQ_AWAIT;
 }
 
@@ -303,8 +317,9 @@ static void dq_promote_submit(dq_slave_t *s) {
 
 static void dq_rollback_submit(dq_slave_t *s) {
     for (uint8_t i = 0; i < s->submit_n; i++) s->bl[s->outstanding + i].id = 0;
-    s->next_id  = s->id_before;
-    s->submit_n = 0;
+    s->next_id     = s->id_before;
+    s->c_resubmits += s->submit_n;
+    s->submit_n    = 0;
 }
 
 /* Pacing after a completed transaction: straight into the next submit when there
@@ -324,12 +339,13 @@ static void dq_handle_await(dq_slave_t *s) {
         if (res < 0) {
             /* Exception: the all-or-nothing submit was rejected, nothing landed.
              * Roll back and back off (defensive — strict credits prevent it). */
+            if (exc == 0x06u) { s->c_busy++; s->free_hint = 0; }  /* no credit until we re-read */
             dq_rollback_submit(s);
-            if (exc == 0x06u) s->free_hint = 0;   /* no credit until we re-read */
             s->st = DQ_IDLE;
             s->next_at = make_timeout_time_ms(DQ_DRAIN_POLL_MS);
             return;
         }
+        s->c_timeouts++;
         if (s->submit_n > 0) {                    /* timeout: verify before resubmit */
             s->verify_left = DQ_VERIFY_RETRIES;
             dq_issue_read_only(s, DQ_VERIFY);
@@ -342,6 +358,7 @@ static void dq_handle_await(dq_slave_t *s) {
     uint8_t free_slots  = (uint8_t)(cb_reg(s, 0) >> 8);
     uint8_t accepted_id = (uint8_t)(cb_reg(s, 0) & 0xFF);
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
+    s->last_accepted = accepted_id;
     if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) { dq_resync(s); return; }
     dq_promote_submit(s);
     s->free_hint = free_slots;
@@ -360,6 +377,7 @@ static void dq_handle_verify(dq_slave_t *s) {
     uint8_t free_slots  = (uint8_t)(cb_reg(s, 0) >> 8);
     uint8_t accepted_id = (uint8_t)(cb_reg(s, 0) & 0xFF);
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
+    s->last_accepted = accepted_id;
     if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) { dq_resync(s); return; }
     /* Did the timed-out submit land? accepted_id equals submit_last_id iff so. */
     if (accepted_id == s->submit_last_id) dq_promote_submit(s);
@@ -380,8 +398,10 @@ static void dq_handle_adopt(dq_slave_t *s) {
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
     s->next_id        = (accepted_id == 0) ? 1u : next_gw_id(accepted_id);
     s->last_completed = completed;
+    s->last_accepted  = accepted_id;
     s->free_hint      = free_slots;
     s->adopted        = true;
+    s->c_adopts++;
     s->st             = DQ_IDLE;
     s->next_at        = get_absolute_time();
 }
@@ -458,4 +478,61 @@ bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
     if (result) *result = s_sync_res;
     if (answer) *answer = s_sync_ans;
     return true;
+}
+
+/* ── `dq` CLI observability ───────────────────────────────────────────────── */
+
+static const char *dq_prio_name(uint8_t p) {
+    switch (p) {
+        case DQ_PRIO_PROVISION:    return "prov";
+        case DQ_PRIO_USER:         return "user";
+        case DQ_PRIO_GROUP_WRITE:  return "gwrite";
+        case DQ_PRIO_CONFIG_WRITE: return "cfgw";
+        case DQ_PRIO_LEVEL_READ:   return "lread";
+        case DQ_PRIO_BACKGROUND:   return "bg";
+        default:                   return "?";
+    }
+}
+
+static const char *dq_state_name(dq_state_t st) {
+    switch (st) {
+        case DQ_IDLE:   return "idle";
+        case DQ_AWAIT:  return "await";
+        case DQ_VERIFY: return "verify";
+        case DQ_ADOPT:  return "adopt";
+        default:        return "?";
+    }
+}
+
+void dq_debug_print(int slave_id) {
+    bool any = false;
+    for (int i = 0; i < MAX_DALI_SLAVES; i++) {
+        dq_slave_t *s = &s_dq[i];
+        if (!s->in_use) continue;
+        if (slave_id >= 0 && s->slave_id != (uint8_t)slave_id) continue;
+        any = true;
+        uint8_t pending = (uint8_t)(s->count - s->outstanding);
+        uint8_t cls[DQ_PRIO_COUNT] = {0};
+        for (uint8_t j = s->outstanding; j < s->count; j++)
+            if (s->bl[j].prio < DQ_PRIO_COUNT) cls[s->bl[j].prio]++;
+        printf("dq slave %u: st=%s adopted=%s next_id=%u free_hint=%u\n",
+               s->slave_id, dq_state_name(s->st), s->adopted ? "y" : "n",
+               s->next_id, s->free_hint);
+        printf("  accepted(last)=%u completed(last)=%u inflight=%u/%u pending=%u boot=%s:%u\n",
+               s->last_accepted, s->last_completed, s->outstanding, DQ_INFLIGHT_MAX,
+               pending, s->boot_valid ? "y" : "n", s->boot_count);
+        printf("  inflight:");
+        for (uint8_t j = 0; j < s->outstanding; j++)
+            printf(" %u:%s", s->bl[j].id, dq_prio_name(s->bl[j].prio));
+        printf("\n  queued/class: prov=%u user=%u gwrite=%u cfgw=%u lread=%u bg=%u\n",
+               cls[DQ_PRIO_PROVISION], cls[DQ_PRIO_USER], cls[DQ_PRIO_GROUP_WRITE],
+               cls[DQ_PRIO_CONFIG_WRITE], cls[DQ_PRIO_LEVEL_READ], cls[DQ_PRIO_BACKGROUND]);
+        printf("  counters: submitted=%lu collected=%lu timeouts=%lu resubmits=%lu "
+               "busy=%lu adopts=%lu resyncs=%lu\n",
+               (unsigned long)s->c_submitted, (unsigned long)s->c_collected,
+               (unsigned long)s->c_timeouts, (unsigned long)s->c_resubmits,
+               (unsigned long)s->c_busy, (unsigned long)s->c_adopts,
+               (unsigned long)s->c_resyncs);
+    }
+    if (!any) printf("dq: no matching DALI slave\n");
 }

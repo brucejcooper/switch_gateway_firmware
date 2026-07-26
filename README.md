@@ -418,6 +418,13 @@ adopts the gateway's `accepted_id`/`completed_id` on first contact before
 submitting, so fresh commands are never mis-collected against retained gateway
 state.
 
+**Observability.** The CLI **`dq [slave]`** command dumps per-slave client state
+for the bench fault drills: scheduler state, `next_id` / last `accepted_id` /
+`completed_id`, the in-flight `(id:class)` list and per-class queued depths, and
+counters — submitted, collected, timeouts, resubmits (records rolled back after
+a read-status), busy exceptions, id adoptions, and reboot resyncs. Bare = all
+DALI slaves.
+
 **Subsystems on the queue.** Every former single-slot producer rides it now: the
 raw command path (button on/off/step, group commands, config DTR0+SET), the
 **any-on probe**, the **config-query** state machine, and the blocking **CLI
