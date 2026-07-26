@@ -330,20 +330,25 @@ new contract:
   writes there return ILLEGAL DATA ADDRESS. The controller owns config: it
   **reads** each field with raw DALI queries (the config-query state machine in
   `lighting_actions.c`, routed through the command queue) and **writes** it with
-  a DTR0+SET pair submitted as one queue command. Requires a raw-config
-  controller ↔ retired-bank gateway as a matched pair; deploy controller-first.
+  a DTR0+SET pair submitted as one queue command. Controller and gateway are a
+  **matched firmware set** (task 04) — deploy both together.
 - **DALI command queue** — the primary path for group/broadcast/specialty sends
-  and all raw queries. Submit window (FC10/FC23 write) at `0x1100`, status block
-  (FC04 `0x0400` / holding alias `0x1180`), FC23 (`0x17`). See "DALI command
-  queue client" below and `../TinyModbus/README.md`. The legacy single-slot
-  `0x1000/0x1001/0x0108` channel still works but is deprecated (CLI `dali_raw`).
+  and all raw queries. Submit window (FC10/FC23 write) at `0x1000–0x1007`, status
+  block at `0x1010–0x1019` (served under both FC03 and FC04), FC23 (`0x17`). See
+  "DALI command queue client" below and `../TinyModbus/README.md`. The legacy
+  single-slot `0x1000/0x1001/0x0108` raw channel was **removed** in task 04 (its
+  addresses are reused by the submit window); the CLI `dali_raw` / `read_mem`
+  now go through the queue client.
 - **Group masks (FC03 read / FC06 write) at `0x0110+`** — four 16-bit words
   per group covering bits 0–63, byte-swapped per word. The controller writes
   the desired mask; the gateway diffs old↔new and issues the per-bit DALI
   `ADD_TO_GROUP` / `REMOVE_FROM_GROUP` commands.
 - **Presence + dirty bitmaps (FC04) at `0x0100–0x0107`** — one 8-register
   read fetches both. The dirty range is read-clears.
-- **Gateway recovery:** `0x1015` (write `0xA5A5`) software-resets a wedged
+- **Action / config registers relocated to `0x1F00+`** (task 04): scan-trigger
+  `0x1F00`, rescan `0x1F01`, slave-addr `0x1F02`, baud `0x1F03`, commission
+  `0x1F04`, system-reset `0x1F05`.
+- **Gateway recovery:** `0x1F05` (write `0xA5A5`) software-resets a wedged
   gateway (CLI `gw_reboot`). RX error counters live at FC04 `0x0300`; uptime /
   boot-count / reset-reason at FC04 `0x0310` (read `get_input <slave> 0x0310 4`
   — a reboot shows as uptime dropping or boot-count incrementing).
@@ -354,22 +359,34 @@ The canonical specification for the gateway is
 ### DALI command queue client (`dali_queue.c`)
 
 Every group/broadcast/specialty DALI send and every raw query goes through a
-per-gateway **command-queue client** that drives the gateway's 8-deep id-tagged
-queue over FC23. It replaced the old single-slot "write `0x1000`, poll `0x0108`,
-back off on DEVICE_BUSY" path and the three separate producers that contended
-for it.
+per-gateway **command-queue client** (`dali_queue.c`) that drives the gateway's
+8-deep id-tagged queue over FC23. It replaced the old single-slot "write
+`0x1000`, poll `0x0108`, back off on DEVICE_BUSY" path (now removed) and the
+three separate producers that contended for it.
 
-**Model.** Each gateway has a local FIFO backlog — the priority queue that sits
-in front of the gateway's queue. Producers (`dq_submit`) drop commands into it;
-`dq_tick()` ships them. Each shipped command gets a controller-assigned **id**
-(cycling 1–31, 0 reserved), and its result is routed back to the command's
-completion callback when collected. A command carries an **idempotency** flag:
-idempotent commands (GOTO_LAST_ACTIVE, group on/off/level, config re-store, all
-queries) may be resubmitted after a fault; UP/DOWN step frames may not.
+**Model.** Each gateway has a per-slave **scheduler state machine** over a local
+backlog — the priority queue in front of the gateway's queue. Producers
+(`dq_submit`) drop commands in with a **priority class**; `dq_tick()` ships the
+highest-priority pending command first (FIFO within a class). Each shipped
+command gets a controller-assigned **id** (cycling 1–31, 0 reserved), and its
+result is routed back to the command's completion callback when collected. A
+command carries an **idempotency** flag: idempotent commands (GOTO_LAST_ACTIVE,
+group on/off/level, config re-store, all queries) may be resubmitted after a
+fault; UP/DOWN step frames may not.
+
+**Priority ladder** (highest first, an ordered table — one-line reorder), mirroring
+the gateway's own work selector: **provisioning** (bus-exclusive: while a slave
+is being commissioned the scheduler admits nothing else on it) → **user actions**
+(brightness/on-off/step + group commands + the any-on probe) → group-membership
+writes → **config writes** (DTR0+SET) → level/status reads → **background** (config
+rotation). Classes with no queue client yet (group writes, level reads — they use
+FC03 / dirty_poll today) are reserved placeholders for task 05. In-flight depth is
+capped at **2–3 per slave** (well below the gateway's 8) so background work never
+fills the gateway queue ahead of a fresh user command.
 
 **One transaction = one FC23:** write up to 4 new records into the submit window
-(`0x1100`) and read the 10-register status block back through the holding alias
-(`0x1180`) in the same round trip. Because the gateway executes the write before
+(`0x1000`) and read the 10-register status block back through the holding view
+(`0x1010`) in the same round trip. Because the gateway executes the write before
 the read, one FC23 both submits new work and collects the results of earlier
 commands (submit-N / collect-N−1). A command's result lives in `QRES[id mod 8]`
 and is valid once the status block's `completed_id` has reached that id.
@@ -401,15 +418,18 @@ adopts the gateway's `accepted_id`/`completed_id` on first contact before
 submitting, so fresh commands are never mis-collected against retained gateway
 state.
 
-**Subsystems on the queue.** All three former single-slot producers ride it now:
-the raw command path (button on/off/step, group commands, config DTR0+SET), the
-**any-on probe**, and the **config-query** state machine. The probe and the
+**Subsystems on the queue.** Every former single-slot producer rides it now: the
+raw command path (button on/off/step, group commands, config DTR0+SET), the
+**any-on probe**, the **config-query** state machine, and the blocking **CLI
+helpers** (`dali_raw` / `read_mem`, via `dq_submit_sync`). The probe and the
 config queries are ordinary expects-answer commands with their own ids, so the
 shared-result-register interlocks and the post-drain settle-gate the single-slot
-path needed are gone — **id-tagging is what retired them**. The click-grace
-guarantee still holds: a probe query resolves in ~1–2 FC23 round-trips
-(~30–90 ms), inside the button FSM's 150 ms grace; a rare overflow lands on the
-pre-existing assume-off fallback, bounded by the 600 ms probe deadline.
+path needed are gone — **id-tagging is what retired them** (this also closes the
+CLI-bypass hole the settle-gate could not cover). `read_mem`'s per-byte SET-DTR0
++ READ is now one atomic `DQ_DTR0` queue entry. The click-grace guarantee still
+holds: a probe query resolves in ~1–2 FC23 round-trips (~30–90 ms), inside the
+button FSM's 150 ms grace; a rare overflow lands on the pre-existing assume-off
+fallback, bounded by the 600 ms probe deadline.
 
 ### State event flow to HA
 
