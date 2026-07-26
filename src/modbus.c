@@ -69,13 +69,25 @@ typedef enum {
     ACTION_GET_INPUT_REGISTERS   = 0x04,   /* new: FC04 for TinyModbus */
     ACTION_SET_COIL              = 0x05,
     ACTION_SET_HOLDING_REGISTER  = 0x06,
+    ACTION_WRITE_MULTI_REG       = 0x10,   /* new: FC16 Write Multiple Registers */
+    ACTION_READ_WRITE_MULTI_REG  = 0x17,   /* new: FC23 Read/Write Multiple Registers */
 } modbus_action_type_t;
+
+/* Largest register block any FC16/FC23 write carries here is the gateway's
+ * 4-command submit window (0x1100-0x1107) = 8 registers = 16 bytes.  Sized to
+ * that; a longer write is rejected at enqueue time. */
+#define MODBUS_WR_PAYLOAD_MAX 16u
 
 typedef struct {
     modbus_action_type_t action;
     uint8_t              device;
-    uint16_t             address;
-    uint16_t             arg;
+    uint16_t             address;   /* FC03/04/06: start addr.  FC23: READ start addr. */
+    uint16_t             arg;       /* read count / single-write value.  FC23: READ reg count. */
+    /* FC16/FC23 write side. */
+    uint16_t             wr_address;              /* write start addr */
+    uint16_t             wr_count;                /* write register count */
+    uint8_t              wr_payload[MODBUS_WR_PAYLOAD_MAX]; /* big-endian register bytes */
+    uint8_t              wr_len;                  /* bytes used in wr_payload */
     modbus_action_cb_t   callback;
     void                *ctx;
 } modbus_action_t;
@@ -149,6 +161,14 @@ static void log_action_intent(const modbus_action_t *a) {
     case ACTION_SET_HOLDING_REGISTER:
         LOG_DBG("modbus", "set holding register slave=%u addr=%u value=%u",
                 a->device, a->address, a->arg);
+        break;
+    case ACTION_WRITE_MULTI_REG:
+        LOG_DBG("modbus", "write multi reg slave=%u addr=%u count=%u",
+                a->device, a->wr_address, a->wr_count);
+        break;
+    case ACTION_READ_WRITE_MULTI_REG:
+        LOG_DBG("modbus", "read/write multi slave=%u rd=%u/%u wr=%u/%u",
+                a->device, a->address, a->arg, a->wr_address, a->wr_count);
         break;
     default:
         LOG_DBG("modbus", "action 0x%02x slave=%u addr=%u arg=%u",
@@ -337,13 +357,47 @@ static void log_frame_hex(const char *dir, const uint8_t *b, size_t n) {
  * Called both for a fresh action (from MODBUS_IDLE) and for a retransmit (from
  * MODBUS_DEADTIME).  Leaves the bus in MODBUS_TRANSMITTING. */
 static void start_action_tx(void) {
-    buf[0] = currentAction.device;
-    buf[1] = currentAction.action;
-    buf[2] = currentAction.address >> 8;
-    buf[3] = currentAction.address & 0xFF;
-    buf[4] = currentAction.arg >> 8;
-    buf[5] = currentAction.arg & 0xFF;
-    size_t sz = 6;
+    size_t sz;
+    if (currentAction.action == ACTION_WRITE_MULTI_REG) {
+        /* FC16: dev, fc, start(2), count(2), bytecount, data[...] */
+        buf[0] = currentAction.device;
+        buf[1] = currentAction.action;
+        buf[2] = currentAction.wr_address >> 8;
+        buf[3] = currentAction.wr_address & 0xFF;
+        buf[4] = currentAction.wr_count >> 8;
+        buf[5] = currentAction.wr_count & 0xFF;
+        buf[6] = currentAction.wr_len;
+        for (uint8_t i = 0; i < currentAction.wr_len; i++)
+            buf[7 + i] = currentAction.wr_payload[i];
+        sz = 7u + currentAction.wr_len;
+    } else if (currentAction.action == ACTION_READ_WRITE_MULTI_REG) {
+        /* FC23: dev, fc, read-start(2), read-count(2), write-start(2),
+         * write-count(2), write-bytecount, write-data[...].  The gateway
+         * executes the write before the read, so the response returns the
+         * post-write read block (submit-N / collect-N-1 pipeline). */
+        buf[0]  = currentAction.device;
+        buf[1]  = currentAction.action;
+        buf[2]  = currentAction.address >> 8;      /* read start */
+        buf[3]  = currentAction.address & 0xFF;
+        buf[4]  = currentAction.arg >> 8;          /* read count */
+        buf[5]  = currentAction.arg & 0xFF;
+        buf[6]  = currentAction.wr_address >> 8;    /* write start */
+        buf[7]  = currentAction.wr_address & 0xFF;
+        buf[8]  = currentAction.wr_count >> 8;      /* write count */
+        buf[9]  = currentAction.wr_count & 0xFF;
+        buf[10] = currentAction.wr_len;
+        for (uint8_t i = 0; i < currentAction.wr_len; i++)
+            buf[11 + i] = currentAction.wr_payload[i];
+        sz = 11u + currentAction.wr_len;
+    } else {
+        buf[0] = currentAction.device;
+        buf[1] = currentAction.action;
+        buf[2] = currentAction.address >> 8;
+        buf[3] = currentAction.address & 0xFF;
+        buf[4] = currentAction.arg >> 8;
+        buf[5] = currentAction.arg & 0xFF;
+        sz = 6;
+    }
 
     readTimeout = make_timeout_time_ms(MODBUS_RESPONSE_TIMEOUT_MS);
     append_crc16(buf, sz);
@@ -546,40 +600,80 @@ uint32_t modbus_drop_count(void) { return s_drop_count; }
 
 bool modbus_get_coils(uint8_t dev, uint16_t addr, uint16_t count,
                       modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = { ACTION_GET_COILS, dev, addr, count, cb, ctx };
+    modbus_action_t a = { .action = ACTION_GET_COILS, .device = dev,
+                          .address = addr, .arg = count, .callback = cb, .ctx = ctx };
     return enqueue(&a);
 }
 
 bool modbus_toggle(uint8_t dev, uint16_t addr,
                    modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = { ACTION_SET_COIL, dev, addr, 0x5500, cb, ctx };
+    modbus_action_t a = { .action = ACTION_SET_COIL, .device = dev,
+                          .address = addr, .arg = 0x5500, .callback = cb, .ctx = ctx };
     return enqueue(&a);
 }
 
 bool modbus_set_coil(uint8_t dev, uint16_t addr, bool is_on,
                      modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = {
-        ACTION_SET_COIL, dev, addr,
-        is_on ? 0xFF00u : 0x0000u, cb, ctx
-    };
+    modbus_action_t a = { .action = ACTION_SET_COIL, .device = dev, .address = addr,
+                          .arg = is_on ? 0xFF00u : 0x0000u, .callback = cb, .ctx = ctx };
     return enqueue(&a);
 }
 
 bool modbus_get_holding_registers(uint8_t dev, uint16_t addr, uint16_t count,
                                    modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = { ACTION_GET_HOLDING_REGISTERS, dev, addr, count, cb, ctx };
+    modbus_action_t a = { .action = ACTION_GET_HOLDING_REGISTERS, .device = dev,
+                          .address = addr, .arg = count, .callback = cb, .ctx = ctx };
     return enqueue(&a);
 }
 
 bool modbus_set_holding_register(uint8_t dev, uint16_t addr, uint16_t value,
                                   modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = { ACTION_SET_HOLDING_REGISTER, dev, addr, value, cb, ctx };
+    modbus_action_t a = { .action = ACTION_SET_HOLDING_REGISTER, .device = dev,
+                          .address = addr, .arg = value, .callback = cb, .ctx = ctx };
     return enqueue(&a);
 }
 
 /* New: FC04 — same frame structure as FC03 */
 bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
                                  modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = { ACTION_GET_INPUT_REGISTERS, dev, addr, count, cb, ctx };
+    modbus_action_t a = { .action = ACTION_GET_INPUT_REGISTERS, .device = dev,
+                          .address = addr, .arg = count, .callback = cb, .ctx = ctx };
+    return enqueue(&a);
+}
+
+/* New: FC16 Write Multiple Registers.  `data` is the big-endian register bytes
+ * (count*2 of them); count registers written starting at addr. */
+bool modbus_write_multiple_registers(uint8_t dev, uint16_t addr, uint16_t count,
+                                     const uint8_t *data,
+                                     modbus_action_cb_t cb, void *ctx) {
+    if (count == 0 || (size_t)count * 2u > MODBUS_WR_PAYLOAD_MAX) return false;
+    modbus_action_t a = {
+        .action = ACTION_WRITE_MULTI_REG, .device = dev,
+        .wr_address = addr, .wr_count = count, .wr_len = (uint8_t)(count * 2u),
+        .callback = cb, .ctx = ctx,
+    };
+    memcpy(a.wr_payload, data, (size_t)count * 2u);
+    return enqueue(&a);
+}
+
+/* New: FC23 Read/Write Multiple Registers.  The slave writes wr_count registers
+ * at wr_addr (data = big-endian bytes), THEN reads rd_count registers at rd_addr;
+ * the response carries the post-write read block.  wr_count may be 0 for a
+ * read-only FC23 (some slaves reject that; the gateway accepts it). */
+bool modbus_read_write_multiple_registers(uint8_t dev,
+                                          uint16_t rd_addr, uint16_t rd_count,
+                                          uint16_t wr_addr, uint16_t wr_count,
+                                          const uint8_t *wr_data,
+                                          modbus_action_cb_t cb, void *ctx) {
+    if (rd_count == 0) return false;
+    if ((size_t)wr_count * 2u > MODBUS_WR_PAYLOAD_MAX) return false;
+    modbus_action_t a = {
+        .action = ACTION_READ_WRITE_MULTI_REG, .device = dev,
+        .address = rd_addr, .arg = rd_count,
+        .wr_address = wr_addr, .wr_count = wr_count,
+        .wr_len = (uint8_t)(wr_count * 2u),
+        .callback = cb, .ctx = ctx,
+    };
+    if (wr_count) memcpy(a.wr_payload, wr_data, (size_t)wr_count * 2u);
     return enqueue(&a);
 }
