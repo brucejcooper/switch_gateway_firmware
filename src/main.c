@@ -22,6 +22,7 @@
 #include "config.h"
 #include "mapping.h"
 #include "lighting_actions.h"
+#include "dali_queue.h"
 #include "dirty_poll.h"
 #include "serial_protocol.h"
 #include "dali_provision.h"
@@ -138,6 +139,7 @@ int main(void) {
     /* Dirty poll init before full scan */
     dirty_poll_init();
     dali_provision_init();
+    dq_init();   /* per-slave gateway command-queue driver state */
 
     /* Full scan of each DALI slave — blocking, establishes ground truth */
     for (int i = 0; i < g_config.dali_slave_count; i++) {
@@ -222,9 +224,9 @@ int main(void) {
         modbus_poll();
         wd_feed();
 
-        lighting_raw_tick();
-        lighting_any_on_probe_tick();
-        lighting_cfg_query_tick();
+        lighting_any_on_probe_tick();   /* submit probe queries into the gateway queue */
+        lighting_cfg_query_tick();      /* submit config queries into the gateway queue */
+        dq_tick();                      /* drive the gateway command queue (FC23) */
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();

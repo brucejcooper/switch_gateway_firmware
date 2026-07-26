@@ -13,6 +13,7 @@
 #include "modbus.h"
 #include "state_cache.h"
 #include "lighting_actions.h"
+#include "dali_queue.h"
 #include "config.h"
 #include "dali_provision.h"
 #include "log.h"
@@ -191,6 +192,9 @@ static void gwdiag_cb(int res, uint8_t *buf, void *ctx) {
     int idx = state_cache_slave_idx(slave);
     if (idx >= 0) gateway_report(slave, idx, true);
     lighting_emit_gw_diag(slave, uptime, boot, reason);
+    /* Feed boot_count to the command-queue driver: a change means the gateway
+     * rebooted and lost its queue, so in-flight commands must be resynced. */
+    dq_note_boot_count(slave, boot);
 }
 
 /* ── Dirty bitmask callback ──────────────────────────────────────────────── */

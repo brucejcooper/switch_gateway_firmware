@@ -30,16 +30,10 @@ bool lighting_set_relay(uint8_t channel, bool on);
  * Returns false for channels beyond byte_count*8. */
 bool lighting_relay_coil_on(const uint8_t *coil_bytes, uint8_t byte_count, uint8_t ch);
 
-/* Queue a raw DALI command for TinyModbus's RAW_CMD (or RAW_CMD_TWICE if
- * `twice` is true). The gateway executes ONE raw command at a time and rejects
- * an overlapping write with MB_ERR_DEVICE_BUSY, so sends go through an
- * internal FIFO (lighting_raw_tick): one in flight, ~25 ms pacing between
- * sends, busy/timeout retried with back-off. Returns false only if the FIFO is
- * full (logged). */
-bool dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice);
-
-/* Drives the RAW_CMD send queue — call every main-loop iteration. */
-void lighting_raw_tick(void);
+/* Raw DALI commands (broadcast/group/specialty sends) go through the id-tagged
+ * gateway command queue (dali_queue.h / dq_submit), driven by dq_tick() from the
+ * main loop. The producers below (on/off, step, group *, config write) submit
+ * into it directly; there is no separate raw-command tick to call. */
 
 /* ── Any-on probe ────────────────────────────────────────────────────────────
  * Ground-truth "is any light in this binding on?" for button toggles. Started
