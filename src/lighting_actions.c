@@ -633,7 +633,6 @@ static void cfgq_field_done(bool ok, uint8_t value) {
 }
 
 void lighting_cfg_query_tick(void) {
-    if (!g_config.dali_raw_cfg) return;
 
     if (!s_cfgq.active && !cfgq_start_next()) return;
 

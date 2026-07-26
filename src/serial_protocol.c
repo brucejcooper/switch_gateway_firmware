@@ -643,7 +643,6 @@ static void cmd_help(void) {
     printf("                                           group (gN) also: members=0,1  add=2  remove=1\n");
     printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms fw_url\n");
     printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
-    printf("                                           dali_raw_cfg=0|1 (config via raw DALI vs gateway banks)\n");
     printf("tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result\n");
@@ -688,14 +687,13 @@ static void cmd_show(char **saveptr) {
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
                "gw_diag_interval_ms=%lu "
-               "baud=%lu rs485=%s relay_byteswap=%u dali_raw_cfg=%u fw_url=%s relay_slaves=",
+               "baud=%lu rs485=%s relay_byteswap=%u fw_url=%s relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
                (unsigned long)g_config.gw_diag_interval_ms,
                (unsigned long)modbus_get_baud(),
                modbus_de_mode_to_str(modbus_get_de_mode()),
                g_config.relay_byteswap ? 1u : 0u,
-               g_config.dali_raw_cfg ? 1u : 0u,
                g_config.fw_url[0] ? g_config.fw_url : "(default)");
         for (int i = 0; i < g_config.relay_slave_count; i++) {
             printf("%s%u", i > 0 ? "," : "", g_config.relay_slave_ids[i]);
@@ -998,8 +996,6 @@ static void cmd_cfg(char **saveptr) {
         else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
         else if (strcasecmp(key, "relay_byteswap") == 0)
             g_config.relay_byteswap = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
-        else if (strcasecmp(key, "dali_raw_cfg") == 0)
-            g_config.dali_raw_cfg = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
         else if (strcasecmp(key, "relay_slaves") == 0)
             g_config.relay_slave_count = (uint8_t)parse_csv_u8(val, g_config.relay_slave_ids, MAX_RELAY_SLAVES);
         else if (strcasecmp(key, "dali_slaves") == 0)
@@ -1065,36 +1061,16 @@ static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t 
     dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
     if (!b) return -1;
 
-    /* Phase B (task 03): when dali_raw_cfg is on, the controller owns the write
-     * as a raw DTR0-load + SET pair, verified by a query-back that write-throughs
-     * the cache. No predictive cache update here — the retained value only changes
-     * on verify. dali_cfg_field's (base,high) maps 1:1 onto the field enum. */
-    if (g_config.dali_raw_cfg) {
-        dali_cfg_field_t f = base == 0x0040u ? (high ? DALI_CFG_MIN       : DALI_CFG_MAX)
-                           : base == 0x0080u ? (high ? DALI_CFG_POWER_ON  : DALI_CFG_SYS_FAIL)
-                           :                    (high ? DALI_CFG_FADE_RATE : DALI_CFG_FADE_TIME);
-        /* 2 = applied async; the query-back write-throughs the cache and emits
-         * the verified (possibly clamped) value — no premature pre-verify emit. */
-        return lighting_dali_cfg_write(slave, addr, f, value) ? 2 : -2;
-    }
-
-    uint8_t mn = b->min_level, mx = b->max_level, po = b->power_on_level,
-            sf = b->sys_fail_level, fr = b->fade_rate, ft = b->fade_time;
-    if      (base == 0x0040u) { if (high) mn = value; else mx = value; }
-    else if (base == 0x0080u) { if (high) po = value; else sf = value; }
-    else                      { if (high) fr = value; else ft = value; }
-    uint16_t regval = base == 0x0040u ? (uint16_t)(((uint16_t)mn << 8) | mx)
-                    : base == 0x0080u ? (uint16_t)(((uint16_t)po << 8) | sf)
-                    :                   (uint16_t)(((uint16_t)fr << 8) | ft);
-    static cli_mb_ctx_t ctx;
-    memset(&ctx, 0, sizeof ctx);
-    modbus_set_holding_register(slave, (uint16_t)(base + addr), regval, cli_mb_cb, &ctx);
-    cli_mb_wait(&ctx);
-    if (cli_mb_report_fail(&ctx)) return -2;
-    /* Predictive cache update; the caller emits one state_dali after applying
-     * every field, so a multi-field set produces a single report. */
-    state_cache_set_dali_config((uint8_t)idx, addr, mx, mn, po, sf, fr, ft);
-    return 1;
+    /* Config writes are always raw DTR0-load + SET pairs, verified by a
+     * query-back that write-throughs the cache. No predictive cache update here
+     * — the retained value only changes on verify. dali_cfg_field's (base,high)
+     * maps 1:1 onto the field enum. */
+    dali_cfg_field_t f = base == 0x0040u ? (high ? DALI_CFG_MIN       : DALI_CFG_MAX)
+                       : base == 0x0080u ? (high ? DALI_CFG_POWER_ON  : DALI_CFG_SYS_FAIL)
+                       :                    (high ? DALI_CFG_FADE_RATE : DALI_CFG_FADE_TIME);
+    /* 2 = applied async; the query-back write-throughs the cache and emits
+     * the verified (possibly clamped) value — no premature pre-verify emit. */
+    return lighting_dali_cfg_write(slave, addr, f, value) ? 2 : -2;
 }
 
 /* ── Unified {t,d,v} state reports — used by get_* and as set_* confirmation ─
@@ -2186,19 +2162,14 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         break;
     }
     case IC_CMD_SEED_DALI_CFG: {
-        /* Warm start (task 03, Phase C): adopt a per-ballast config read back
-         * from its retained MQTT topic at boot, so HA's numbers stay populated
-         * before the raw config sweep confirms them. Adopt ONLY while our cache
-         * is still unread (all config fields zero); once the sweep, dirty-poll
-         * or a set fills it, the measured value is authoritative. An all-zero
-         * seed is ignored (nothing to warm — and this breaks any
-         * publish->echo->seed loop, since our own re-emit makes the cache
-         * non-zero). */
-        /* Strict dual-path: in legacy (bank-read) mode the boot scan is the sole
-         * authority, so ignore warm-start seeds entirely — flag-off stays exactly
-         * as main. (Core 1 still subscribes/parses, but that has no cache effect
-         * here.) */
-        if (!g_config.dali_raw_cfg) break;
+        /* Warm start: adopt a per-ballast config read back from its retained
+         * MQTT topic at boot, so HA's numbers stay populated before the raw
+         * config sweep confirms them. Adopt ONLY while our cache is still unread
+         * (all config fields zero); once the sweep, dirty-poll or a set fills it,
+         * the measured value is authoritative. An all-zero seed is ignored
+         * (nothing to warm — and this breaks any publish->echo->seed loop, since
+         * our own re-emit makes the cache non-zero). Raw config is the only path
+         * now, so the seed is always in effect. */
         uint8_t slave = c->seed_dali_cfg.slave, addr = c->seed_dali_cfg.addr;
         int idx = state_cache_slave_idx(slave);
         if (idx < 0 || addr > 63) break;

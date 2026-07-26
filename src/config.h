@@ -33,16 +33,6 @@ typedef struct {
      * physical state. Default 0 (spec-compliant). */
     bool     relay_byteswap;       /* default 0 */
 
-    /* Dual-path flag for the config-over-raw migration (task 03). When 0 (the
-     * default) per-ballast config (min/max/power-on/sys-fail/fade) is read from
-     * the gateway BLOCK1-3 register banks in the full scan, as before. When 1 the
-     * controller instead fills that config with its own raw DALI queries
-     * (lighting_cfg_query_*), sweeping at boot and rotating in the background —
-     * the path that lets the gateway retire those banks (Phase D). Kept runtime-
-     * switchable (CLI `cfg dali_raw_cfg=1`) so both paths can be compared on the
-     * bench before the default flips. Default 0 = no behaviour change on flash. */
-    bool     dali_raw_cfg;         /* default 0 */
-
     /* MQTT broker. host is a dotted-quad IP (hostname/DNS is a follow-up).
      * Compile defaults are placeholders only — never commit secrets. */
     char     mqtt_host[64];
