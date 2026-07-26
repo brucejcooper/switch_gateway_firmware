@@ -448,8 +448,21 @@ static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
         s->dbg_trace_on     = true;
         s->dbg_log_resubmit = true;
         if (s->submit_n > 0) {   /* resolve any tentative submit before adopting the ledger */
-            if (accepted_id == s->submit_last_id) dq_promote_submit(s);
-            else                                  dq_rollback_submit(s);
+            /* TEMP instrumentation: mechanism B — this rollback-vs-promote is the
+             * suspected persistent regressor. If accepted_id lags submit_last_id
+             * because the status read predates the gateway's accept of the just-sent
+             * submit, ROLLBACK re-pends a command the gateway ACTUALLY accepted →
+             * permanent inflight-vs-gateway offset. Log the decision + the operands. */
+            if (accepted_id == s->submit_last_id) {
+                LOG_WARN("dqdbg", "slave %u   alive-submit: PROMOTE submit_n=%u submit_last_id=%u accepted=%u",
+                         s->slave_id, s->submit_n, s->submit_last_id, accepted_id);
+                dq_promote_submit(s);
+            } else {
+                LOG_WARN("dqdbg", "slave %u   alive-submit: ROLLBACK submit_n=%u submit_last_id=%u accepted=%u"
+                         " (mechB if gateway actually accepted submit_last_id)",
+                         s->slave_id, s->submit_n, s->submit_last_id, accepted_id);
+                dq_rollback_submit(s);
+            }
         }
     }
 
