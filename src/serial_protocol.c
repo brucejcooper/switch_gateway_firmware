@@ -1039,13 +1039,14 @@ static void cmd_btn(char **saveptr) {
 }
 
 /* ── DALI config get/set ───────────────────────────────────────────────────
- * Fields map to gateway holding-register pairs (high byte first):
- *   BLOCK1 0x0040+addr = (min<<8)|max
- *   BLOCK2 0x0080+addr = (power_on<<8)|sys_fail
- *   BLOCK3 0x00C0+addr = (fade_rate<<8)|fade_time
- * Writing a register arms the gateway's DALI "STORE DTR AS ..." sequence.  The
- * ballast may clamp a value (e.g. min to its physical minimum); a rescan then
- * reflects the actual stored value. */
+ * dali_cfg_field maps a field name to an INTERNAL (base,high) encoding — the
+ * `base` values 0x0040/0x0080/0x00C0 are just a compact way to identify the
+ * field pair (min|max, power_on|sys_fail, fade_rate|fade_time); they are NOT
+ * gateway register addresses (the gateway config banks were retired in task 04).
+ * dali_cfg_set translates (base,high) into a DALI field enum and writes it via a
+ * raw DTR0+SET queue entry (lighting_dali_cfg_write). The ballast may clamp a
+ * value (e.g. min to its physical minimum); the query-back rescan then reflects
+ * the actual stored value. */
 static bool dali_cfg_field(const char *name, uint16_t *base, bool *high) {
     if (strcasecmp(name, "min")       == 0) { *base = 0x0040u; *high = true;  return true; }
     if (strcasecmp(name, "max")       == 0) { *base = 0x0040u; *high = false; return true; }

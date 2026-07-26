@@ -94,10 +94,16 @@ bool dq_busy(uint8_t slave_id);
 /* Blocking submit-and-wait, for the text CLI (dali_raw / read_mem). Submits one
  * command and spins the bus (modbus_poll + dq_tick) until its result is
  * collected or `timeout_ms` elapses. Returns true on a result (fills *result /
- * *answer), false on backlog-full or timeout. Marked idempotent — a CLI debug
- * frame is safe to have the driver retry across a transport hiccup. Do NOT call
- * from the non-CLI main-loop path (it blocks the loop like the other cli_mb_wait
- * helpers). */
+ * *answer), false on backlog-full or timeout.
+ *
+ * The command is submitted idempotent=true. On a transport timeout the driver's
+ * read-status-before-resubmit recovery checks accepted_id and only resends if
+ * the command did NOT land, so an arbitrary CLI frame (even a non-idempotent
+ * UP/DOWN step) is not double-applied on a transport hiccup. The only residual
+ * double-apply window is a gateway reboot MID-command (the resync re-pends
+ * idempotent in-flight commands) — accepted here because the CLI is a debug-only,
+ * human-driven tool and this is astronomically rare. Do NOT call from the non-CLI
+ * main-loop path (it blocks the loop like the other cli_mb_wait helpers). */
 bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
                     uint8_t dtr0, uint32_t timeout_ms,
                     dq_result_t *result, uint8_t *answer);

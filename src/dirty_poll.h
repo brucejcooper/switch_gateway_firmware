@@ -27,19 +27,17 @@ void dirty_poll_emit_gateway_states(void);
 #define DIRTY_ACTIVE_WINDOW_MS   2000u   /* stay active this long after the last command/change */
 #define DIRTY_SWEEP_MS           1000u   /* regular cheap dirty-mask sweep while idle */
 #define BACKGROUND_CHECK_MS      60000u  /* heavy presence/group/fault scan */
-/* Steady-state config-over-raw rotation (task 03, only when g_config.dali_raw_cfg):
- * mark one present ballast per gateway for a background raw config re-read this
- * often. ~14 s × 64 ballasts ≈ 15 min for full coverage — enough to catch an
- * external recommissioning without loading the bus. */
+/* Steady-state config-over-raw rotation: mark one present ballast per gateway
+ * for a background raw config re-read this often. ~14 s × 64 ballasts ≈ 15 min
+ * for full coverage — enough to catch an external recommissioning without
+ * loading the bus. */
 #define DALI_CFG_ROTATE_MS       14000u
 
-/* TinyModbus register addresses (post task-1-flag-driven refactor).
- * Per-ballast banks (BLOCK0..BLOCK3) are FC03 holding registers; the
- * presence and dirty bitmasks are FC04 input registers. */
-#define DALI_BLOCK0_START     0x0000u  /* FC03 holding */
-#define DALI_BLOCK1_START     0x0040u  /* FC03 holding */
-#define DALI_BLOCK2_START     0x0080u  /* FC03 holding */
-#define DALI_BLOCK3_START     0x00C0u  /* FC03 holding */
+/* TinyModbus register addresses. Only BLOCK0 (live arc level / status) is read
+ * from the gateway now — the config banks (min/max/power-on/sys-fail/fade,
+ * formerly 0x0040/0x0080/0x00C0) were retired in task 04 and config is read via
+ * raw DALI queries. Presence/dirty are FC04 input registers. */
+#define DALI_BLOCK0_START     0x0000u  /* FC03 holding: status | brightness */
 #define DALI_PRESENT_START    0x0100u  /* FC04 input, 4 regs */
 #define DALI_DIRTY_START      0x0104u  /* FC04 input, 4 regs, read-clears */
 #define DALI_SYSINFO_START    0x0310u  /* FC04 input, 4 regs: uptime(2) boot_count reset_reason */
