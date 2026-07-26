@@ -1073,7 +1073,9 @@ static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t 
         dali_cfg_field_t f = base == 0x0040u ? (high ? DALI_CFG_MIN       : DALI_CFG_MAX)
                            : base == 0x0080u ? (high ? DALI_CFG_POWER_ON  : DALI_CFG_SYS_FAIL)
                            :                    (high ? DALI_CFG_FADE_RATE : DALI_CFG_FADE_TIME);
-        return lighting_dali_cfg_write(slave, addr, f, value) ? 1 : -2;
+        /* 2 = applied async; the query-back write-throughs the cache and emits
+         * the verified (possibly clamped) value — no premature pre-verify emit. */
+        return lighting_dali_cfg_write(slave, addr, f, value) ? 2 : -2;
     }
 
     uint8_t mn = b->min_level, mx = b->max_level, po = b->power_on_level,
