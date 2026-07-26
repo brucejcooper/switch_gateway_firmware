@@ -414,18 +414,27 @@ from the gw-diag poll) changing, or a status **anomaly** (free_slots back to 8
 and `accepted_id` 0 while the client still holds in-flight commands). The anomaly
 detector reacts within one FC23 (~30 ms); the boot-count poll is the slower
 (~30 s) backstop. Recovery reads the gateway's live status and **gates on
-`accepted_id`**:
+`accepted_id` — but only to pick the command surgery, never the id-baseline
+source**:
 
 - **Gateway confirmed fresh** (`accepted_id == 0`): the in-flight set is genuinely
-  lost, so **drop** non-idempotent commands, **re-pend** idempotent ones, and reset
-  the id baseline to `1` / `0`. (This is the real-reboot path.)
+  lost, so **drop** non-idempotent commands and **re-pend** idempotent ones. (This
+  is the real-reboot path.)
 - **Gateway alive** (`accepted_id != 0`): the detection was spurious or a
   duplicate — the two detectors both firing for one reboot. The in-flight commands
-  are still genuinely at the gateway, so **reconcile** the id sequence from the
-  live status (the exact `dq_handle_adopt` reconciliation a warm controller boot
-  uses) and **keep** the in-flight set — never tear it down. Tearing down a live
-  set is precisely what desynced the ledger and mis-attributed the result ring by
-  one slot; gating on `accepted_id` makes a spurious resync harmless.
+  are still genuinely at the gateway, so **keep** them — never tear them down.
+  Tearing down a live set is precisely what desynced the ledger and mis-attributed
+  the result ring by one slot; gating on `accepted_id` makes a spurious resync
+  harmless.
+
+**Both** branches then re-baseline `next_id` / `last_completed` from the gateway's
+**live status** through the exact `dq_handle_adopt` logic a warm controller boot
+uses — the path proven clean on hardware. The fresh branch used to hardcode the
+baseline to `1` / `0`; that parallel baseline sat one behind the gateway's real
+`completed_id` and shifted the result ring by a slot (a persistent
+`accepted − completed = 1` with a one-command answer lag). Deriving `last_completed`
+from the live read instead of assuming `0` removes that skew, so the fresh-reboot
+path converges through the same clean adoption logic as a controller reboot.
 
 To stop the duplicate arising in the first place, a resync also **re-baselines the
 other detector**: it clears the stored boot-count so the next sysinfo poll adopts

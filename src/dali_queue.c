@@ -207,15 +207,18 @@ static const char *dq_reason_name(dq_resync_reason_t r) {
     }
 }
 
-/* Destructive rebuild for a CONFIRMED-fresh gateway (accepted_id read as 0): the
+/* Command surgery for a CONFIRMED-fresh gateway (accepted_id read as 0): the
  * gateway lost every command we believed in flight, so drop the non-idempotent
- * ones (their result is unknowable and replaying a step would double it), re-pend
- * the idempotent ones plus all still-pending, re-sort by priority, and reset the
- * id baseline to a fresh gateway (next_id=1, last_completed=0). "In flight" spans
- * both the confirmed outstanding prefix AND any tentative submit_n records — a
- * fresh reboot lost those too. Callers MUST gate this on accepted_id==0
- * (dq_resync_apply); running it against a live gateway is exactly the ledger
- * corruption this path exists to avoid. */
+ * ones (their result is unknowable and replaying a step would double it) and
+ * re-pend the idempotent ones plus all still-pending, re-sorted by priority.
+ * "In flight" spans both the confirmed outstanding prefix AND any tentative
+ * submit_n records — a fresh reboot lost those too. This touches ONLY the backlog
+ * (outstanding/submit_n/count); it does NOT set the id baseline — dq_resync_apply
+ * baselines next_id/last_completed/free_hint/adopted from the gateway's live
+ * status for both branches, exactly as dq_handle_adopt does, so the fresh path can
+ * never drift from the gateway's real ids the way a hardcoded 1/0 did. Callers
+ * MUST gate this on accepted_id==0 (dq_resync_apply); running it against a live
+ * gateway is exactly the ledger corruption this path exists to avoid. */
 static void dq_rebuild_fresh(dq_slave_t *s) {
     uint8_t inflight = (uint8_t)(s->outstanding + s->submit_n);
     dq_cmd_t keep[DQ_BACKLOG];
@@ -238,8 +241,6 @@ static void dq_rebuild_fresh(dq_slave_t *s) {
     }
     memcpy(s->bl, keep, (size_t)nkeep * sizeof(dq_cmd_t));
     s->count = nkeep; s->outstanding = 0; s->submit_n = 0;
-    s->next_id = 1u; s->last_completed = 0; s->free_hint = DQ_GW_DEPTH;
-    s->adopted = true;   /* we just read the fresh gateway; the 1/0 baseline is correct */
 }
 
 /* Collect every newly-completed front entry (up to and including completed_id)
@@ -347,17 +348,27 @@ static void dq_rollback_submit(dq_slave_t *s) {
     s->submit_n    = 0;
 }
 
-/* Apply a resync using the gateway's just-read status. The destructive rebuild
- * (dq_rebuild_fresh: drop non-idempotent / re-pend idempotent, reset ids to 1/0)
- * runs ONLY when the gateway is confirmed fresh (accepted_id==0). If the gateway
- * is alive (accepted_id!=0) the detection was spurious or a duplicate — the two
- * reboot detectors both firing for one reboot, the classic case being the
- * boot_count poll re-flagging a reboot the status-anomaly detector already
- * consumed. The in-flight commands are then genuinely still at the gateway, so we
- * reconcile ids from its live status (adopt exactly as a warm controller boot
- * does) and KEEP the commands — never tearing them down, which is what desynced
- * the ledger and mis-attributed the result ring by one slot. Either branch clears
- * boot_valid so the boot_count detector re-baselines instead of firing again. */
+/* Apply a resync using the gateway's just-read status. accepted_id gates ONLY the
+ * command surgery, never the id-baseline source:
+ *
+ *  - Gateway fresh (accepted_id==0): the in-flight set is genuinely lost, so
+ *    dq_rebuild_fresh drops non-idempotent / re-pends idempotent (backlog only).
+ *  - Gateway alive (accepted_id!=0): the detection was spurious or a duplicate
+ *    (the two reboot detectors both firing for one reboot, classically the
+ *    boot_count poll re-flagging a reboot the status-anomaly detector already
+ *    consumed). The in-flight commands are still genuinely at the gateway, so we
+ *    resolve any tentative submit and KEEP them — never tearing them down.
+ *
+ * Then BOTH branches baseline next_id/last_completed/free_hint/adopted from the
+ * gateway's live status through the SAME logic dq_handle_adopt uses on a warm
+ * controller boot — the path proven clean on hardware. The fresh branch used to
+ * hardcode next_id=1/last_completed=0, a parallel baseline that sat one behind the
+ * gateway's real completed_id and shifted the result ring by one slot (persistent
+ * accepted−completed=1 / answer-lag). Deriving last_completed from the live read
+ * instead of assuming 0 removes that skew. For the alive branch last_completed is
+ * advanced by dq_collect (which collects the delta from its prior value up to
+ * completed_id), so it must NOT be pre-set there. Either branch clears boot_valid
+ * so the boot_count detector re-baselines instead of firing again. */
 static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
                             uint8_t accepted_id, uint8_t completed_id,
                             uint8_t free_slots) {
@@ -366,6 +377,7 @@ static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
     s->boot_valid     = false;
     s->reboot_flag    = false;
     s->resync_pending = false;
+
     if (accepted_id == 0) {
         LOG_WARN("dq", "slave %u resync (%s): gateway fresh — rebuilding in-flight set",
                  s->slave_id, dq_reason_name(reason));
@@ -377,11 +389,15 @@ static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
             if (accepted_id == s->submit_last_id) dq_promote_submit(s);
             else                                  dq_rollback_submit(s);
         }
-        s->next_id   = next_gw_id(accepted_id);
-        s->free_hint = free_slots;
-        dq_collect(s, completed_id);
-        s->adopted   = true;
     }
+
+    /* Unified id-baseline from the live status — identical to dq_handle_adopt. */
+    s->next_id   = (accepted_id == 0) ? 1u : next_gw_id(accepted_id);
+    s->free_hint = free_slots;
+    if (accepted_id == 0) s->last_completed = completed_id;   /* fresh: nothing in flight to collect */
+    else                  dq_collect(s, completed_id);        /* alive: collect the kept in-flight delta */
+    s->adopted   = true;
+
     s->st = DQ_IDLE; s->next_at = get_absolute_time();
 }
 
