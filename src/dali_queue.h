@@ -20,17 +20,30 @@
  * timeout the driver reads status before resubmitting, so a landed-but-unacked
  * submit is never blind-resubmitted (UP/DOWN steps are not idempotent). Gateway
  * reboot (boot_count change / status anomaly): recovery reads the gateway's live
- * status and GATES on accepted_id — but only to choose the COMMAND surgery, never
- * the id-baseline source. If the gateway is confirmed fresh (accepted_id==0) the
- * in-flight set is genuinely lost, so non-idempotent commands are dropped and
- * idempotent ones re-pended. If the gateway is alive (accepted_id!=0) the detection
- * was spurious/duplicate — the two detectors both firing for one reboot — so the
- * in-flight set is KEPT, never torn down. Then BOTH branches baseline
- * next_id/last_completed from the gateway's live status through the same logic a
- * warm controller boot uses (dq_handle_adopt), the path proven clean on hardware —
- * never a hardcoded 1/0, which sat one behind the gateway's real completed_id and
- * shifted the result ring by a slot. A resync also clears the stored boot_count so
- * the sysinfo poll re-baselines rather than reading the same reboot as a second one.
+ * status. A boot_count-confirmed reboot (or accepted_id==0) is AUTHORITATIVE queue
+ * loss → FRESH-REBUILD: drop non-idempotent in-flight, re-pend idempotent. This is
+ * load-bearing in a busy burst, where the controller's own post-reboot submits make
+ * accepted_id!=0 (so the accepted==0 anomaly detector never fires) and the lost
+ * pre-reboot commands would otherwise stay stuck at the front of the backlog —
+ * gating fresh-vs-alive on accepted alone (a boot-confirmed reboot taking the alive
+ * branch) is what desynced the result ring by one slot. Alive-reconcile (KEEP the
+ * in-flight set) is reserved for UNCONFIRMED detections against a genuinely-live
+ * gateway (accepted_id!=0, boot_count unchanged, e.g. a verify-exhaust transport
+ * glitch). Then BOTH branches baseline next_id/last_completed from the gateway's
+ * live status through the same logic a warm controller boot uses (dq_handle_adopt).
+ * A resync also clears the stored boot_count so the sysinfo poll re-baselines rather
+ * than reading the same reboot as a second one.
+ *
+ * KNOWN LIMITATION (tracked: tasks/06-dq-collect-hardening.md): a gateway reboot
+ * mid-burst has a brief reboot-recovery window (~2s of transport-recovery timeouts)
+ * during which normal collection can attribute a stale ring slot to a lost in-flight
+ * command — a TRANSIENT, self-healing wrong-answer window. If a boot-count poll fires
+ * INSIDE that window it USED to make the desync permanent; the fresh-rebuild above
+ * removes the permanent case. The permanent case needs the gw-diag poll to land in
+ * the ~2s window, so it is unreachable at the 30 s production `gw_diag_interval_ms`
+ * default (recovery always drains first) and only reproduces at aggressive poll
+ * intervals (≤2 s). Fully closing the residual transient needs dq_collect to drop
+ * entries whose ids the gateway can no longer complete — the tracked follow-up.
  */
 
 #include <stdbool.h>

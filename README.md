@@ -413,28 +413,39 @@ detects it two ways: the sysinfo **boot-count** (fed in via `dq_note_boot_count`
 from the gw-diag poll) changing, or a status **anomaly** (free_slots back to 8
 and `accepted_id` 0 while the client still holds in-flight commands). The anomaly
 detector reacts within one FC23 (~30 ms); the boot-count poll is the slower
-(~30 s) backstop. Recovery reads the gateway's live status and **gates on
-`accepted_id` — but only to pick the command surgery, never the id-baseline
-source**:
+(~30 s) backstop. Recovery reads the gateway's live status and picks the command
+surgery by whether the reboot is **confirmed** — never by `accepted_id` alone:
 
-- **Gateway confirmed fresh** (`accepted_id == 0`): the in-flight set is genuinely
-  lost, so **drop** non-idempotent commands and **re-pend** idempotent ones. (This
-  is the real-reboot path.)
-- **Gateway alive** (`accepted_id != 0`): the detection was spurious or a
-  duplicate — the two detectors both firing for one reboot. The in-flight commands
-  are still genuinely at the gateway, so **keep** them — never tear them down.
-  Tearing down a live set is precisely what desynced the ledger and mis-attributed
-  the result ring by one slot; gating on `accepted_id` makes a spurious resync
-  harmless.
+- **Confirmed queue loss** (`boot_count`-confirmed reboot, **or** `accepted_id == 0`):
+  the in-flight set is lost, so **drop** non-idempotent commands and **re-pend**
+  idempotent ones (FRESH-REBUILD). A boot_count delta that survived the
+  re-baseline suppression is authoritative — the gateway rebooted — **even if
+  `accepted_id != 0`**. This is load-bearing in a busy burst: the controller's own
+  post-reboot submits make `accepted_id != 0`, so the `accepted == 0` anomaly
+  detector never fires, and the lost pre-reboot commands would otherwise stay stuck
+  at the front of the backlog. Gating fresh-vs-alive on `accepted_id` alone (a
+  boot-confirmed reboot taking the alive branch) is exactly what desynced the result
+  ring by one slot.
+- **Unconfirmed, gateway alive** (`accepted_id != 0` **and** `boot_count` unchanged):
+  a spurious/duplicate detection or a verify-exhaust transport glitch against a
+  genuinely-live gateway — the in-flight commands are still at the gateway, so
+  **keep** them, never tear them down.
 
 **Both** branches then re-baseline `next_id` / `last_completed` from the gateway's
 **live status** through the exact `dq_handle_adopt` logic a warm controller boot
-uses — the path proven clean on hardware. The fresh branch used to hardcode the
-baseline to `1` / `0`; that parallel baseline sat one behind the gateway's real
-`completed_id` and shifted the result ring by a slot (a persistent
-`accepted − completed = 1` with a one-command answer lag). Deriving `last_completed`
-from the live read instead of assuming `0` removes that skew, so the fresh-reboot
-path converges through the same clean adoption logic as a controller reboot.
+uses.
+
+> **Known limitation (tracked: `tasks/06-dq-collect-hardening.md`).** A gateway
+> reboot mid-burst has a brief **reboot-recovery window** (~2 s of transport-recovery
+> timeouts) in which normal collection can momentarily attribute a stale result-ring
+> slot to a lost in-flight command — a **transient, self-healing** wrong-answer
+> window. A `gw-diag` boot-count poll landing *inside* that window used to make the
+> desync **permanent**; the confirmed-reboot fresh-rebuild above removes the permanent
+> case. Because it needs the poll to land in the ~2 s window, the permanent case is
+> **unreachable at the 30 s production `gw_diag_interval_ms` default** (recovery
+> always drains first) and only reproduces at aggressive poll intervals (≤ 2 s).
+> Fully closing the residual transient needs `dq_collect` to drop entries whose ids
+> the gateway can no longer complete — the tracked follow-up.
 
 To stop the duplicate arising in the first place, a resync also **re-baselines the
 other detector**: it clears the stored boot-count so the next sysinfo poll adopts
