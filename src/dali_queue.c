@@ -270,10 +270,16 @@ static void dq_collect(dq_slave_t *s, uint8_t completed_id) {
         uint16_t r  = cb_reg(s, (uint8_t)(2u + (rid & 0x07u)));  /* QRES[rid&7] */
         dq_result_t res = (dq_result_t)((r >> 8) & 0xFFu);
         uint8_t     ans = (uint8_t)(r & 0xFFu);
-        if (s->dbg_collect_left > 0) {   /* TEMP: first collects after a rebuild */
-            LOG_WARN("dqdbg", "slave %u collect: expected_id=%u ring_slot=%u completed_id=%u last_completed=%u res=%u ans=%02X",
-                     s->slave_id, rid, (unsigned)(rid & 0x07u), completed_id, s->last_completed,
-                     (unsigned)res, ans);
+        if (s->dbg_collect_left > 0) {   /* TEMP: post-rebuild collects — STRUCTURAL offset check */
+            /* front_id − completed_id persistently == −1 is the structural phantom
+             * (front entry forever one behind the gateway's just-completed id →
+             * every answer is the previous command's). count/outstanding vs the
+             * accepted−completed span exposes the extra backlog entry. */
+            LOG_WARN("dqdbg", "slave %u collect: front_id=%u completed_id=%u (front-comp=%d) ring_slot=%u ans=%02X | count=%u outstanding=%u accepted=%u span=%d",
+                     s->slave_id, rid, completed_id, (int)rid - (int)completed_id,
+                     (unsigned)(rid & 0x07u), ans,
+                     s->count, s->outstanding, s->last_accepted,
+                     (int)s->last_accepted - (int)completed_id);
             s->dbg_collect_left--;
         }
         if (h->cb) h->cb(s->slave_id, res, ans, h->ctx);
@@ -416,7 +422,7 @@ static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
                  s->last_completed, s->last_accepted, s->next_id);
         dq_rebuild_fresh(s);
         s->dbg_log_resubmit = true;
-        s->dbg_collect_left = 3;
+        s->dbg_collect_left = 16;   /* span the transient AND steady state to prove persistence */
     } else {
         LOG_WARN("dq", "slave %u resync (%s): gateway alive (accepted=%u) — reconciling ids",
                  s->slave_id, dq_reason_name(reason), accepted_id);
