@@ -431,9 +431,10 @@ static uint16_t dq_result_word(dq_result_t res, uint8_t answer) {
  * (DQ_ANSWER) so a query's response byte is returned; a twice-send does not
  * (no answer, reports nak).  `idempotent` is passed to the queue: pass false for
  * the arbitrary-frame `dali_raw` command (a human may send an UP/DOWN step, which
- * must never auto-resubmit on a fault), true for known-idempotent internal uses
- * (SET DTR, DAPC).  Sets *result to the legacy result word and returns true; on
- * backlog-full/timeout prints an error and returns false. */
+ * must be DROPPED not resubmitted if a gateway reboot interrupts it), true for
+ * known-idempotent internal uses (SET DTR, DAPC).  Sets *result to the legacy
+ * result word and returns true; on backlog-full/timeout prints an error and
+ * returns false. */
 static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
                             bool idempotent, uint16_t *result) {
     dq_result_t res;
@@ -651,7 +652,7 @@ static void cmd_help(void) {
     printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
     printf("tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
-    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result (no auto-retry on fault)\n");
+    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result (dropped-not-resubmitted on gw reboot)\n");
     printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
     printf("identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n");
     printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
@@ -1230,8 +1231,10 @@ static void cmd_dali_raw(char **saveptr) {
     LOG_INFO("cli", "dali_raw slave=%ld frame=0x%04x%s",
              slave, value, twice ? " twice" : "");
     /* Arbitrary human-supplied frame (could be a non-idempotent UP/DOWN step):
-     * pass idempotent=false so a transport fault fails-and-reports rather than
-     * auto-resubmitting and risking a double-apply. */
+     * pass idempotent=false so a gateway reboot mid-command DROPS it (reports the
+     * error) rather than resubmitting and risking a double-apply. (A plain
+     * transport timeout is already safe — the driver only resends a command that
+     * did not land.) */
     if (!dali_raw_result((uint8_t)slave, value, twice, false, &result)) return;
     /* Let dirty-poll pick up any resulting ballast state change. */
     dirty_poll_mark_active((uint8_t)slave);

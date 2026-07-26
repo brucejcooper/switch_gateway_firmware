@@ -97,11 +97,14 @@ bool dq_busy(uint8_t slave_id);
  * *answer), false on backlog-full or timeout. Do NOT call from the non-CLI
  * main-loop path (it blocks the loop like the other cli_mb_wait helpers).
  *
- * `idempotent` matters only on a fault: an idempotent command (queries, SET DTR,
- * DAPC) is safe to resubmit; a NON-idempotent one (an arbitrary `dali_raw` frame,
- * which a human can make an UP/DOWN step) must NOT auto-resubmit — pass false so
- * a transport fault fails-and-reports to the operator rather than risking a
- * double-apply ("stale-but-never-wrong"). */
+ * `idempotent` matters on a gateway REBOOT mid-command (not a plain transport
+ * timeout — that path reads status and only resends a command that did NOT land,
+ * safe regardless of the flag). On a reboot resync an idempotent command is
+ * re-pended/resubmitted, a NON-idempotent one is DROPPED (DQ_RES_DROPPED, surfaced
+ * to the caller). So an arbitrary `dali_raw` frame (a human can make it an UP/DOWN
+ * step) passes false — a reboot mid-command drops-and-reports rather than
+ * resubmitting and risking a double-apply ("stale-but-never-wrong"); queries /
+ * SET DTR / DAPC pass true. */
 bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
                     uint8_t dtr0, bool idempotent, uint32_t timeout_ms,
                     dq_result_t *result, uint8_t *answer);
