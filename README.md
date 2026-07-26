@@ -411,12 +411,25 @@ resubmit.
 **Gateway reboot resync.** A reboot empties the gateway's queue. The client
 detects it two ways: the sysinfo **boot-count** (fed in via `dq_note_boot_count`
 from the gw-diag poll) changing, or a status **anomaly** (free_slots back to 8
-and `accepted_id` 0 while the client still holds in-flight commands). Either way
-it rebuilds the in-flight set — **drop** non-idempotent commands, **re-pend**
-idempotent ones — and resyncs the id sequence. On a controller-only reboot it
-adopts the gateway's `accepted_id`/`completed_id` on first contact before
-submitting, so fresh commands are never mis-collected against retained gateway
-state.
+and `accepted_id` 0 while the client still holds in-flight commands). The anomaly
+detector reacts within one FC23 (~30 ms); the boot-count poll is the slower
+(~30 s) backstop. Whichever fires first, the resync rebuilds the in-flight set —
+**drop** non-idempotent commands, **re-pend** idempotent ones — and then
+**re-baselines the id sequence through the exact same read-only adoption a fresh
+boot uses** (`dq_handle_adopt`: read the gateway's live `accepted_id` /
+`completed_id`, never assume it is at id 0). This is deliberate: recovery always
+goes through adoption, so a resync that fires against a gateway that did **not**
+actually reboot — e.g. the boot-count poll firing for a reboot the anomaly
+detector already consumed — adopts the gateway's real ids and stays consistent
+instead of corrupting the ledger. To stop that duplicate in the first place, a
+resync also **re-baselines the other detector**: it clears the stored boot-count
+so the next sysinfo poll adopts the gateway's current value rather than reading
+the already-consumed change as a second reboot. So either detector consuming a
+reboot silently re-syncs the other, and the recovery is idempotent regardless of
+how many times it fires. The `dq` **resyncs** counter is split by trigger
+(`resyncs=N(boot=B,anom=A)`) so a fault drill can tell the two apart. A
+controller-only reboot uses the same adoption on first contact, so fresh commands
+are never mis-collected against retained gateway state.
 
 **Observability.** The CLI **`dq [slave]`** command dumps per-slave client state
 for the bench fault drills: scheduler state, `next_id` / last `accepted_id` /
