@@ -19,13 +19,16 @@
  * transactions never bounce on SLAVE_DEVICE_BUSY. Transport recovery: on an FC23
  * timeout the driver reads status before resubmitting, so a landed-but-unacked
  * submit is never blind-resubmitted (UP/DOWN steps are not idempotent). Gateway
- * reboot (boot_count change / status anomaly): non-idempotent in-flight commands
- * are dropped, idempotent ones resubmitted, and the id sequence re-baselined via
- * the same read-only adoption a fresh boot uses (never assumed to be id 0) — so a
- * resync that fires against a gateway that did NOT actually reboot (a duplicate
- * detection) adopts the gateway's real ids and stays consistent instead of
- * corrupting the ledger. A resync also clears the stored boot_count so the
- * sysinfo poll re-baselines rather than reading the same reboot as a second one.
+ * reboot (boot_count change / status anomaly): recovery reads the gateway's live
+ * status and GATES on accepted_id. If the gateway is confirmed fresh
+ * (accepted_id==0) the in-flight set is genuinely lost, so non-idempotent commands
+ * are dropped, idempotent ones re-pended, and the id baseline reset to 1/0. If the
+ * gateway is alive (accepted_id!=0) the detection was spurious/duplicate — the
+ * two detectors both firing for one reboot — so the id sequence is reconciled from
+ * the live status (adopted exactly as a warm controller boot does) WITHOUT tearing
+ * down the in-flight set: adopting a live gateway's real ids, never corrupting the
+ * ledger. A resync also clears the stored boot_count so the sysinfo poll
+ * re-baselines rather than reading the same reboot as a second one.
  */
 
 #include <stdbool.h>

@@ -83,6 +83,8 @@ typedef struct {
     uint16_t boot_count;
     bool     boot_valid;
     bool     reboot_flag;    /* set by dq_note_boot_count on a change */
+    bool     resync_pending; /* a gated resync awaits an adoption read (no status in hand yet) */
+    uint8_t  resync_reason;  /* dq_resync_reason_t captured for the deferred resync */
 
     dq_state_t st;
     uint8_t  submit_n;       /* records shipped in the in-flight txn (tentative) */
@@ -205,35 +207,22 @@ static const char *dq_reason_name(dq_resync_reason_t r) {
     }
 }
 
-/* Rebuild the backlog after a (suspected) gateway reboot, then re-baseline the
- * id sequence via the SAME adoption read a fresh boot uses — never by assuming
- * the gateway is at id 0. This is load-bearing: a resync can fire against a
- * gateway that did NOT actually reboot (e.g. the boot_count poll double-firing
- * for a reboot the status-anomaly detector already consumed). Hardcoding
- * next_id=1 / last_completed=0 there desynced the ledger against the gateway's
- * real accepted/completed ids and mis-attributed every subsequent result by one
- * ring slot. Converging resync with adoption makes a spurious resync harmless:
- * it adopts whatever ids the gateway actually holds.
- *
- * Command bookkeeping: drop non-idempotent in-flight commands (their result is
- * unknowable and replaying a step would double it), re-pend idempotent in-flight
- * and keep all pending, re-sorted by priority. Then clear `adopted` so dq_tick
- * issues a read-only adoption before the next submit — dq_handle_adopt sets
- * next_id/last_completed/free_hint from the gateway's live status.
- *
- * `boot_valid` is cleared so the boot_count detector re-baselines to the
- * gateway's current value on its next sysinfo poll rather than reading the same
- * change as a second reboot (the double-fire this whole path guards against). */
-static void dq_resync(dq_slave_t *s, dq_resync_reason_t reason) {
-    s->c_resyncs++;
-    if (reason == DQ_RSN_BOOTCOUNT) s->c_resync_boot++; else s->c_resync_anom++;
-    LOG_WARN("dq", "slave %u resync (%s) — re-adopting gateway ids", s->slave_id,
-             dq_reason_name(reason));
+/* Destructive rebuild for a CONFIRMED-fresh gateway (accepted_id read as 0): the
+ * gateway lost every command we believed in flight, so drop the non-idempotent
+ * ones (their result is unknowable and replaying a step would double it), re-pend
+ * the idempotent ones plus all still-pending, re-sort by priority, and reset the
+ * id baseline to a fresh gateway (next_id=1, last_completed=0). "In flight" spans
+ * both the confirmed outstanding prefix AND any tentative submit_n records — a
+ * fresh reboot lost those too. Callers MUST gate this on accepted_id==0
+ * (dq_resync_apply); running it against a live gateway is exactly the ledger
+ * corruption this path exists to avoid. */
+static void dq_rebuild_fresh(dq_slave_t *s) {
+    uint8_t inflight = (uint8_t)(s->outstanding + s->submit_n);
     dq_cmd_t keep[DQ_BACKLOG];
     uint8_t  nkeep = 0;
     for (uint8_t i = 0; i < s->count; i++) {
         dq_cmd_t *e = &s->bl[i];
-        if (i < s->outstanding && !e->idempotent) {
+        if (i < inflight && !e->idempotent) {
             if (e->cb) e->cb(s->slave_id, DQ_RES_DROPPED, 0, e->ctx);
             continue;   /* drop */
         }
@@ -249,11 +238,8 @@ static void dq_resync(dq_slave_t *s, dq_resync_reason_t reason) {
     }
     memcpy(s->bl, keep, (size_t)nkeep * sizeof(dq_cmd_t));
     s->count = nkeep; s->outstanding = 0; s->submit_n = 0;
-    s->free_hint = DQ_GW_DEPTH;
-    s->adopted = false;      /* force an adoption read to re-baseline next_id/last_completed */
-    s->boot_valid = false;   /* re-baseline boot_count next poll — don't double-fire */
-    s->reboot_flag = false;
-    s->st = DQ_IDLE; s->next_at = get_absolute_time();
+    s->next_id = 1u; s->last_completed = 0; s->free_hint = DQ_GW_DEPTH;
+    s->adopted = true;   /* we just read the fresh gateway; the 1/0 baseline is correct */
 }
 
 /* Collect every newly-completed front entry (up to and including completed_id)
@@ -361,6 +347,57 @@ static void dq_rollback_submit(dq_slave_t *s) {
     s->submit_n    = 0;
 }
 
+/* Apply a resync using the gateway's just-read status. The destructive rebuild
+ * (dq_rebuild_fresh: drop non-idempotent / re-pend idempotent, reset ids to 1/0)
+ * runs ONLY when the gateway is confirmed fresh (accepted_id==0). If the gateway
+ * is alive (accepted_id!=0) the detection was spurious or a duplicate — the two
+ * reboot detectors both firing for one reboot, the classic case being the
+ * boot_count poll re-flagging a reboot the status-anomaly detector already
+ * consumed. The in-flight commands are then genuinely still at the gateway, so we
+ * reconcile ids from its live status (adopt exactly as a warm controller boot
+ * does) and KEEP the commands — never tearing them down, which is what desynced
+ * the ledger and mis-attributed the result ring by one slot. Either branch clears
+ * boot_valid so the boot_count detector re-baselines instead of firing again. */
+static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
+                            uint8_t accepted_id, uint8_t completed_id,
+                            uint8_t free_slots) {
+    s->c_resyncs++;
+    if (reason == DQ_RSN_BOOTCOUNT) s->c_resync_boot++; else s->c_resync_anom++;
+    s->boot_valid     = false;
+    s->reboot_flag    = false;
+    s->resync_pending = false;
+    if (accepted_id == 0) {
+        LOG_WARN("dq", "slave %u resync (%s): gateway fresh — rebuilding in-flight set",
+                 s->slave_id, dq_reason_name(reason));
+        dq_rebuild_fresh(s);
+    } else {
+        LOG_WARN("dq", "slave %u resync (%s): gateway alive (accepted=%u) — reconciling ids",
+                 s->slave_id, dq_reason_name(reason), accepted_id);
+        if (s->submit_n > 0) {   /* resolve any tentative submit before adopting the ledger */
+            if (accepted_id == s->submit_last_id) dq_promote_submit(s);
+            else                                  dq_rollback_submit(s);
+        }
+        s->next_id   = next_gw_id(accepted_id);
+        s->free_hint = free_slots;
+        dq_collect(s, completed_id);
+        s->adopted   = true;
+    }
+    s->st = DQ_IDLE; s->next_at = get_absolute_time();
+}
+
+/* Defer a gated resync for a trigger with no status in hand (idle-tick boot_count
+ * change, or transport-recovery exhaustion): request an adoption read and let
+ * dq_handle_adopt route it back through dq_resync_apply once the gateway answers,
+ * so the fresh-vs-alive gate always sees a real accepted_id. */
+static void dq_defer_resync(dq_slave_t *s, dq_resync_reason_t reason) {
+    s->resync_pending = true;
+    s->resync_reason  = (uint8_t)reason;
+    s->adopted        = false;
+    s->reboot_flag    = false;
+    s->st             = DQ_IDLE;
+    s->next_at        = get_absolute_time();
+}
+
 /* Pacing after a completed transaction: straight into the next submit when there
  * is pending work with credit, otherwise pace the collect-only drain polls. */
 static void dq_pace_next(dq_slave_t *s) {
@@ -398,8 +435,19 @@ static void dq_handle_await(dq_slave_t *s) {
     uint8_t accepted_id = (uint8_t)(cb_reg(s, 0) & 0xFF);
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
     s->last_accepted = accepted_id;
-    if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) {
-        dq_resync(s, s->reboot_flag ? DQ_RSN_BOOTCOUNT : DQ_RSN_ANOMALY);
+    /* Confirmed-fresh reboot (queue empty + accepted 0 while we hold work): rebuild
+     * against the fresh gateway. dq_status_is_reboot guarantees accepted_id==0, so
+     * dq_resync_apply takes its fresh branch. */
+    if (dq_status_is_reboot(s, free_slots, accepted_id)) {
+        dq_resync_apply(s, s->reboot_flag ? DQ_RSN_BOOTCOUNT : DQ_RSN_ANOMALY,
+                        accepted_id, completed, free_slots);
+        return;
+    }
+    /* boot_count backstop fired but the gateway is alive (accepted!=0): a
+     * duplicate/spurious detection — reconcile ids from this very read, keep the
+     * in-flight set, never tear it down. */
+    if (s->reboot_flag) {
+        dq_resync_apply(s, DQ_RSN_BOOTCOUNT, accepted_id, completed, free_slots);
         return;
     }
     dq_promote_submit(s);
@@ -412,16 +460,21 @@ static void dq_handle_verify(dq_slave_t *s) {
     int res = s->cb_res;
     if (res <= 0) {
         if (s->verify_left > 0) { s->verify_left--; dq_issue_read_only(s, DQ_VERIFY); return; }
-        LOG_WARN("dq", "slave %u verify exhausted — rebuilding in-flight set", s->slave_id);
-        dq_resync(s, DQ_RSN_VERIFY);
+        LOG_WARN("dq", "slave %u verify exhausted — deferring gated resync", s->slave_id);
+        dq_defer_resync(s, DQ_RSN_VERIFY);   /* adopt read gates fresh-vs-alive once it answers */
         return;
     }
     uint8_t free_slots  = (uint8_t)(cb_reg(s, 0) >> 8);
     uint8_t accepted_id = (uint8_t)(cb_reg(s, 0) & 0xFF);
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
     s->last_accepted = accepted_id;
-    if (s->reboot_flag || dq_status_is_reboot(s, free_slots, accepted_id)) {
-        dq_resync(s, s->reboot_flag ? DQ_RSN_BOOTCOUNT : DQ_RSN_ANOMALY);
+    if (dq_status_is_reboot(s, free_slots, accepted_id)) {
+        dq_resync_apply(s, s->reboot_flag ? DQ_RSN_BOOTCOUNT : DQ_RSN_ANOMALY,
+                        accepted_id, completed, free_slots);
+        return;
+    }
+    if (s->reboot_flag) {
+        dq_resync_apply(s, DQ_RSN_BOOTCOUNT, accepted_id, completed, free_slots);
         return;
     }
     /* Did the timed-out submit land? accepted_id equals submit_last_id iff so. */
@@ -441,9 +494,16 @@ static void dq_handle_adopt(dq_slave_t *s) {
     uint8_t free_slots  = (uint8_t)(cb_reg(s, 0) >> 8);
     uint8_t accepted_id = (uint8_t)(cb_reg(s, 0) & 0xFF);
     uint8_t completed   = (uint8_t)(cb_reg(s, 1) & 0xFF);
+    s->last_accepted  = accepted_id;
+    /* A deferred gated resync (idle boot_count change / verify-exhaust) reuses this
+     * adoption read for its fresh-vs-alive decision. */
+    if (s->resync_pending) {
+        dq_resync_apply(s, (dq_resync_reason_t)s->resync_reason,
+                        accepted_id, completed, free_slots);
+        return;
+    }
     s->next_id        = (accepted_id == 0) ? 1u : next_gw_id(accepted_id);
     s->last_completed = completed;
-    s->last_accepted  = accepted_id;
     s->free_hint      = free_slots;
     s->adopted        = true;
     s->c_adopts++;
@@ -465,7 +525,7 @@ void dq_tick(void) {
             continue;
         }
 
-        if (s->reboot_flag) { dq_resync(s, DQ_RSN_BOOTCOUNT); continue; }
+        if (s->reboot_flag) { dq_defer_resync(s, DQ_RSN_BOOTCOUNT); continue; }
         if (!time_reached(s->next_at)) continue;
 
         /* Provisioning is highest priority AND bus-exclusive: while a slave is
@@ -478,7 +538,10 @@ void dq_tick(void) {
         }
 
         uint8_t pending = (uint8_t)(s->count - s->outstanding);
-        if (pending == 0 && s->outstanding == 0) continue;   /* nothing to do */
+        /* Nothing to do — unless a deferred resync (or a leftover tentative submit)
+         * still needs an adoption read to reconcile against the gateway. */
+        if (pending == 0 && s->outstanding == 0 && s->submit_n == 0 && !s->resync_pending)
+            continue;
 
         if (!s->adopted) { dq_issue_read_only(s, DQ_ADOPT); continue; }
 

@@ -413,23 +413,28 @@ detects it two ways: the sysinfo **boot-count** (fed in via `dq_note_boot_count`
 from the gw-diag poll) changing, or a status **anomaly** (free_slots back to 8
 and `accepted_id` 0 while the client still holds in-flight commands). The anomaly
 detector reacts within one FC23 (~30 ms); the boot-count poll is the slower
-(~30 s) backstop. Whichever fires first, the resync rebuilds the in-flight set —
-**drop** non-idempotent commands, **re-pend** idempotent ones — and then
-**re-baselines the id sequence through the exact same read-only adoption a fresh
-boot uses** (`dq_handle_adopt`: read the gateway's live `accepted_id` /
-`completed_id`, never assume it is at id 0). This is deliberate: recovery always
-goes through adoption, so a resync that fires against a gateway that did **not**
-actually reboot — e.g. the boot-count poll firing for a reboot the anomaly
-detector already consumed — adopts the gateway's real ids and stays consistent
-instead of corrupting the ledger. To stop that duplicate in the first place, a
-resync also **re-baselines the other detector**: it clears the stored boot-count
-so the next sysinfo poll adopts the gateway's current value rather than reading
-the already-consumed change as a second reboot. So either detector consuming a
-reboot silently re-syncs the other, and the recovery is idempotent regardless of
-how many times it fires. The `dq` **resyncs** counter is split by trigger
-(`resyncs=N(boot=B,anom=A)`) so a fault drill can tell the two apart. A
-controller-only reboot uses the same adoption on first contact, so fresh commands
-are never mis-collected against retained gateway state.
+(~30 s) backstop. Recovery reads the gateway's live status and **gates on
+`accepted_id`**:
+
+- **Gateway confirmed fresh** (`accepted_id == 0`): the in-flight set is genuinely
+  lost, so **drop** non-idempotent commands, **re-pend** idempotent ones, and reset
+  the id baseline to `1` / `0`. (This is the real-reboot path.)
+- **Gateway alive** (`accepted_id != 0`): the detection was spurious or a
+  duplicate — the two detectors both firing for one reboot. The in-flight commands
+  are still genuinely at the gateway, so **reconcile** the id sequence from the
+  live status (the exact `dq_handle_adopt` reconciliation a warm controller boot
+  uses) and **keep** the in-flight set — never tear it down. Tearing down a live
+  set is precisely what desynced the ledger and mis-attributed the result ring by
+  one slot; gating on `accepted_id` makes a spurious resync harmless.
+
+To stop the duplicate arising in the first place, a resync also **re-baselines the
+other detector**: it clears the stored boot-count so the next sysinfo poll adopts
+the gateway's current value rather than reading the already-consumed change as a
+second reboot. So either detector consuming a reboot silently re-syncs the other,
+and recovery is idempotent no matter how many times it fires. The `dq` **resyncs**
+counter is split by trigger (`resyncs=N(boot=B,anom=A)`) so a fault drill can tell
+the two apart. A controller-only reboot uses the same adoption on first contact,
+so fresh commands are never mis-collected against retained gateway state.
 
 **Observability.** The CLI **`dq [slave]`** command dumps per-slave client state
 for the bench fault drills: scheduler state, `next_id` / last `accepted_id` /
