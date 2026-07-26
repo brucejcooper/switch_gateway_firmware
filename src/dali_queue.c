@@ -97,6 +97,11 @@ typedef struct {
     int      cb_res;
     uint8_t  cb_buf[32];
     uint8_t  cb_len;
+
+    /* TEMP bench instrumentation for the fresh-rebuild phantom (STRIP after root
+     * cause: this commit + the follow-up that removes it). */
+    uint8_t  dbg_collect_left;   /* log the first N collects after a rebuild */
+    bool     dbg_log_resubmit;   /* log the ids assigned on the first post-rebuild submit */
 } dq_slave_t;
 
 static dq_slave_t s_dq[MAX_DALI_SLAVES];
@@ -221,6 +226,15 @@ static const char *dq_reason_name(dq_resync_reason_t r) {
  * gateway is exactly the ledger corruption this path exists to avoid. */
 static void dq_rebuild_fresh(dq_slave_t *s) {
     uint8_t inflight = (uint8_t)(s->outstanding + s->submit_n);
+    /* TEMP instrumentation: the in-flight prefix ids being dropped/re-pended. */
+    LOG_WARN("dqdbg", "slave %u rebuild: inflight=%u (outstanding=%u submit_n=%u) count=%u",
+             s->slave_id, inflight, s->outstanding, s->submit_n, s->count);
+    for (uint8_t i = 0; i < s->count; i++) {
+        dq_cmd_t *e = &s->bl[i];
+        const char *fate = (i < inflight) ? (e->idempotent ? "repend" : "DROP") : "pending";
+        LOG_WARN("dqdbg", "slave %u   entry[%u] id=%u prio=%u idem=%u -> %s",
+                 s->slave_id, i, e->id, e->prio, (unsigned)e->idempotent, fate);
+    }
     dq_cmd_t keep[DQ_BACKLOG];
     uint8_t  nkeep = 0;
     for (uint8_t i = 0; i < s->count; i++) {
@@ -256,6 +270,12 @@ static void dq_collect(dq_slave_t *s, uint8_t completed_id) {
         uint16_t r  = cb_reg(s, (uint8_t)(2u + (rid & 0x07u)));  /* QRES[rid&7] */
         dq_result_t res = (dq_result_t)((r >> 8) & 0xFFu);
         uint8_t     ans = (uint8_t)(r & 0xFFu);
+        if (s->dbg_collect_left > 0) {   /* TEMP: first collects after a rebuild */
+            LOG_WARN("dqdbg", "slave %u collect: expected_id=%u ring_slot=%u completed_id=%u last_completed=%u res=%u ans=%02X",
+                     s->slave_id, rid, (unsigned)(rid & 0x07u), completed_id, s->last_completed,
+                     (unsigned)res, ans);
+            s->dbg_collect_left--;
+        }
         if (h->cb) h->cb(s->slave_id, res, ans, h->ctx);
         s->c_collected++;
         if (rid == completed_id) done = true;
@@ -306,6 +326,11 @@ static void dq_issue(dq_slave_t *s, uint8_t n) {
     s->submit_last_id = last_id;
     s->c_submitted   += n;
     s->st             = DQ_AWAIT;
+    if (s->dbg_log_resubmit && n > 0) {   /* TEMP: ids on the first post-rebuild submit */
+        LOG_WARN("dqdbg", "slave %u first-resubmit: n=%u ids %u..%u next_id=%u free_hint=%u",
+                 s->slave_id, n, s->bl[s->outstanding].id, last_id, s->next_id, s->free_hint);
+        s->dbg_log_resubmit = false;
+    }
 }
 
 /* Transport-recovery / adoption read: status block only, no write. */
@@ -381,7 +406,17 @@ static void dq_resync_apply(dq_slave_t *s, dq_resync_reason_t reason,
     if (accepted_id == 0) {
         LOG_WARN("dq", "slave %u resync (%s): gateway fresh — rebuilding in-flight set",
                  s->slave_id, dq_reason_name(reason));
+        /* TEMP instrumentation: raw classifying read + pre-rebuild ledger. If
+         * completed_id!=0 here the "fresh" gate raced a non-zero ledger (baseline
+         * would matter); reviewer-04 proves accepted==0 => completed==0, so this
+         * should read 0 — in which case the phantom is the re-pend id alignment. */
+        LOG_WARN("dqdbg", "slave %u REBUILD-entry: reason=%s read{accepted=%u completed=%u free=%u} "
+                 "ledger{last_completed=%u last_accepted=%u next_id=%u}",
+                 s->slave_id, dq_reason_name(reason), accepted_id, completed_id, free_slots,
+                 s->last_completed, s->last_accepted, s->next_id);
         dq_rebuild_fresh(s);
+        s->dbg_log_resubmit = true;
+        s->dbg_collect_left = 3;
     } else {
         LOG_WARN("dq", "slave %u resync (%s): gateway alive (accepted=%u) — reconciling ids",
                  s->slave_id, dq_reason_name(reason), accepted_id);
