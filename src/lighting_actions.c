@@ -145,6 +145,9 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
 #define RAWQ_GAP_MS       25   /* ≈ forward frame (16.7 ms) + bus settling */
 #define RAWQ_RETRY_MS     15
 #define RAWQ_RETRIES_MAX  8
+#define RAWQ_SETTLE_MS    100  /* quiet window a query SM waits after the FIFO
+                                * drains before it may read 0x0108 — justified
+                                * on rawq_settled() below */
 
 typedef struct { uint8_t slave; uint16_t value; bool twice; } rawq_ent_t;
 
@@ -152,15 +155,17 @@ static struct {
     rawq_ent_t      q[RAWQ_DEPTH];
     uint8_t         head, count;
     uint8_t         retries;
-    bool            in_flight;   /* head's Modbus write awaiting its callback */
-    absolute_time_t next_at;     /* pacing gap / retry back-off */
+    bool            in_flight;      /* head's Modbus write awaiting its callback */
+    absolute_time_t next_at;        /* pacing gap / retry back-off */
+    absolute_time_t last_activity;  /* last FIFO transmit/dequeue — settle timer */
 } s_rawq;
 
 static void rawq_pop(void) {
-    s_rawq.head    = (uint8_t)((s_rawq.head + 1) % RAWQ_DEPTH);
+    s_rawq.head          = (uint8_t)((s_rawq.head + 1) % RAWQ_DEPTH);
     s_rawq.count--;
-    s_rawq.retries = 0;
-    s_rawq.next_at = make_timeout_time_ms(RAWQ_GAP_MS);
+    s_rawq.retries       = 0;
+    s_rawq.next_at       = make_timeout_time_ms(RAWQ_GAP_MS);
+    s_rawq.last_activity = get_absolute_time();  /* frame just handed to the gateway */
 }
 
 static void rawq_write_cb(int res, uint8_t *buf, void *ctx) {
@@ -198,10 +203,12 @@ void lighting_raw_tick(void) {
     const rawq_ent_t *e = &s_rawq.q[s_rawq.head];
     if (modbus_set_holding_register(e->slave,
                                     e->twice ? 0x1001u : 0x1000u,
-                                    e->value, rawq_write_cb, NULL))
-        s_rawq.in_flight = true;
-    else   /* modbus action queue full — try again shortly */
+                                    e->value, rawq_write_cb, NULL)) {
+        s_rawq.in_flight     = true;
+        s_rawq.last_activity = get_absolute_time();  /* gateway now busy on the bus */
+    } else {   /* modbus action queue full — try again shortly */
         s_rawq.next_at = make_timeout_time_ms(RAWQ_RETRY_MS);
+    }
 }
 
 bool dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice) {
@@ -215,6 +222,38 @@ bool dali_raw_arm(uint8_t slave_id, uint16_t value, bool twice) {
                                    .twice = twice };
     s_rawq.count++;
     return true;
+}
+
+/* Settle gate for the single shared raw-result register (0x0108).
+ *
+ * The FIFO reaching empty (count==0 && !in_flight) means only that the last raw
+ * frame's *Modbus write* was accepted by the gateway — not that the gateway has
+ * finished clocking that frame onto the DALI bus, and not that the terminal
+ * result it leaves in 0x0108 has stopped changing. A query SM that commits its
+ * first read inside this window can have its first 0x0108 poll consume the
+ * *previous* raw command's result instead of its own. That is the stale-result
+ * race this hotfix closes: after a config write (fire-and-forget DTR0+SET on the
+ * FIFO, no result read), the cfgq query-back would start the instant the FIFO
+ * drained and its first field read the SET's leftover result.
+ *
+ * `last_activity` is stamped at every FIFO transmit and dequeue — the last
+ * instant we know the gateway was (about to be) busy on the bus — so a query
+ * holds off until the raw path has been quiet for RAWQ_SETTLE_MS. Budget: a
+ * gateway frame is ~RAWQ_GAP_MS (25 ms) of forward-frame + settling; a
+ * send-twice SET is ~2× that (~50 ms) of on-bus execution *after* the dequeue
+ * that stamps the timestamp, and a DTR0+SET config write is a DTR0 frame plus
+ * that send-twice SET (~75 ms worst case). 100 ms clears that with margin for
+ * the gateway to latch the terminal result before the first poll reads it.
+ *
+ * Scope: this gate tracks s_rawq only. The blocking CLI raw helpers in
+ * serial_protocol.c (dali_raw_result/dali_read_mem) drive 0x1000/0x1001 and poll
+ * 0x0108 directly and do NOT stamp last_activity, so a raw command issued from
+ * the CLI while a query is committed is invisible here — a pre-existing, human-
+ * driven, self-healing contention that this hotfix does not attempt to cover. */
+static bool rawq_settled(void) {
+    if (s_rawq.count || s_rawq.in_flight) return false;
+    return absolute_time_diff_us(s_rawq.last_activity, get_absolute_time())
+               >= (int64_t)RAWQ_SETTLE_MS * 1000;
 }
 
 /* ── Any-on probe ────────────────────────────────────────────────────────────
@@ -343,12 +382,24 @@ void lighting_any_on_probe_tick(void) {
     switch (s_probe.st) {
     case PST_SEND:
         if (!time_reached(s_probe.next_at)) return;
-        /* Let queued raw commands drain first — the gateway's single raw slot
-         * and result register can only serve one master at a time. If the
-         * queue never drains, the probe deadline aborts us and the click
-         * falls back to assume-off (warned). No deadlock: the raw queue only
-         * pauses for a probe once the query is committed (not in PST_SEND). */
-        if (s_rawq.count || s_rawq.in_flight) return;
+        /* Let queued raw commands drain AND settle first — the gateway's single
+         * raw slot and result register can only serve one master at a time, and
+         * a first poll issued before the last raw frame's result has settled in
+         * 0x0108 would read that stale result (same hazard as the config query
+         * SM below; see rawq_settled()). If the queue never drains, the probe
+         * deadline aborts us and the click falls back to assume-off (warned).
+         * No deadlock: the raw queue only pauses for a probe once the query is
+         * committed (not in PST_SEND), so the FIFO keeps draining while we wait.
+         *
+         * Budget: the settle only delays the probe when raw traffic was recently
+         * active — precisely the case where the probe already yields to the FIFO
+         * — so an isolated press (last_activity long past) is unaffected. When
+         * raw traffic IS in flight, adding the ≤100 ms settle can push probe
+         * resolution past button_fsm's 150 ms click grace, but that lands on the
+         * pre-existing assume-off fallback rather than acting on a confidently
+         * wrong stale result — no new failure mode, and the 600 ms probe
+         * deadline still bounds the wait. */
+        if (!rawq_settled()) return;
         /* A config query already committed to the slot must finish its result
          * read first (it yields to us before committing, so this waits at most
          * one query ~30 ms — well inside the probe deadline). */
@@ -478,6 +529,7 @@ static struct {
     int      cb_res;
     uint8_t  cb_excep;
     uint16_t cb_word;
+    bool     guard_reread;            /* first field: discard one suspect poll */
 } s_cfgq;
 
 /* True once a query has been committed to the gateway and its result not yet
@@ -595,8 +647,14 @@ void lighting_cfg_query_tick(void) {
     switch (s_cfgq.st) {
     case CQ_SEND:
         /* Lowest priority: yield the slot to the raw FIFO and to a pending
-         * probe. cfgq_query_in_flight() is false here, so nothing waits on us. */
-        if (s_rawq.count || s_rawq.in_flight)  return;
+         * probe. cfgq_query_in_flight() is false here, so nothing waits on us.
+         * rawq_settled() also enforces the post-drain settle window, so the
+         * first field never commits until the last raw frame's result has
+         * cleared 0x0108. It gates every field, not just the first: a raw send
+         * that interleaves mid-sequence (button/HA) leaves the identical stale
+         * result, and in steady state (no recent raw traffic) the gate passes
+         * immediately, so background rotation is unaffected. */
+        if (!rawq_settled())                   return;
         if (s_probe.active && !s_probe.done)   return;
         if (!time_reached(s_cfgq.next_at))     return;
         {
@@ -607,6 +665,14 @@ void lighting_cfg_query_tick(void) {
                                             cfgq_write_cb, NULL)) {
                 s_cfgq.st       = CQ_AWAIT_WRITE;
                 s_cfgq.deadline = make_timeout_time_ms(CFGQ_FIELD_DEADLINE_MS);
+                /* First field only: even after the settle gate, 0x0108 still
+                 * holds the last raw command's terminal result (settled = stable,
+                 * not gone). If the gateway hasn't yet marked our query PENDING
+                 * when we take the first poll, that poll would read the leftover.
+                 * Arm a one-shot discard of a first-poll terminal result for the
+                 * first field so a stale leftover is re-read past; a genuinely
+                 * fast answer simply reappears on the next poll. */
+                s_cfgq.guard_reread = (s_cfgq.field == 0);
             } else {  /* action queue full — retry shortly */
                 s_cfgq.next_at = make_timeout_time_ms(CFGQ_WRITE_RETRY_MS);
             }
@@ -647,11 +713,31 @@ void lighting_cfg_query_tick(void) {
             return;
         }
         if (s_cfgq.cb_res < 5) { cfgq_field_done(false, 0); return; }
-        switch (s_cfgq.cb_word >> 8) {
-        case 0xFF:   /* still pending on the gateway — keep polling */
+        if ((s_cfgq.cb_word >> 8) == 0xFFu) {   /* still pending — keep polling */
+            /* Our query owns 0x0108 now (the gateway marked it PENDING), so the
+             * leftover the first-field guard worried about is gone. */
+            s_cfgq.guard_reread = false;
             s_cfgq.st      = CQ_POLL_DELAY;
             s_cfgq.next_at = make_timeout_time_ms(CFGQ_POLL_MS);
             break;
+        }
+        if (s_cfgq.guard_reread) {
+            /* First field returned a terminal result on its very first poll —
+             * ambiguous between a stale leftover raw result and a fast answer.
+             * Discard this one poll and read once more (one-shot, bounded by the
+             * field deadline); by the next poll the gateway has almost always
+             * overwritten 0x0108 with our query's pending/answer. This is a
+             * monotonic improvement, not a proof: if the gateway's accept->result
+             * latency exceeds one poll cycle (~10 ms), the re-read can still catch
+             * the stable leftover and accept it — the background rotation then
+             * self-heals. A stronger form (discard until a 0xFF PENDING is seen,
+             * or the deadline) is left as future hardening. */
+            s_cfgq.guard_reread = false;
+            s_cfgq.st      = CQ_POLL_DELAY;
+            s_cfgq.next_at = make_timeout_time_ms(CFGQ_POLL_MS);
+            break;
+        }
+        switch (s_cfgq.cb_word >> 8) {
         case 0x00:   /* answered — low byte is the queried value */
             cfgq_field_done(true, (uint8_t)(s_cfgq.cb_word & 0xFFu));
             break;
