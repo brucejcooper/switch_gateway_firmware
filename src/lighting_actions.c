@@ -436,7 +436,14 @@ void lighting_any_on_probe_tick(void) {
 #define CFGQ_POLL_MS           10        /* result-poll pacing (DALI query ~25 ms) */
 #define CFGQ_WRITE_RETRY_MS    15        /* RAW_CMD busy back-off */
 #define CFGQ_WRITE_RETRIES_MAX 5
-#define CFGQ_FIELD_DEADLINE_MS 250       /* per-field guard (write + result polls) */
+/* Per-field guard (write + result polls). A field commits the shared slot until
+ * its result read completes (it can't be abandoned — a stale 0x0108 could
+ * mislead the probe), so this caps how long a committed field can block a
+ * concurrent button probe. Kept under button_fsm's CLICK_PROBE_GRACE_MS (150)
+ * with headroom for the probe's own send+resolve; a typical field is ~40 ms, so
+ * a field that overruns this is a busy/slow gateway and just aborts + re-reads
+ * on the next rotation (its cached value is preserved). */
+#define CFGQ_FIELD_DEADLINE_MS 100
 
 /* DALI-16 query opcodes (low byte of the forward frame). Verified against
  * IEC 62386-102 and the gateway's TinyModbus/src/dali.h: 0xA1 QUERY MAX LEVEL,

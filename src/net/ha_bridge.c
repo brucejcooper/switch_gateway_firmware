@@ -778,12 +778,41 @@ static void tombstone_group(uint8_t slave, uint8_t grp) {
     LOG_INFO("mqtt", "tombstoned group %u.%u", slave, grp);
 }
 
+/* Clears the whole gateway HA device `lighting_dali_gw_<slave>` — its diagnostic
+ * + provisioning discovery configs (disc_gw_diag / disc_prov) and the gateway-
+ * scoped data topics — so no ghost device is left after retirement. Its ballasts
+ * and groups are separate HA devices, retired individually. ~15 empty retained
+ * publishes; best-effort QoS0 into the ~2 KB socket (drained during a manual
+ * decommission) and idempotent, so a re-run completes it if a publish was ever
+ * dropped under concurrent TX. Discovery configs go first (they remove the HA
+ * device) so a dropped tail leaves only a harmless stale data topic. */
 static void tombstone_gateway(uint8_t slave) {
     const char *P = mqtt_app_prefix();
     char tp[96];
-    snprintf(tp, sizeof tp, "%s/gateway/%u/availability", P, slave); tomb(tp);
-    snprintf(tp, sizeof tp, "%s/gateway/%u/diag", P, slave);         tomb(tp);
-    LOG_INFO("mqtt", "tombstoned gateway %u (avail+diag; ballasts/groups retire individually)", slave);
+    /* Diagnostic sensors (disc_gw_diag) — device lighting_dali_gw_<slave>. */
+    static const char *const gwdiag[] = { "uptime", "reboots", "reset" };
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(tp, sizeof tp, "homeassistant/sensor/lighting_gwdiag_%u_%s/config", slave, gwdiag[i]);
+        tomb(tp);
+    }
+    /* Provisioning entities (disc_prov) — same device. */
+    static const char *const prov_sensor[] = { "state", "msg", "count" };
+    for (unsigned i = 0; i < 3; i++) {
+        snprintf(tp, sizeof tp, "homeassistant/sensor/lighting_prov_%u_%s/config", slave, prov_sensor[i]);
+        tomb(tp);
+    }
+    static const char *const prov_btn[] = { "all", "unaddressed", "address", "abort" };
+    for (unsigned i = 0; i < 4; i++) {
+        snprintf(tp, sizeof tp, "homeassistant/button/lighting_prov_%u_%s/config", slave, prov_btn[i]);
+        tomb(tp);
+    }
+    snprintf(tp, sizeof tp, "homeassistant/number/lighting_prov_%u_target/config", slave); tomb(tp);
+    /* Gateway-scoped retained data topics. */
+    snprintf(tp, sizeof tp, "%s/gateway/%u/availability", P, slave);   tomb(tp);
+    snprintf(tp, sizeof tp, "%s/gateway/%u/diag", P, slave);           tomb(tp);
+    snprintf(tp, sizeof tp, "%s/provision/%u/status", P, slave);       tomb(tp);
+    snprintf(tp, sizeof tp, "%s/provision/%u/target_state", P, slave); tomb(tp);
+    LOG_INFO("mqtt", "tombstoned gateway %u device (diag+prov entities; ballasts/groups retire individually)", slave);
 }
 
 void ha_bridge_publish_event(const ic_event_t *e) {

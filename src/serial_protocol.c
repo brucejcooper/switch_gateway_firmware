@@ -2194,6 +2194,11 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
          * seed is ignored (nothing to warm — and this breaks any
          * publish->echo->seed loop, since our own re-emit makes the cache
          * non-zero). */
+        /* Strict dual-path: in legacy (bank-read) mode the boot scan is the sole
+         * authority, so ignore warm-start seeds entirely — flag-off stays exactly
+         * as main. (Core 1 still subscribes/parses, but that has no cache effect
+         * here.) */
+        if (!g_config.dali_raw_cfg) break;
         uint8_t slave = c->seed_dali_cfg.slave, addr = c->seed_dali_cfg.addr;
         int idx = state_cache_slave_idx(slave);
         if (idx < 0 || addr > 63) break;

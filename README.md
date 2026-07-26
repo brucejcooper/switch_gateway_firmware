@@ -679,8 +679,11 @@ and state topics would otherwise linger in HA and on the broker forever. The CLI
 topics, so HA drops the entity and the broker keeps no stale state. It is a
 deliberate operator action (a transient DALI dropout is *availability*, not
 removal, and is handled by the per-ballast availability topic). A whole-gateway
-tombstone clears the gateway-scoped topics; its ballasts/groups are tombstoned
-individually.
+tombstone clears the entire gateway HA device (`lighting_dali_gw_<slave>`) — its
+diagnostic + provisioning discovery configs and gateway-scoped data topics — so no
+ghost device is left; its ballasts and groups are separate HA devices, tombstoned
+individually. Tombstones are best-effort idempotent retained publishes, so re-run
+the command if it coincided with heavy MQTT traffic.
 
 ### Discovery
 
