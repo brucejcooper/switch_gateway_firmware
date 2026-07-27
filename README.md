@@ -195,7 +195,8 @@ Each boot, before the main loop starts, the firmware runs:
 | `mapping.c/h` | Button-to-light mappings, persisted to `/mappings.json` |
 | `state_cache.c/h` | In-memory cache of relay + DALI ballast + group state |
 | `lighting_actions.c/h` | Command dispatch, any-on probe + config-query state machines, state event queue |
-| `dali_queue.c/h` | Per-gateway command-queue client (FC23 submit/collect, credits, recovery, reboot resync) |
+| `dali_queue.c/h` | DALI adapter: per-slave priority scheduler + producer API over the generic client |
+| `mbq_client.c/h` | Generic DALI-agnostic command-queue client (8-slot lifecycle protocol over FC23) |
 | `dirty_poll.c/h` | TinyModbus dirty-bit polling, background scans |
 | `serial_protocol.c/h` | USB-CDC text CLI + the core-0/core-1 inter-core seam |
 | `serial_protocol_provision.c` | Provision status → core-1 event forwarding |
@@ -331,14 +332,13 @@ new contract:
   **reads** each field with raw DALI queries (the config-query state machine in
   `lighting_actions.c`, routed through the command queue) and **writes** it with
   a DTR0+SET pair submitted as one queue command. Controller and gateway are a
-  **matched firmware set** (task 04) — deploy both together.
-- **DALI command queue** — the primary path for group/broadcast/specialty sends
-  and all raw queries. Submit window (FC10/FC23 write) at `0x1000–0x1007`, status
-  block at `0x1010–0x1019` (served under both FC03 and FC04), FC23 (`0x17`). See
-  "DALI command queue client" below and `../TinyModbus/README.md`. The legacy
-  single-slot `0x1000/0x1001/0x0108` raw channel was **removed** in task 04 (its
-  addresses are reused by the submit window); the CLI `dali_raw` / `read_mem`
-  now go through the queue client.
+  **matched firmware set** (queue v2, task 06) — deploy both together.
+- **DALI command queue (queue v2)** — the primary path for group/broadcast/
+  specialty sends and all raw queries. 8-slot command block (FC10/FC23 write) at
+  `0x1000–0x100F`, per-slot status block at `0x1010–0x1017` (served under both
+  FC03 and FC04), FC23 (`0x17`). See "DALI command queue: adapter + generic
+  client" below and `../TinyModbus/README.md`. The CLI `dali_raw` / `read_mem`
+  go through the queue via `dq_submit_sync`.
 - **Group masks (FC03 read / FC06 write) at `0x0110+`** — four 16-bit words
   per group covering bits 0–63, byte-swapped per word. The controller writes
   the desired mask; the gateway diffs old↔new and issues the per-bit DALI
@@ -356,23 +356,36 @@ new contract:
 The canonical specification for the gateway is
 [`../TinyModbus/README.md`](../TinyModbus/README.md).
 
-### DALI command queue client (`dali_queue.c`)
+### DALI command queue: adapter + generic client (`dali_queue.c` / `mbq_client.c`)
 
 Every group/broadcast/specialty DALI send and every raw query goes through a
-per-gateway **command-queue client** (`dali_queue.c`) that drives the gateway's
-8-deep id-tagged queue over FC23. It replaced the old single-slot "write
-`0x1000`, poll `0x0108`, back off on DEVICE_BUSY" path (now removed) and the
-three separate producers that contended for it.
+**two-layer** command queue (queue v2, task 06):
 
-**Model.** Each gateway has a per-slave **scheduler state machine** over a local
-backlog — the priority queue in front of the gateway's queue. Producers
-(`dq_submit`) drop commands in with a **priority class**; `dq_tick()` ships the
-highest-priority pending command first (FIFO within a class). Each shipped
-command gets a controller-assigned **id** (cycling 1–31, 0 reserved), and its
-result is routed back to the command's completion callback when collected. A
-command carries an **idempotency** flag: idempotent commands (GOTO_LAST_ACTIVE,
-group on/off/level, config re-store, all queries) may be resubmitted after a
-fault; UP/DOWN step frames may not.
+1. **`mbq_client.c` — the generic, DALI-agnostic client.** It mirrors the
+   gateway's **8-slot self-describing lifecycle protocol**: it carries opaque
+   32-bit commands into a slave's 8 slots and delivers back a terminal outcome
+   (`complete` / `failed` / `lost`) + an 8-bit response per command. It knows
+   nothing about DALI. The generic protocol — the slot command/status register
+   layout, the lifecycle states, the all-or-nothing reject-active write, and the
+   "idle means gone" reboot signal — is specified once in
+   [`docs/modbus-command-queue.md`](docs/modbus-command-queue.md).
+2. **`dali_queue.c` — the DALI adapter** on top. It owns the per-slave priority
+   scheduler and the producer API, packs a DALI command into the client's 4
+   opaque command bytes, and maps the client's outcome back to a `dq_result_t`.
+
+This replaced the task-04 id-ledger client (a controller-assigned id sequence
+with a result ring, credit tracking, and a boot_count-driven resync/rebuild/
+rollback machine). Queue v2 has **no id ledger and no resync machinery** — the 8
+slot statuses are the truth, so the whole class of reboot/glitch recovery-
+corruption bugs the ledger fought is gone by construction.
+
+**Scheduler (the adapter).** Each gateway has a per-slave **priority backlog** in
+front of the gateway's 8 slots. Producers (`dq_submit`) drop commands in with a
+**priority class**; `dq_tick()` ships the highest-priority pending command first
+(FIFO within a class) into a free slot via the client. A command carries an
+**idempotency** flag: idempotent commands (GOTO_LAST_ACTIVE, group on/off/level,
+config re-store, all queries) may be resubmitted after a gateway reboot; UP/DOWN
+step frames may not.
 
 **Priority ladder** (highest first, an ordered table — one-line reorder), mirroring
 the gateway's own work selector: **provisioning** (bus-exclusive: while a slave
@@ -381,114 +394,51 @@ is being commissioned the scheduler admits nothing else on it) → **user action
 writes → **config writes** (DTR0+SET) → level/status reads → **background** (config
 rotation). Classes with no queue client yet (group writes, level reads — they use
 FC03 / dirty_poll today) are reserved placeholders for task 05. In-flight depth is
-capped at **2–3 per slave** (well below the gateway's 8) so background work never
-fills the gateway queue ahead of a fresh user command.
+capped at **2–3 per slave** (`DQ_INFLIGHT_MAX`, well below the gateway's 8) so a
+backlog of background work never fills all 8 slots ahead of a fresh user command —
+the depth cap is what keeps the priority ladder meaningful above the client.
 
-**One transaction = one FC23:** write up to 4 new records into the submit window
-(`0x1000`) and read the 10-register status block back through the holding view
-(`0x1010`) in the same round trip. Because the gateway executes the write before
-the read, one FC23 both submits new work and collects the results of earlier
-commands (submit-N / collect-N−1). A command's result lives in `QRES[id mod 8]`
-and is valid once the status block's `completed_id` has reached that id.
+**Payload contract (the adapter).** A DALI command packs into the 4 opaque bytes
+as `[addr, data, flags, dtr0]`, where `flags` is `DQ_TWICE` / `DQ_DTR0` /
+`DQ_ANSWER` (bit-for-bit the gateway's `QF_*`). On completion the client's 8-bit
+response is the DALI backward-frame answer (on `complete`) or a failure code
+(`NAK` / `collision` / `bus fault`, on `failed`), which the adapter maps to
+`DQ_RES_OK` / `DQ_RES_NAK` / `DQ_RES_ERR`. The **collision-vs-NAK** distinction is
+preserved for the any-on probe (a garbled backward frame → `DQ_RES_ERR` → "≥1
+on"; silence → `DQ_RES_NAK` → "none on"). A gateway reboot that discards a
+non-idempotent command surfaces as `DQ_RES_DROPPED`.
 
-**Credit policy (baud-derived, one place).** The client submits
-`min(pending, free_slots, 4)` per transaction, tracking `free_slots` from every
-response. Since `free_slots` only decreases when the client submits (the gateway
-frees slots as it executes, learned on the next response), it is a conservative
-lower bound — the client never over-submits, so at **19200 the gateway never
-answers SLAVE_DEVICE_BUSY** (strict credits). The FC23 round-trip (~28–30 ms at
-19200) is the natural pacing; the only baud-adjacent constant is the collect-only
-drain pace (`DQ_DRAIN_POLL_MS`). At 38400 the same path stays correct (just
-conservative); relaxing to optimistic pacing there is a future knob.
+**Gateway reboot recovery — status-driven, in the client.** A reboot clears every
+slot. The client detects it from the slot statuses alone: a slot the client
+*confirmed* live that reads back `idle` is the unambiguous "idle means gone"
+signal → fail all outstanding, delivering `lost` and resubmitting the idempotent
+ones. There is no boot_count feed, no id re-baselining, no fresh-rebuild-vs-
+alive-reconcile gate — the corruption modes those existed to manage cannot arise
+because nothing is inferred from an id sequence. (boot_count / the FC04 sysinfo
+block remain, purely as an HA diagnostic in `dirty_poll.c`.)
 
-**Transport recovery.** On an FC23 timeout the write may or may not have landed.
-The client does not blind-resubmit (UP/DOWN steps aren't idempotent): it first
-issues a status-only read and compares the gateway's `accepted_id` to the id of
-the timed-out submit. Match → the write landed, promote it; mismatch → it did
-not, roll the records back to pending (ids un-assigned, sequence rewound) and
-resubmit.
+**Observability.** The CLI **`dq [slave]`** command dumps the adapter's per-class
+backlog depths, the in-flight count, and its counters (submitted / ok / nak / err
+/ dropped / backlog-full), then the underlying client's per-slot state
+(`free`/`armed`/`sent`/`live`) and counters. Bare = all DALI slaves.
 
-**Gateway reboot resync.** A reboot empties the gateway's queue. The client
-detects it two ways: the sysinfo **boot-count** (fed in via `dq_note_boot_count`
-from the gw-diag poll) changing, or a status **anomaly** (free_slots back to 8
-and `accepted_id` 0 while the client still holds in-flight commands). The anomaly
-detector reacts within one FC23 (~30 ms); the boot-count poll is the slower
-(~30 s) backstop. Recovery reads the gateway's live status and picks the command
-surgery by whether the reboot is **confirmed** — never by `accepted_id` alone:
+**Subsystems on the queue.** Every former single-slot producer rides it: the raw
+command path (button on/off/step, group commands, config DTR0+SET), the **any-on
+probe**, the **config-query** state machine, and the blocking **CLI helpers**
+(`dali_raw` / `read_mem`, via `dq_submit_sync`). The probe and the config queries
+are ordinary expects-answer commands, each occupying its own slot — no shared-
+result-register interlock, no settle-gate. `read_mem`'s per-byte SET-DTR0 + READ
+is one atomic `DQ_DTR0` queue entry. The click-grace guarantee holds: a probe
+query resolves in a couple of FC23 round-trips (tens of ms), inside the button
+FSM's 150 ms grace; a rare overflow lands on the pre-existing assume-off fallback,
+bounded by the 600 ms probe deadline.
 
-- **Confirmed queue loss** (`boot_count`-confirmed reboot, **or** `accepted_id == 0`):
-  the in-flight set is lost, so **drop** non-idempotent commands and **re-pend**
-  idempotent ones (FRESH-REBUILD). A boot_count delta that survived the
-  re-baseline suppression is authoritative — the gateway rebooted — **even if
-  `accepted_id != 0`**. This is load-bearing in a busy burst: the controller's own
-  post-reboot submits make `accepted_id != 0`, so the `accepted == 0` anomaly
-  detector never fires, and the lost pre-reboot commands would otherwise stay stuck
-  at the front of the backlog. Gating fresh-vs-alive on `accepted_id` alone (a
-  boot-confirmed reboot taking the alive branch) is exactly what desynced the result
-  ring by one slot.
-- **Unconfirmed, gateway alive** (`accepted_id != 0` **and** `boot_count` unchanged):
-  a spurious/duplicate detection or a verify-exhaust transport glitch against a
-  genuinely-live gateway — the in-flight commands are still at the gateway, so
-  **keep** them, never tear them down.
-
-**Both** branches then re-baseline `next_id` / `last_completed` from the gateway's
-**live status** through the exact `dq_handle_adopt` logic a warm controller boot
-uses.
-
-> **Known limitations (tracked: `tasks/06-dq-collect-hardening.md`).** On a gateway
-> reboot mid-burst two residual result-**attribution** offsets remain. Both are
-> **controller-side only** — the gateway executes every command correctly and neither
-> corrupts gateway or ballast state; they mis-map *answers* to commands (a one-command
-> answer lag) and both **self-heal on a controller reboot**.
->
-> 1. **Fast-poll transient** — within the ~2 s transport-recovery window normal
->    collection can momentarily attribute a stale ring slot to a lost in-flight
->    command. A `gw-diag` boot-count poll landing *inside* that window used to make it
->    **permanent**; the confirmed-reboot fresh-rebuild above removes that, so it is now
->    **transient and unreachable at the 30 s production `gw_diag_interval_ms` default**
->    (recovery drains first) — it only shows at aggressive poll intervals (≤ 2 s).
-> 2. **Transport-glitch `submit_n` rollback — PROD-REACHABLE, independent of poll
->    rate.** A verify-exhaust against a genuinely-live gateway takes the alive-reconcile
->    branch; if the status read driving it predates the gateway's accept of the just-
->    sent submit (`accepted_id != submit_last_id`), `dq_rollback_submit` re-pends a
->    command the gateway actually accepted → a persistent inflight-vs-gateway id offset.
->    This is on the transport-recovery path, **not** gated by the `gw-diag` poll, so it
->    is reachable at the production poll interval. It is **rare** (transport-glitch
->    drills at the 30 s poll came back clean 6/6) and self-heals on controller reboot.
->
-> The tracked follow-up is **one unified** kept-vs-lost fix — re-pend/drop only
-> genuinely-lost commands, verify-before-drop, keep-on-ambiguity — spanning the
-> `dq_resync_apply` `submit_n` resolution *and* `dq_collect` (drop entries whose ids
-> the gateway can no longer complete), not two separate patches.
-
-To stop the duplicate arising in the first place, a resync also **re-baselines the
-other detector**: it clears the stored boot-count so the next sysinfo poll adopts
-the gateway's current value rather than reading the already-consumed change as a
-second reboot. So either detector consuming a reboot silently re-syncs the other,
-and recovery is idempotent no matter how many times it fires. The `dq` **resyncs**
-counter is split by trigger (`resyncs=N(boot=B,anom=A)`) so a fault drill can tell
-the two apart. A controller-only reboot uses the same adoption on first contact,
-so fresh commands are never mis-collected against retained gateway state.
-
-**Observability.** The CLI **`dq [slave]`** command dumps per-slave client state
-for the bench fault drills: scheduler state, `next_id` / last `accepted_id` /
-`completed_id`, the in-flight `(id:class)` list and per-class queued depths, and
-counters — submitted, collected, timeouts, resubmits (records rolled back after
-a read-status), busy exceptions, id adoptions, and reboot resyncs. Bare = all
-DALI slaves.
-
-**Subsystems on the queue.** Every former single-slot producer rides it now: the
-raw command path (button on/off/step, group commands, config DTR0+SET), the
-**any-on probe**, the **config-query** state machine, and the blocking **CLI
-helpers** (`dali_raw` / `read_mem`, via `dq_submit_sync`). The probe and the
-config queries are ordinary expects-answer commands with their own ids, so the
-shared-result-register interlocks and the post-drain settle-gate the single-slot
-path needed are gone — **id-tagging is what retired them** (this also closes the
-CLI-bypass hole the settle-gate could not cover). `read_mem`'s per-byte SET-DTR0
-+ READ is now one atomic `DQ_DTR0` queue entry. The click-grace guarantee still
-holds: a probe query resolves in ~1–2 FC23 round-trips (~30–90 ms), inside the
-button FSM's 150 ms grace; a rare overflow lands on the pre-existing assume-off
-fallback, bounded by the 600 ms probe deadline.
+> **Matched firmware set (no cross-version interop).** Queue v2 is a protocol
+> break: the controller (`switch_gateway_firmware`) and the TinyModbus gateway
+> firmware are a **matched set** and must be deployed together. A v1 (task-04
+> id-ledger) master cannot drive a v2 gateway and vice versa — the register
+> semantics at `0x1000`/`0x1010` are incompatible. There is no mixed-version
+> operation.
 
 ### State event flow to HA
 
@@ -804,8 +754,8 @@ MIN/MAX/POWER-ON/SYSTEM-FAILURE LEVEL`, `QUERY FADE TIME/FADE RATE`) at boot (a
 sweep of every present ballast) and refreshed by a slow background rotation, and
 **written** with `DTR0`-load + `SET` sequences that are verified by a query-back
 before the cache and the retained `.../config` topic update. Both the reads and
-the writes ride the DALI command queue client (see "DALI command queue client"
-above).
+the writes ride the DALI command queue (see "DALI command queue: adapter +
+generic client" above).
 
 The `.../config` topic is published **retained**, so it doubles as the **warm
 start**: on boot the controller subscribes to `dali/+/+/config` and adopts the
