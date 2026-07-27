@@ -111,6 +111,12 @@ static void mbq_fc23_cb(int res, uint8_t *buf, void *ctx) {
         uint8_t n = (res > (int)sizeof s->cb_buf) ? (uint8_t)sizeof s->cb_buf : (uint8_t)res;
         memcpy(s->cb_buf, buf, n);
         s->cb_len = n;
+    } else if (res < 0 && buf) {
+        /* Exception frame [addr, fc|0x80, exc_code]: keep the code so a submit that
+         * was rejected SLAVE_DEVICE_BUSY (0x06 = target slot active) can be read as
+         * "the command actually landed". */
+        s->cb_buf[0] = buf[0]; s->cb_buf[1] = buf[1]; s->cb_buf[2] = buf[2];
+        s->cb_len = 3;
     }
     s->cb_fired = true;
 }
@@ -149,7 +155,7 @@ void mbq_client_add_slave(uint8_t slave_id) {
             return;
         }
     }
-    LOG_WARN("mbq", "no room to register DALI slave %u", slave_id);
+    LOG_WARN("mbq", "no room to register slave %u", slave_id);
 }
 
 bool mbq_client_busy(uint8_t slave_id) {
@@ -210,75 +216,65 @@ static void deliver(slave_t *s, uint8_t k, mbq_result_t r, uint8_t resp) {
     if (cb) cb(s->slave_id, r, resp, ctx);
 }
 
-/* Reconcile the 8 just-read statuses against the cache: deliver terminals once,
- * confirm actives, and detect the gateway-reboot "idle means gone" signal. */
-static void reconcile(slave_t *s) {
-    /* Pass 1: does any CONFIRMED (LIVE) owned slot read idle? That is the
-     * unambiguous whole-gateway reboot signal (a reboot clears every slot; a
-     * still-SENT slot reading idle is only a lost submit-write, not a reboot). */
+/* Resolve an ambiguous owned slot by idempotency: re-arm to resubmit if the
+ * command is safe to repeat, else deliver it LOST. Used for every case where the
+ * slot's read-back status cannot be trusted as this command's true outcome. */
+static void resolve_ambiguous(slave_t *s, uint8_t k) {
+    if (s->slot[k].idempotent) s->slot[k].st = SLOT_ARMED;   /* resubmit; a later 0x06 confirms if it landed */
+    else { deliver(s, k, MBQ_R_LOST, 0); s->c_lost++; }
+}
+
+/* Reconcile the 8 just-read statuses against the cache. `submit_slot` is the slot
+ * this transaction wrote (0xFF for a read-only poll) — the ONLY slot whose status
+ * is trustworthy while still SENT, because its write executed before this same
+ * read (gateway FC23 ordering). Deliver terminals once, confirm actives, detect
+ * the gateway-reboot "idle means gone" signal.
+ *
+ * TRUST RULE (the v2 mis-attribution guard): a never-confirmed SENT slot resolved
+ * by anything other than its own submit read-back has an AMBIGUOUS status — it may
+ * be a stale pre-reuse terminal (a collected terminal we reused whose rewrite timed
+ * out), an unlanded idle, or a real landed state — so it is NEVER delivered by that
+ * status; it is resolved by idempotency instead. Only LIVE slots (confirmed active
+ * earlier) and the current submit_slot are trusted to carry this command's result. */
+static void reconcile(slave_t *s, uint8_t submit_slot) {
+    /* Pass 1: a CONFIRMED (LIVE) owned slot reading idle = whole-gateway reboot
+     * (a reboot clears every slot; a still-SENT slot reading idle is handled per
+     * slot below, not as a reboot). */
     bool reboot = false;
-    for (uint8_t k = 0; k < MBQ_SLOTS; k++) {
+    for (uint8_t k = 0; k < MBQ_SLOTS; k++)
         if (s->slot[k].st == SLOT_LIVE && stat_status(s, k) == GW_IDLE) { reboot = true; break; }
-    }
 
     if (reboot) {
-        /* The gateway rebooted and lost every command we believed in flight. Fail
-         * all outstanding: re-arm the idempotent ones for resubmit, deliver LOST for
-         * the rest. (A rebooted gateway reads all-idle, so there are no terminals to
-         * collect here.) */
         s->c_reboots++;
-        LOG_WARN("mbq", "slave %u gateway reboot (idle-means-gone) — failing outstanding",
-                 s->slave_id);
-        for (uint8_t k = 0; k < MBQ_SLOTS; k++) {
-            if (s->slot[k].st == SLOT_FREE) continue;
-            if (s->slot[k].idempotent) {
-                s->slot[k].st = SLOT_ARMED;   /* resubmit (never executed on the fresh gw) */
-            } else {
-                deliver(s, k, MBQ_R_LOST, 0);
-                s->c_lost++;
-            }
-        }
+        LOG_WARN("mbq", "slave %u reboot (idle-means-gone) — failing outstanding", s->slave_id);
+        for (uint8_t k = 0; k < MBQ_SLOTS; k++)
+            if (s->slot[k].st != SLOT_FREE && s->slot[k].st != SLOT_ARMED) resolve_ambiguous(s, k);
         return;
     }
 
-    /* Pass 2: per-slot reconcile. */
+    /* Pass 2: per owned slot. */
     for (uint8_t k = 0; k < MBQ_SLOTS; k++) {
-        if (s->slot[k].st == SLOT_FREE || s->slot[k].st == SLOT_ARMED) continue;
-        uint8_t gw = stat_status(s, k);
-        switch (gw) {
+        uint8_t cs = s->slot[k].st;
+        if (cs == SLOT_FREE || cs == SLOT_ARMED) continue;
+
+        /* Untrustworthy: a never-confirmed SENT slot that is NOT this txn's own
+         * submit read-back. Its status is ambiguous (stale reused terminal, unlanded
+         * idle, or a real landed state) — never deliver it; resolve by idempotency. */
+        if (cs == SLOT_SENT && k != submit_slot) { resolve_ambiguous(s, k); continue; }
+
+        /* Trusted: a LIVE slot, or the SENT slot in its own confirmed submit
+         * read-back (its write landed this txn, so the status is our command's). */
+        switch (stat_status(s, k)) {
             case GW_PENDING:
-            case GW_EXECUTING:
-                s->slot[k].st = SLOT_LIVE;              /* confirmed present */
-                break;
-            case GW_COMPLETE:
-                deliver(s, k, MBQ_R_COMPLETE, stat_resp(s, k));
-                s->c_completed++;
-                break;
-            case GW_FAILED:
-                deliver(s, k, MBQ_R_FAILED, stat_resp(s, k));
-                s->c_failed++;
-                break;
+            case GW_EXECUTING: s->slot[k].st = SLOT_LIVE; break;
+            case GW_COMPLETE:  deliver(s, k, MBQ_R_COMPLETE, stat_resp(s, k)); s->c_completed++; break;
+            case GW_FAILED:    deliver(s, k, MBQ_R_FAILED,   stat_resp(s, k)); s->c_failed++;    break;
             case GW_IDLE:
             default:
-                /* A SENT (never-confirmed) slot reading idle. A SENT slot exists
-                 * only because the submit FC23's response was lost, so an idle read
-                 * here has TWO indistinguishable causes: (a) the write never landed
-                 * → the command never executed; or (b) it landed, the gateway
-                 * executed it, then rebooted before this read → it ALREADY RAN.
-                 * Because we can't tell them apart, apply the SAME idempotency policy
-                 * as the reboot/fail path: re-arm to resubmit ONLY if idempotent; a
-                 * non-idempotent command (e.g. an UP/DOWN step) is delivered LOST,
-                 * never blind-resubmitted, so case (b) cannot double-apply it. (A
-                 * CONFIRMED slot reading idle is an unambiguous reboot, handled in
-                 * Pass 1.) */
-                if (s->slot[k].st == SLOT_SENT) {
-                    if (s->slot[k].idempotent) {
-                        s->slot[k].st = SLOT_ARMED;
-                    } else {
-                        deliver(s, k, MBQ_R_LOST, 0);
-                        s->c_lost++;
-                    }
-                }
+                /* A LIVE slot idle is a reboot (Pass 1). The submit_slot reading idle
+                 * in its own successful write+read can't happen (the write landed).
+                 * Defensive only. */
+                resolve_ambiguous(s, k);
                 break;
         }
     }
@@ -293,14 +289,25 @@ void mbq_client_tick(void) {
             if (!s->cb_fired) continue;
             s->cb_fired = false;
             int res = s->cb_res;
+            uint8_t submit_slot = s->tx_slot;
             s->tx = TX_IDLE;
             if (res > 0) {
-                reconcile(s);
+                reconcile(s, submit_slot);
                 s->next_at = get_absolute_time();   /* act again immediately if there's more */
             } else {
-                /* Timeout / exception: the txn did not complete. A SENT slot stays
-                 * SENT (unknown if the write landed) — the next poll's read-back
-                 * resolves it (active→LIVE, idle→re-arm). Just pace a retry. */
+                /* Timeout / exception — the txn did not complete. If a SUBMIT was
+                 * rejected SLAVE_DEVICE_BUSY (0x06), the target slot is ACTIVE on the
+                 * gateway: our command actually landed and is executing (the usual
+                 * case is a resubmit of a SENT command whose original write landed but
+                 * whose response was lost). Confirm it LIVE — do NOT keep resubmitting,
+                 * which would loop. Any other error: leave the slot SENT; a later
+                 * poll's read-back resolves it (idempotency-gated, never trusting a
+                 * possibly-stale status). */
+                uint8_t exc = (res < 0 && s->cb_len >= 3) ? s->cb_buf[2] : 0u;
+                if (submit_slot != 0xFFu && exc == 0x06u
+                    && s->slot[submit_slot].st == SLOT_SENT) {
+                    s->slot[submit_slot].st = SLOT_LIVE;
+                }
                 s->c_timeouts++;
                 s->next_at = make_timeout_time_ms(MBQ_POLL_MS);
             }
