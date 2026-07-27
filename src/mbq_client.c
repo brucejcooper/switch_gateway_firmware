@@ -21,11 +21,13 @@
  *   - "idle means gone" (gateway reboot → fail all) fires ONLY for a CONFIRMED
  *     (LIVE) slot that reads back idle. On a real reboot the gateway clears ALL
  *     slots, so every confirmed-owned slot reads idle — an unambiguous signal.
- *   - A slot still SENT (write issued, never confirmed) that reads idle means the
- *     submit write simply did not land (a lost frame, gateway alive) — re-arm and
- *     resubmit that one command; it never executed, so this is safe. This is NOT
- *     treated as a reboot, so a single lost submit-write can't false-trigger
- *     fail-all.
+ *   - A slot still SENT (write issued, never confirmed) that reads idle is NOT
+ *     treated as a reboot (so a single lost submit-write can't false-trigger
+ *     fail-all). But its outcome is genuinely ambiguous — the write either never
+ *     landed (never executed) OR landed+executed then the gateway rebooted before
+ *     this read (already ran) — so it follows the SAME idempotency policy as the
+ *     reboot path: re-arm to resubmit ONLY if idempotent, else deliver LOST. A
+ *     non-idempotent step is never blind-resubmitted.
  * ABA / deliver-once: a slot is delivered exactly when it leaves owned→FREE; a FREE
  * slot is ignored on re-reads. A collected-terminal slot is only reused by a new
  * submit, whose FC23 write executes before the read (gateway ordering), so the
@@ -258,11 +260,25 @@ static void reconcile(slave_t *s) {
                 break;
             case GW_IDLE:
             default:
-                /* Only reachable for a SENT (never-confirmed) slot — its submit
-                 * write did not land (a lost frame on an ALIVE gateway; a reboot
-                 * would have tripped Pass 1). Re-arm to resubmit the command, which
-                 * never executed. */
-                if (s->slot[k].st == SLOT_SENT) s->slot[k].st = SLOT_ARMED;
+                /* A SENT (never-confirmed) slot reading idle. A SENT slot exists
+                 * only because the submit FC23's response was lost, so an idle read
+                 * here has TWO indistinguishable causes: (a) the write never landed
+                 * → the command never executed; or (b) it landed, the gateway
+                 * executed it, then rebooted before this read → it ALREADY RAN.
+                 * Because we can't tell them apart, apply the SAME idempotency policy
+                 * as the reboot/fail path: re-arm to resubmit ONLY if idempotent; a
+                 * non-idempotent command (e.g. an UP/DOWN step) is delivered LOST,
+                 * never blind-resubmitted, so case (b) cannot double-apply it. (A
+                 * CONFIRMED slot reading idle is an unambiguous reboot, handled in
+                 * Pass 1.) */
+                if (s->slot[k].st == SLOT_SENT) {
+                    if (s->slot[k].idempotent) {
+                        s->slot[k].st = SLOT_ARMED;
+                    } else {
+                        deliver(s, k, MBQ_R_LOST, 0);
+                        s->c_lost++;
+                    }
+                }
                 break;
         }
     }
