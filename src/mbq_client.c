@@ -252,26 +252,35 @@ static void reconcile(slave_t *s, uint8_t submit_slot) {
         return;
     }
 
-    /* Pass 2: per owned slot. */
+    /* Pass 2: per owned slot. The rule (reviewer-04): a SENT slot is resolved only
+     * by (i) reading pending/executing → LIVE, or (ii) the idempotency policy for
+     * anything else; a TERMINAL is delivered only from a slot confirmed LIVE or from
+     * the submit_slot's own read-back. */
     for (uint8_t k = 0; k < MBQ_SLOTS; k++) {
         uint8_t cs = s->slot[k].st;
         if (cs == SLOT_FREE || cs == SLOT_ARMED) continue;
+        uint8_t gw = stat_status(s, k);
 
-        /* Untrustworthy: a never-confirmed SENT slot that is NOT this txn's own
-         * submit read-back. Its status is ambiguous (stale reused terminal, unlanded
-         * idle, or a real landed state) — never deliver it; resolve by idempotency. */
-        if (cs == SLOT_SENT && k != submit_slot) { resolve_ambiguous(s, k); continue; }
+        /* PENDING/EXECUTING is unambiguous: the gateway makes a slot active ONLY in
+         * response to our write, so even a still-SENT slot reading active means its
+         * (response-lost) write actually landed → confirm LIVE. */
+        if (gw == GW_PENDING || gw == GW_EXECUTING) { s->slot[k].st = SLOT_LIVE; continue; }
 
-        /* Trusted: a LIVE slot, or the SENT slot in its own confirmed submit
-         * read-back (its write landed this txn, so the status is our command's). */
-        switch (stat_status(s, k)) {
-            case GW_PENDING:
-            case GW_EXECUTING: s->slot[k].st = SLOT_LIVE; break;
-            case GW_COMPLETE:  deliver(s, k, MBQ_R_COMPLETE, stat_resp(s, k)); s->c_completed++; break;
-            case GW_FAILED:    deliver(s, k, MBQ_R_FAILED,   stat_resp(s, k)); s->c_failed++;    break;
+        /* Terminal or idle. Trust it as THIS command's outcome only from a slot we
+         * confirmed LIVE, or the submit_slot's OWN read-back (its write executed
+         * before this same read → its terminal is ours, never a stale reused one). A
+         * never-confirmed SENT slot resolved by a later poll is ambiguous (a stale
+         * pre-reuse terminal, or an unlanded idle) → idempotency-resolve, never
+         * deliver its status. */
+        bool trusted = (cs == SLOT_LIVE) || (k == submit_slot);
+        if (!trusted) { resolve_ambiguous(s, k); continue; }
+
+        switch (gw) {
+            case GW_COMPLETE: deliver(s, k, MBQ_R_COMPLETE, stat_resp(s, k)); s->c_completed++; break;
+            case GW_FAILED:   deliver(s, k, MBQ_R_FAILED,   stat_resp(s, k)); s->c_failed++;    break;
             case GW_IDLE:
             default:
-                /* A LIVE slot idle is a reboot (Pass 1). The submit_slot reading idle
+                /* A LIVE slot idle is a reboot (Pass 1); the submit_slot reading idle
                  * in its own successful write+read can't happen (the write landed).
                  * Defensive only. */
                 resolve_ambiguous(s, k);
