@@ -60,6 +60,11 @@ typedef enum {
     DQ_RES_NAK = 1,   /* no backward frame (normal for fire-and-forget sends) */
     DQ_RES_ERR = 2,   /* bus/timing error or answer collision; `answer` = failure code */
     DQ_RES_DROPPED = 3, /* command lost (gateway reboot; non-idempotent → not resubmitted) */
+    /* Synchronous-submit failure reasons (dq_submit_sync only; never delivered to
+     * a callback). Set in *result on the false return so the CLI can distinguish
+     * them instead of printing a bare "timeout" for both. */
+    DQ_RES_BACKLOG = 4, /* submit rejected up front — controller backlog full */
+    DQ_RES_TIMEOUT = 5, /* submitted, but no result within the sync deadline (bus congestion) */
 } dq_result_t;
 
 /* Completion callback for one submitted command. Invoked exactly once (from

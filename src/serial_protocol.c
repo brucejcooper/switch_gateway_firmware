@@ -442,8 +442,12 @@ static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
     uint8_t     flags = twice ? DQ_TWICE : DQ_ANSWER;
     if (!dq_submit_sync(slave, (uint8_t)(frame >> 8), (uint8_t)frame,
                         flags, 0, idempotent, 300, &res, &ans)) {
-        txt_err("timeout"); return false;
+        txt_err(res == DQ_RES_BACKLOG ? "backlog full"
+              : res == DQ_RES_TIMEOUT ? "timeout (no result in 300ms — bus busy)"
+              : "timeout");
+        return false;
     }
+    if (res == DQ_RES_DROPPED) { txt_err("lost (gateway reboot)"); return false; }
     *result = dq_result_word(res, ans);
     return true;
 }

@@ -237,14 +237,16 @@ bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
                     dq_result_t *result, uint8_t *answer) {
     s_sync_have = false;
     if (!dq_submit(slave_id, DQ_PRIO_USER, addr, data, flags, dtr0, idempotent,
-                   dq_sync_cb, NULL))
-        return false;   /* backlog full */
+                   dq_sync_cb, NULL)) {
+        if (result) *result = DQ_RES_BACKLOG;   /* rejected up front */
+        return false;
+    }
     absolute_time_t deadline = make_timeout_time_ms(timeout_ms);
     while (!s_sync_have && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         modbus_poll();
         dq_tick();
     }
-    if (!s_sync_have) return false;
+    if (!s_sync_have) { if (result) *result = DQ_RES_TIMEOUT; return false; }
     if (result) *result = s_sync_res;
     if (answer) *answer = s_sync_ans;
     return true;
