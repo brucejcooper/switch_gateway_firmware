@@ -274,6 +274,7 @@ if(OTA_APP_LAYOUT)
         src/mapping.c
         src/lighting_actions.c
         src/dali_queue.c
+        src/mbq_client.c
         src/dirty_poll.c
         src/bus_discovery.c
         src/serial_protocol.c

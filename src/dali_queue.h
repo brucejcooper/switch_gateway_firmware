@@ -1,71 +1,38 @@
 #pragma once
 /*
- * dali_queue.h — controller-side client for the gateway's 8-deep id-tagged
- * DALI command queue (task 04).
+ * dali_queue.h — DALI adapter over the generic Modbus command-queue client
+ * (task 06, queue v2).
  *
- * One driver per DALI gateway (slave). Producers (the raw command path, the
- * any-on probe, the config-query SM) submit commands into a per-slave local
- * backlog — the priority queue that sits in front of the gateway's queue. The
- * driver assigns each command a gateway id (1..31, cycling, 0 reserved), ships
- * a window of them via FC23 (write submit-window + read status block in one
- * transaction), and routes each command's result back to its callback as the
- * status block reports it collected. Because every command carries a unique id
- * and its result lands in a ring slot the controller reads back, the old
- * shared-result-register interlocks (probe_query_in_flight / cfgq settle-gate)
- * are gone — id-tagging makes result attribution unambiguous.
+ * This is the DALI-SPECIFIC layer. It owns the per-slave PRIORITY SCHEDULER and
+ * the producer API; the transaction layer beneath it is mbq_client.c (opaque
+ * 32-bit command in, terminal outcome + 8-bit response out — DALI-agnostic; see
+ * mbq_client.h and docs/modbus-command-queue.md). Producers (the raw command
+ * path, the any-on probe, the config-query SM) submit DALI commands into a
+ * per-slave local backlog sorted by priority class. dq_tick() drains the
+ * highest-priority pending command into a free gateway slot (via mbq_client),
+ * keeping at most DQ_INFLIGHT_MAX in flight so a fresh high-priority command
+ * never waits behind a backlog of background work. Each command's terminal
+ * outcome is mapped back to a dq_result_t and delivered to its callback exactly
+ * once.
  *
- * Policy (see dali_queue.c): submit min(backlog, free_slots, 4) per transaction,
- * tracking credits (free_slots) from every response — strict credits at 19200 so
- * transactions never bounce on SLAVE_DEVICE_BUSY. Transport recovery: on an FC23
- * timeout the driver reads status before resubmitting, so a landed-but-unacked
- * submit is never blind-resubmitted (UP/DOWN steps are not idempotent). Gateway
- * reboot (boot_count change / status anomaly): recovery reads the gateway's live
- * status. A boot_count-confirmed reboot (or accepted_id==0) is AUTHORITATIVE queue
- * loss → FRESH-REBUILD: drop non-idempotent in-flight, re-pend idempotent. This is
- * load-bearing in a busy burst, where the controller's own post-reboot submits make
- * accepted_id!=0 (so the accepted==0 anomaly detector never fires) and the lost
- * pre-reboot commands would otherwise stay stuck at the front of the backlog —
- * gating fresh-vs-alive on accepted alone (a boot-confirmed reboot taking the alive
- * branch) is what desynced the result ring by one slot. Alive-reconcile (KEEP the
- * in-flight set) is reserved for UNCONFIRMED detections against a genuinely-live
- * gateway (accepted_id!=0, boot_count unchanged, e.g. a verify-exhaust transport
- * glitch). Then BOTH branches baseline next_id/last_completed from the gateway's
- * live status through the same logic a warm controller boot uses (dq_handle_adopt).
- * A resync also clears the stored boot_count so the sysinfo poll re-baselines rather
- * than reading the same reboot as a second one.
+ * The adapter packs a DALI command into the 4 opaque command bytes the client
+ * carries: byte0 addr, byte1 data, byte2 flags (DQ_* below), byte3 dtr0. On
+ * completion the client's response8 is the DALI backward-frame answer (OK) or a
+ * DALI failure code (NAK / collision / bus fault), which the adapter maps to
+ * DQ_RES_*.
  *
- * KNOWN LIMITATIONS on a gateway reboot mid-burst (tracked: one unified kept-vs-lost
- * fix in tasks/06-dq-collect-hardening.md). Two residual result-ATTRIBUTION offsets
- * remain — both are controller-side only: the gateway executes every command
- * correctly and neither corrupts gateway or ballast state; they mis-map ANSWERS to
- * commands (a one-command answer lag) and both self-heal on a controller reboot.
- *
- *   (i) Fast-poll transient: within the ~2 s transport-recovery window normal
- *   collection can momentarily attribute a stale ring slot to a lost in-flight
- *   command. A boot-count poll landing INSIDE that window USED to make it permanent;
- *   the fresh-rebuild above removes that permanent case, so this is now transient and
- *   UNREACHABLE at the 30 s production `gw_diag_interval_ms` default (recovery drains
- *   first) — it only shows at aggressive poll intervals (≤2 s).
- *
- *   (ii) Transport-glitch submit_n rollback (PROD-REACHABLE, independent of poll
- *   rate): a verify-exhaust against a genuinely-live gateway takes the alive-reconcile
- *   branch; if the status read driving it predates the gateway's accept of the just-
- *   sent submit, accepted_id != submit_last_id, so dq_rollback_submit re-pends a
- *   command the gateway actually accepted → a persistent inflight-vs-gateway id offset.
- *   This is on the transport-recovery path, NOT gated by the gw-diag poll, so it is
- *   reachable at the production poll interval. It is rare (transport-glitch drills at
- *   the 30 s poll came back clean 6/6) and self-heals on controller reboot.
- *
- * The tracked follow-up is ONE unified fix (re-pend/drop only genuinely-lost commands,
- * verify-before-drop, keep-on-ambiguity) spanning the dq_resync_apply submit_n
- * resolution AND dq_collect (drop entries whose ids the gateway can no longer
- * complete), not two separate patches.
+ * v2 has NO id ledger and NO reboot resync/rebuild/rollback machinery: the
+ * client detects a gateway reboot from the slot statuses ("idle means gone") and
+ * either resubmits an idempotent command or reports it DQ_RES_DROPPED. There is
+ * nothing here to feed the gateway boot_count into — reboot recovery is entirely
+ * status-driven in the client. (boot_count / the FC04 sysinfo block remain a
+ * pure HA diagnostic in dirty_poll.c.)
  */
 
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Command flags — mirror the gateway QF_* record flags. */
+/* Command flags — mirror the gateway QF_* record flags (identical bit values). */
 #define DQ_TWICE   0x01u   /* send the forward frame twice, no answer */
 #define DQ_DTR0    0x02u   /* preload DTR0 (0xA3<dtr0>) back-to-back before the frame */
 #define DQ_ANSWER  0x04u   /* expects a backward frame; deliver the 8-bit answer */
@@ -91,8 +58,8 @@ typedef enum {
 typedef enum {
     DQ_RES_OK  = 0,   /* backward frame received; `answer` is the response byte */
     DQ_RES_NAK = 1,   /* no backward frame (normal for fire-and-forget sends) */
-    DQ_RES_ERR = 2,   /* bus/timing error; `answer` = error subtype */
-    DQ_RES_DROPPED = 3, /* command dropped without executing (gateway reboot; non-idempotent) */
+    DQ_RES_ERR = 2,   /* bus/timing error or answer collision; `answer` = failure code */
+    DQ_RES_DROPPED = 3, /* command lost (gateway reboot; non-idempotent → not resubmitted) */
 } dq_result_t;
 
 /* Completion callback for one submitted command. Invoked exactly once (from
@@ -102,28 +69,25 @@ typedef enum {
 typedef void (*dq_result_cb_t)(uint8_t slave_id, dq_result_t result,
                                uint8_t answer, void *ctx);
 
-/* Reset all per-slave driver state. Call once at boot. */
+/* Reset all per-slave adapter state and (re)register each configured DALI slave
+ * with the underlying command-queue client. Call once at boot. */
 void dq_init(void);
 
 /* Submit one DALI command to slave_id's gateway queue. The command joins the
- * local backlog (FIFO) and is shipped by a later dq_tick(). `flags` is a bitwise
- * OR of DQ_*; `dtr0` is used only with DQ_DTR0. `idempotent` = safe to resubmit
- * after a transport fault or gateway reboot (queries, GOTO_LAST_ACTIVE, OFF,
- * DAPC level, group on/off/level are idempotent; UP/DOWN step frames are NOT).
- * `cb`/`ctx` receive the result (cb may be NULL). Returns false (and does not
- * enqueue) if the local backlog is full. */
+ * local backlog (priority-sorted, FIFO within a class) and is shipped by a later
+ * dq_tick(). `flags` is a bitwise OR of DQ_*; `dtr0` is used only with DQ_DTR0.
+ * `idempotent` = safe to resubmit after a gateway reboot (queries,
+ * GOTO_LAST_ACTIVE, OFF, DAPC level, group on/off/level are idempotent; UP/DOWN
+ * step frames are NOT). `cb`/`ctx` receive the result (cb may be NULL). Returns
+ * false (and does not enqueue) if the local backlog is full. */
 bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
                uint8_t flags, uint8_t dtr0, bool idempotent,
                dq_result_cb_t cb, void *ctx);
 
-/* Per-loop driver: ship FC23 transactions, collect results, run recovery. Call
- * every main-loop iteration. */
+/* Per-loop driver: drive the underlying client (mbq_client_tick), then ship any
+ * pending backlog commands into free gateway slots. Call every main-loop
+ * iteration. */
 void dq_tick(void);
-
-/* Feed the gateway boot_count observed by the sysinfo (0x0310) poll, for reboot
- * detection/resync. Safe to call every poll; a change from the last-seen value
- * triggers a resync of that slave's in-flight commands. */
-void dq_note_boot_count(uint8_t slave_id, uint16_t boot_count);
 
 /* True if slave_id has any command pending in the backlog or in flight at the
  * gateway. Producers that must serialise against the queue (e.g. a probe that
@@ -136,23 +100,17 @@ bool dq_busy(uint8_t slave_id);
  * *answer), false on backlog-full or timeout. Do NOT call from the non-CLI
  * main-loop path (it blocks the loop like the other cli_mb_wait helpers).
  *
- * `idempotent` matters on a gateway REBOOT mid-command (not a plain transport
- * timeout — that path reads status and only resends a command that did NOT land,
- * safe regardless of the flag). On a reboot resync an idempotent command is
- * re-pended/resubmitted, a NON-idempotent one is DROPPED (DQ_RES_DROPPED, surfaced
- * to the caller). So an arbitrary `dali_raw` frame (a human can make it an UP/DOWN
- * step) passes false — a reboot mid-command drops-and-reports rather than
- * resubmitting and risking a double-apply ("stale-but-never-wrong"); queries /
- * SET DTR / DAPC pass true. */
+ * `idempotent` matters on a gateway REBOOT mid-command: an idempotent command is
+ * resubmitted, a NON-idempotent one is DROPPED (DQ_RES_DROPPED, surfaced to the
+ * caller). So an arbitrary `dali_raw` frame (a human can make it an UP/DOWN step)
+ * passes false — a reboot mid-command drops-and-reports rather than resubmitting
+ * and risking a double-apply; queries / SET DTR / DAPC pass true. */
 bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
                     uint8_t dtr0, bool idempotent, uint32_t timeout_ms,
                     dq_result_t *result, uint8_t *answer);
 
-/* Dump per-slave queue-client state to the console (CLI `dq [slave]`): scheduler
- * state, ids (next/accepted/completed), in-flight (id:class) list, per-class
- * queued depths, and the diagnostic counters (submitted/collected/timeouts/
- * resubmits/busy/adopts/resyncs) the bench fault drills read — resyncs breaks
- * out as boot=<boot_count-triggered>,anom=<status-anomaly/verify-triggered> so a
- * drill can tell the two detectors apart. slave_id < 0 dumps all configured DALI
- * slaves. Dev-grade; no MQTT surface. */
+/* Dump per-slave adapter state to the console (CLI `dq [slave]`): per-class
+ * backlog depths, in-flight count, and the diagnostic counters, then the
+ * underlying client's slot state. slave_id < 0 dumps all configured DALI slaves.
+ * Dev-grade; no MQTT surface. */
 void dq_debug_print(int slave_id);
