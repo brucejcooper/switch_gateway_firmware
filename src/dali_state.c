@@ -208,7 +208,8 @@ static void ds_cb(uint8_t slave_id, dq_result_t res, uint8_t answer, void *ctx) 
 
 /* Apply the presence evidence rules to one query outcome. Returns true if the
  * ballast is (still) believed present. */
-static bool presence_from(ds_slave_t *d, uint8_t addr, dq_result_t res) {
+static bool presence_from(ds_slave_t *d, uint8_t addr, dq_result_t res,
+                          bool authoritative) {
     uint64_t bit = (uint64_t)1 << addr;
     switch (res) {
         case DQ_RES_OK:
@@ -221,8 +222,17 @@ static bool presence_from(ds_slave_t *d, uint8_t addr, dq_result_t res) {
             return true;
         case DQ_RES_NAK:
             /* The only outcome that is evidence of absence: the bus was healthy
-             * and nobody answered a directed query. */
+             * and nobody answered a directed query.
+             *
+             * An EXPLICIT SCAN is authoritative and skips the debounce. The
+             * debounce exists so a single missed reply during routine background
+             * polling cannot drop a healthy ballast — but a scan is a deliberate
+             * re-establishment of ground truth (boot, `scan`, post-provisioning),
+             * and there the caution actively hurts: after a re-provision every
+             * vacated address would linger as a phantom in HA, one per background
+             * sweep step, so a full renumber could take minutes to converge. */
             if (d->strikes[addr] < 0xFFu) d->strikes[addr]++;
+            if (authoritative) d->strikes[addr] = DALI_ABSENT_STRIKES;
             if (d->strikes[addr] >= DALI_ABSENT_STRIKES && (d->present & bit)) {
                 d->present &= ~bit;
                 state_cache_set_dali_present(d->slave_idx, addr, false);
@@ -371,7 +381,7 @@ static void advance(ds_slave_t *d) {
      * one clean no-answer there is the absence evidence; the remaining steps are
      * pointless if nobody is home. */
     if (d->step == STEP_STATUS) {
-        bool present = presence_from(d, d->addr, d->res);
+        bool present = presence_from(d, d->addr, d->res, d->is_scan);
         if (!present) {
             /* Abandon the rest of this ballast's pass. */
             d->verify &= ~bit;
