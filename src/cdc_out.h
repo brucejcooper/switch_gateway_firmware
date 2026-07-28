@@ -33,6 +33,15 @@ void cdc_out_write(const char *buf, int len);
  * pending and there is room. Call from core-0's main loop (serial_poll). */
 void cdc_out_drain(void);
 
+/* Format one line and enqueue it via cdc_out_write(). Use this instead of
+ * printf() for any output longer than the USB-CDC FIFO: stdout is configured
+ * non-blocking (PICO_STDIO_USB_STDOUT_TIMEOUT_US=0), so a printf burst that
+ * outruns the host is silently TRUNCATED MID-LINE, which quietly corrupts long
+ * diagnostic dumps. Going through the ring hands the bytes to the drain in
+ * serial_poll instead, which paces them to what the FIFO can take. Lines longer
+ * than 256 bytes are truncated (with the formatting intact). */
+void cdc_out_printf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));
+
 /* Copy the most recent log scrollback (oldest→newest) into dst, up to cap bytes,
  * and return the byte count. This is a SEPARATE retained ring from the delivery
  * ring above: it is never consumed (new bytes overwrite the oldest), so recent

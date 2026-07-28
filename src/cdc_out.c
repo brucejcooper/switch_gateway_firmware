@@ -1,4 +1,6 @@
 #include "cdc_out.h"
+#include <stdarg.h>
+#include <stdio.h>
 #include "partition_map.h"  /* compiled here purely so its _Static_assert()s run */
 
 #include "pico/critical_section.h"
@@ -73,6 +75,17 @@ int cdc_out_history(char *dst, int cap) {
         dst[i] = s_hist[(start + i) & HIST_MASK];
     critical_section_exit(&s_cs);
     return (int)avail;
+}
+
+void cdc_out_printf(const char *fmt, ...) {
+    char line[256];
+    va_list ap;
+    va_start(ap, fmt);
+    int n = vsnprintf(line, sizeof line, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof line - 1) n = (int)sizeof line - 1;
+    cdc_out_write(line, n);
 }
 
 void cdc_out_drain(void) {

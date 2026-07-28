@@ -24,6 +24,7 @@
 #include "log.h"
 #include "pico/time.h"
 #include <string.h>
+#include "cdc_out.h"
 #include <stdio.h>
 
 /* DALI wire constants used by the probe (the gateway's dali.h equivalents). */
@@ -301,20 +302,20 @@ bool dq_soak_active(void) { return S.running || S.draining; }
 /* Print `num/den` as a fixed-point value with 2 decimals, integer math only
  * (this firmware is float-free). */
 static void print_rate(const char *label, uint64_t num, uint64_t den, const char *unit) {
-    if (den == 0) { printf("  %-22s n/a\n", label); return; }
+    if (den == 0) { cdc_out_printf("  %-22s n/a\n", label); return; }
     uint64_t x100 = (num * 100u) / den;
-    printf("  %-22s %lu.%02lu %s\n", label,
+    cdc_out_printf("  %-22s %lu.%02lu %s\n", label,
            (unsigned long)(x100 / 100u), (unsigned long)(x100 % 100u), unit);
 }
 
 static void print_ms(const char *label, uint64_t us) {
-    printf("  %-22s %lu.%02lu ms\n", label,
+    cdc_out_printf("  %-22s %lu.%02lu ms\n", label,
            (unsigned long)(us / 1000u), (unsigned long)((us % 1000u) / 10u));
 }
 
 void dq_soak_report(void) {
     if (!S.have_result && !S.running && !S.draining) {
-        printf("soak: never run\n");
+        cdc_out_printf("soak: never run\n");
         return;
     }
 
@@ -331,35 +332,35 @@ void dq_soak_report(void) {
 
     uint32_t bad = S.n_lag1 + S.n_other + S.n_query_fail + S.n_lost + S.n_set_fail;
 
-    printf("soak %s: slave=%u addr=%u depth=%u\n",
+    cdc_out_printf("soak %s: slave=%u addr=%u depth=%u\n",
            S.running ? "RUNNING" : (S.draining ? "DRAINING" : "done"),
            S.slave, S.addr, S.depth);
-    printf("  elapsed %lu.%02lu s, %lu pairs, %lu commands (%lu DALI frames)\n",
+    cdc_out_printf("  elapsed %lu.%02lu s, %lu pairs, %lu commands (%lu DALI frames)\n",
            (unsigned long)(el_us / 1000000u), (unsigned long)((el_us % 1000000u) / 10000u),
            (unsigned long)S.pairs_done, (unsigned long)S.n_submit,
            (unsigned long)S.n_submit);
 
-    printf(" verify:\n");
-    printf("  %-22s %lu\n", "query correct", (unsigned long)S.n_query_ok);
-    printf("  %-22s %lu\n", "query LAG-1 (stale)", (unsigned long)S.n_lag1);
-    printf("  %-22s %lu\n", "query OTHER (wrong)", (unsigned long)S.n_other);
-    printf("  %-22s %lu\n", "query nak/err", (unsigned long)S.n_query_fail);
-    printf("  %-22s %lu / %lu\n", "set ok / failed",
+    cdc_out_printf(" verify:\n");
+    cdc_out_printf("  %-22s %lu\n", "query correct", (unsigned long)S.n_query_ok);
+    cdc_out_printf("  %-22s %lu\n", "query LAG-1 (stale)", (unsigned long)S.n_lag1);
+    cdc_out_printf("  %-22s %lu\n", "query OTHER (wrong)", (unsigned long)S.n_other);
+    cdc_out_printf("  %-22s %lu\n", "query nak/err", (unsigned long)S.n_query_fail);
+    cdc_out_printf("  %-22s %lu / %lu\n", "set ok / failed",
            (unsigned long)S.n_set_ok, (unsigned long)S.n_set_fail);
-    printf("  %-22s %lu\n", "lost (gw reboot)", (unsigned long)S.n_lost);
-    printf("  %-22s %lu\n", "submit rejected", (unsigned long)S.n_reject);
-    printf("  %-22s %lu (informational)\n", "out-of-order delivery", (unsigned long)S.n_ooo);
-    printf("  %-22s %s (%lu bad)\n", "VERDICT", bad ? "FAIL" : "clean",
+    cdc_out_printf("  %-22s %lu\n", "lost (gw reboot)", (unsigned long)S.n_lost);
+    cdc_out_printf("  %-22s %lu\n", "submit rejected", (unsigned long)S.n_reject);
+    cdc_out_printf("  %-22s %lu (informational)\n", "out-of-order delivery", (unsigned long)S.n_ooo);
+    cdc_out_printf("  %-22s %s (%lu bad)\n", "VERDICT", bad ? "FAIL" : "clean",
            (unsigned long)bad);
 
     for (uint8_t i = 0; i < S.miss_n; i++) {
         static const char *kn[] = { "value", "nak", "err", "lost" };
-        printf("   #%lu seq=%lu %s expect=0x%02X got=0x%02X\n",
+        cdc_out_printf("   #%lu seq=%lu %s expect=0x%02X got=0x%02X\n",
                (unsigned long)i, (unsigned long)S.miss[i].seq,
                kn[S.miss[i].kind & 3u], S.miss[i].expect, S.miss[i].got);
     }
 
-    printf(" timing:\n");
+    cdc_out_printf(" timing:\n");
     print_rate("pair rate", (uint64_t)S.pairs_done * 1000000u, el_us, "pairs/s");
     print_rate("DALI frame rate", (uint64_t)S.n_submit * 1000000u, el_us, "frames/s");
     if (S.pairs_done)
@@ -371,8 +372,8 @@ void dq_soak_report(void) {
         print_ms("latency max", S.lat_max);
     }
 
-    printf(" transport:\n");
-    printf("  %-22s %lu submit + %lu poll = %lu\n", "modbus txns",
+    cdc_out_printf(" transport:\n");
+    cdc_out_printf("  %-22s %lu submit + %lu poll = %lu\n", "modbus txns",
            (unsigned long)txs, (unsigned long)txp, (unsigned long)(txs + txp));
     if (S.n_submit)
         print_rate("txns per command", (uint64_t)(txs + txp), S.n_submit, "");
@@ -383,7 +384,7 @@ void dq_soak_report(void) {
         print_ms("txn time avg", ts.us_avg);
         print_ms("txn time min", ts.us_min);
         print_ms("txn time max", ts.us_max);
-        printf("  %-22s %lu fail (%lu device-busy) of %lu\n", "txn failures",
+        cdc_out_printf("  %-22s %lu fail (%lu device-busy) of %lu\n", "txn failures",
                (unsigned long)ts.n_fail, (unsigned long)ts.n_busy, (unsigned long)ts.n);
     }
 
@@ -399,16 +400,16 @@ void dq_soak_report(void) {
         uint32_t rt = 0, rb = 0, ta = 0, tm = 0;
         modbus_busload_retries(&rt, &rb);
         modbus_busload_turnaround(&ta, &tm, NULL);
-        printf("  %-22s %lu%% busy over %lu txns\n", "RS-485 bus",
+        cdc_out_printf("  %-22s %lu%% busy over %lu txns\n", "RS-485 bus",
                (unsigned long)(busy * 100u / win), (unsigned long)bt);
-        printf("  %-22s %lu timeout, %lu device-busy\n", "re-sends",
+        cdc_out_printf("  %-22s %lu timeout, %lu device-busy\n", "re-sends",
                (unsigned long)rt, (unsigned long)rb);
-        printf("  %-22s avg %lu.%02lu ms, max %lu.%02lu ms\n", "slave turnaround",
+        cdc_out_printf("  %-22s avg %lu.%02lu ms, max %lu.%02lu ms\n", "slave turnaround",
                (unsigned long)(ta / 1000u), (unsigned long)((ta % 1000u) / 10u),
                (unsigned long)(tm / 1000u), (unsigned long)((tm % 1000u) / 10u));
         for (uint8_t i = 0; i < MODBUS_BUSLOAD_SLAVES; i++) {
             if (!per[i].txns) continue;
-            printf("    slave %-3u %5lu txns %3lu%% of wall  %lu.%02lu ms avg\n",
+            cdc_out_printf("    slave %-3u %5lu txns %3lu%% of wall  %lu.%02lu ms avg\n",
                    per[i].slave, (unsigned long)per[i].txns,
                    (unsigned long)(per[i].us * 100u / win),
                    (unsigned long)((per[i].us / per[i].txns) / 1000u),
@@ -416,18 +417,18 @@ void dq_soak_report(void) {
         }
     }
 
-    printf(" pacing (why we weren't submitting):\n");
+    cdc_out_printf(" pacing (why we weren't submitting):\n");
     uint64_t tt = (uint64_t)S.t_queue_full + S.t_tx_busy + S.t_ready;
     if (tt == 0) tt = 1;
-    printf("  %-22s %lu%%  (gateway queue at depth — DALI-bound)\n", "queue full",
+    cdc_out_printf("  %-22s %lu%%  (gateway queue at depth — DALI-bound)\n", "queue full",
            (unsigned long)((uint64_t)S.t_queue_full * 100u / tt));
-    printf("  %-22s %lu%%  (room in queue, bus mid-txn — Modbus-bound)\n", "tx busy",
+    cdc_out_printf("  %-22s %lu%%  (room in queue, bus mid-txn — Modbus-bound)\n", "tx busy",
            (unsigned long)((uint64_t)S.t_tx_busy * 100u / tt));
-    printf("  %-22s %lu%%\n", "submitted", (unsigned long)((uint64_t)S.t_ready * 100u / tt));
-    printf("  inflight:");
+    cdc_out_printf("  %-22s %lu%%\n", "submitted", (unsigned long)((uint64_t)S.t_ready * 100u / tt));
+    cdc_out_printf("  inflight:");
     for (uint8_t i = 0; i <= MBQ_SLOTS; i++) {
         uint64_t pct = (uint64_t)S.inflight_hist[i] * 100u / tt;
-        if (S.inflight_hist[i]) printf(" %u:%lu%%", i, (unsigned long)pct);
+        if (S.inflight_hist[i]) cdc_out_printf(" %u:%lu%%", i, (unsigned long)pct);
     }
-    printf("\n");
+    cdc_out_printf("\n");
 }
