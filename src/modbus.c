@@ -130,6 +130,89 @@ static uint64_t              s_bl_turn_sum;       /* slave turnaround: request o
 static uint32_t              s_bl_turn_n, s_bl_turn_max;
 static uint32_t              s_bl_busy_retries;   /* re-sends after a DEVICE_BUSY (0x06) */
 static modbus_busload_slave_t s_bl[MODBUS_BUSLOAD_SLAVES];
+static uint32_t              s_bl_skipped;        /* transactions skipped by backoff */
+
+/* ── Absent-slave backoff ────────────────────────────────────────────────────
+ * A slave that is not there costs MODBUS_MAX_RETRIES+1 attempts x the response
+ * timeout — ~168 ms of bus per transaction, every time any producer polls it.
+ * On the bench that single dead board held ~8% of the RS-485 bus and was the
+ * LARGEST contributor to worst-case button latency (measured 137 ms of the
+ * 236 ms idle worst case): a user command arriving behind one waits the whole
+ * thing out, because a Modbus transaction cannot be preempted.
+ *
+ * So after MODBUS_BACKOFF_TRIP consecutive dead transactions, stop putting that
+ * slave on the wire. Requests to it are completed IMMEDIATELY as a timeout
+ * (res = 0) without transmitting — producers see exactly what they saw before,
+ * just without the bus cost, so no caller needs to know this exists. The
+ * backoff doubles from 1 s to a 60 s cap, and ONE probe is allowed through each
+ * time it expires, so a slave that comes back is picked up within a minute. Any
+ * valid reply — including a Modbus exception, which is the slave alive and
+ * disagreeing — resets it to healthy at once. */
+#define MODBUS_BACKOFF_SLAVES  8u
+#define MODBUS_BACKOFF_TRIP    3u
+#define MODBUS_BACKOFF_MIN_MS  1000u
+#define MODBUS_BACKOFF_MAX_MS  60000u
+
+typedef struct {
+    bool            in_use;
+    uint8_t         slave;
+    uint8_t         fails;        /* consecutive dead transactions */
+    uint32_t        backoff_ms;   /* 0 = healthy */
+    absolute_time_t retry_at;
+    uint32_t        skipped;      /* transactions spared the bus */
+} mb_backoff_t;
+static mb_backoff_t s_bo[MODBUS_BACKOFF_SLAVES];
+
+static mb_backoff_t *backoff_for(uint8_t slave) {
+    mb_backoff_t *free_slot = NULL;
+    for (uint8_t i = 0; i < MODBUS_BACKOFF_SLAVES; i++) {
+        if (s_bo[i].in_use && s_bo[i].slave == slave) return &s_bo[i];
+        if (!s_bo[i].in_use && !free_slot) free_slot = &s_bo[i];
+    }
+    if (!free_slot) return NULL;   /* more slaves than slots: no backoff for it */
+    free_slot->in_use = true;
+    free_slot->slave  = slave;
+    return free_slot;
+}
+
+/* A transaction to `slave` finished. `answered` = we got a valid frame back
+ * (data or exception); false = no reply after every retry. */
+static void backoff_note(uint8_t slave, bool answered) {
+    mb_backoff_t *b = backoff_for(slave);
+    if (!b) return;
+    if (answered) {
+        if (b->backoff_ms)
+            LOG_INFO("modbus", "slave %u answering again — backoff cleared", slave);
+        b->fails = 0;
+        b->backoff_ms = 0;
+        return;
+    }
+    if (b->fails < 0xFFu) b->fails++;
+    if (b->fails < MODBUS_BACKOFF_TRIP) return;
+    b->backoff_ms = b->backoff_ms ? (b->backoff_ms * 2u) : MODBUS_BACKOFF_MIN_MS;
+    if (b->backoff_ms > MODBUS_BACKOFF_MAX_MS) b->backoff_ms = MODBUS_BACKOFF_MAX_MS;
+    b->retry_at = make_timeout_time_ms(b->backoff_ms);
+    LOG_WARN("modbus", "slave %u unresponsive — backing off %lu ms",
+             slave, (unsigned long)b->backoff_ms);
+}
+
+/* True if this request should be failed without touching the bus. Lets exactly
+ * one probe through each time the backoff expires. Sets *is_probe so the caller
+ * can make that probe CHEAP. */
+static bool backoff_should_skip(uint8_t slave, bool *is_probe) {
+    *is_probe = false;
+    mb_backoff_t *b = backoff_for(slave);
+    if (!b || !b->backoff_ms) return false;
+    if (time_reached(b->retry_at)) {
+        /* Probe window: let one through, and re-arm immediately so a burst of
+         * queued requests does not all become probes. */
+        b->retry_at = make_timeout_time_ms(b->backoff_ms);
+        *is_probe = true;
+        return false;
+    }
+    b->skipped++;
+    return true;
+}
 
 static bool modbus_rx_valid(void) { return true; }
 
@@ -484,7 +567,18 @@ void modbus_busload_reset(void) {
     s_bl_turn_sum = 0;
     s_bl_turn_n = 0;
     s_bl_turn_max = 0;
+    s_bl_skipped = 0;
     s_bl_window  = get_absolute_time();
+}
+
+void modbus_busload_backoff(uint32_t *skipped, uint8_t *slaves_backed_off) {
+    if (skipped) *skipped = s_bl_skipped;
+    if (slaves_backed_off) {
+        uint8_t n = 0;
+        for (uint8_t i = 0; i < MODBUS_BACKOFF_SLAVES; i++)
+            if (s_bo[i].in_use && s_bo[i].backoff_ms) n++;
+        *slaves_backed_off = n;
+    }
 }
 
 void modbus_busload_retries(uint32_t *timeouts, uint32_t *device_busy) {
@@ -555,8 +649,24 @@ void modbus_poll(void) {
 
     case MODBUS_IDLE:
         if (queue_try_remove(&action_queue, &currentAction)) {
+            /* Slave is in backoff: complete as a timeout without transmitting.
+             * Identical outcome for the caller, zero bus cost. */
+            bool is_probe = false;
+            if (backoff_should_skip(currentAction.device, &is_probe)) {
+                s_bl_skipped++;
+                if (currentAction.callback)
+                    currentAction.callback(0, buf, currentAction.ctx);
+                break;
+            }
             s_bl_act_start  = get_absolute_time();
-            s_attempts_left = MODBUS_MAX_RETRIES;
+            /* A backoff PROBE gets ONE attempt, not the full retry budget. Its
+             * only question is "are you back?", which a single try answers — and
+             * the retries are what make a dead slave expensive: 3 attempts x the
+             * 50 ms response timeout is ~186 ms of bus that any user command
+             * arriving behind it must wait out. Measured: this alone was the
+             * whole remaining latency tail (247 ms worst case) once the backoff
+             * had removed the frequent hits. */
+            s_attempts_left = is_probe ? 0u : MODBUS_MAX_RETRIES;
             s_busy_left     = DALI_BUSY_RETRIES;
             s_retry_pending = false;
             s_op_deadline   = make_timeout_time_ms(MODBUS_OP_MAX_MS);
@@ -610,6 +720,7 @@ void modbus_poll(void) {
             } else {
                 LOG_WARN("modbus", "rx timeout slave=%u fc=0x%02x (gave up)",
                          currentAction.device, (unsigned)currentAction.action);
+                backoff_note(currentAction.device, false);
                 if (currentAction.callback)
                     currentAction.callback(0, buf, currentAction.ctx);
             }
@@ -625,6 +736,7 @@ void modbus_poll(void) {
                         currentAction.device, (unsigned)currentAction.action,
                         (unsigned)s_busy_left);
             } else {
+                backoff_note(currentAction.device, true);   /* alive, just disagreeing */
                 LOG_WARN("modbus", "rx exception slave=%u fc=0x%02x code=0x%02x (%s)",
                          currentAction.device, (unsigned)currentAction.action,
                          (unsigned)exc, modbus_exception_str(exc));
@@ -635,6 +747,7 @@ void modbus_poll(void) {
             LOG_DBG("modbus", "rx ok slave=%u fc=0x%02x bytes=%d",
                     currentAction.device, (unsigned)currentAction.action,
                     (int)readbuf_sz);
+            backoff_note(currentAction.device, true);
             if (currentAction.callback)
                 currentAction.callback((int)readbuf_sz, buf, currentAction.ctx);
         }

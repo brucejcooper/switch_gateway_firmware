@@ -46,6 +46,15 @@
 #define MBQ_CMD_BASE   0x1000u   /* slot k command at 0x1000 + 2*k (2 regs) */
 #define MBQ_STAT_BASE  0x1010u   /* slot k status  at 0x1010 + k   (1 reg)  */
 #define MBQ_POLL_MS    5u        /* pace of active-slot poll reads          */
+/* Pace when the gateway has stopped answering. The transport keeps a dead slave
+ * off the wire (modbus.c absent-slave backoff), but a skipped request completes
+ * INSTANTLY — so a 5 ms poll cadence becomes a main-loop-speed spin against a
+ * gateway that will never reply. Measured: ~12000 skipped requests in 76 s
+ * against two dead slaves, essentially all of them from this loop. Costs no bus
+ * either way; this just stops the pointless churn and keeps the counters
+ * meaningful. */
+#define MBQ_POLL_DOWN_MS   1000u
+#define MBQ_LINK_DOWN_FAILS   3u
 
 /* A slot's command occupies MBQ_CMD_REGS Modbus REGISTERS. The FC23 enqueue API
  * counts registers, not bytes — passing the byte count declared a write twice as
@@ -394,7 +403,9 @@ void mbq_client_tick(void) {
                     s->slot[submit_slot].st = SLOT_LIVE;
                 }
                 s->c_timeouts++;
-                s->next_at = make_timeout_time_ms(MBQ_POLL_MS);
+                s->next_at = make_timeout_time_ms(
+                    s->c_consec_fail >= MBQ_LINK_DOWN_FAILS ? MBQ_POLL_DOWN_MS
+                                                            : MBQ_POLL_MS);
             }
             continue;
         }

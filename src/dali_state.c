@@ -16,6 +16,7 @@
 
 #include "dali_state.h"
 #include "dali_queue.h"
+#include "mbq_client.h"
 #include "state_cache.h"
 #include "lighting_actions.h"
 #include "dali_provision.h"
@@ -62,6 +63,12 @@
  * "never". */
 #define ABSENT_PROBE_EVERY  6u
 
+/* Consecutive no-reply transactions after which a gateway is treated as down,
+ * and how often to re-attempt while it is. Matches the transport's own backoff
+ * trip point so the two agree about what "dead" means. */
+#define LINK_DOWN_FAILS   3u
+#define LINK_RETRY_MS     5000u
+
 /* QUERY STATUS bit 4 = fade running (IEC 62386-102). */
 #define STATUS_FADE_RUNNING 0x10u
 
@@ -107,6 +114,7 @@ typedef struct {
     uint8_t  absent_cursor; /* rotating probe position across ALL addresses */
     uint8_t  step_count;    /* sweep steps taken, for the absent-probe cadence */
     absolute_time_t next_step_at;
+    absolute_time_t link_retry_at;  /* gateway unreachable: don't re-attempt until this */
 
     /* Fade tracking: re-verify a ballast while it reports FADE RUNNING. */
     uint64_t fade_watch;              /* ballasts being tracked through a fade */
@@ -435,6 +443,21 @@ void dali_state_tick(void) {
 
         /* A slave mid-provisioning owns its bus. */
         if (dali_provision_busy_slave(d->slave_id)) continue;
+
+        /* Gateway not answering: stop generating work for it. The transport
+         * keeps a dead slave off the wire (modbus.c absent-slave backoff), but
+         * that alone is not enough — a skipped request completes instantly, and
+         * every producer's pacing assumes a transaction costs ~25 ms of wall
+         * time, so the sweep would churn through all 64 addresses at main-loop
+         * speed and re-arm forever. Measured: 10589 skipped requests in 68 s
+         * against two dead slaves. Off the bus, but pointless work.
+         *
+         * One attempt per LINK_RETRY_MS is enough to notice it come back — the
+         * queue client's own reconnect and the 5 s scan re-arm do the rest. */
+        if (mbq_client_consec_fail(d->slave_id) >= LINK_DOWN_FAILS) {
+            if (!time_reached(d->link_retry_at)) continue;
+            d->link_retry_at = make_timeout_time_ms(LINK_RETRY_MS);
+        }
 
         if (d->busy) {
             if (d->have) {

@@ -1449,8 +1449,12 @@ static void cmd_busload(char **saveptr) {
            (unsigned long)(txns ? ((busy / txns) % 1000u) / 10u : 0u));
     uint32_t ta = 0, tm = 0, tn = 0;
     modbus_busload_turnaround(&ta, &tm, &tn);
+    uint32_t skipped = 0; uint8_t nbo = 0;
+    modbus_busload_backoff(&skipped, &nbo);
     cdc_out_printf("  retries: %lu timeout, %lu device-busy\n",
            (unsigned long)rt, (unsigned long)rb);
+    cdc_out_printf("  backoff: %u slave(s) backed off, %lu txns skipped (bus untouched)\n",
+           nbo, (unsigned long)skipped);
     cdc_out_printf("  turnaround: avg %lu.%02lu ms, max %lu.%02lu ms over %lu replies "
            "(timeout is %u ms)\n",
            (unsigned long)(ta / 1000u), (unsigned long)((ta % 1000u) / 10u),

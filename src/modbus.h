@@ -68,6 +68,12 @@ void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
  * count, but costs a full response timeout of bus time. Either may be NULL. */
 void modbus_busload_retries(uint32_t *timeouts, uint32_t *device_busy);
 
+/* Absent-slave backoff: transactions skipped without touching the bus, and how
+ * many slaves are currently backed off. A slave that is not there otherwise
+ * costs a full response timeout per attempt, which is the single largest
+ * contributor to worst-case command latency. Either pointer may be NULL. */
+void modbus_busload_backoff(uint32_t *skipped, uint8_t *slaves_backed_off);
+
 /* Slave turnaround within the busload window: time from our request clearing the
  * line to the first valid reply byte pattern completing, over all slaves that
  * answered. Compare against MODBUS_RESPONSE_TIMEOUT_MS — a slave whose worst
