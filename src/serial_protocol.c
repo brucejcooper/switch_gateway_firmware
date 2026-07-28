@@ -211,12 +211,18 @@ static void txt_ok(void) {
     printf("ok\n");
 }
 
-/* Parse "on" / "off" / "toggle" — case-insensitive. Returns 1=on, 0=off,
- * 2=toggle, -1 on parse error. */
+/* Parse a boolean-ish on/off value — case-insensitive. Returns 1=on, 0=off,
+ * 2=toggle, -1 on parse error.
+ *
+ * Accepts every spelling the CLI and the JSON API actually use: the documented
+ * grammar is `on=true` (README, `relay 0 on=true`, `dali 2 1 on=toggle`) while
+ * `echo on|off` uses the bare words, and HA sends JSON true/false. Accepting
+ * only on/off/toggle here silently broke `dali <s> g<n> on=true` when this
+ * helper was first reused for groups. */
 static int parse_on_off_toggle(const char *s) {
     if (!s) return -1;
-    if (strcasecmp(s, "on") == 0)     return 1;
-    if (strcasecmp(s, "off") == 0)    return 0;
+    if (strcasecmp(s, "on")   == 0 || strcasecmp(s, "true")  == 0 || strcmp(s, "1") == 0) return 1;
+    if (strcasecmp(s, "off")  == 0 || strcasecmp(s, "false") == 0 || strcmp(s, "0") == 0) return 0;
     if (strcasecmp(s, "toggle") == 0) return 2;
     return -1;
 }
@@ -942,9 +948,27 @@ static void cmd_dali(char **saveptr) {
         if (is_group) {
             if (strcasecmp(key, "bri") == 0)
                 lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)atoi(val));
-            else if (strcasecmp(key, "on") == 0)
-                lighting_group_set_on_off((uint8_t)slave, (uint8_t)group,
-                    strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
+            else if (strcasecmp(key, "on") == 0) {
+                /* "toggle" used to match none of the true-ish spellings and so
+                 * evaluated to FALSE — a group toggle silently meant OFF, with
+                 * no error. The per-ballast path handled toggle properly; only
+                 * groups were wrong.
+                 *
+                 * NOTE the asymmetry this leaves: a BUTTON toggle resolves via
+                 * the press-time any-on probe (QUERY LAMP POWER ON straight to
+                 * the gear — see button_fsm.c resolve_any_on), whereas this
+                 * CLI/HA path resolves from the cached membership state. The
+                 * cache is trustworthy now that the controller owns it and
+                 * learns it from the ballasts, but the two paths deciding "is
+                 * it on?" by different means is worth unifying. */
+                int t = parse_on_off_toggle(val);
+                if (t < 0) { txt_err("bad_arg"); return; }
+                int gidx = state_cache_slave_idx((uint8_t)slave);
+                bool on = (t == 2)
+                        ? !(gidx >= 0 && state_cache_dali_group_any_on((uint8_t)gidx, (uint8_t)group))
+                        : (t == 1);
+                lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, on);
+            }
             else if (strcasecmp(key, "members") == 0 || strcasecmp(key, "add") == 0 ||
                      strcasecmp(key, "remove") == 0) {
                 uint8_t arr[DALI_ADDR_COUNT];
