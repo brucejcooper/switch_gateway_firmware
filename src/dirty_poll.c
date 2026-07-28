@@ -13,6 +13,7 @@
 #include "dali_state.h"
 #include "dali_queue.h"
 #include "mbq_client.h"
+#include "core1.h"   /* wd_feed — this file blocks past the watchdog period */
 #include "modbus.h"
 #include "state_cache.h"
 #include "lighting_actions.h"
@@ -304,15 +305,25 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     LOG_INFO("dirty", "slave %u full scan (DALI interrogation)", slave_id);
     dali_state_request_full_scan(slave_id);
 
-    /* 64 addresses x up to 4 queries, one in flight at a time; a NAK for an
-     * absent address resolves in one query. Bounded so a wedged bus cannot hang
-     * boot forever. */
+    /* 64 addresses x up to 4 queries, one in flight at a time. An ABSENT address
+     * costs one query; a PRESENT one costs four — so the duration scales with how
+     * much gear is actually on the bus: ~4.9 s for a single ballast, ~15 s for a
+     * full 64.
+     *
+     * MUST feed the watchdog. At boot this is called before watchdog_enable() so
+     * it does not matter, but `scan` and the post-provisioning re-scan run at
+     * RUNTIME against a live 5 s watchdog — and a bus with more than a handful of
+     * present ballasts takes longer than that. Without this the controller
+     * reboots in the middle of a scan, which on the bench was hidden only because
+     * one ballast happens to finish in 4.87 s. Same reasoning as cli_mb_wait();
+     * wd_feed is core-1-gated, so a genuine core-1 wedge still reboots. */
     absolute_time_t deadline = make_timeout_time_ms(45000u);
     while (dali_state_scan_busy(slave_id)
            && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         modbus_poll();
         dq_tick();
         dali_state_tick();
+        wd_feed();
     }
     if (dali_state_scan_busy(slave_id))
         LOG_WARN("dirty", "slave %u full scan timed out", slave_id);

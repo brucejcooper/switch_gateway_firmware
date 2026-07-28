@@ -144,11 +144,12 @@ void dali_provision_tick(void) {
 
     switch (dcom_state()) {
     case DCOM_COMPLETE:
-        snprintf(msg, sizeof msg, "Commissioning finished: %u device%s — re-syncing...",
-                 n, n == 1 ? "" : "s");
-        set_status(PROV_STATE_SEARCHING, msg);
-        dirty_poll_full_scan(s.slave_id);
-        snprintf(msg, sizeof msg, "Complete: %u device%s commissioned",
+        /* Re-interrogate, but do NOT block on it. dcom already armed a full scan
+         * when the run ended; the main loop drives it and state converges over
+         * the next few seconds. Blocking here would stall buttons and MQTT for
+         * the whole scan — seconds on a real bus — for no benefit, since nothing
+         * in this function needs the result. */
+        snprintf(msg, sizeof msg, "Complete: %u device%s commissioned — re-syncing",
                  n, n == 1 ? "" : "s");
         set_status(PROV_STATE_COMPLETE, msg);
         break;
