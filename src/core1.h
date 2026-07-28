@@ -36,6 +36,12 @@ void core1_config_ready(void);
  * A single aligned 32-bit read is atomic on Cortex-M0+. */
 uint32_t core1_heartbeat_ms(void);
 
+/* The LIVE address core 1's interface currently holds — the DHCP lease when
+ * dhcp is on, the static address otherwise. Distinct from g_config.net_ip,
+ * which is only the configured static address and is all zeros under DHCP.
+ * Diagnostics must report this one. Zeros mean "no lease yet". */
+void core1_live_ip(uint8_t out[4]);
+
 /* Feed the hardware watchdog using the same core-1-liveness gating the main
  * loop uses (fed only while core 1's heartbeat is fresh or during the grace
  * window). Exposed so long-running blocking core-0 work — e.g. a multi-write

@@ -1940,6 +1940,13 @@ static bool hostname_ok(const char *s) {
 static void cmd_net(char **sp) {
     char *sub = strtok_r(NULL, " \t", sp);
     if (!sub || strcasecmp(sub, "show") == 0) {
+        /* The LIVE address first — under DHCP the configured static fields are
+         * all zeros, so printing only those reported 0.0.0.0 for a device with a
+         * perfectly good lease. */
+        uint8_t lip[4];
+        core1_live_ip(lip);
+        printf("net addr=%u.%u.%u.%u%s\n", lip[0], lip[1], lip[2], lip[3],
+               (lip[0] | lip[1] | lip[2] | lip[3]) ? "" : " (no lease yet)");
         printf("net dhcp=%s ip=%u.%u.%u.%u mask=%u.%u.%u.%u gw=%u.%u.%u.%u dns=%u.%u.%u.%u hostname=%s\n",
                g_config.net_dhcp ? "on" : "off",
                g_config.net_ip[0], g_config.net_ip[1], g_config.net_ip[2], g_config.net_ip[3],

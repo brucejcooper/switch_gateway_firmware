@@ -34,11 +34,22 @@
 static uint32_t s_core1_stack[CORE1_STACK_WORDS];
 
 static volatile uint32_t s_heartbeat_ms  = 0;
+/* Live (DHCP-leased or static) address, republished each loop for core 0 to
+ * read. Same shared-volatile pattern as the heartbeat — no queue involved. It
+ * exists because the `net` CLI could only print the STATIC config, which is all
+ * zeros under DHCP: a device with a perfectly good lease reported 0.0.0.0, and
+ * that is exactly how it reads to anyone diagnosing a network problem. */
+static volatile uint8_t  s_live_ip[4]    = {0, 0, 0, 0};
 static volatile bool     s_ready         = false;
 static volatile bool     s_config_ready  = false;
 
 uint32_t core1_heartbeat_ms(void) {
     return s_heartbeat_ms;
+}
+
+void core1_live_ip(uint8_t out[4]) {
+    out[0] = s_live_ip[0]; out[1] = s_live_ip[1];
+    out[2] = s_live_ip[2]; out[3] = s_live_ip[3];
 }
 
 void core1_config_ready(void) {
@@ -105,6 +116,11 @@ static void core1_entry(void) {
     uint32_t last_log_ms = 0;
     while (true) {
         s_heartbeat_ms = to_ms_since_boot(get_absolute_time());
+        {   /* republish the live address for core 0's `net` command */
+            uint8_t ip[4]; netif_get_ip(ip);
+            s_live_ip[0] = ip[0]; s_live_ip[1] = ip[1];
+            s_live_ip[2] = ip[2]; s_live_ip[3] = ip[3];
+        }
 
         netif_tick();
         mqtt_app_tick();
