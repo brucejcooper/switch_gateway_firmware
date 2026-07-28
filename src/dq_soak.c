@@ -49,6 +49,7 @@ typedef struct {
 
 static struct {
     bool     running;      /* still submitting new pairs */
+    soak_path_t path;      /* how commands reach the gateway */
     bool     draining;     /* target reached; waiting for in-flight to resolve */
     uint8_t  slave, addr, depth;
     uint32_t pairs_target; /* 0 = unlimited */
@@ -185,6 +186,17 @@ static void soak_cb(uint8_t slave, mbq_result_t r, uint8_t response8, void *ctx)
     if (S.draining && inflight_recs() == 0) run_finish();
 }
 
+/* Adapter for the scheduler path: dq_result_t carries the same information in a
+ * different shape, so translate it back and reuse the one verification path. */
+static void soak_dq_cb(uint8_t slave, dq_result_t r, uint8_t answer, void *ctx) {
+    switch (r) {
+        case DQ_RES_OK:  soak_cb(slave, MBQ_R_COMPLETE, answer, ctx); break;
+        case DQ_RES_NAK: soak_cb(slave, MBQ_R_FAILED, SOAK_DALI_NAK, ctx); break;
+        case DQ_RES_ERR: soak_cb(slave, MBQ_R_FAILED, answer ? answer : 0x03u, ctx); break;
+        default:         soak_cb(slave, MBQ_R_LOST, 0, ctx); break;
+    }
+}
+
 /* ── driver ──────────────────────────────────────────────────────────────── */
 
 /* Build and submit the next command of the alternating sequence. Returns false
@@ -221,7 +233,15 @@ static bool submit_next(void) {
     /* Idempotent: both frames are safe to repeat after a gateway reboot (a SET
      * DTR0 re-write and a query have no cumulative effect), so a reboot mid-run
      * resubmits rather than reporting LOST — the value check still holds. */
-    if (!mbq_client_submit(S.slave, cmd, true, soak_cb, rec)) {
+    bool sent;
+    if (S.path == SOAK_PATH_DIRECT) {
+        sent = mbq_client_submit(S.slave, cmd, true, soak_cb, rec);
+    } else {
+        sent = dq_submit(S.slave, S.path == SOAK_PATH_BG ? DQ_PRIO_BACKGROUND
+                                                         : DQ_PRIO_USER,
+                         cmd[0], cmd[1], cmd[2], cmd[3], true, soak_dq_cb, rec);
+    }
+    if (!sent) {
         rec->in_use = false;
         S.n_reject++;
         return false;
@@ -256,6 +276,16 @@ void dq_soak_tick(void) {
     uint8_t occupied = mbq_client_inflight(S.slave);
     S.inflight_hist[occupied <= MBQ_SLOTS ? occupied : MBQ_SLOTS]++;
 
+    if (S.path != SOAK_PATH_DIRECT) {
+        /* Scheduler path: keep that class's storage fed and let its own depth
+         * policy decide when to ship. A refused submit means the class is full,
+         * which is the scheduler doing its job, not an error. */
+        if (inflight_recs() >= MBQ_SLOTS) { S.t_queue_full++; return; }
+        if (!submit_next()) S.t_queue_full++;
+        else                S.t_ready++;
+        return;
+    }
+
     if (occupied >= S.depth) { S.t_queue_full++; return; }   /* gateway queue half full — back off */
     if (!mbq_client_can_submit(S.slave)) { S.t_tx_busy++; return; }
     S.t_ready++;
@@ -264,7 +294,8 @@ void dq_soak_tick(void) {
 
 /* ── control ─────────────────────────────────────────────────────────────── */
 
-bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs) {
+bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs,
+                   soak_path_t path) {
     if (S.running || S.draining) return false;
     if (depth < 1u) depth = 1u;
     if (depth > MBQ_SLOTS) depth = MBQ_SLOTS;
@@ -273,6 +304,7 @@ bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs) {
     S.slave = slave;
     S.addr  = addr;
     S.depth = depth;
+    S.path  = path;
     S.pairs_target = pairs;
     S.val_next = 0x5Au;      /* arbitrary non-trivial start */
     S.val_cur  = 0u;
@@ -283,8 +315,8 @@ bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs) {
     mbq_client_txn_stats_reset(slave);
     modbus_busload_reset();   /* the run's report includes who else used the bus */
     S.running = true;
-    LOG_INFO("soak", "start slave=%u addr=%u depth=%u pairs=%lu",
-             slave, addr, depth, (unsigned long)pairs);
+    LOG_INFO("soak", "start slave=%u addr=%u depth=%u pairs=%lu path=%u",
+             slave, addr, depth, (unsigned long)pairs, (unsigned)path);
     return true;
 }
 
@@ -332,9 +364,10 @@ void dq_soak_report(void) {
 
     uint32_t bad = S.n_lag1 + S.n_other + S.n_query_fail + S.n_lost + S.n_set_fail;
 
-    cdc_out_printf("soak %s: slave=%u addr=%u depth=%u\n",
+    static const char *pn[] = { "direct", "sched-bg", "sched-user" };
+    cdc_out_printf("soak %s: slave=%u addr=%u depth=%u path=%s\n",
            S.running ? "RUNNING" : (S.draining ? "DRAINING" : "done"),
-           S.slave, S.addr, S.depth);
+           S.slave, S.addr, S.depth, pn[S.path <= SOAK_PATH_USER ? S.path : 0]);
     cdc_out_printf("  elapsed %lu.%02lu s, %lu pairs, %lu commands (%lu DALI frames)\n",
            (unsigned long)(el_us / 1000000u), (unsigned long)((el_us % 1000000u) / 10000u),
            (unsigned long)S.pairs_done, (unsigned long)S.n_submit,

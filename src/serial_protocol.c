@@ -436,13 +436,18 @@ static uint16_t dq_result_word(dq_result_t res, uint8_t answer) {
  * known-idempotent internal uses (SET DTR, DAPC).  Sets *result to the legacy
  * result word and returns true; on backlog-full/timeout prints an error and
  * returns false. */
+static uint32_t s_dali_raw_us;   /* elapsed time of the last dali_raw_result */
+
 static bool dali_raw_result(uint8_t slave, uint16_t frame, bool twice,
                             bool idempotent, uint16_t *result) {
     dq_result_t res;
     uint8_t     ans   = 0;
     uint8_t     flags = twice ? DQ_TWICE : DQ_ANSWER;
-    if (!dq_submit_sync(slave, (uint8_t)(frame >> 8), (uint8_t)frame,
-                        flags, 0, idempotent, 300, &res, &ans)) {
+    absolute_time_t t0 = get_absolute_time();
+    bool got = dq_submit_sync(slave, (uint8_t)(frame >> 8), (uint8_t)frame,
+                              flags, 0, idempotent, 300, &res, &ans);
+    s_dali_raw_us = (uint32_t)absolute_time_diff_us(t0, get_absolute_time());
+    if (!got) {
         txt_err(res == DQ_RES_BACKLOG ? "backlog full"
               : res == DQ_RES_TIMEOUT ? "timeout (no result in 300ms — bus busy)"
               : "timeout");
@@ -663,7 +668,7 @@ static void cmd_help(void) {
     printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dq [slave]                                 dump command-queue client state + counters\n");
-    printf("soak [<slave> <addr> [n=] [depth=]] | stop  queue soak: verified DTR0 write/read pairs\n");
+    printf("soak [<slave> <addr> [n=] [depth=] [path=direct|bg|user]] | stop   queue soak\n");
     printf("busload [reset]                            RS-485 bus occupancy, split per slave\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
@@ -1245,10 +1250,17 @@ static void cmd_dali_raw(char **saveptr) {
     if (!dali_raw_result((uint8_t)slave, value, twice, false, &result)) return;
     /* Let dirty-poll pick up any resulting ballast state change. */
     dirty_poll_mark_active((uint8_t)slave);
+    /* Elapsed time is the point of this command on the bench: it is a USER-class
+     * submit, so it measures exactly the latency a button press would see under
+     * whatever load the bus is currently carrying. */
     if ((result >> 8) == 0x00u)
-        printf("ok: result 0x%04X (response byte 0x%02X)\n", result, result & 0xFFu);
+        printf("ok: result 0x%04X (response byte 0x%02X) in %lu.%02lu ms\n",
+               result, result & 0xFFu, (unsigned long)(s_dali_raw_us / 1000u),
+               (unsigned long)((s_dali_raw_us % 1000u) / 10u));
     else
-        printf("ok: result 0x%04X (%s)\n", result, dali_result_str(result));
+        printf("ok: result 0x%04X (%s) in %lu.%02lu ms\n", result,
+               dali_result_str(result), (unsigned long)(s_dali_raw_us / 1000u),
+               (unsigned long)((s_dali_raw_us % 1000u) / 10u));
 }
 
 /* ── read_mem <slave> <addr> <bank> <offset> <count> ───────────────────────
@@ -1421,15 +1433,22 @@ static void cmd_soak(char **saveptr) {
     if (!parse_int_range_auto(a2, 0, 63, &addr)) { txt_err("invalid_addr"); return; }
 
     long pairs = 0, depth = SOAK_DEPTH_DEFAULT;
+    soak_path_t path = SOAK_PATH_DIRECT;
     for (char *t = strtok_r(NULL, " \t", saveptr); t; t = strtok_r(NULL, " \t", saveptr)) {
         char *eq = strchr(t, '=');
         if (!eq) { txt_err("bad_arg"); return; }
         *eq = '\0';
         if      (strcasecmp(t, "n") == 0)     { if (!parse_int_range_auto(eq + 1, 0, 10000000, &pairs)) { txt_err("bad_n"); return; } }
         else if (strcasecmp(t, "depth") == 0) { if (!parse_int_range_auto(eq + 1, 1, 8, &depth)) { txt_err("bad_depth"); return; } }
+        else if (strcasecmp(t, "path") == 0) {
+            if      (strcasecmp(eq + 1, "direct") == 0) path = SOAK_PATH_DIRECT;
+            else if (strcasecmp(eq + 1, "bg") == 0)     path = SOAK_PATH_BG;
+            else if (strcasecmp(eq + 1, "user") == 0)   path = SOAK_PATH_USER;
+            else { txt_err("bad_path"); return; }
+        }
         else { txt_err("bad_arg"); return; }
     }
-    if (!dq_soak_start((uint8_t)slave, (uint8_t)addr, (uint8_t)depth, (uint32_t)pairs)) {
+    if (!dq_soak_start((uint8_t)slave, (uint8_t)addr, (uint8_t)depth, (uint32_t)pairs, path)) {
         txt_err("already_running");
         return;
     }

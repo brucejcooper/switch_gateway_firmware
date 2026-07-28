@@ -34,10 +34,24 @@
 
 #define SOAK_DEPTH_DEFAULT  4u   /* half of the gateway's 8 slots */
 
+/* Which path the probe's commands take to the gateway. The default bypasses the
+ * scheduler entirely (measuring the transport); routing through the scheduler
+ * instead turns the probe into realistic load OF A GIVEN CLASS, which is how the
+ * scheduler's priority-inversion bound gets measured: run the probe as
+ * background and time a user command against it. */
+typedef enum {
+    SOAK_PATH_DIRECT = 0,   /* straight into mbq_client (transport measurement) */
+    SOAK_PATH_BG,           /* via dq_submit at DQ_PRIO_BACKGROUND */
+    SOAK_PATH_USER,         /* via dq_submit at DQ_PRIO_USER */
+} soak_path_t;
+
 /* Start a soak against `addr` on `slave`. `pairs` = number of set/query pairs to
- * run (0 = until `soak stop`). `depth` = max gateway-side active slots (1..8).
- * Returns false if a soak is already running or the slave is not a DALI slave. */
-bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs);
+ * run (0 = until `soak stop`). `depth` = max gateway-side active slots (1..8),
+ * used only on the direct path — on a scheduler path the class's own depth
+ * policy governs. Returns false if a soak is already running or the slave is not
+ * a DALI slave. */
+bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs,
+                   soak_path_t path);
 
 /* Stop the running soak (results are kept for `soak` to report). */
 void dq_soak_stop(void);
