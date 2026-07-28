@@ -31,11 +31,30 @@
 #define Q_GROUPS_0_7    0xC0u
 #define Q_GROUPS_8_15   0xC1u
 
-/* One full pass of the idle sweep per this interval, spread across addresses —
- * slow enough to leave the bus free, fast enough that a change made outside the
- * controller (a wall dimmer, a manual override) surfaces within a few seconds
- * per ballast rather than never. */
-#define SWEEP_STEP_MS   250u
+/* Background sweep pace: ONE ballast interrogated per this interval, per slave.
+ *
+ * This is deliberately slow. The sweep exists only to catch what nothing tells
+ * us about — a ballast that lost power and came back, or gear changed by
+ * something outside this controller. Everything the system itself does is
+ * verified immediately by the post-command path below, so the sweep is a
+ * backstop, not the mechanism.
+ *
+ * For scale: the gateway's own rescan cursor (which this replaces) ran at ONE
+ * ballast per 64 s. An earlier version of this file used 250 ms, which is 256x
+ * faster than the thing it replaced and kept the RS-485 bus ~59% busy doing
+ * nothing useful. */
+#define SWEEP_INTERVAL_MS   10000u
+
+/* While a ballast reports FADE RUNNING, re-read it at this pace until it
+ * settles. A DAPC lands immediately but the level ramps, so a single read taken
+ * mid-fade caches an intermediate value and — without this — would stand until
+ * the next sweep, minutes later. Bounded by FADE_TRACK_MAX_MS because a stuck
+ * fade bit must not pin the bus forever; DALI's longest fade time is ~90 s. */
+#define FADE_POLL_MS        250u
+#define FADE_TRACK_MAX_MS   95000u
+
+/* QUERY STATUS bit 4 = fade running (IEC 62386-102). */
+#define STATUS_FADE_RUNNING 0x10u
 
 /* Per-ballast query sequence. */
 typedef enum {
@@ -77,6 +96,11 @@ typedef struct {
 
     uint8_t  cursor;      /* rotating idle sweep position */
     absolute_time_t next_step_at;
+
+    /* Fade tracking: re-verify a ballast while it reports FADE RUNNING. */
+    uint64_t fade_watch;              /* ballasts being tracked through a fade */
+    absolute_time_t fade_next_at;
+    absolute_time_t fade_give_up_at;
 } ds_slave_t;
 
 static ds_slave_t s_ds[MAX_DALI_SLAVES];
@@ -220,6 +244,16 @@ static void commit_ballast(ds_slave_t *d, uint8_t addr, uint8_t arc, uint8_t sta
 /* Pick the next address to interrogate. Verification marks win; then scan
  * marks; then the rotating idle sweep over believed-present ballasts. */
 static bool pick_next(ds_slave_t *d, uint8_t *addr_out, bool *is_scan) {
+    /* A ballast mid-fade is re-queued for verification as soon as its poll
+     * interval elapses — ahead of the background sweep, behind fresh commands. */
+    if (d->fade_watch) {
+        if (time_reached(d->fade_give_up_at)) {
+            LOG_WARN("dstate", "slave %u fade never settled — dropping watch", d->slave_id);
+            d->fade_watch = 0;
+        } else if (time_reached(d->fade_next_at)) {
+            d->verify |= d->fade_watch;
+        }
+    }
     if (d->verify) {
         *addr_out = (uint8_t)__builtin_ctzll(d->verify);
         *is_scan  = false;
@@ -315,6 +349,17 @@ static void advance(ds_slave_t *d) {
              * changes. Group membership is only re-read on a full scan. */
             commit_ballast(d, d->addr, d->got_level, d->got_status, false, 0);
             d->verify &= ~bit;
+            /* Still ramping? Keep watching until it settles, so the cached level
+             * is the ballast's final one and not a point on the way there. */
+            if (d->got_status & STATUS_FADE_RUNNING) {
+                if (!(d->fade_watch & bit)) {
+                    d->fade_watch |= bit;
+                    d->fade_give_up_at = make_timeout_time_ms(FADE_TRACK_MAX_MS);
+                }
+                d->fade_next_at = make_timeout_time_ms(FADE_POLL_MS);
+            } else {
+                d->fade_watch &= ~bit;
+            }
             d->busy    = false;
             d->step    = STEP_STATUS;
             return;
@@ -363,7 +408,7 @@ void dali_state_tick(void) {
             if (!pick_next(d, &addr, &is_scan)) continue;
             d->addr    = addr;
             d->is_scan = is_scan;
-            d->next_step_at = make_timeout_time_ms(SWEEP_STEP_MS);
+            d->next_step_at = make_timeout_time_ms(SWEEP_INTERVAL_MS);
         }
         issue(d);   /* false = class full; retried next tick */
     }
