@@ -94,9 +94,19 @@ static int slave_idx(uint8_t id) {
 }
 
 /* ── discovery builders ──────────────────────────────────────────────────── */
+/* One size for every discovery identifier / display-name / topic-fragment
+ * buffer in this file. These were individually sized 24/28/32/40/48, and the
+ * one that was too small (controller config object_ids, 32 vs the 35 chars
+ * "lighting_cfg_dali_sweep_interval_ms" needs) truncated silently — snprintf
+ * does not complain and the discovery topic is the only place it shows. A
+ * single generous constant removes the whole class: adding a longer entity key
+ * cannot quietly cut a topic short. Cost is stack in core-1 discovery frames,
+ * which have 8 KB to play with. */
+#define DISC_BUF 64
+
 static void disc_plate_event(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
-    char ids[40], name[24], objid[40];
+    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
     /* No value_template: HA's MQTT *event* platform parses the raw payload as
      * JSON and takes event_type from it (and any extra keys as attributes). A
      * value_template would be applied first and its *result* must itself be a
@@ -119,7 +129,7 @@ static void disc_plate_event(uint8_t fix, uint8_t btn) {
 
 static void disc_plate_binding(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
-    char ids[40], name[24], objid[40];
+    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_binding_%02u_btn_%u\",\"name\":\"Button %u Binding\","
         "\"command_topic\":\"%s/binding/%u/%u/set\",\"state_topic\":\"%s/binding/%u/%u/state\","
@@ -143,7 +153,7 @@ static uint8_t s_stuck_mask[MAX_FIX];
 
 static void disc_plate_stuck(uint8_t fix) {
     const char *P = mqtt_app_prefix();
-    char ids[40], name[24], objid[40];
+    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_switch_%02u_stuck\",\"name\":\"Button Stuck\","
         "\"state_topic\":\"%s/plate/%u/stuck\","
@@ -161,7 +171,7 @@ static void disc_plate_stuck(uint8_t fix) {
 
 static void disc_relay(uint8_t slave, uint8_t ch) {
     const char *P = mqtt_app_prefix();
-    char ids[32], name[24], objid[32];
+    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_relay_%u\",\"name\":null,"
         "\"state_topic\":\"%s/relay/%u/state\",\"command_topic\":\"%s/relay/%u/set\","
@@ -180,7 +190,7 @@ static void disc_relay(uint8_t slave, uint8_t ch) {
 
 static void disc_ballast(uint8_t slave, uint8_t addr) {
     const char *P = mqtt_app_prefix();
-    char ids[40], name[24], gw[32], objid[40];
+    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_dali_%u_%u\",\"name\":null,\"schema\":\"json\","
         "\"state_topic\":\"%s/dali/%u/%u/state\",\"command_topic\":\"%s/dali/%u/%u/set\","
@@ -207,7 +217,7 @@ static void disc_ballast_cfg(uint8_t slave, uint8_t addr, uint8_t k) {
         { "fade_rate", "Fade Rate", 0, 15 }, { "fade_time", "Fade Time", 0, 15 },
     };
     const char *P = mqtt_app_prefix();
-    char ids[40], name[24], gw[32], objid[48];
+    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_dali_%u_%u_%s\",\"name\":\"%s\","
         "\"command_topic\":\"%s/dali/%u/%u/config/%s/set\","
@@ -229,7 +239,7 @@ static void disc_ballast_cfg(uint8_t slave, uint8_t addr, uint8_t k) {
 
 static void disc_group_light(uint8_t slave, uint8_t grp) {
     const char *P = mqtt_app_prefix();
-    char ids[40], name[28], gw[32], objid[40];
+    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_group_%u_%u\",\"name\":null,\"schema\":\"json\","
         "\"state_topic\":\"%s/group/%u/%u/state\",\"command_topic\":\"%s/group/%u/%u/set\","
@@ -249,7 +259,7 @@ static void disc_group_light(uint8_t slave, uint8_t grp) {
 
 static void disc_group_members(uint8_t slave, uint8_t grp) {
     const char *P = mqtt_app_prefix();
-    char ids[40], name[28], gw[32], objid[48];
+    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"lighting_group_%u_%u_members\",\"name\":\"Members\","
         "\"command_topic\":\"%s/group/%u/%u/members/set\","
@@ -270,7 +280,7 @@ static void disc_group_members(uint8_t slave, uint8_t grp) {
 
 static void disc_prov(uint8_t slave, uint8_t k) {
     const char *P = mqtt_app_prefix();
-    char gwids[32], gwname[24], objid[48], status[64];
+    char gwids[DISC_BUF], gwname[DISC_BUF], objid[DISC_BUF], status[DISC_BUF];
     snprintf(gwids, sizeof gwids, "lighting_dali_gw_%u", slave);
     snprintf(gwname, sizeof gwname, "DALI Gateway %u", slave);
     snprintf(status, sizeof status, "%s/provision/%u/status", P, slave);
@@ -350,7 +360,7 @@ static void disc_prov(uint8_t slave, uint8_t k) {
  * k 0..2 = the three sensors, k 3 = seed an initial retained state. */
 static void disc_gw_diag(uint8_t slave, uint8_t k) {
     const char *P = mqtt_app_prefix();
-    char gwids[32], gwname[24], objid[48], diag[48];
+    char gwids[DISC_BUF], gwname[DISC_BUF], objid[DISC_BUF], diag[DISC_BUF];
     snprintf(gwids, sizeof gwids, "lighting_dali_gw_%u", slave);
     snprintf(gwname, sizeof gwname, "DALI Gateway %u", slave);
     snprintf(diag, sizeof diag, "%s/gateway/%u/diag", P, slave);
@@ -420,12 +430,7 @@ static const struct { const char *key, *name, *icon; } CFG_SENS[] = {
 
 static void disc_controller(uint8_t k) {
     const char *P = mqtt_app_prefix();
-    /* Longest object_id here is "lighting_cfg_dali_sweep_interval_ms" (35 ch).
-     * This was 32, so it silently truncated BOTH that and
-     * "lighting_cfg_gw_diag_interval_ms" (32 ch) — snprintf truncates without
-     * complaint, and the discovery topic is the only place it shows. Sized to
-     * match the other discovery buffers in this file, with headroom. */
-    char objid[48];
+    char objid[DISC_BUF];
     if (k >= CFG_NUM_N + CFG_SENS_N) {
         /* relay_byteswap switch — reverses Waveshare 32CH coil read-back order. */
         int n = snprintf(s_pl, PL_CAP,
