@@ -38,6 +38,10 @@
 
 #define SOAK_MISS_LOG             6u   /* mismatches kept in detail for the report */
 
+/* Scheduler-path backoff after a class-full refusal — roughly a fifth of a DALI
+ * frame, so the class is re-offered promptly without spinning. */
+#define SOAK_CLASS_RETRY_MS       5u
+
 typedef struct {
     bool     in_use;
     bool     is_query;
@@ -50,6 +54,7 @@ typedef struct {
 static struct {
     bool     running;      /* still submitting new pairs */
     soak_path_t path;      /* how commands reach the gateway */
+    absolute_time_t retry_at;  /* scheduler path: don't re-offer until this time */
     bool     draining;     /* target reached; waiting for in-flight to resolve */
     uint8_t  slave, addr, depth;
     uint32_t pairs_target; /* 0 = unlimited */
@@ -279,10 +284,18 @@ void dq_soak_tick(void) {
     if (S.path != SOAK_PATH_DIRECT) {
         /* Scheduler path: keep that class's storage fed and let its own depth
          * policy decide when to ship. A refused submit means the class is full,
-         * which is the scheduler doing its job, not an error. */
+         * which is the scheduler doing its job, not an error — but the main loop
+         * spins far faster than DALI drains, so back off before re-offering
+         * instead of retrying thousands of times per second. Any polling producer
+         * against a deliberately shallow class needs this. */
         if (inflight_recs() >= S.depth) { S.t_queue_full++; return; }
-        if (!submit_next()) S.t_queue_full++;
-        else                S.t_ready++;
+        if (!time_reached(S.retry_at)) { S.t_tx_busy++; return; }
+        if (!submit_next()) {
+            S.t_queue_full++;
+            S.retry_at = make_timeout_time_ms(SOAK_CLASS_RETRY_MS);
+        } else {
+            S.t_ready++;
+        }
         return;
     }
 
