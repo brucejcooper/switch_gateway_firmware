@@ -299,6 +299,12 @@ typedef struct {
  * interrogation driven by dali_state (QUERY STATUS / ACTUAL LEVEL / GROUPS per
  * address, through the command queue). Kept blocking because every caller —
  * boot, `scan`, post-provisioning — expects the cache populated on return. */
+void dirty_poll_arm_scan(uint8_t slave_id) {
+    if (state_cache_slave_idx(slave_id) < 0) return;
+    LOG_INFO("dirty", "slave %u full scan armed (non-blocking)", slave_id);
+    dali_state_request_full_scan(slave_id);
+}
+
 void dirty_poll_full_scan(uint8_t slave_id) {
     int idx = state_cache_slave_idx(slave_id);
     if (idx < 0) return;
@@ -324,6 +330,13 @@ void dirty_poll_full_scan(uint8_t slave_id) {
         dq_tick();
         dali_state_tick();
         wd_feed();
+        /* Gateway not answering: stop waiting. Every query to it will fail, so
+         * the scan can only ever burn the whole deadline — measured at 45 s for
+         * one absent slave, which is why this must not be on the boot path. */
+        if (mbq_client_consec_fail(slave_id) >= 3u) {
+            LOG_WARN("dirty", "slave %u not answering — abandoning scan", slave_id);
+            break;
+        }
     }
     if (dali_state_scan_busy(slave_id))
         LOG_WARN("dirty", "slave %u full scan timed out", slave_id);

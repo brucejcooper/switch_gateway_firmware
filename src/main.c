@@ -144,11 +144,15 @@ int main(void) {
     dali_provision_init();
     dq_init();   /* per-slave gateway command-queue driver state */
 
-    /* Full scan of each DALI slave — blocking, establishes ground truth */
-    for (int i = 0; i < g_config.dali_slave_count; i++) {
-        LOG_INFO("boot", "scanning slave %u", g_config.dali_slave_ids[i]);
-        dirty_poll_full_scan(g_config.dali_slave_ids[i]);
-    }
+    /* Arm a full DALI interrogation per slave and carry on. This used to block
+     * until each finished, which was fine when it was a few register reads but
+     * not now that it is a multi-second bus interrogation: an ABSENT gateway
+     * burns the whole 45 s deadline, and boot measured 53 s with one configured
+     * absent slave — buttons, network and watchdog all waiting on it. The main
+     * loop drives the scans instead; a live bus converges in ~5 s and HA gets
+     * state as it arrives. */
+    for (int i = 0; i < g_config.dali_slave_count; i++)
+        dirty_poll_arm_scan(g_config.dali_slave_ids[i]);
 
     /* Read all relay coils to sync cache */
     if (g_config.relay_slave_count > 0) {
