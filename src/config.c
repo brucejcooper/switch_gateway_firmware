@@ -82,10 +82,16 @@ static bool get_ip(const char *js, const jsmntok_t *t, int n, const char *key, u
     return true;
 }
 /* Parse a JSON array of small uints at key into out, returns count. */
-static uint8_t get_u8_array(const char *js, const jsmntok_t *t, int n, const char *key,
-                            uint8_t *out, uint8_t max) {
+/* Returns the element count, or -1 if the key is ABSENT (or not an array).
+ * The distinction matters: an EMPTY array is a valid configuration — "this
+ * installation has no relay board" / "no DALI gateways" — and must be
+ * distinguishable from "the key isn't there, keep the default". Collapsing the
+ * two made an empty list impossible to persist: it was settable at runtime and
+ * silently reverted to the compiled default on the next boot. */
+static int get_u8_array(const char *js, const jsmntok_t *t, int n, const char *key,
+                        uint8_t *out, uint8_t max) {
     int i = find_key(js, t, n, key);
-    if (i < 0 || t[i].type != JSMN_ARRAY) return 0;
+    if (i < 0 || t[i].type != JSMN_ARRAY) return -1;
     int count = t[i].size; if (count > max) count = max;
     for (int k = 0; k < count; k++) {
         const jsmntok_t *e = &t[i + 1 + k];
@@ -93,7 +99,7 @@ static uint8_t get_u8_array(const char *js, const jsmntok_t *t, int n, const cha
         memcpy(b, js + e->start, len); b[len] = '\0';
         out[k] = (uint8_t)strtol(b, NULL, 10);
     }
-    return (uint8_t)count;
+    return count;
 }
 
 /* One-time import of the legacy modbus text files into g_config, then delete. */
@@ -144,12 +150,15 @@ bool config_load(void) {
             if (get_uint(buf, tk, nt, "de_mode", &u))            g_config.de_mode            = (uint8_t)u;
             if (get_uint(buf, tk, nt, "relay_byteswap", &u))     g_config.relay_byteswap     = u ? true : false;
 
+            /* >= 0 means the key was present — including an empty list, which
+             * legitimately means "no slaves of this kind". Only a missing key
+             * leaves the compiled default in place. */
             uint8_t rs[MAX_RELAY_SLAVES];
-            uint8_t rc = get_u8_array(buf, tk, nt, "relay_slaves", rs, MAX_RELAY_SLAVES);
-            if (rc > 0) { memcpy(g_config.relay_slave_ids, rs, rc); g_config.relay_slave_count = rc; }
+            int rc = get_u8_array(buf, tk, nt, "relay_slaves", rs, MAX_RELAY_SLAVES);
+            if (rc >= 0) { memcpy(g_config.relay_slave_ids, rs, (size_t)rc); g_config.relay_slave_count = (uint8_t)rc; }
             uint8_t ds[MAX_DALI_SLAVES];
-            uint8_t dc = get_u8_array(buf, tk, nt, "dali_slaves", ds, MAX_DALI_SLAVES);
-            if (dc > 0) { memcpy(g_config.dali_slave_ids, ds, dc); g_config.dali_slave_count = dc; }
+            int dc = get_u8_array(buf, tk, nt, "dali_slaves", ds, MAX_DALI_SLAVES);
+            if (dc >= 0) { memcpy(g_config.dali_slave_ids, ds, (size_t)dc); g_config.dali_slave_count = (uint8_t)dc; }
 
             get_str(buf, tk, nt, "mqtt_host",   g_config.mqtt_host,   sizeof g_config.mqtt_host);
             get_str(buf, tk, nt, "mqtt_user",   g_config.mqtt_user,   sizeof g_config.mqtt_user);
