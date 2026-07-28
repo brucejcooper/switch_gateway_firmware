@@ -20,8 +20,8 @@ MQTT **directly over its on-board Ethernet** — no external bridge host.
 RS-485 bus @ 19200 baud (canonical; firmware auto-recovers slaves stuck at 9600)
 
 W5100S-EVB-Pico (RP2040) — Modbus master, single source of truth
- ├── core 0: Modbus master · button matrix (PIO) · button FSM · dirty-bit
- │           polling · state cache · persistence · USB-CDC text CLI
+ ├── core 0: Modbus master · button matrix (PIO) · button FSM · DALI world
+ │           model · command queue · state cache · persistence · USB-CDC CLI
  ├── core 1: W5100S Ethernet · MQTT connection mgmt · Home Assistant
  │           discovery / availability / state ↔ command translation (JSON)
  │
@@ -50,7 +50,9 @@ feeds the hardware watchdog while core 1's heartbeat is fresh, so a genuine
 core-1 wedge (not a network outage) is what triggers a reboot.
 
 **State is never assumed.** Core 0 only updates its state cache from hardware
-readback (dirty-bit polling from TinyModbus), never from the commands it sent.
+readback — DALI queries sent to the ballasts themselves — never from the
+commands it sent. Since task 05 the gateway caches nothing, so the ballasts are
+the only authority.
 This correctly handles DALI min/max level clamping and ballast-side fade curves.
 
 **Discovery is republished on every connect.** On each MQTT (re)connect core 1
@@ -197,7 +199,9 @@ Each boot, before the main loop starts, the firmware runs:
 | `lighting_actions.c/h` | Command dispatch, any-on probe + config-query state machines, state event queue |
 | `dali_queue.c/h` | DALI adapter: per-slave priority scheduler + producer API over the generic client |
 | `mbq_client.c/h` | Generic DALI-agnostic command-queue client (8-slot lifecycle protocol over FC23) |
-| `dirty_poll.c/h` | TinyModbus dirty-bit polling, background scans |
+| `dali_state.c/h` | the DALI world model: presence, level/status, groups, fade tracking |
+| `dali_commission.c/h` | controller-side IEC 62386-102 commissioning |
+| `dirty_poll.c/h` | relay-board polling + gateway sysinfo/reachability |
 | `serial_protocol.c/h` | USB-CDC text CLI + the core-0/core-1 inter-core seam |
 | `serial_protocol_provision.c` | Provision status → core-1 event forwarding |
 | `dali_provision.c/h` | DALI commissioning state machine |
@@ -219,7 +223,8 @@ while (true) {
     lighting_cfg_query_tick();   // submit config queries into the gateway queue
     dq_tick();                   // drive the gateway command queue (FC23 submit/collect)
     button_fsm_tick();           // classify raw button events, dispatch commands
-    dirty_poll_tick();           // check dirty bits, read changed ballast state
+    dali_state_tick();           // interrogate ballasts: verify, discover, sweep
+    dirty_poll_tick();           // relay board + gateway sysinfo
     dali_provision_tick();       // advance commissioning state machine if active
     serial_poll();               // read text CLI; drain core-1 cmds; forward state events to core 1
     wd_feed();
@@ -289,31 +294,52 @@ write-callback. Relay state is instantaneous — no polling needed after a comma
 The Waveshare board's state is also read in full at boot to synchronise the
 cache with the hardware's actual state (handles Pico restarts while power was on).
 
-### DALI ballasts — dirty-bit polling
+### DALI ballasts — the controller's world model (`dali_state.c`)
 
-DALI ballasts go through TinyModbus, which maintains a dirty bitmask (FC04
-registers 0x0104–0x0107, one bit per ballast). A bit is set whenever a
-ballast's block-0 cache (status byte | arc level) changes, and cleared when
-read.
+**The controller learns the bus by asking the ballasts.** Task 05 removed every
+gateway cache, so presence, arc level, status and group membership are all
+established by DALI queries sent through the command queue — nothing is read
+from a gateway register any more.
 
-The Pico's polling loop:
+Three sources of work, in priority order, at most one query in flight per slave:
 
-1. Every **100 ms** when a command is in flight: read the 4-register dirty
-   bitmask (one RTU frame). For each dirty bit, read that ballast's single
-   block-0 register via FC03 at `0x0000 + addr` and queue a DALI state event.
-2. Every **60 s** (background): read the present bitmask and all block-0
-   status bytes. Queue presence events for any changes. Queue fault events
-   for ballasts with lamp-failure or power-cycle bits set.
-3. At **boot**: trigger a TinyModbus bus scan, then blocking-read block 0
-   (arc/status) and the present bitmask for each slave, and queue every present
-   ballast for the background raw-DALI **config sweep** (the gateway no longer
-   stores per-ballast config — see below).
+1. **Post-command verification** (`DQ_PRIO_LEVEL_READ`). Any command marks what
+   it touched — one ballast, a group's cached members, or everything for a
+   broadcast — and the toucher is re-read immediately so user-visible state
+   converges without waiting for a sweep.
+2. **Discovery** (`DQ_PRIO_BACKGROUND`). A full pass over all 64 addresses:
+   `QUERY STATUS` → `QUERY ACTUAL LEVEL` → `QUERY GROUPS 0-7` → `QUERY GROUPS
+   8-15`. Run at boot, by CLI `scan`, and after provisioning. It is **not**
+   paced by the sweep interval — measured at **4.87 s** for 64 addresses,
+   because an absent address costs a single query.
+3. **Background sweep** (`DQ_PRIO_BACKGROUND`). One ballast per
+   `dali_sweep_interval_ms` (default 10 s, 0 = off). This is a *backstop* for
+   what nothing tells us about — a ballast that lost power, or gear changed
+   outside this controller — not the mechanism. Every 6th step probes an
+   **absent** address instead, so gear that was off at boot or added later is
+   discovered without a manual scan.
 
-The Pico never caches a DALI arc level from the command it sent — it always
-waits for the dirty bit and reads the hardware. This correctly handles:
-- DALI min/max level clamping (commanded 10, got 20 → reports 20)
-- Real-time fade tracking (arc level changes on each dirty-bit read during fade)
-- Power-cycle events (ballast restarted → new arc level read immediately)
+**Fade tracking.** A DAPC lands immediately but the level *ramps*, so a single
+read taken mid-fade would cache a value on the way to the destination. The
+verifier re-reads while `QUERY STATUS` bit 4 (FADE RUNNING) is set, at 250 ms,
+until it settles — bounded at 95 s (past DALI's longest fade) so a stuck fade
+bit cannot pin the bus.
+
+**Presence — absence needs proof.** Only a CLEAN no-answer to a directed query
+counts against presence, and normally only after two consecutive. A collision,
+bus fault or dropped command is evidence about the **bus**, not the ballast, so
+it freezes the counters and keeps the current belief. The one exception: an
+**explicit scan is authoritative** and drops presence on the first clean
+no-answer — a scan is a deliberate re-establishment of ground truth (boot,
+`scan`, post-provisioning) and is precisely when addresses are expected to have
+moved. Without that, every address vacated by a re-provision lingered as a
+phantom in HA, one per sweep step.
+
+The controller never caches an arc level from the command it sent — it reads
+back what actually happened. That is what makes DALI min/max clamping report
+honestly (commanded 128 on a binary relay ballast → reports 254 with status
+`0x0C`, limit error), rather than the controller claiming a level the gear never
+reached.
 
 #### TinyModbus register contract
 
@@ -339,15 +365,12 @@ new contract:
   FC03 and FC04), FC23 (`0x17`). See "DALI command queue: adapter + generic
   client" below and `../TinyModbus/README.md`. The CLI `dali_raw` / `read_mem`
   go through the queue via `dq_submit_sync`.
-- **Group masks (FC03 read / FC06 write) at `0x0110+`** — four 16-bit words
-  per group covering bits 0–63, byte-swapped per word. The controller writes
-  the desired mask; the gateway diffs old↔new and issues the per-bit DALI
-  `ADD_TO_GROUP` / `REMOVE_FROM_GROUP` commands.
-- **Presence + dirty bitmaps (FC04) at `0x0100–0x0107`** — one 8-register
-  read fetches both. The dirty range is read-clears.
-- **Action / config registers relocated to `0x1F00+`** (task 04): scan-trigger
-  `0x1F00`, rescan `0x1F01`, slave-addr `0x1F02`, baud `0x1F03`, commission
-  `0x1F04`, system-reset `0x1F05`.
+- **Everything else is GONE (task 05).** The arc/status bank, presence and
+  dirty bitmaps, group masks, scan trigger, rescan interval and the commission
+  register all return ILLEGAL DATA ADDRESS. Group membership is now read with
+  `QUERY GROUPS` and written with `ADD/REMOVE FROM GROUP` frames; commissioning
+  runs in `dali_commission.c`. The only surviving action registers are
+  slave-addr `0x1F02`, baud `0x1F03` and system-reset `0x1F05`.
 - **Gateway recovery:** `0x1F05` (write `0xA5A5`) software-resets a wedged
   gateway (CLI `gw_reboot`). RX error counters live at FC04 `0x0300`; uptime /
   boot-count / reset-reason at FC04 `0x0310` (read `get_input <slave> 0x0310 4`
@@ -355,6 +378,43 @@ new contract:
 
 The canonical specification for the gateway is
 [`../TinyModbus/README.md`](../TinyModbus/README.md).
+
+### Scheduler model (task 05)
+
+The queue client is fed by a **pull scheduler**, not a shared backlog. Storage is
+partitioned by priority class, and each class carries **its own gateway depth**:
+
+| class | storage | gateway depth | what uses it |
+|---|---|---|---|
+| provisioning | 2 | **1** | the commissioning sequence (each step depends on the previous answer) |
+| user | 8 | 4 | buttons, HA commands, group commands — sized to one button's full fan-out |
+| config | 3 | 3 | DTR0+SET config writes |
+| background | 2 | **2** | the world-model sweep, config-query rotation |
+
+Depth matters because the **gateway executes strictly FIFO with no priority** —
+anything already submitted delays a button by a whole DALI frame. Capping
+background at 2 bounds that inversion; letting user work reach 4 keeps bursts
+fast. Measured on the bench: background load costs a user command **+13 ms
+median**, the same load admitted at user depth costs **+75 ms**.
+
+While a slave is provisioning the scheduler ships **only** the provisioning
+class, so nothing can interleave with the binary search — a stray DTR0 write
+mid-bisect would corrupt it.
+
+**Dim steps are counters, not commands.** A held button emits repeats faster than
+DALI can issue them, so queueing each step makes the light keep dimming after
+release. `dq_add_delta()` accumulates a signed per-ballast/per-group step count
+which the scheduler drains one frame per submit opportunity, rotating across
+targets for fairness. Real UP/DOWN frames still go out — the ballast's own fade
+rate and min/max clamping govern the result, deliberately not a DAPC computed
+from cache. The counter decrements on **submit** and saturates at ±4: losing a
+step to the clamp or a gateway reboot is invisible in a ramp, whereas replaying
+one would double-step.
+
+Duplicate idempotent submits that have not shipped are folded, so a repeated
+press or a re-published HA state costs nothing. A class-full refusal is
+**backpressure**, not an error — a polling producer sees it routinely — so it is
+a rate-limited counter (`refused=` in `dq`), not a warning per event.
 
 ### DALI command queue: adapter + generic client (`dali_queue.c` / `mbq_client.c`)
 
@@ -475,9 +535,8 @@ bounded by the 600 ms probe deadline.
 
 ```
 Hardware change
-  → TinyModbus sets dirty bit
-  → dirty_poll_tick() reads dirty bitmask
-  → reads block-0 register for that ballast
+  → dali_state_tick() interrogates the ballast (QUERY STATUS / ACTUAL LEVEL)
+     — from a post-command verification mark, or the background sweep
   → lighting_emit_dali_state() pushes levt_t to the core-0 event ring
   → serial_poll() drains the ring, converts to a typed ic_event_t
   → intercore_push_event() — onto the core-0 → core-1 SPSC queue
@@ -685,7 +744,9 @@ Example: `# 12345 I dirty: ballast 2.5 arc=128 status=0x80`
 | `disc` | Boot-time bus discovery and baud recovery |
 | `config` | Config load / legacy-file migration |
 | `modbus` | RS-485 Modbus master — frames, timeouts, retries |
-| `dirty` | TinyModbus dirty-bit poller — state cache updates |
+| `dirty` | relay-board polling + gateway reachability |
+| `dstate` | DALI world model — presence changes, sweep, fade tracking |
+| `dcom`  | controller-side commissioning |
 | `light` | Lighting command dispatch — relay coil and DALI writes |
 | `btn` | Button matrix — gestures, classified events |
 | `prov` | DALI commissioning state machine |
