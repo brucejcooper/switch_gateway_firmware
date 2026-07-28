@@ -206,9 +206,17 @@ bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
     }
 
     if (c->n >= c->cap) {
-        LOG_WARN("dq", "slave %u class %u full — cmd %02X%02X dropped",
-                 slave_id, (unsigned)class_of(prio), addr, data);
+        /* A refusal means different things to different producers: to a button it
+         * is a dropped command (and that caller logs it), to a polling producer
+         * (config-query rotation, bench probes) it is ordinary backpressure —
+         * "try again next tick". So this is a rate-limited counter, not a warning
+         * per event: a polling producer against a 2-deep class would otherwise
+         * emit hundreds of thousands of them. The counter is the signal. */
         s->c_full++;
+        if ((s->c_full & 0xFFu) == 1u)
+            LOG_WARN("dq", "slave %u class %u full — cmd %02X%02X refused (total %lu)",
+                     slave_id, (unsigned)class_of(prio), addr, data,
+                     (unsigned long)s->c_full);
         return false;
     }
     c->e[c->n++] = entry;   /* FIFO within the class */
@@ -421,7 +429,7 @@ void dq_debug_print(int slave_id) {
         cdc_out_printf("  dim delta: %d target(s), net %d steps, cursor=%u\n",
                        dn, dsum, s->delta_cursor);
         cdc_out_printf("  counters: submitted=%lu ok=%lu nak=%lu err=%lu dropped=%lu "
-                       "class_full=%lu coalesced=%lu steps=%lu clamped=%lu\n",
+                       "refused=%lu coalesced=%lu steps=%lu clamped=%lu\n",
                        (unsigned long)s->c_submitted, (unsigned long)s->c_ok,
                        (unsigned long)s->c_nak, (unsigned long)s->c_err,
                        (unsigned long)s->c_dropped, (unsigned long)s->c_full,

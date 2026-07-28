@@ -280,7 +280,7 @@ void dq_soak_tick(void) {
         /* Scheduler path: keep that class's storage fed and let its own depth
          * policy decide when to ship. A refused submit means the class is full,
          * which is the scheduler doing its job, not an error. */
-        if (inflight_recs() >= MBQ_SLOTS) { S.t_queue_full++; return; }
+        if (inflight_recs() >= S.depth) { S.t_queue_full++; return; }
         if (!submit_next()) S.t_queue_full++;
         else                S.t_ready++;
         return;
