@@ -417,9 +417,30 @@ alive-reconcile gate — the corruption modes those existed to manage cannot ari
 because nothing is inferred from an id sequence. (boot_count / the FC04 sysinfo
 block remain, purely as an HA diagnostic in `dirty_poll.c`.)
 
-**Observability.** The CLI **`dq [slave]`** command dumps the adapter's per-class
-backlog depths, the in-flight count, and its counters (submitted / ok / nak / err
-/ dropped / backlog-full), then the underlying client's per-slot state
+**Scheduler (task 05 phase 1).** There is no shared backlog. Storage is
+partitioned by priority class — user 8 entries (one button's full fan-out), cfg
+3, bg 2 — and each class carries **its own gateway depth** (user 4, cfg 3, bg 2).
+That matters because the *gateway* executes strictly FIFO with no priority, so a
+background command already submitted delays a button by a whole DALI frame;
+capping background at 2 bounds that inversion at ~2 frame times while leaving
+user bursts the depth they need for throughput. Measured: background load costs
+a user command +22 ms median, the same load as user class costs +75 ms.
+Duplicate idempotent submits that have not shipped are folded.
+
+**Dim steps are counters, not commands.** A held button emits repeats faster
+than DALI can issue them, so queueing each step makes the light keep dimming
+after release. `dq_add_delta()` accumulates a signed per-ballast/per-group step
+count which the scheduler drains one frame per submit opportunity, rotating
+across targets for fairness. Real UP/DOWN frames still go out — the ballast's
+own fade rate and min/max clamping govern the result, deliberately not a DAPC
+computed from cache. The counter decrements on **submit** and saturates at ±4:
+losing a step to the clamp or to a gateway reboot is invisible in a ramp,
+whereas replaying one would double-step.
+
+**Observability.** The CLI **`dq [slave]`** command dumps the per-class pending
+counts and depths, the pending dim deltas and cursor, the in-flight count, and
+its counters (submitted / ok / nak / err / dropped / refused / coalesced / steps
+/ clamped), then the underlying client's per-slot state
 (`free`/`armed`/`sent`/`live`) and counters, including the poll-transaction count.
 Bare = all DALI slaves. For throughput and correctness under load, see
 [`busload` and `soak`](#measuring-the-command-path-busload-and-soak).
@@ -1089,8 +1110,8 @@ permanently). Also reports re-sends split into timeout vs DEVICE_BUSY, and slave
 turnaround against the 50 ms response timeout — which distinguishes a reply that
 was *lost* from one that was merely *late*.
 
-**`soak <slave> <addr> [n=<pairs>] [depth=<1-8>]`** (bare = report, `soak stop`
-to end an open-ended run) — hammers the gateway command queue with alternating
+**`soak <slave> <addr> [n=<pairs>] [depth=<1-8>] [path=direct|bg|user]`** (bare =
+report, `soak stop` to end an open-ended run) — hammers the gateway command queue with alternating
 
 ```
 SET DTR0 = v          special command 0xA3<v>, one forward frame, no answer
@@ -1104,8 +1125,13 @@ values, so consecutive pairs never share an expected answer — which makes a
 result that is one command stale distinguishable from random corruption, and
 both distinguishable from success.
 
-The probe submits straight into `mbq_client`, bypassing the `dali_queue` priority
-backlog, and paces on gateway-side slot occupancy (`depth`, default 4 = half the
+`path=direct` (default) submits straight into `mbq_client`, bypassing the
+scheduler, and measures the transport. `path=bg`/`path=user` route through
+`dq_submit` at that priority class instead, turning the probe into realistic
+load *of a chosen class* — which is how the scheduler's priority-inversion bound
+gets measured: saturate with `path=bg` and time a `dali_raw` (a USER-class
+submit, which reports its own elapsed time) against it. The direct path paces on
+gateway-side slot occupancy (`depth`, default 4 = half the
 queue) rather than on a DEVICE_BUSY rejection. Its report gives the verdict
 (correct / lag-1 / other / nak / lost), pair and DALI frame rates, latency, the
 Modbus transactions that paid for it, the bus split, and a pacing breakdown that
