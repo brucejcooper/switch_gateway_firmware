@@ -12,6 +12,7 @@
 #include "dirty_poll.h"
 #include "dali_state.h"
 #include "dali_queue.h"
+#include "mbq_client.h"
 #include "modbus.h"
 #include "state_cache.h"
 #include "lighting_actions.h"
@@ -144,7 +145,6 @@ void dirty_poll_mark_active(uint8_t slave_id) {
     s_dp[idx].last_activity_ms = to_ms_since_boot(get_absolute_time());
 }
 
-static void ballast_read_cb(int res, uint8_t *buf, void *ctx);   /* forward decl */
 
 /* Track a gateway's Modbus reachability and emit state_gateway on transition.
  * `ok` = this read of the gateway succeeded. Debounced by GATEWAY_FAIL_THRESHOLD
@@ -198,127 +198,7 @@ static void gwdiag_cb(int res, uint8_t *buf, void *ctx) {
      * boot_count) — nothing to feed to the command queue. */
 }
 
-/* ── Dirty bitmask callback ──────────────────────────────────────────────── */
-static void dirty_bitmask_cb(int res, uint8_t *buf, void *ctx) {
-    uint8_t slave_id = *(uint8_t *)ctx;
-    int     idx      = state_cache_slave_idx(slave_id);
-    if (idx < 0) return;
 
-    dpoll_t *dp     = &s_dp[idx];
-    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    dp->state       = DPOLL_IDLE;
-
-    /* fix #5: FC04 4-register frame = slave+FC+bytecount+8data+CRC = 13 bytes */
-    if (res < 13) {
-        LOG_WARN("dirty", "bitmask read failed slave %u (%d)", slave_id, res);
-        gateway_report(slave_id, idx, false);
-        return;
-    }
-    gateway_report(slave_id, idx, true);
-
-    uint8_t *p = buf + 3;
-    uint64_t mask = ((uint64_t)((p[0]<<8)|p[1]))       |
-                    ((uint64_t)((p[2]<<8)|p[3]) << 16)  |
-                    ((uint64_t)((p[4]<<8)|p[5]) << 32)  |
-                    ((uint64_t)((p[6]<<8)|p[7]) << 48);
-
-    if (mask != 0) {
-        LOG_DBG("dirty", "slave=%u dirty_mask=0x%016llx",
-                 slave_id, (unsigned long long)mask);
-    }
-
-    if (mask == 0) {
-        /* Deactivate only once the active window has fully elapsed since the last
-         * command or detected change — not after a couple of quick zero reads.
-         * On/fade/multi-target dirty bits can land hundreds of ms after the
-         * command, well past the old 2-zero (~200ms) cutoff. */
-        if (now_ms - dp->last_activity_ms >= DIRTY_ACTIVE_WINDOW_MS) {
-            dp->active = false;
-        }
-    } else {
-        dp->active           = true;   /* a sweep that finds a change re-activates fast polling */
-        dp->last_activity_ms = now_ms;
-        dp->pending_dirty    = mask;
-        for (int a = 0; a < DALI_ADDR_COUNT; a++) {
-            if (mask & ((uint64_t)1 << a)) {
-                LOG_DBG("dirty",
-                         "slave=%u: ballast %d flagged dirty — reading BLOCK0 holding reg %u for fresh arc/status",
-                         slave_id, a, (unsigned)(DALI_BLOCK0_START + a));
-                /* BLOCK0 is now an FC03 holding-register bank (post refactor).
-                 * Only advance if queued (else stay IDLE and re-poll next tick). */
-                if (modbus_get_holding_registers(slave_id,
-                                                 DALI_BLOCK0_START + (uint16_t)a, 1,
-                                                 ballast_read_cb, &s_bctx[idx][a]))
-                    dp->state = DPOLL_AWAITING_BALLAST;
-                break;
-            }
-        }
-    }
-}
-
-/* ── Per-ballast block-0 read callback ──────────────────────────────────── */
-static void ballast_read_cb(int res, uint8_t *buf, void *ctx) {
-    ballast_ctx_t *bc    = (ballast_ctx_t *)ctx;
-    uint8_t        slave = bc->slave_id;
-    uint8_t        addr  = bc->addr;
-    int            idx   = state_cache_slave_idx(slave);
-    if (idx < 0) return;
-
-    dpoll_t *dp = &s_dp[idx];
-    dp->state   = DPOLL_IDLE;
-
-    /* fix #5: FC04 1-register frame = slave+FC+bytecount+2data+CRC = 7 bytes */
-    if (res >= 7) {
-        uint8_t status = buf[3];
-        uint8_t arc    = buf[4];
-        if (arc == 0xFFu) {
-            /* 0xFF is not a valid DALI level (max is 254) — a corrupt or
-             * unavailable read. Drop it rather than reporting 100%; the cached
-             * (last good) level stands until a valid read arrives. */
-            LOG_WARN("dirty", "ballast %u.%u read arc=0xFF (invalid) — ignoring",
-                     slave, addr);
-        } else {
-            /* Only emit when something reportable actually changed. The gateway
-             * re-polls a fading ballast continuously (correct — until FADE_RUNNING
-             * clears), so without this we'd spam an identical state_dali every
-             * ~100 ms for the whole fade. We still update the cache and keep
-             * polling (to catch the level ramp and the fade end) — we just don't
-             * re-report no-ops. */
-            dali_ballast_state_t *b =
-                (idx >= 0) ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
-            bool report = (b == NULL)
-                || b->arc_level != arc
-                || ((b->status_byte ^ status) & 0x12u);  /* 0x10 fading | 0x02 lamp_fail */
-            if (report) {
-                lighting_emit_dali_state(slave, addr, arc, status);
-                LOG_DBG("dirty", "ballast %u.%u arc=%u status=0x%02x",
-                        slave, addr, arc, status);
-                if ((status & 0x02) || (status & 0x80))
-                    lighting_emit_fault(slave, addr,
-                                        (status & 0x02) != 0, (status & 0x80) != 0);
-            } else if (idx >= 0) {
-                state_cache_set_dali_arc((uint8_t)idx, addr, arc, status);
-            }
-        }
-    }
-
-    dp->pending_dirty &= ~((uint64_t)1 << addr);
-    for (int a = addr + 1; a < DALI_ADDR_COUNT; a++) {
-        if (dp->pending_dirty & ((uint64_t)1 << a)) {
-            LOG_DBG("dirty",
-                     "slave=%u: ballast %d also dirty — reading next BLOCK0 holding reg %u",
-                     slave, a, (unsigned)(DALI_BLOCK0_START + a));
-            /* BLOCK0 is now an FC03 holding-register bank (post refactor).
-             * Only advance if queued; otherwise stay IDLE so the next dirty-mask
-             * poll re-detects and retries (vs. stranding state at AWAITING). */
-            if (modbus_get_holding_registers(slave,
-                                             DALI_BLOCK0_START + (uint16_t)a, 1,
-                                             ballast_read_cb, &s_bctx[idx][a]))
-                dp->state = DPOLL_AWAITING_BALLAST;
-            return;
-        }
-    }
-}
 
 /* ── Tick ────────────────────────────────────────────────────────────────── */
 void dirty_poll_tick(void) {
@@ -384,35 +264,15 @@ void dirty_poll_tick(void) {
          * driven from the main loop. What remains in this file is the relay
          * board (a different device entirely) and the gateway sysinfo poll,
          * neither of which the strip touches. */
-        if (false && dp->active && dp->state == DPOLL_IDLE) {
-            if (now_ms - dp->last_poll_ms >= DIRTY_POLL_INTERVAL_MS) {
-                dp->last_poll_ms = now_ms;
-                /* Advance state only if the read queued; a dropped action never
-                 * fires its callback, which would strand state at AWAITING_* and
-                 * permanently stop polling this slave. Stay IDLE and retry. */
-                if (modbus_get_input_registers(slave_id, DALI_DIRTY_START, 4,
-                                               dirty_bitmask_cb,
-                                               &s_dirty_ctx_slave[i]))
-                    dp->state = DPOLL_AWAITING_DIRTY;
-            }
-        }
-
-        if (false && !dp->active && dp->state == DPOLL_IDLE) {
-            if (now_ms - dp->last_bg_ms >= BACKGROUND_CHECK_MS) {
-                dp->last_bg_ms = now_ms;
-                dirty_poll_background_check(slave_id);
-            } else if (dp->reachable
-                       && now_ms - dp->last_sweep_ms >= DIRTY_SWEEP_MS) {
-                /* Regular cheap dirty-mask sweep so external / manual / post-fade
-                 * changes reflect within ~1s even when no command was issued. A
-                 * non-zero mask re-activates fast polling (see dirty_bitmask_cb). */
-                dp->last_sweep_ms = now_ms;
-                if (modbus_get_input_registers(slave_id, DALI_DIRTY_START, 4,
-                                               dirty_bitmask_cb,
-                                               &s_dirty_ctx_slave[i]))
-                    dp->state = DPOLL_AWAITING_DIRTY;
-            }
-        }
+        /* Gateway reachability now rides the COMMAND QUEUE rather than a
+         * dedicated register poll. The queue talks to each gateway continuously
+         * (the world-model sweep alone keeps it busy), so consecutive no-reply
+         * transactions are both the earliest and the cheapest liveness signal
+         * available — far better than the 30 s sysinfo poll, which was the only
+         * other candidate once the dirty sweep went away. A Modbus exception
+         * does NOT count: that is the gateway alive and disagreeing. */
+        gateway_report(slave_id, i,
+                       mbq_client_consec_fail(slave_id) < GATEWAY_FAIL_THRESHOLD);
     }
 }
 
@@ -425,89 +285,10 @@ typedef struct {
     uint16_t      count;
 } sync_ctx_t;
 
-static void sync_read_cb(int res, uint8_t *buf, void *ctx) {
-    sync_ctx_t *c = (sync_ctx_t *)ctx;
-    /* fix #5: full frame = slave+FC+bytecount+data+CRC = 5 + count*2 bytes */
-    if (res >= (int)(5 + c->count * 2)) {
-        uint8_t *p = buf + 3;
-        for (uint16_t i = 0; i < c->count; i++) {
-            c->out[i] = ((uint16_t)p[0] << 8) | p[1];
-            p += 2;
-        }
-        c->ok = true;
-    }
-    c->done = true;
-}
 
-static bool sync_read(uint8_t slave, uint16_t addr, uint16_t count,
-                       uint16_t *out) {
-    static sync_ctx_t ctx;
-    ctx.done  = false;
-    ctx.ok    = false;
-    ctx.out   = out;
-    ctx.count = count;
-    modbus_get_input_registers(slave, addr, count, sync_read_cb, &ctx);
-    absolute_time_t deadline = make_timeout_time_ms(1000);
-    while (!ctx.done && absolute_time_diff_us(get_absolute_time(), deadline) > 0)
-        modbus_poll();
-    return ctx.ok;
-}
 
-/* FC03 holding-register variant — used for the per-ballast banks (BLOCK0..3)
- * which moved from FC04 input regs to FC03 holding regs in the refactor. */
-static bool sync_read_holding(uint8_t slave, uint16_t addr, uint16_t count,
-                              uint16_t *out) {
-    static sync_ctx_t ctx;
-    ctx.done  = false;
-    ctx.ok    = false;
-    ctx.out   = out;
-    ctx.count = count;
-    modbus_get_holding_registers(slave, addr, count, sync_read_cb, &ctx);
-    absolute_time_t deadline = make_timeout_time_ms(1000);
-    while (!ctx.done && absolute_time_diff_us(get_absolute_time(), deadline) > 0)
-        modbus_poll();
-    return ctx.ok;
-}
 
 /* ── Group-mask read (used by full_scan and background_check) ────────────── */
-/* Group g lives at FC03 holding regs DALI_GROUP_MASK_START + 4*g .. +4*g+3.
- * TinyModbus stores each group's 8-byte member bitmap as group_mask[g][0..7]
- * where byte 0 covers ballasts 0-7 (LSB=ballast 0), byte 1 ballasts 8-15, …,
- * byte 7 ballasts 56-63 (see TinyModbus/src/registers.c:376-387).
- * The register read path packs each pair as (group_mask[g][2r] << 8) |
- * group_mask[g][2r+1] (registers.c:159-163). So in the 16-bit register value
- * received here, the HIGH byte holds the lower-numbered ballasts and the LOW
- * byte holds the higher-numbered ones. Byte-swap each register so that bit N
- * in the assembled 64-bit mask corresponds to ballast short address N. */
-static void read_all_group_masks(uint8_t slave_id, uint8_t idx) {
-    uint16_t regs[64];  /* 16 groups * 4 regs */
-    LOG_DBG("dirty",
-            "slave=%u: reading 16 DALI group membership masks (holding regs %u..%u) to refresh group state",
-            slave_id, (unsigned)DALI_GROUP_MASK_START,
-            (unsigned)(DALI_GROUP_MASK_START + 64 - 1));
-    for (uint16_t chunk = 0; chunk < 4; chunk++) {
-        uint16_t off = chunk * DALI_MAX_CHUNK;  /* 4 groups per 16-reg chunk */
-        if (!sync_read_holding(slave_id,
-                                DALI_GROUP_MASK_START + off,
-                                DALI_MAX_CHUNK, regs + off)) {
-            LOG_WARN("dirty", "group mask chunk %u failed slave %u",
-                     chunk, slave_id);
-            return;
-        }
-    }
-    for (uint8_t g = 0; g < 16; g++) {
-        uint16_t *r = regs + 4 * g;
-        uint64_t mask = 0;
-        for (int word = 0; word < 4; word++) {
-            uint16_t v = r[word];
-            /* Swap bytes: high byte = lower-numbered ballasts (bits N..N+7),
-             * low byte = higher-numbered ballasts (bits N+8..N+15). */
-            uint16_t le = (uint16_t)((v >> 8) | ((v & 0xFFu) << 8));
-            mask |= (uint64_t)le << (word * 16);
-        }
-        state_cache_set_dali_group(idx, g, mask);
-    }
-}
 
 /* ── Blocking startup full scan ──────────────────────────────────────────── */
 
@@ -545,69 +326,3 @@ void dirty_poll_full_scan(uint8_t slave_id) {
     lighting_emit_scan_complete(slave_id, present);
 }
 
-void dirty_poll_background_check(uint8_t slave_id) {
-    int idx = state_cache_slave_idx(slave_id);
-    if (idx < 0 || s_dp[idx].active) return;
-
-    uint16_t present_regs[4] = {0};
-    if (!sync_read(slave_id, DALI_PRESENT_START, 4, present_regs)) {
-        gateway_report(slave_id, idx, false);
-        return;
-    }
-    gateway_report(slave_id, idx, true);
-
-    uint64_t present_mask =
-        ((uint64_t)present_regs[0])       |
-        ((uint64_t)present_regs[1] << 16) |
-        ((uint64_t)present_regs[2] << 32) |
-        ((uint64_t)present_regs[3] << 48);
-
-    LOG_DBG("dirty", "background check slave=%u present=0x%016llx",
-             slave_id, (unsigned long long)present_mask);
-
-    uint64_t prev        = s_dp[idx].last_present;
-    uint64_t appeared    = present_mask & ~prev;
-    uint64_t disappeared = prev & ~present_mask;
-
-    if (appeared || disappeared) {
-        LOG_INFO("dirty",
-                 "presence change slave=%u appeared=0x%016llx disappeared=0x%016llx",
-                 slave_id,
-                 (unsigned long long)appeared,
-                 (unsigned long long)disappeared);
-        s_dp[idx].last_present = present_mask;
-        for (int a = 0; a < DALI_ADDR_COUNT; a++) {
-            state_cache_set_dali_present((uint8_t)idx, (uint8_t)a,
-                                          (present_mask >> a) & 1);
-        }
-        lighting_emit_presence(slave_id, appeared, disappeared);
-    }
-
-    /* Re-read group membership masks so memberships set via Modbus by an
-     * external master are picked up (and to recover from any drift). */
-    read_all_group_masks(slave_id, (uint8_t)idx);
-
-    /* BLOCK0 is FC03 holding regs post refactor. */
-    LOG_DBG("dirty",
-            "slave=%u: background check reading BLOCK0 arc/status (holding regs %u..%u) to detect faults",
-            slave_id, (unsigned)DALI_BLOCK0_START,
-            (unsigned)(DALI_BLOCK0_START + DALI_ADDR_COUNT - 1));
-    uint16_t b0[DALI_ADDR_COUNT];
-    bool b0_ok[4];
-    for (uint16_t c = 0; c < 4; c++) {
-        b0_ok[c] = sync_read_holding(slave_id, DALI_BLOCK0_START + c * DALI_MAX_CHUNK,
-                                     DALI_MAX_CHUNK, b0 + c * DALI_MAX_CHUNK);
-        if (!b0_ok[c])
-            LOG_WARN("dirty", "bg block0 chunk %u read failed slave %u", (unsigned)c, slave_id);
-    }
-    for (int a = 0; a < DALI_ADDR_COUNT; a++) {
-        if (!(present_mask & ((uint64_t)1 << a))) continue;
-        if (!b0_ok[a / DALI_MAX_CHUNK]) continue;   /* skip fault check on a failed read */
-        uint8_t status = (b0[a] >> 8) & 0xFF;
-        if ((status & 0x02) || (status & 0x80)) {
-            lighting_emit_dali_state(slave_id, (uint8_t)a, b0[a] & 0xFF, status);
-            lighting_emit_fault(slave_id, (uint8_t)a,
-                                (status & 0x02) != 0, (status & 0x80) != 0);
-        }
-    }
-}

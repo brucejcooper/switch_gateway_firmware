@@ -89,6 +89,7 @@ typedef struct {
     /* diagnostics */
     uint32_t c_submitted, c_completed, c_failed, c_lost, c_reboots, c_timeouts;
     uint32_t c_polls;   /* read-only status-poll transactions issued */
+    uint16_t c_consec_fail;  /* consecutive failed transactions; 0 = link healthy */
 
     /* Per-transaction timing window (bench; reset by mbq_client_txn_stats_reset).
      * t_issue is stamped when the FC23 is handed to the Modbus layer, so the
@@ -132,6 +133,11 @@ static void mbq_fc23_cb(int res, uint8_t *buf, void *ctx) {
     if (res <= 0) {
         s->w_fail++;
         if (res < 0 && buf && buf[2] == 0x06u) s->w_busy++;
+        /* Link liveness: a Modbus exception is still an ANSWER — the gateway is
+         * alive and disagreeing — so only a genuine no-reply counts against it. */
+        if (res == 0 && s->c_consec_fail < 0xFFFFu) s->c_consec_fail++;
+    } else {
+        s->c_consec_fail = 0;
     }
     s->cb_res = res;
     s->cb_len = 0;
@@ -218,6 +224,11 @@ void mbq_client_txn_stats(uint8_t slave_id, mbq_txn_stats_t *out) {
     out->us_avg = (uint32_t)(s->w_sum / s->w_n);
     out->n_fail = s->w_fail;
     out->n_busy = s->w_busy;
+}
+
+uint16_t mbq_client_consec_fail(uint8_t slave_id) {
+    slave_t *s = slave_for(slave_id);
+    return s ? s->c_consec_fail : 0u;
 }
 
 void mbq_client_txn_stats_reset(uint8_t slave_id) {

@@ -101,5 +101,11 @@ void mbq_client_txn_stats(uint8_t slave_id, mbq_txn_stats_t *out);
  * bench run measures only its own window. */
 void mbq_client_txn_stats_reset(uint8_t slave_id);
 
+/* Consecutive transactions to `slave_id` that got NO REPLY (0 = healthy). This
+ * is the controller's best liveness signal for a gateway: the queue talks to it
+ * continuously, so it notices a dead link far sooner than any periodic probe. A
+ * Modbus EXCEPTION does not count — that is the gateway alive and disagreeing. */
+uint16_t mbq_client_consec_fail(uint8_t slave_id);
+
 /* Dump per-slave client state to the console (dev CLI). slave_id < 0 = all. */
 void mbq_client_debug_print(int slave_id);
