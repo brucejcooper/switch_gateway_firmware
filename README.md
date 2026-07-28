@@ -420,7 +420,17 @@ block remain, purely as an HA diagnostic in `dirty_poll.c`.)
 **Observability.** The CLI **`dq [slave]`** command dumps the adapter's per-class
 backlog depths, the in-flight count, and its counters (submitted / ok / nak / err
 / dropped / backlog-full), then the underlying client's per-slot state
-(`free`/`armed`/`sent`/`live`) and counters. Bare = all DALI slaves.
+(`free`/`armed`/`sent`/`live`) and counters, including the poll-transaction count.
+Bare = all DALI slaves. For throughput and correctness under load, see
+[`busload` and `soak`](#measuring-the-command-path-busload-and-soak).
+
+**Submit length (task 07).** A submit's FC23 write count is in **registers**, and
+the gateway derives `n_slots = wr_count / 2` from it — so a one-command submit
+declares `MBQ_CMD_REGS` (2), not `MBQ_CMD_BYTES` (4). Declaring bytes there does
+not fail the request: it arms the *next* slot as well, using whatever memory
+followed the command buffer as a second, real DALI frame. That shipped in task 06
+and is fixed here; `MBQ_CMD_REGS` and a `_Static_assert` now sit beside
+`MBQ_CMD_BYTES` so the units cannot drift apart again.
 
 **Subsystems on the queue.** Every former single-slot producer rides it: the raw
 command path (button on/off/step, group commands, config DTR0+SET), the **any-on
@@ -1063,6 +1073,49 @@ printf 'show mappings\n'     > /dev/tty.usbmodem111201
 Raise verbosity with `log dbg` to watch Modbus traffic and the button/DALI event
 flow. Core 1's own activity (link, DHCP, MQTT connect, discovery, publish flow)
 logs on the same port under the `net` / `mqtt` / `core1` tags.
+
+### Measuring the command path: `busload` and `soak`
+
+Two bench instruments answer "is the comms path healthy, and how fast can it
+actually go?" (task 07). Both are dev-grade CLI only — no MQTT surface.
+
+**`busload [reset]`** — who is using the RS-485 bus. Each transaction is charged
+from leaving the action queue until the bus SM returns to IDLE, so the figure
+includes its retries and dead time — what that transaction really costs every
+other producer. The per-slave split is the point: an absent board being retried
+three times a poll costs the same bus time as real work and is invisible
+everywhere else (the bench's dead relay at slave 1 holds ~8 % of the bus
+permanently). Also reports re-sends split into timeout vs DEVICE_BUSY, and slave
+turnaround against the 50 ms response timeout — which distinguishes a reply that
+was *lost* from one that was merely *late*.
+
+**`soak <slave> <addr> [n=<pairs>] [depth=<1-8>]`** (bare = report, `soak stop`
+to end an open-ended run) — hammers the gateway command queue with alternating
+
+```
+SET DTR0 = v          special command 0xA3<v>, one forward frame, no answer
+QUERY CONTENT DTR0    opcode 0x98, backward frame — MUST answer v
+```
+
+DTR0 is deliberately the stimulus: it is the one settable value in the control
+gear that is **volatile**, so unlike fade time or power-on level a long soak
+costs no ballast EEPROM write cycles. `v` walks a stride-97 cycle over all 256
+values, so consecutive pairs never share an expected answer — which makes a
+result that is one command stale distinguishable from random corruption, and
+both distinguishable from success.
+
+The probe submits straight into `mbq_client`, bypassing the `dali_queue` priority
+backlog, and paces on gateway-side slot occupancy (`depth`, default 4 = half the
+queue) rather than on a DEVICE_BUSY rejection. Its report gives the verdict
+(correct / lag-1 / other / nak / lost), pair and DALI frame rates, latency, the
+Modbus transactions that paid for it, the bus split, and a pacing breakdown that
+names the actual constraint: **queue-full % = DALI-bound** (good — the gateway
+queue is kept fed and the DALI bus is the limit) vs **tx-busy % = Modbus-bound**.
+
+Reference numbers on the bench (slave 3 addr 0, 19200): depth 4 sustains ~14
+pairs/s = 28 DALI frames/s at 71 ms per pair, which is ~88 % of the IEC 62386
+frame budget for that pair (~63 ms); throughput saturates at depth 3 and beyond
+that only latency grows. See `tasks/07-queue-soak.md`.
 
 ### Resetting to defaults
 

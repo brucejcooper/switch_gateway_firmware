@@ -63,6 +63,14 @@ addresses, so an FC23 read range can target it):**
 There are no aggregate counters and no shared result ring — each slot is complete on
 its own.
 
+**A submit's write length selects how many slots it arms**, and the slave derives
+`n_slots = wr_count / 2` from it. A one-command submit must therefore declare
+**2 registers**, not 4 bytes. Getting those units wrong is not a rejected request:
+it silently arms the FOLLOWING slot too, with whatever memory sat after the
+command buffer as its payload — a real command the queue will faithfully execute.
+The controller keeps `MBQ_CMD_REGS` and a `_Static_assert` next to
+`MBQ_CMD_BYTES` for exactly this reason (see task 07).
+
 ## Ordering
 
 Execution order is the **slave-assigned accept sequence**: when a slot goes
