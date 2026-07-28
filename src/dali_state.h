@@ -53,6 +53,11 @@ void dali_state_mark_all(uint8_t slave_id);
  * boot, after provisioning, and by the CLI `scan`. Non-blocking — progress is
  * made by dali_state_tick(); dali_state_scan_busy() reports completion. */
 void dali_state_request_full_scan(uint8_t slave_id);
+
+/* Re-interrogate ONE ballast completely, group membership included. Used after
+ * an ADD/REMOVE FROM GROUP write so the membership cache is confirmed by a read
+ * rather than left as the controller's prediction. */
+void dali_state_mark_scan(uint8_t slave_id, uint8_t addr);
 bool dali_state_scan_busy(uint8_t slave_id);
 
 /* Dump per-slave sweep state and presence to the console (CLI `dstate`). */

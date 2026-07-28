@@ -140,6 +140,12 @@ void dali_state_request_full_scan(uint8_t slave_id) {
     LOG_INFO("dstate", "slave %u full scan armed", slave_id);
 }
 
+void dali_state_mark_scan(uint8_t slave_id, uint8_t addr) {
+    ds_slave_t *d = slave_for(slave_id);
+    if (!d || addr >= 64) return;
+    d->scan |= (uint64_t)1 << addr;
+}
+
 bool dali_state_scan_busy(uint8_t slave_id) {
     ds_slave_t *d = slave_for(slave_id);
     return d && (d->scan != 0 || (d->busy && d->is_scan));

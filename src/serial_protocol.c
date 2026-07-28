@@ -1144,29 +1144,53 @@ static void emit_state_group(uint8_t slave, uint8_t group) {
 /* Set a DALI group's full membership mask.  Writes the changed group-mask
  * registers (0x0110+); the gateway diffs old vs new and issues the DALI
  * ADD/REMOVE-from-group commands.  Updates the cache predictively. */
+/* Set a DALI group's membership.
+ *
+ * Task 05: this used to write the gateway's group-mask registers (0x0110+) and
+ * let the GATEWAY diff old-vs-new and emit the ADD/REMOVE FROM GROUP frames.
+ * That cache is being removed, and it was also the root of the group-toggle bug
+ * — a rebooted gateway lost the masks and the diff had nothing to work from.
+ * The controller now diffs against its own cache and emits the frames itself.
+ *
+ * ADD TO GROUP is 0x60|g and REMOVE FROM GROUP is 0x70|g, both SET-class so
+ * they go send-twice, addressed to each ballast whose membership changed. They
+ * are idempotent (re-adding a member is a no-op), so a retry is safe.
+ *
+ * The membership cache is NOT taken on trust afterwards: each touched ballast is
+ * marked for a full re-interrogation, so QUERY GROUPS confirms what actually
+ * stuck. Predicting it locally is what made the old bug invisible. */
 static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_mask) {
     int idx = state_cache_slave_idx(slave);
     if (idx < 0) return;
     uint64_t old_mask = state_cache_get_dali_group((uint8_t)idx, group);
-    int last = -1;
-    for (int w = 0; w < 4; w++)
-        if (((old_mask ^ new_mask) >> (w * 16)) & 0xFFFFu) last = w;
-    for (int w = 0; w < 4; w++) {
-        uint16_t old_w = (uint16_t)((old_mask >> (w * 16)) & 0xFFFFu);
-        uint16_t new_w = (uint16_t)((new_mask >> (w * 16)) & 0xFFFFu);
-        if (old_w == new_w) continue;
-        /* group-mask wire order is byte-swapped vs the 16-bit word (mirror of
-         * read_all_group_masks). */
-        uint16_t reg_val = (uint16_t)(((new_w & 0xFFu) << 8) | (new_w >> 8));
-        static cli_mb_ctx_t ctx;
-        memset(&ctx, 0, sizeof ctx);
-        modbus_set_holding_register(slave,
-            (uint16_t)(DALI_GROUP_MASK_START + group * 4 + w), reg_val, cli_mb_cb, &ctx);
-        cli_mb_wait(&ctx);
-        /* The gateway processes one group write at a time, so let its ADD/REMOVE
-         * traffic settle before the next changed word. */
-        if (w != last) sleep_ms(250);
+    uint64_t diff = old_mask ^ new_mask;
+    if (!diff) return;
+
+    for (uint8_t a = 0; a < DALI_ADDR_COUNT; a++) {
+        uint64_t bit = (uint64_t)1 << a;
+        if (!(diff & bit)) continue;
+        bool add = (new_mask & bit) != 0;
+        uint8_t addr_byte = (uint8_t)(((a & 0x3Fu) << 1) | 0x01u);
+        uint8_t opcode    = (uint8_t)((add ? 0x60u : 0x70u) | (group & 0x0Fu));
+
+        /* The user class is bounded, so spin the bus until this one is accepted
+         * rather than dropping members of a membership change on the floor. */
+        absolute_time_t dl = make_timeout_time_ms(2000);
+        while (!dq_submit(slave, DQ_PRIO_GROUP_WRITE, addr_byte, opcode,
+                          DQ_TWICE, 0, true, NULL, NULL)) {
+            if (absolute_time_diff_us(get_absolute_time(), dl) <= 0) {
+                LOG_WARN("cli", "group %u.G%u %s addr %u dropped — queue busy",
+                         slave, group, add ? "add" : "remove", a);
+                break;
+            }
+            modbus_poll();
+            dq_tick();
+            wd_feed();
+        }
+        dali_state_mark_scan(slave, a);   /* confirm by reading it back */
     }
+    /* Optimistic local update; the re-interrogation above is the authority and
+     * will correct it if a write did not take. */
     state_cache_set_dali_group((uint8_t)idx, group, new_mask);
 }
 
