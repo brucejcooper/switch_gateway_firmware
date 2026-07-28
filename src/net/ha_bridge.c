@@ -399,12 +399,29 @@ static void disc_gw_diag(uint8_t slave, uint8_t k) {
     #undef GWD_TAIL
 }
 
-/* one of the 7 controller-config entities (4 numbers + 2 sensors + 1 switch). No
- * values needed for discovery — the config/state topic carries them. */
+/* Controller-config entities. The tables live at file scope and the step bounds
+ * are DERIVED from their sizes: they used to be hardcoded (k < 4, k - 4, k == 6,
+ * total 7), so adding a fifth number silently published nothing — the new entity
+ * sat in the table but past the guard. */
+static const struct { const char *key, *name; int lo, hi, step; } CFG_NUM[] = {
+    { "long_press_ms",          "Long-Press (ms)",            100,   5000,   50 },
+    { "dim_repeat_ms",          "Dim Repeat (ms)",             50,   2000,   10 },
+    { "reversal_window_ms",     "Reversal Window (ms)",        50,   2000,   10 },
+    { "gw_diag_interval_ms",    "Gateway Diag Poll (ms)",       0, 600000, 1000 },
+    { "dali_sweep_interval_ms", "DALI Background Sweep (ms)",   0, 600000, 1000 },
+};
+static const struct { const char *key, *name, *icon; } CFG_SENS[] = {
+    { "fw_version", "Firmware",    "mdi:chip" },
+    { "baud",       "Modbus Baud", "mdi:speedometer" },
+};
+#define CFG_NUM_N   (sizeof CFG_NUM  / sizeof CFG_NUM[0])
+#define CFG_SENS_N  (sizeof CFG_SENS / sizeof CFG_SENS[0])
+#define CFG_STEPS   (CFG_NUM_N + CFG_SENS_N + 1u)   /* + the relay_byteswap switch */
+
 static void disc_controller(uint8_t k) {
     const char *P = mqtt_app_prefix();
     char objid[32];
-    if (k == 6) {
+    if (k >= CFG_NUM_N + CFG_SENS_N) {
         /* relay_byteswap switch — reverses Waveshare 32CH coil read-back order. */
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"lighting_cfg_relay_byteswap\",\"name\":\"Relay Byte-Swap\","
@@ -421,41 +438,31 @@ static void disc_controller(uint8_t k) {
         pub_cfg("switch", "lighting_cfg_relay_byteswap");
         return;
     }
-    if (k < 4) {
-        static const struct { const char *key, *name; int lo, hi, step; } N[] = {
-            { "long_press_ms", "Long-Press (ms)", 100, 5000, 50 },
-            { "dim_repeat_ms", "Dim Repeat (ms)", 50, 2000, 10 },
-            { "reversal_window_ms", "Reversal Window (ms)", 50, 2000, 10 },
-            { "gw_diag_interval_ms", "Gateway Diag Poll (ms)", 0, 600000, 1000 },
-            { "dali_sweep_interval_ms", "DALI Background Sweep (ms)", 0, 600000, 1000 },
-        };
+    if (k < CFG_NUM_N) {
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\","
             "\"command_topic\":\"%s/config/%s/set\",\"state_topic\":\"%s/config/state\","
             "\"value_template\":\"{{ value_json.%s }}\",\"min\":%d,\"max\":%d,\"step\":%d,"
             "\"mode\":\"box\",\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\"",
-            N[k].key, N[k].name, P, N[k].key, P, N[k].key, N[k].lo, N[k].hi, N[k].step, P);
+            CFG_NUM[k].key, CFG_NUM[k].name, P, CFG_NUM[k].key, P, CFG_NUM[k].key,
+            CFG_NUM[k].lo, CFG_NUM[k].hi, CFG_NUM[k].step, P);
         pcat(n,
             ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
             "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
             "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-        snprintf(objid, sizeof objid, "lighting_cfg_%s", N[k].key); pub_cfg("number", objid);
+        snprintf(objid, sizeof objid, "lighting_cfg_%s", CFG_NUM[k].key); pub_cfg("number", objid);
     } else {
-        static const struct { const char *key, *name, *icon; } S[] = {
-            { "fw_version", "Firmware", "mdi:chip" },
-            { "baud", "Modbus Baud", "mdi:speedometer" },
-        };
-        int b = k - 4;
+        int b = k - (int)CFG_NUM_N;
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\",\"state_topic\":\"%s/config/state\","
             "\"value_template\":\"{{ value_json.%s }}\",\"availability_topic\":\"%s/availability\","
             "\"entity_category\":\"diagnostic\",\"icon\":\"%s\"",
-            S[b].key, S[b].name, P, S[b].key, P, S[b].icon);
+            CFG_SENS[b].key, CFG_SENS[b].name, P, CFG_SENS[b].key, P, CFG_SENS[b].icon);
         pcat(n,
             ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
             "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
             "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-        snprintf(objid, sizeof objid, "lighting_cfg_%s", S[b].key); pub_cfg("sensor", objid);
+        snprintf(objid, sizeof objid, "lighting_cfg_%s", CFG_SENS[b].key); pub_cfg("sensor", objid);
     }
 }
 
@@ -490,7 +497,7 @@ static disc_res_t disc_step(void) {
         return DISC_MORE;
     case PH_CONTROLLER:
         disc_controller((uint8_t)s_i);
-        if (++s_i >= 7) { s_ph = PH_PLATE_EVT; s_i = s_j = 0; }
+        if (++s_i >= CFG_STEPS) { s_ph = PH_PLATE_EVT; s_i = s_j = 0; }
         return DISC_MORE;
     case PH_PLATE_EVT:
         disc_plate_event((uint8_t)s_i, (uint8_t)s_j);
