@@ -43,7 +43,6 @@
  * ballast per 64 s. An earlier version of this file used 250 ms, which is 256x
  * faster than the thing it replaced and kept the RS-485 bus ~59% busy doing
  * nothing useful. */
-#define SWEEP_INTERVAL_MS   10000u
 
 /* While a ballast reports FADE RUNNING, re-read it at this pace until it
  * settles. A DAPC lands immediately but the level ramps, so a single read taken
@@ -52,6 +51,16 @@
  * fade bit must not pin the bus forever; DALI's longest fade time is ~90 s. */
 #define FADE_POLL_MS        250u
 #define FADE_TRACK_MAX_MS   95000u
+
+/* Every Nth background step probes an ABSENT address instead of re-reading a
+ * present one. Without this the sweep only ever walks ballasts it already
+ * believes in, so a ballast that was powered off at boot — or added afterwards —
+ * would never be rediscovered short of a manual `scan` or a reboot. A probe of
+ * an absent address costs exactly one query (STATUS gets a clean no-answer and
+ * the pass is abandoned), and at one probe per 6 steps a full pass over 64
+ * addresses takes ~64 min at the default interval: cheap, and far faster than
+ * "never". */
+#define ABSENT_PROBE_EVERY  6u
 
 /* QUERY STATUS bit 4 = fade running (IEC 62386-102). */
 #define STATUS_FADE_RUNNING 0x10u
@@ -94,7 +103,9 @@ typedef struct {
     bool     got_level_ok;
     uint16_t got_groups;
 
-    uint8_t  cursor;      /* rotating idle sweep position */
+    uint8_t  cursor;        /* rotating idle sweep position (present ballasts) */
+    uint8_t  absent_cursor; /* rotating probe position across ALL addresses */
+    uint8_t  step_count;    /* sweep steps taken, for the absent-probe cadence */
     absolute_time_t next_step_at;
 
     /* Fade tracking: re-verify a ballast while it reports FADE RUNNING. */
@@ -108,6 +119,14 @@ static ds_slave_t s_ds[MAX_DALI_SLAVES];
 #define QUERY_DEADLINE_MS 400u
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
+
+/* Background sweep pace, from config. 0 DISABLES the sweep (same convention as
+ * gw_diag_interval_ms). Disabling it is safe: every command the system issues is
+ * still verified immediately by the post-command path, so switching the sweep
+ * off only means "never re-check a ballast that nothing told us about". */
+static uint32_t sweep_interval_ms(void) {
+    return g_config.dali_sweep_interval_ms;
+}
 
 static ds_slave_t *slave_for(uint8_t slave_id) {
     for (int i = 0; i < MAX_DALI_SLAVES; i++)
@@ -264,7 +283,27 @@ static bool pick_next(ds_slave_t *d, uint8_t *addr_out, bool *is_scan) {
         *is_scan  = true;
         return true;
     }
+    if (sweep_interval_ms() == 0u) return false;   /* sweep disabled by config */
     if (!time_reached(d->next_step_at)) return false;
+
+    /* Periodically probe an address we believe is EMPTY, so gear that was off at
+     * boot or added later is discovered without a manual scan. */
+    if (++d->step_count >= ABSENT_PROBE_EVERY) {
+        d->step_count = 0;
+        for (uint8_t i = 0; i < 64; i++) {
+            uint8_t a = (uint8_t)((d->absent_cursor + i) & 0x3Fu);
+            if (!(d->present & ((uint64_t)1 << a))) {
+                d->absent_cursor = (uint8_t)((a + 1u) & 0x3Fu);
+                *addr_out = a;
+                /* Scan-style pass: a newly-found ballast needs its groups read
+                 * too, not just its level. */
+                *is_scan  = true;
+                return true;
+            }
+        }
+        /* Every address occupied — nothing to probe for. */
+    }
+
     for (uint8_t i = 0; i < 64; i++) {
         uint8_t a = (uint8_t)((d->cursor + i) & 0x3Fu);
         if (d->present & ((uint64_t)1 << a)) {
@@ -408,7 +447,7 @@ void dali_state_tick(void) {
             if (!pick_next(d, &addr, &is_scan)) continue;
             d->addr    = addr;
             d->is_scan = is_scan;
-            d->next_step_at = make_timeout_time_ms(SWEEP_INTERVAL_MS);
+            d->next_step_at = make_timeout_time_ms(sweep_interval_ms());
         }
         issue(d);   /* false = class full; retried next tick */
     }

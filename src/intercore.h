@@ -97,7 +97,8 @@ typedef struct {
         struct { uint8_t slave, state, count; char msg[IC_PROV_MSG_MAX]; } provision;
         struct { uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
                  uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap;
-                 uint32_t gw_diag_interval_ms; } cfg;
+                 uint32_t gw_diag_interval_ms;
+                 uint32_t dali_sweep_interval_ms; } cfg;
         /* CLI network-ping request: send `count` ICMP echoes to ip on core 1. */
         struct { uint8_t ip[4]; uint8_t count; } ping_req;
         /* DALI-gateway sysinfo (FC04 0x0310): seconds of uptime, reboots since
@@ -137,6 +138,7 @@ typedef struct {
 #define IC_CFG_F_DE_MODE    (1u << 4)
 #define IC_CFG_F_RELAY_BYTESWAP (1u << 5)
 #define IC_CFG_F_GW_DIAG    (1u << 6)
+#define IC_CFG_F_DALI_SWEEP (1u << 7)
 
 /* set_netcfg field-present bits */
 #define IC_NET_F_DHCP       (1u << 0)
@@ -198,7 +200,8 @@ typedef struct {
                  uint64_t members; } set_group;
         struct { uint16_t fields; uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
                  uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap;
-                 uint32_t gw_diag_interval_ms; } set_cfg;
+                 uint32_t gw_diag_interval_ms;
+                 uint32_t dali_sweep_interval_ms; } set_cfg;
         struct { uint8_t fixture, button, count;
                  mapping_target_t targets[MAX_TARGETS_PER_BTN]; } set_mapping;
         struct { uint8_t fixture, button; } del_mapping;

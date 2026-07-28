@@ -17,6 +17,12 @@ typedef struct {
      * block (uptime / boot count / reset reason) and publishes it to HA as
      * diagnostic sensors. Piggybacks on the existing dirty-poll loop. 0 = off. */
     uint32_t gw_diag_interval_ms;  /* default 30000 */
+    /* Background DALI sweep: interrogate ONE ballast per slave this often.
+     * 0 disables it. This is a backstop for changes nothing tells us about (a
+     * ballast that lost power, gear changed outside this controller) — every
+     * command the system issues is verified immediately regardless, so a slow
+     * sweep costs nothing user-visible. Default 10000. */
+    uint32_t dali_sweep_interval_ms;
     uint8_t  relay_slave_ids[MAX_RELAY_SLAVES];
     uint8_t  relay_slave_count;
     uint8_t  dali_slave_ids[MAX_DALI_SLAVES];

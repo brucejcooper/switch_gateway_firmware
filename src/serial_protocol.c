@@ -714,11 +714,12 @@ static void cmd_show(char **saveptr) {
 
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
-               "gw_diag_interval_ms=%lu "
+               "gw_diag_interval_ms=%lu dali_sweep_interval_ms=%lu "
                "baud=%lu rs485=%s relay_byteswap=%u fw_url=%s relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
                (unsigned long)g_config.gw_diag_interval_ms,
+               (unsigned long)g_config.dali_sweep_interval_ms,
                (unsigned long)modbus_get_baud(),
                modbus_de_mode_to_str(modbus_get_de_mode()),
                g_config.relay_byteswap ? 1u : 0u,
@@ -1039,6 +1040,7 @@ static void cmd_cfg(char **saveptr) {
         else if (strcasecmp(key, "dim_repeat_ms") == 0)      g_config.dim_repeat_ms = (uint16_t)atoi(val);
         else if (strcasecmp(key, "reversal_window_ms") == 0) g_config.reversal_window_ms = (uint16_t)atoi(val);
         else if (strcasecmp(key, "gw_diag_interval_ms") == 0) g_config.gw_diag_interval_ms = (uint32_t)strtoul(val, NULL, 10);
+        else if (strcasecmp(key, "dali_sweep_interval_ms") == 0) g_config.dali_sweep_interval_ms = (uint32_t)strtoul(val, NULL, 10);
         else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
         else if (strcasecmp(key, "relay_byteswap") == 0)
             g_config.relay_byteswap = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
@@ -1229,6 +1231,7 @@ static void emit_state_cfg(void) {
     ev.cfg.de_mode            = (uint8_t)modbus_get_de_mode();
     ev.cfg.relay_byteswap     = g_config.relay_byteswap ? 1u : 0u;
     ev.cfg.gw_diag_interval_ms = g_config.gw_diag_interval_ms;
+    ev.cfg.dali_sweep_interval_ms = g_config.dali_sweep_interval_ms;
     intercore_push_event(&ev);
 }
 
@@ -2416,6 +2419,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
         if (c->set_cfg.fields & IC_CFG_F_RELAY_BYTESWAP) { g_config.relay_byteswap = c->set_cfg.relay_byteswap ? true : false; any = true; }
         if (c->set_cfg.fields & IC_CFG_F_GW_DIAG)    { g_config.gw_diag_interval_ms = c->set_cfg.gw_diag_interval_ms; any = true; }
+        if (c->set_cfg.fields & IC_CFG_F_DALI_SWEEP) { g_config.dali_sweep_interval_ms = c->set_cfg.dali_sweep_interval_ms; any = true; }
         if (any && !config_save()) LOG_ERR("cli", "config_save failed — set_cfg not persisted");
         /* de_mode applies live and self-persists; keep it out of the `any` save. */
         if ((c->set_cfg.fields & IC_CFG_F_DE_MODE) && c->set_cfg.de_mode < MODBUS_DE_MAX)

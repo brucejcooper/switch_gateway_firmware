@@ -427,6 +427,7 @@ static void disc_controller(uint8_t k) {
             { "dim_repeat_ms", "Dim Repeat (ms)", 50, 2000, 10 },
             { "reversal_window_ms", "Reversal Window (ms)", 50, 2000, 10 },
             { "gw_diag_interval_ms", "Gateway Diag Poll (ms)", 0, 600000, 1000 },
+            { "dali_sweep_interval_ms", "DALI Background Sweep (ms)", 0, 600000, 1000 },
         };
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\","
@@ -923,10 +924,12 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         snprintf(pl, sizeof pl,
             "{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,\"baud\":%lu,"
             "\"relay_byteswap\":%u,\"gw_diag_interval_ms\":%lu,"
+            "\"dali_sweep_interval_ms\":%lu,"
             "\"fw_version\":\"" FW_VERSION "\",\"max_fixtures\":%u,\"max_buttons\":%u,\"max_targets\":%u}",
             e->cfg.long_press_ms, e->cfg.dim_repeat_ms, e->cfg.reversal_window_ms,
             (unsigned long)e->cfg.baud, e->cfg.relay_byteswap ? 1u : 0u,
             (unsigned long)e->cfg.gw_diag_interval_ms,
+            (unsigned long)e->cfg.dali_sweep_interval_ms,
             MAX_FIX, MAX_BTN, MAX_TARGETS_PER_BTN);
         mqtt_app_publish(top, pl, strlen(pl), true);
         break;
@@ -1228,6 +1231,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             if ((i = jfind(pay, tk, nt, "reversal_window_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = (uint16_t)jint(pay, &tk[i]); }
             if ((i = jfind(pay, tk, nt, "relay_byteswap")) >= 0)     { c.set_cfg.fields |= IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = jint(pay, &tk[i]) ? 1u : 0u; }
             if ((i = jfind(pay, tk, nt, "gw_diag_interval_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_GW_DIAG; c.set_cfg.gw_diag_interval_ms = (uint32_t)jint(pay, &tk[i]); }
+            if ((i = jfind(pay, tk, nt, "dali_sweep_interval_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_DALI_SWEEP; c.set_cfg.dali_sweep_interval_ms = (uint32_t)jint(pay, &tk[i]); }
         } else if (ns >= 3 && !strcmp(seg[2], "set")) {
             uint16_t v = (uint16_t)atoi(pay); const char *f = seg[1];
             if      (!strcmp(f, "long_press_ms"))      { c.set_cfg.fields = IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = v; }
@@ -1235,6 +1239,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             else if (!strcmp(f, "reversal_window_ms")) { c.set_cfg.fields = IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = v; }
             else if (!strcmp(f, "relay_byteswap"))     { c.set_cfg.fields = IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = v ? 1u : 0u; }
             else if (!strcmp(f, "gw_diag_interval_ms")) { c.set_cfg.fields = IC_CFG_F_GW_DIAG; c.set_cfg.gw_diag_interval_ms = (uint32_t)strtoul(pay, NULL, 10); }
+            else if (!strcmp(f, "dali_sweep_interval_ms")) { c.set_cfg.fields = IC_CFG_F_DALI_SWEEP; c.set_cfg.dali_sweep_interval_ms = (uint32_t)strtoul(pay, NULL, 10); }
         }
         if (c.set_cfg.fields) ic_push_cmd(&c);
         return;
