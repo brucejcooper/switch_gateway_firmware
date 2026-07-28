@@ -23,6 +23,7 @@
 #include "mapping.h"
 #include "lighting_actions.h"
 #include "dali_queue.h"
+#include "dq_soak.h"
 #include "dirty_poll.h"
 #include "serial_protocol.h"
 #include "dali_provision.h"
@@ -227,6 +228,7 @@ int main(void) {
         lighting_any_on_probe_tick();   /* submit probe queries into the gateway queue */
         lighting_cfg_query_tick();      /* submit config queries into the gateway queue */
         dq_tick();                      /* drive the gateway command queue (FC23) */
+        dq_soak_tick();                 /* bench: queue soak probe (idle unless started) */
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();

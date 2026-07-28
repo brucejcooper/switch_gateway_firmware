@@ -80,6 +80,7 @@ typedef struct {
 
     /* diagnostics */
     uint32_t c_submitted, c_completed, c_failed, c_lost, c_reboots, c_timeouts;
+    uint32_t c_polls;   /* read-only status-poll transactions issued */
 } slave_t;
 
 static slave_t s_sl[MAX_DALI_SLAVES];
@@ -164,6 +165,21 @@ bool mbq_client_busy(uint8_t slave_id) {
     return s->tx != TX_IDLE || any_owned_slot(s);
 }
 
+uint8_t mbq_client_inflight(uint8_t slave_id) {
+    slave_t *s = slave_for(slave_id);
+    if (!s) return 0;
+    uint8_t n = 0;
+    for (uint8_t k = 0; k < MBQ_SLOTS; k++)
+        if (s->slot[k].st != SLOT_FREE) n++;
+    return n;
+}
+
+void mbq_client_txn_counts(uint8_t slave_id, uint32_t *submits, uint32_t *polls) {
+    slave_t *s = slave_for(slave_id);
+    if (submits) *submits = s ? s->c_submitted : 0u;
+    if (polls)   *polls   = s ? s->c_polls     : 0u;
+}
+
 bool mbq_client_can_submit(uint8_t slave_id) {
     slave_t *s = slave_for(slave_id);
     if (!s) return false;
@@ -193,6 +209,7 @@ static void issue_poll(slave_t *s) {
     if (!ok) { s->next_at = make_timeout_time_ms(MBQ_POLL_MS); return; }
     s->tx      = TX_AWAIT;
     s->tx_slot = 0xFFu;
+    s->c_polls++;
 }
 
 bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
@@ -351,10 +368,11 @@ void mbq_client_debug_print(int slave_id) {
         for (uint8_t k = 0; k < MBQ_SLOTS; k++)
             printf(" %u:%s", k, s->slot[k].st <= SLOT_LIVE ? nm[s->slot[k].st] : "?");
         printf("\n  counters: submitted=%lu completed=%lu failed=%lu lost=%lu "
-               "reboots=%lu timeouts=%lu\n",
+               "reboots=%lu timeouts=%lu polls=%lu\n",
                (unsigned long)s->c_submitted, (unsigned long)s->c_completed,
                (unsigned long)s->c_failed, (unsigned long)s->c_lost,
-               (unsigned long)s->c_reboots, (unsigned long)s->c_timeouts);
+               (unsigned long)s->c_reboots, (unsigned long)s->c_timeouts,
+               (unsigned long)s->c_polls);
     }
     if (!any) printf("mbq: no matching slave\n");
 }

@@ -12,6 +12,7 @@
 #include "dali_provision.h"
 #include "lighting_actions.h"
 #include "dali_queue.h"
+#include "dq_soak.h"
 #include "mapping.h"
 #include "button_fsm.h"
 #include "config.h"
@@ -662,6 +663,7 @@ static void cmd_help(void) {
     printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dq [slave]                                 dump command-queue client state + counters\n");
+    printf("soak [<slave> <addr> [n=] [depth=]] | stop  queue soak: verified DTR0 write/read pairs\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
     printf("provision <slave> {all|new|<addr>}         commission: all / incremental / re-provision collided <addr>\n");
@@ -1357,6 +1359,41 @@ static void cmd_dq(char **saveptr) {
     dq_debug_print((int)slave);
 }
 
+/* `soak [<slave> <addr> [n=<pairs>] [depth=<1-8>]] | stop` — bench queue soak.
+ * Bare = report the running/last run. Hammers the gateway command queue with
+ * alternating SET DTR0 / QUERY CONTENT DTR0 pairs and verifies every answer
+ * against the value its paired write put there (see dq_soak.h). */
+static void cmd_soak(char **saveptr) {
+    char *a1 = strtok_r(NULL, " \t", saveptr);
+    if (!a1) { dq_soak_report(); return; }
+    if (strcasecmp(a1, "stop") == 0) {
+        if (!dq_soak_active()) { txt_err("not_running"); return; }
+        dq_soak_stop();
+        txt_ok();
+        return;
+    }
+    long slave, addr;
+    if (!parse_int_range_auto(a1, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    if (state_cache_slave_idx((uint8_t)slave) < 0) { txt_err("invalid_slave"); return; }
+    char *a2 = strtok_r(NULL, " \t", saveptr);
+    if (!parse_int_range_auto(a2, 0, 63, &addr)) { txt_err("invalid_addr"); return; }
+
+    long pairs = 0, depth = SOAK_DEPTH_DEFAULT;
+    for (char *t = strtok_r(NULL, " \t", saveptr); t; t = strtok_r(NULL, " \t", saveptr)) {
+        char *eq = strchr(t, '=');
+        if (!eq) { txt_err("bad_arg"); return; }
+        *eq = '\0';
+        if      (strcasecmp(t, "n") == 0)     { if (!parse_int_range_auto(eq + 1, 0, 10000000, &pairs)) { txt_err("bad_n"); return; } }
+        else if (strcasecmp(t, "depth") == 0) { if (!parse_int_range_auto(eq + 1, 1, 8, &depth)) { txt_err("bad_depth"); return; } }
+        else { txt_err("bad_arg"); return; }
+    }
+    if (!dq_soak_start((uint8_t)slave, (uint8_t)addr, (uint8_t)depth, (uint32_t)pairs)) {
+        txt_err("already_running");
+        return;
+    }
+    txt_ok();
+}
+
 /* ── dim <slave> <addr|gN> {up|down} ───────────────────────────────────── */
 static void cmd_dim(char **saveptr) {
     char *ss = strtok_r(NULL, " \t", saveptr);
@@ -1960,6 +1997,10 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "dq") == 0) {
         cmd_dq(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "soak") == 0) {
+        cmd_soak(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "dim") == 0) {

@@ -69,5 +69,19 @@ void mbq_client_tick(void);
  * this. */
 bool mbq_client_busy(uint8_t slave_id);
 
+/* Number of `slave_id`'s 8 gateway slots the client believes are occupied —
+ * armed, written-but-unconfirmed, or confirmed active. This is the controller's
+ * view of GATEWAY-SIDE queue occupancy across ALL producers, and is what a
+ * producer pacing itself against the gateway queue (rather than against its own
+ * submissions) should gate on: back off at MBQ_SLOTS/2 to keep the queue fed
+ * without ever provoking a DEVICE_BUSY rejection. 0 if the slave is unknown. */
+uint8_t mbq_client_inflight(uint8_t slave_id);
+
+/* Modbus transactions this client has issued to `slave_id` since boot, split
+ * into submits (FC23 write+read) and read-only status polls. Bench
+ * instrumentation: transactions-per-command is what says whether a workload is
+ * Modbus-bound or DALI-bound. Either pointer may be NULL. */
+void mbq_client_txn_counts(uint8_t slave_id, uint32_t *submits, uint32_t *polls);
+
 /* Dump per-slave client state to the console (dev CLI). slave_id < 0 = all. */
 void mbq_client_debug_print(int slave_id);
