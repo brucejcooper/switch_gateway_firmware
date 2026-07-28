@@ -420,7 +420,12 @@ static const struct { const char *key, *name, *icon; } CFG_SENS[] = {
 
 static void disc_controller(uint8_t k) {
     const char *P = mqtt_app_prefix();
-    char objid[32];
+    /* Longest object_id here is "lighting_cfg_dali_sweep_interval_ms" (35 ch).
+     * This was 32, so it silently truncated BOTH that and
+     * "lighting_cfg_gw_diag_interval_ms" (32 ch) — snprintf truncates without
+     * complaint, and the discovery topic is the only place it shows. Sized to
+     * match the other discovery buffers in this file, with headroom. */
+    char objid[48];
     if (k >= CFG_NUM_N + CFG_SENS_N) {
         /* relay_byteswap switch — reverses Waveshare 32CH coil read-back order. */
         int n = snprintf(s_pl, PL_CAP,
