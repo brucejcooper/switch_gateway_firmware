@@ -396,8 +396,11 @@ void dq_soak_report(void) {
         modbus_busload_slave_t per[MODBUS_BUSLOAD_SLAVES];
         modbus_busload_get(&win, &busy, &bt, per);
         if (win == 0) win = 1;
-        printf("  %-22s %lu%% busy over %lu txns\n", "RS-485 bus",
-               (unsigned long)(busy * 100u / win), (unsigned long)bt);
+        uint32_t rt = 0, rb = 0;
+        modbus_busload_retries(&rt, &rb);
+        printf("  %-22s %lu%% busy over %lu txns (%lu timeout-retries, %lu busy-retries)\n",
+               "RS-485 bus", (unsigned long)(busy * 100u / win), (unsigned long)bt,
+               (unsigned long)rt, (unsigned long)rb);
         for (uint8_t i = 0; i < MODBUS_BUSLOAD_SLAVES; i++) {
             if (!per[i].txns) continue;
             printf("    slave %-3u %5lu txns %3lu%% of wall  %lu.%02lu ms avg\n",

@@ -1375,11 +1375,15 @@ static void cmd_busload(char **saveptr) {
     modbus_busload_get(&win, &busy, &txns, per);
     if (win == 0) win = 1;
 
+    uint32_t rt = 0, rb = 0;
+    modbus_busload_retries(&rt, &rb);
     printf("busload: window %lu.%02lu s, bus busy %lu%% (%lu txns, %lu.%02lu ms avg)\n",
            (unsigned long)(win / 1000000u), (unsigned long)((win % 1000000u) / 10000u),
            (unsigned long)(busy * 100u / win), (unsigned long)txns,
            (unsigned long)(txns ? (busy / txns) / 1000u : 0u),
            (unsigned long)(txns ? ((busy / txns) % 1000u) / 10u : 0u));
+    printf("  retries: %lu timeout, %lu device-busy\n",
+           (unsigned long)rt, (unsigned long)rb);
     for (uint8_t i = 0; i < MODBUS_BUSLOAD_SLAVES; i++) {
         if (!per[i].txns) continue;
         printf("  slave %-3u %5lu txns  %3lu%% of bus  %lu.%02lu ms avg\n",

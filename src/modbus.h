@@ -61,6 +61,13 @@ void modbus_busload_reset(void);
 void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
                         modbus_busload_slave_t *per);
 
+/* Re-sends within the busload window: `timeouts` = the reply was missing or
+ * invalid, `device_busy` = the slave answered exception 0x06. These distinguish
+ * "the slave is slow to answer" from "the reply is being lost" — a transaction
+ * that retries and then succeeds is invisible in every per-transaction success
+ * count, but costs a full response timeout of bus time. Either may be NULL. */
+void modbus_busload_retries(uint32_t *timeouts, uint32_t *device_busy);
+
 /* ── Enqueue API ─────────────────────────────────────────────────────────────
  * Each returns true if the action was queued, false if the action queue was full
  * and it was dropped (in which case the callback will NEVER fire). Stateful

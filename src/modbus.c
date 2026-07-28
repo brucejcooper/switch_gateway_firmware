@@ -124,6 +124,8 @@ static absolute_time_t       s_bl_window;         /* start of the measurement wi
 static absolute_time_t       s_bl_act_start;      /* current transaction's start */
 static uint64_t              s_bl_busy_us;        /* total bus-occupied time in the window */
 static uint32_t              s_bl_txns;
+static uint32_t              s_bl_retries;        /* re-sends after no valid reply */
+static uint32_t              s_bl_busy_retries;   /* re-sends after a DEVICE_BUSY (0x06) */
 static modbus_busload_slave_t s_bl[MODBUS_BUSLOAD_SLAVES];
 
 static bool modbus_rx_valid(void) { return true; }
@@ -473,7 +475,14 @@ void modbus_busload_reset(void) {
     memset(s_bl, 0, sizeof s_bl);
     s_bl_busy_us = 0;
     s_bl_txns    = 0;
+    s_bl_retries = 0;
+    s_bl_busy_retries = 0;
     s_bl_window  = get_absolute_time();
+}
+
+void modbus_busload_retries(uint32_t *timeouts, uint32_t *device_busy) {
+    if (timeouts)    *timeouts    = s_bl_retries;
+    if (device_busy) *device_busy = s_bl_busy_retries;
 }
 
 void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
@@ -568,6 +577,7 @@ void modbus_poll(void) {
             if (s_attempts_left > 0) {
                 s_attempts_left--;
                 retry = true;
+                s_bl_retries++;
                 LOG_WARN("modbus",
                          "rx timeout slave=%u fc=0x%02x — retrying (%u left)",
                          currentAction.device, (unsigned)currentAction.action,
@@ -585,6 +595,7 @@ void modbus_poll(void) {
                 s_busy_left--;
                 retry = true;
                 busy_retry = true;
+                s_bl_busy_retries++;
                 LOG_DBG("modbus", "slave=%u fc=0x%02x busy — retrying (%u left)",
                         currentAction.device, (unsigned)currentAction.action,
                         (unsigned)s_busy_left);
