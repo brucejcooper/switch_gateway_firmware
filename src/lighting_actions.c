@@ -581,11 +581,17 @@ bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
                 slave_id, dali_addr);
         return false;
     }
-    /* UP (0x01) / DOWN (0x02) via the queue, short-address command-form.
-     * NON-idempotent: replaying a step double-steps the level. */
-    uint8_t addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
-    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, up ? 0x01u : 0x02u, 0, 0, false)) {
-        LOG_WARN("light", "dali %u.%u step %s dropped — queue full",
+    /* A dim step is an EVENT, not a state, so it cannot be regenerated from the
+     * cache — but it also must not be queued as a command: a held button emits
+     * repeats faster than DALI can issue them, and the queued tail keeps dimming
+     * after release. Instead it accumulates into a per-ballast signed step
+     * counter that the scheduler drains one frame at a time (dali_queue.c). Real
+     * UP/DOWN frames still go on the wire, so the ballast's own fade rate and
+     * min/max clamping govern the result — deliberately NOT a level computed
+     * from cache. Steps beyond the clamp are dropped, which is invisible in a
+     * ramp. */
+    if (!dq_add_delta(slave_id, false, dali_addr, up ? 1 : -1)) {
+        LOG_WARN("light", "dali %u.%u step %s dropped — unknown slave",
                  slave_id, dali_addr, up ? "up" : "down");
         return false;
     }
@@ -662,10 +668,10 @@ bool lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {
         LOG_DBG("light", "group %u.G%u step skipped — slave provisioning", slave_id, group);
         return false;
     }
-    uint8_t addr_byte = (uint8_t)(0x81u | ((group & 0x0Fu) << 1));  /* command */
-    /* group UP/DOWN — NON-idempotent (double-steps on replay). */
-    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, up ? 0x01u : 0x02u, 0, 0, false)) {
-        LOG_WARN("light", "group %u.G%u step %s dropped — queue full",
+    /* Same as the per-ballast step: accumulate into the group's step counter and
+     * let the scheduler drain it one frame at a time. */
+    if (!dq_add_delta(slave_id, true, group, up ? 1 : -1)) {
+        LOG_WARN("light", "group %u.G%u step %s dropped — unknown slave",
                  slave_id, group, up ? "up" : "down");
         return false;
     }

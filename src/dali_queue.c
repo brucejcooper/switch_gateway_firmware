@@ -3,11 +3,12 @@
  * (task 06, queue v2). See dali_queue.h for the model.
  *
  * This layer is DALI-SPECIFIC and sits ABOVE the DALI-agnostic mbq_client:
- *   1. a per-slave PRIORITY BACKLOG (the scheduler): dq_submit insertion-sorts
- *      by priority class (highest first, FIFO within a class); dq_tick ships the
- *      front of the backlog into a free gateway slot via the client, keeping at
- *      most DQ_INFLIGHT_MAX in flight so a fresh high-priority command is never
- *      stuck behind a backlog of background work already filling the 8 slots;
+ *   1. a per-slave PULL SCHEDULER (task 05 phase 1): storage partitioned by
+ *      priority class rather than one shared FIFO, plus per-ballast dim-step
+ *      COUNTERS that hold no commands at all. dq_tick walks the priority ladder
+ *      and ships at most one command per tick per slave, applying that class's
+ *      own gateway depth — so background work can neither displace a user
+ *      command's storage nor sit more than 2 slots deep in front of one;
  *   2. a PAYLOAD ADAPTER: pack a DALI command into the client's 4 opaque command
  *      bytes ([addr, data, flags, dtr0]) and map the client's terminal outcome +
  *      response8 back to a dq_result_t for the producer's callback.
@@ -25,11 +26,47 @@
 #include "log.h"
 #include "pico/time.h"
 #include <string.h>
+#include "cdc_out.h"
 #include <stdio.h>
 
-#define DQ_BACKLOG      16u   /* local backlog depth (per slave) */
-#define DQ_INFLIGHT_MAX  3u   /* scheduler policy cap: 2-3 in flight per slave, below the
-                               * gateway's 8, so a high-priority command has headroom */
+/* ── Scheduler shape (task 05 phase 1) ───────────────────────────────────────
+ * There is no single FIFO backlog any more. Two reasons, both measured:
+ *
+ * 1. A shared pool lets background work occupy the storage a button press needs
+ *    — the old 16-deep backlog reported backlog_full=2 in normal operation, and
+ *    every one of those is a silently dropped command. Storage is now
+ *    PARTITIONED BY CLASS, so a burst of background work can neither displace a
+ *    user command nor sit in front of one. The user class is sized to one
+ *    button's full fan-out (MAX_TARGETS_PER_BTN), so a press always fits.
+ *
+ * 2. Latency comes from commands already at the GATEWAY, which executes strictly
+ *    FIFO with no priority — so a queued background command delays a button by a
+ *    whole DALI frame. Hence a per-class DEPTH: background may only occupy 2 of
+ *    the gateway's slots, bounding that inversion to ~2 frame times, while user
+ *    work may fill to 4. The task-07 soak measured the trade: depth 2 = 82 % of
+ *    peak throughput, depth 4 = 96 %, and every extra slot costs ~25 ms of
+ *    inversion. Background work is not latency-sensitive; buttons are.
+ *
+ * Dim steps are not stored as commands at all — see the delta counters below. */
+#define DQ_CLASS_MAX     8u   /* per-class ring capacity (max over the classes) */
+#define DQ_DEPTH_USER    4u   /* gateway slots a user command may fill to */
+#define DQ_DEPTH_CFG     3u
+#define DQ_DEPTH_BG      2u   /* background never gets deeper than this */
+
+/* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
+ * frames (user decision, 2026-07-28). A held button emits dim repeats faster
+ * than DALI can issue them, so queueing each one builds a backlog that keeps
+ * dimming after release — the exact latency problem this task removes. A signed
+ * counter collapses that: the scheduler issues ONE step per submit opportunity
+ * and decrements ON SUBMIT.
+ *
+ * Decrementing on submit (not on completion) is deliberate: a step lost to a
+ * gateway reboot simply doesn't happen, which is invisible in a dim ramp, and
+ * it can never be replayed into a double-step. That is also why these frames go
+ * out non-idempotent. The clamp drops excess by design — the ballast's own fade
+ * rate and min/max clamping still govern the result, which is why this issues
+ * real UP/DOWN rather than computing a level from cache. */
+#define DQ_DELTA_MAX     4
 
 /* DALI response8 failure codes on a FAILED slot — the payload contract mirrored
  * from the gateway (TinyModbus dali_sync.h). A COMPLETE slot's response8 is the
@@ -40,11 +77,34 @@
 
 typedef struct {
     uint8_t  addr, data, flags, dtr0;
-    uint8_t  prio;           /* dq_prio_t */
+    uint8_t  prio;           /* dq_prio_t — kept for the debug dump */
     bool     idempotent;
     dq_result_cb_t cb;
     void    *ctx;
 } dq_cmd_t;
+
+/* One priority class's storage. FIFO within a class; classes are consulted in
+ * order, so ordering between classes is priority, not arrival. */
+typedef struct {
+    dq_cmd_t e[DQ_CLASS_MAX];
+    uint8_t  n;
+    uint8_t  cap;      /* entries this class may hold */
+    uint8_t  depth;    /* gateway slots this class may fill to */
+} dq_class_t;
+
+/* Class index. dq_prio_t maps onto these — the ladder is unchanged, only its
+ * storage is partitioned. */
+typedef enum { DQ_CL_USER = 0, DQ_CL_CFG, DQ_CL_BG, DQ_CL_COUNT } dq_class_id_t;
+
+static dq_class_id_t class_of(dq_prio_t p) {
+    switch (p) {
+        case DQ_PRIO_PROVISION:
+        case DQ_PRIO_USER:
+        case DQ_PRIO_GROUP_WRITE:   return DQ_CL_USER;
+        case DQ_PRIO_CONFIG_WRITE:  return DQ_CL_CFG;
+        default:                    return DQ_CL_BG;
+    }
+}
 
 /* One trampoline per possible in-flight command: carries the producer's
  * cb/ctx across the client, and maps the client's outcome back on completion.
@@ -60,9 +120,14 @@ typedef struct {
     bool     in_use;
     uint8_t  slave_id;
 
-    dq_cmd_t bl[DQ_BACKLOG];
-    uint8_t  count;          /* pending entries in the backlog */
+    dq_class_t cl[DQ_CL_COUNT];
     uint8_t  outstanding;    /* commands submitted to the client, awaiting completion */
+
+    /* Pending dim steps — state, not queued commands (see DQ_DELTA_MAX). */
+    int8_t   delta[64];      /* per short address */
+    int8_t   gdelta[16];     /* per group */
+    uint8_t  delta_cursor;   /* rotating start point, so one ballast being dimmed
+                              * cannot starve another's steps */
 
     dq_pending_t pend[MBQ_SLOTS];
 
@@ -72,7 +137,10 @@ typedef struct {
     uint32_t c_nak;          /* delivered DQ_RES_NAK */
     uint32_t c_err;          /* delivered DQ_RES_ERR (collision / bus fault) */
     uint32_t c_dropped;      /* delivered DQ_RES_DROPPED (gateway reboot, non-idempotent) */
-    uint32_t c_full;         /* submits refused — backlog full */
+    uint32_t c_full;         /* submits refused — that class's storage was full */
+    uint32_t c_coalesced;    /* duplicate idempotent submits folded into a pending one */
+    uint32_t c_steps;        /* dim steps issued from the delta counters */
+    uint32_t c_steps_clamp;  /* dim steps dropped by the delta clamp */
 } dq_slave_t;
 
 static dq_slave_t s_dq[MAX_DALI_SLAVES];
@@ -99,6 +167,11 @@ void dq_init(void) {
     for (int i = 0; i < g_config.dali_slave_count && i < MAX_DALI_SLAVES; i++) {
         s_dq[i].in_use   = true;
         s_dq[i].slave_id = g_config.dali_slave_ids[i];
+        /* Per-class capacity and gateway depth. USER is sized to one button's
+         * full fan-out so a press is never refused by a background burst. */
+        s_dq[i].cl[DQ_CL_USER] = (dq_class_t){ .cap = DQ_CLASS_MAX, .depth = DQ_DEPTH_USER };
+        s_dq[i].cl[DQ_CL_CFG]  = (dq_class_t){ .cap = 3u,           .depth = DQ_DEPTH_CFG  };
+        s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 2u,           .depth = DQ_DEPTH_BG   };
         mbq_client_add_slave(s_dq[i].slave_id);
     }
 }
@@ -111,31 +184,64 @@ bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
         LOG_WARN("dq", "submit to unknown DALI slave %u dropped", slave_id);
         return false;
     }
-    if (s->count >= DQ_BACKLOG) {
-        LOG_WARN("dq", "slave %u backlog full — cmd %02X%02X dropped", slave_id, addr, data);
+    dq_class_t *c = &s->cl[class_of(prio)];
+    dq_cmd_t entry = { .addr = addr, .data = data,
+                       .flags = (uint8_t)(flags & 0x07u), .dtr0 = dtr0,
+                       .prio = (uint8_t)prio, .idempotent = idempotent,
+                       .cb = cb, .ctx = ctx };
+
+    /* Coalesce an exact duplicate that has not shipped yet. Only for idempotent
+     * commands with no callback: repeating one has no additional effect, so a
+     * repeated press or a re-published HA state costs nothing. A command with a
+     * callback is never folded — its caller is waiting for its own result. */
+    if (idempotent && !cb) {
+        for (uint8_t i = 0; i < c->n; i++) {
+            if (c->e[i].addr == entry.addr && c->e[i].data == entry.data
+                && c->e[i].flags == entry.flags && c->e[i].dtr0 == entry.dtr0
+                && !c->e[i].cb) {
+                s->c_coalesced++;
+                return true;
+            }
+        }
+    }
+
+    if (c->n >= c->cap) {
+        LOG_WARN("dq", "slave %u class %u full — cmd %02X%02X dropped",
+                 slave_id, (unsigned)class_of(prio), addr, data);
         s->c_full++;
         return false;
     }
-    /* Insertion-sort into the backlog by priority (ascending class number = higher
-     * priority first). Insert before the first strictly-lower-priority entry, so
-     * equal-priority entries keep FIFO order. */
-    uint8_t pos = s->count;
-    for (uint8_t i = 0; i < s->count; i++) {
-        if (s->bl[i].prio > (uint8_t)prio) { pos = i; break; }
-    }
-    for (uint8_t i = s->count; i > pos; i--) s->bl[i] = s->bl[i - 1];
-    s->bl[pos] = (dq_cmd_t){ .addr = addr, .data = data,
-                             .flags = (uint8_t)(flags & 0x07u), .dtr0 = dtr0,
-                             .prio = (uint8_t)prio, .idempotent = idempotent,
-                             .cb = cb, .ctx = ctx };
-    s->count++;
+    c->e[c->n++] = entry;   /* FIFO within the class */
     return true;
+}
+
+bool dq_add_delta(uint8_t slave_id, bool is_group, uint8_t addr, int8_t steps) {
+    dq_slave_t *s = slave_for(slave_id);
+    if (!s) return false;
+    int8_t *d = is_group ? &s->gdelta[addr & 0x0Fu] : &s->delta[addr & 0x3Fu];
+    int v = *d + steps;
+    if (v >  DQ_DELTA_MAX) { v =  DQ_DELTA_MAX; s->c_steps_clamp++; }
+    if (v < -DQ_DELTA_MAX) { v = -DQ_DELTA_MAX; s->c_steps_clamp++; }
+    *d = (int8_t)v;
+    return true;
+}
+
+static bool any_delta(const dq_slave_t *s) {
+    for (uint8_t i = 0; i < 64; i++) if (s->delta[i]) return true;
+    for (uint8_t i = 0; i < 16; i++) if (s->gdelta[i]) return true;
+    return false;
+}
+
+static uint8_t pending_total(const dq_slave_t *s) {
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < DQ_CL_COUNT; i++) n = (uint8_t)(n + s->cl[i].n);
+    return n;
 }
 
 bool dq_busy(uint8_t slave_id) {
     dq_slave_t *s = slave_for(slave_id);
     if (!s) return false;
-    return s->count > 0 || mbq_client_busy(slave_id);
+    return pending_total(s) > 0 || any_delta(s) || mbq_client_busy(slave_id);
 }
 
 /* ── driver internals ────────────────────────────────────────────────────── */
@@ -173,28 +279,64 @@ static void dq_mbq_cb(uint8_t slave_id, mbq_result_t r, uint8_t response8, void 
     if (cb) cb(slave_id, res, answer, cctx);
 }
 
-/* Ship the front backlog command of `s` into a free gateway slot. Returns true
- * if one was submitted (backlog shrank), false to try again next tick. */
-static bool ship_front(dq_slave_t *s) {
+/* Hand one command to the client. Returns false if it did not go out (no
+ * trampoline, or the Modbus action queue was full) — the caller leaves its work
+ * where it was and retries next tick. */
+static bool ship(dq_slave_t *s, const dq_cmd_t *e) {
     dq_pending_t *p = pend_alloc(s);
     if (!p) return false;   /* all trampolines busy (should not happen under the cap) */
 
-    dq_cmd_t *e = &s->bl[0];
     uint8_t cmd[MBQ_CMD_BYTES] = { e->addr, e->data, e->flags, e->dtr0 };
-
     p->in_use = true;
     p->cb     = e->cb;
     p->ctx    = e->ctx;
     if (!mbq_client_submit(s->slave_id, cmd, e->idempotent, dq_mbq_cb, p)) {
-        p->in_use = false;   /* modbus action queue full — nothing sent; retry next tick */
+        p->in_use = false;
         return false;
     }
-    /* Landed with the client: drop the front of the backlog. */
-    for (uint8_t i = 0; i + 1u < s->count; i++) s->bl[i] = s->bl[i + 1u];
-    s->count--;
     s->outstanding++;
     s->c_submitted++;
     return true;
+}
+
+/* Ship the front of class `ci` if its depth policy allows it. */
+static bool ship_class(dq_slave_t *s, dq_class_id_t ci) {
+    dq_class_t *c = &s->cl[ci];
+    if (c->n == 0 || s->outstanding >= c->depth) return false;
+    if (!ship(s, &c->e[0])) return false;
+    for (uint8_t i = 0; i + 1u < c->n; i++) c->e[i] = c->e[i + 1u];
+    c->n--;
+    return true;
+}
+
+/* Issue one pending dim step, scanning from a rotating cursor so a ballast being
+ * held down cannot starve another's steps. The counter is decremented HERE, on
+ * submit — a step that is subsequently lost just doesn't happen, and can never
+ * be replayed as a double-step (hence idempotent=false). */
+static bool ship_delta(dq_slave_t *s) {
+    if (s->outstanding >= DQ_DEPTH_USER) return false;
+
+    for (uint8_t i = 0; i < 64u + 16u; i++) {
+        uint8_t k = (uint8_t)((s->delta_cursor + i) % (64u + 16u));
+        bool is_group = (k >= 64u);
+        int8_t *d = is_group ? &s->gdelta[k - 64u] : &s->delta[k];
+        if (*d == 0) continue;
+
+        bool up = (*d > 0);
+        uint8_t addr_byte = is_group
+            ? (uint8_t)(0x81u | (((k - 64u) & 0x0Fu) << 1))          /* group, command form */
+            : (uint8_t)(((k & 0x3Fu) << 1) | 0x01u);                 /* short address, command form */
+        dq_cmd_t e = { .addr = addr_byte, .data = up ? 0x01u : 0x02u,  /* UP / DOWN */
+                       .flags = 0, .dtr0 = 0, .prio = (uint8_t)DQ_PRIO_USER,
+                       .idempotent = false, .cb = NULL, .ctx = NULL };
+        if (!ship(s, &e)) return false;
+
+        *d = (int8_t)(up ? *d - 1 : *d + 1);
+        s->delta_cursor = (uint8_t)((k + 1u) % (64u + 16u));
+        s->c_steps++;
+        return true;
+    }
+    return false;
 }
 
 void dq_tick(void) {
@@ -205,19 +347,25 @@ void dq_tick(void) {
 
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
         dq_slave_t *s = &s_dq[i];
-        if (!s->in_use || s->count == 0) continue;
+        if (!s->in_use) continue;
 
         /* Provisioning is highest priority AND bus-exclusive: while a slave is
-         * being commissioned (the 0x1F04 commission SM) the scheduler admits
-         * nothing else — commands accumulate in the backlog and drain once
-         * provisioning finishes. */
+         * being commissioned the scheduler admits nothing else — work waits and
+         * drains once provisioning finishes. */
         if (dali_provision_busy_slave(s->slave_id)) continue;
 
-        /* Ship while we have credit and the client can take a command this
-         * instant. can_submit is false once a transaction is in flight, so this
-         * naturally ships one command per tick per slave. */
-        if (s->outstanding < DQ_INFLIGHT_MAX && mbq_client_can_submit(s->slave_id))
-            ship_front(s);
+        /* can_submit is false once a transaction is in flight, so at most one
+         * command per tick per slave goes out regardless. */
+        if (!mbq_client_can_submit(s->slave_id)) continue;
+
+        /* Priority ladder, consulted in order. Each step applies its own class
+         * depth, so background work stops filling the gateway two slots before
+         * user work does and a button press is never more than ~2 frame times
+         * behind background traffic. */
+        if (ship_class(s, DQ_CL_USER)) continue;   /* discrete presses / HA commands */
+        if (ship_delta(s))             continue;   /* dim ramps, one step at a time */
+        if (ship_class(s, DQ_CL_CFG))  continue;   /* config writes */
+        ship_class(s, DQ_CL_BG);                   /* sweeps, rotation queries */
     }
 }
 
@@ -261,19 +409,25 @@ void dq_debug_print(int slave_id) {
         if (!s->in_use) continue;
         if (slave_id >= 0 && s->slave_id != (uint8_t)slave_id) continue;
         any = true;
-        uint8_t cls[DQ_PRIO_COUNT] = {0};
-        for (uint8_t j = 0; j < s->count; j++)
-            if (s->bl[j].prio < DQ_PRIO_COUNT) cls[s->bl[j].prio]++;
-        printf("dq slave %u: backlog=%u inflight=%u/%u\n",
-               s->slave_id, s->count, s->outstanding, DQ_INFLIGHT_MAX);
-        printf("  queued/class: prov=%u user=%u gwrite=%u cfgw=%u lread=%u bg=%u\n",
-               cls[DQ_PRIO_PROVISION], cls[DQ_PRIO_USER], cls[DQ_PRIO_GROUP_WRITE],
-               cls[DQ_PRIO_CONFIG_WRITE], cls[DQ_PRIO_LEVEL_READ], cls[DQ_PRIO_BACKGROUND]);
-        printf("  counters: submitted=%lu ok=%lu nak=%lu err=%lu dropped=%lu backlog_full=%lu\n",
-               (unsigned long)s->c_submitted, (unsigned long)s->c_ok,
-               (unsigned long)s->c_nak, (unsigned long)s->c_err,
-               (unsigned long)s->c_dropped, (unsigned long)s->c_full);
+        int dsum = 0, dn = 0;
+        for (uint8_t j = 0; j < 64; j++) if (s->delta[j])  { dsum += s->delta[j]; dn++; }
+        for (uint8_t j = 0; j < 16; j++) if (s->gdelta[j]) { dsum += s->gdelta[j]; dn++; }
+        cdc_out_printf("dq slave %u: inflight=%u\n", s->slave_id, s->outstanding);
+        cdc_out_printf("  pending/class: user=%u/%u cfg=%u/%u bg=%u/%u  (depth %u/%u/%u)\n",
+                       s->cl[DQ_CL_USER].n, s->cl[DQ_CL_USER].cap,
+                       s->cl[DQ_CL_CFG].n,  s->cl[DQ_CL_CFG].cap,
+                       s->cl[DQ_CL_BG].n,   s->cl[DQ_CL_BG].cap,
+                       DQ_DEPTH_USER, DQ_DEPTH_CFG, DQ_DEPTH_BG);
+        cdc_out_printf("  dim delta: %d target(s), net %d steps, cursor=%u\n",
+                       dn, dsum, s->delta_cursor);
+        cdc_out_printf("  counters: submitted=%lu ok=%lu nak=%lu err=%lu dropped=%lu "
+                       "class_full=%lu coalesced=%lu steps=%lu clamped=%lu\n",
+                       (unsigned long)s->c_submitted, (unsigned long)s->c_ok,
+                       (unsigned long)s->c_nak, (unsigned long)s->c_err,
+                       (unsigned long)s->c_dropped, (unsigned long)s->c_full,
+                       (unsigned long)s->c_coalesced, (unsigned long)s->c_steps,
+                       (unsigned long)s->c_steps_clamp);
         mbq_client_debug_print((int)s->slave_id);
     }
-    if (!any) printf("dq: no matching DALI slave\n");
+    if (!any) cdc_out_printf("dq: no matching DALI slave\n");
 }

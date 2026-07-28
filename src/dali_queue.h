@@ -89,6 +89,24 @@ bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
                uint8_t flags, uint8_t dtr0, bool idempotent,
                dq_result_cb_t cb, void *ctx);
 
+/* Accumulate `steps` dim steps (signed; + = UP, − = DOWN) for a ballast short
+ * address (`is_group` false) or a group number (`is_group` true).
+ *
+ * Dim steps do NOT go through dq_submit. A step is an event — it cannot be
+ * regenerated from cached state — but queueing one command per step is what
+ * makes a held button keep dimming after release, because the repeats arrive
+ * faster than DALI can issue them. So they accumulate into a per-target signed
+ * counter which the scheduler drains one frame per submit opportunity, in
+ * rotating order across targets. Real UP/DOWN frames go on the wire (the
+ * ballast's own fade rate and min/max clamping still apply — this is
+ * deliberately not a DAPC computed from cache), the counter is decremented on
+ * SUBMIT, and it saturates at ±DQ_DELTA_MAX. Losing a step at the clamp or to a
+ * gateway reboot is by design: one missing step in a ramp is invisible, whereas
+ * a replayed one would double-step.
+ *
+ * Returns false only for an unknown slave. */
+bool dq_add_delta(uint8_t slave_id, bool is_group, uint8_t addr, int8_t steps);
+
 /* Per-loop driver: drive the underlying client (mbq_client_tick), then ship any
  * pending backlog commands into free gateway slots. Call every main-loop
  * iteration. */
