@@ -553,11 +553,13 @@ bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
         uint8_t addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
         ok = raw_submit(slave_id, DQ_PRIO_USER, addr_byte, 0x0Au, 0, 0, true);
     } else {
-        /* OFF — write 0 to the per-ballast brightness register. High byte is
-         * ignored by the gateway on write. */
-        uint16_t reg = 0x0000u + (uint16_t)dali_addr;
-        ok = modbus_set_holding_register(slave_id, reg,
-                                         0x0000u, dali_write_cb, NULL);
+        /* OFF — DAPC level 0 as a queued frame. This used to write 0 to the
+         * gateway's per-ballast brightness bank (FC06 0x0000+addr) and let the
+         * gateway synthesise the DAPC; task 05 removes that register, so the
+         * controller emits the frame itself. Address byte is DAPC form (bit 0
+         * clear); idempotent — re-sending level 0 has no cumulative effect. */
+        uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
+        ok = raw_submit(slave_id, DQ_PRIO_USER, dapc_addr, 0x00u, 0, 0, true);
     }
     if (!ok) {
         LOG_WARN("light", "dali %u.%u %s dropped — queue full",
@@ -607,11 +609,13 @@ bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
                 slave_id, dali_addr);
         return false;
     }
-    /* DAPC via per-ballast brightness bank. Low byte = arc level; high byte
-     * ignored on write. */
-    uint16_t reg = 0x0000u + (uint16_t)dali_addr;
-    if (!modbus_set_holding_register(slave_id, reg,
-                                     (uint16_t)arc, dali_write_cb, NULL)) {
+    /* DAPC as a queued frame (address byte in DAPC form — bit 0 clear — and the
+     * arc level as the data byte). Replaces the gateway's per-ballast brightness
+     * bank, which task 05 removes; the ballast still clamps to its own min/max,
+     * so the read-back remains the authority on what actually happened.
+     * Idempotent: re-sending the same level has no cumulative effect. */
+    uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
+    if (!raw_submit(slave_id, DQ_PRIO_USER, dapc_addr, arc, 0, 0, true)) {
         LOG_WARN("light", "dali %u.%u bri=%u dropped — queue full",
                  slave_id, dali_addr, arc);
         return false;
