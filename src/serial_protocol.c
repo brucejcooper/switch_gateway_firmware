@@ -1382,8 +1382,15 @@ static void cmd_busload(char **saveptr) {
            (unsigned long)(busy * 100u / win), (unsigned long)txns,
            (unsigned long)(txns ? (busy / txns) / 1000u : 0u),
            (unsigned long)(txns ? ((busy / txns) % 1000u) / 10u : 0u));
+    uint32_t ta = 0, tm = 0, tn = 0;
+    modbus_busload_turnaround(&ta, &tm, &tn);
     printf("  retries: %lu timeout, %lu device-busy\n",
            (unsigned long)rt, (unsigned long)rb);
+    printf("  turnaround: avg %lu.%02lu ms, max %lu.%02lu ms over %lu replies "
+           "(timeout is %u ms)\n",
+           (unsigned long)(ta / 1000u), (unsigned long)((ta % 1000u) / 10u),
+           (unsigned long)(tm / 1000u), (unsigned long)((tm % 1000u) / 10u),
+           (unsigned long)tn, 50u);
     for (uint8_t i = 0; i < MODBUS_BUSLOAD_SLAVES; i++) {
         if (!per[i].txns) continue;
         printf("  slave %-3u %5lu txns  %3lu%% of bus  %lu.%02lu ms avg\n",

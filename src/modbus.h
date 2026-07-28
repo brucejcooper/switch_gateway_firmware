@@ -68,6 +68,13 @@ void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
  * count, but costs a full response timeout of bus time. Either may be NULL. */
 void modbus_busload_retries(uint32_t *timeouts, uint32_t *device_busy);
 
+/* Slave turnaround within the busload window: time from our request clearing the
+ * line to the first valid reply byte pattern completing, over all slaves that
+ * answered. Compare against MODBUS_RESPONSE_TIMEOUT_MS — a slave whose worst
+ * turnaround approaches it is producing "lost" replies that are really late ones.
+ * Any pointer may be NULL. */
+void modbus_busload_turnaround(uint32_t *avg_us, uint32_t *max_us, uint32_t *n);
+
 /* ── Enqueue API ─────────────────────────────────────────────────────────────
  * Each returns true if the action was queued, false if the action queue was full
  * and it was dropped (in which case the callback will NEVER fire). Stateful

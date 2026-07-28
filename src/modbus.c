@@ -125,6 +125,9 @@ static absolute_time_t       s_bl_act_start;      /* current transaction's start
 static uint64_t              s_bl_busy_us;        /* total bus-occupied time in the window */
 static uint32_t              s_bl_txns;
 static uint32_t              s_bl_retries;        /* re-sends after no valid reply */
+static absolute_time_t       s_bl_rx_start;       /* DE release -> waiting for the reply */
+static uint64_t              s_bl_turn_sum;       /* slave turnaround: request out -> reply in */
+static uint32_t              s_bl_turn_n, s_bl_turn_max;
 static uint32_t              s_bl_busy_retries;   /* re-sends after a DEVICE_BUSY (0x06) */
 static modbus_busload_slave_t s_bl[MODBUS_BUSLOAD_SLAVES];
 
@@ -283,6 +286,7 @@ static int64_t release_de(alarm_id_t id, void *userdata) {
     readbuf_max = sizeof(buf);
     readbuf_crc = 0xFFFF;
     readTimeout = make_timeout_time_ms(MODBUS_RESPONSE_TIMEOUT_MS);
+    s_bl_rx_start = get_absolute_time();
     uart_set_irqs_enabled(UART_ID, true, false);
     bus_state = MODBUS_RECEIVING;
     return 0;
@@ -477,12 +481,21 @@ void modbus_busload_reset(void) {
     s_bl_txns    = 0;
     s_bl_retries = 0;
     s_bl_busy_retries = 0;
+    s_bl_turn_sum = 0;
+    s_bl_turn_n = 0;
+    s_bl_turn_max = 0;
     s_bl_window  = get_absolute_time();
 }
 
 void modbus_busload_retries(uint32_t *timeouts, uint32_t *device_busy) {
     if (timeouts)    *timeouts    = s_bl_retries;
     if (device_busy) *device_busy = s_bl_busy_retries;
+}
+
+void modbus_busload_turnaround(uint32_t *avg_us, uint32_t *max_us, uint32_t *n) {
+    if (avg_us) *avg_us = s_bl_turn_n ? (uint32_t)(s_bl_turn_sum / s_bl_turn_n) : 0u;
+    if (max_us) *max_us = s_bl_turn_max;
+    if (n)      *n      = s_bl_turn_n;
 }
 
 void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
@@ -567,7 +580,19 @@ void modbus_poll(void) {
 
         /* Log the raw response bytes (mirrors the tx dump). Covers both normal
          * and exception replies; a timeout leaves readbuf_sz == 0 (nothing). */
-        if (readbuf_sz > 0) log_frame_hex("rx", buf, readbuf_sz);
+        if (readbuf_sz > 0) {
+            log_frame_hex("rx", buf, readbuf_sz);
+            /* Slave turnaround: how long this slave took to answer, measured from
+             * the moment our last byte cleared the line. Against a 50 ms response
+             * timeout this is the margin — a slave creeping up on it produces
+             * "lost" replies that are really late ones, and the retry then finds
+             * its own earlier write already applied. */
+            uint64_t t = (uint64_t)absolute_time_diff_us(s_bl_rx_start, get_absolute_time());
+            uint32_t t32 = (t > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)t;
+            s_bl_turn_sum += t32;
+            s_bl_turn_n++;
+            if (t32 > s_bl_turn_max) s_bl_turn_max = t32;
+        }
 
         bool retry = false;
         bool busy_retry = false;
