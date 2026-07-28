@@ -47,6 +47,14 @@
 #define MBQ_STAT_BASE  0x1010u   /* slot k status  at 0x1010 + k   (1 reg)  */
 #define MBQ_POLL_MS    5u        /* pace of active-slot poll reads          */
 
+/* A slot's command occupies MBQ_CMD_REGS Modbus REGISTERS. The FC23 enqueue API
+ * counts registers, not bytes — passing the byte count declared a write twice as
+ * long as the payload, which armed the NEXT slot as well with whatever followed
+ * cmd[] in slot_t (the callback pointer) as its DALI frame. Keep these two facts
+ * adjacent so the units can't drift apart again. */
+#define MBQ_CMD_REGS   (MBQ_CMD_BYTES / 2u)
+_Static_assert(MBQ_CMD_BYTES % 2u == 0u, "a slot command must be a whole number of registers");
+
 /* Gateway slot lifecycle status (hi byte of a status reg) — must match the
  * gateway MBQ_S_* enum. Generic values; not DALI. */
 enum { GW_IDLE = 0u, GW_PENDING = 1u, GW_EXECUTING = 2u, GW_COMPLETE = 3u, GW_FAILED = 4u };
@@ -231,7 +239,7 @@ static void issue_submit(slave_t *s, uint8_t k) {
     s->t_issue  = get_absolute_time();
     bool ok = modbus_read_write_multiple_registers(
         s->slave_id, MBQ_STAT_BASE, MBQ_SLOTS,
-        (uint16_t)(MBQ_CMD_BASE + 2u * k), MBQ_CMD_BYTES, s->slot[k].cmd,
+        (uint16_t)(MBQ_CMD_BASE + 2u * k), MBQ_CMD_REGS, s->slot[k].cmd,
         mbq_fc23_cb, s);
     if (!ok) { s->next_at = make_timeout_time_ms(MBQ_POLL_MS); return; }
     s->slot[k].st = SLOT_SENT;   /* written, not yet confirmed present */
