@@ -40,6 +40,7 @@ typedef enum {
     DCOM_ERR_NO_BALLASTS,
     DCOM_ERR_VERIFY,
     DCOM_ERR_ADDR_EXHAUST,
+    DCOM_ERR_TIMEOUT,       /* a step produced no result — bus or transport fault */
 } dcom_state_t;
 
 /* Start a run on `slave_id`. `target` is the short address to re-provision,

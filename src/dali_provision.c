@@ -164,6 +164,9 @@ void dali_provision_tick(void) {
     case DCOM_ERR_ADDR_EXHAUST:
         set_status(PROV_STATE_ERROR, "Error: short-address pool exhausted");
         break;
+    case DCOM_ERR_TIMEOUT:
+        set_status(PROV_STATE_ERROR, "Error: a commissioning step got no result");
+        break;
     default:
         set_status(PROV_STATE_ERROR, "Error: commissioning ended unexpectedly");
         break;

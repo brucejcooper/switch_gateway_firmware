@@ -269,6 +269,7 @@ static void advance(void) {
                  : s.state == DCOM_ERR_NO_BALLASTS   ? "no ballasts found"
                  : s.state == DCOM_ERR_VERIFY        ? "verify failures"
                  : s.state == DCOM_ERR_ADDR_EXHAUST  ? "address pool exhausted"
+                 : s.state == DCOM_ERR_TIMEOUT       ? "step timed out"
                                                      : "error");
             return;
 
@@ -323,8 +324,8 @@ void dcom_tick(void) {
             s.exp_gen = 0;
             s.busy    = false;
             LOG_WARN("dcom", "slave %u step %s timed out", s.slave_id, dcom_phase_name());
-            if (s.phase == P_TERMINATE) { finish(DCOM_ERR_ABORTED, "timeout"); return; }
-            s.state = DCOM_ERR_ABORTED;
+            if (s.phase == P_TERMINATE) { finish(DCOM_ERR_TIMEOUT, "timeout"); return; }
+            s.state = DCOM_ERR_TIMEOUT;
             s.phase = P_TERMINATE;
         }
         return;

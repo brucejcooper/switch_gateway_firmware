@@ -94,11 +94,11 @@ typedef struct {
 
 /* Class index. dq_prio_t maps onto these — the ladder is unchanged, only its
  * storage is partitioned. */
-typedef enum { DQ_CL_USER = 0, DQ_CL_CFG, DQ_CL_BG, DQ_CL_COUNT } dq_class_id_t;
+typedef enum { DQ_CL_PROV = 0, DQ_CL_USER, DQ_CL_CFG, DQ_CL_BG, DQ_CL_COUNT } dq_class_id_t;
 
 static dq_class_id_t class_of(dq_prio_t p) {
     switch (p) {
-        case DQ_PRIO_PROVISION:
+        case DQ_PRIO_PROVISION:     return DQ_CL_PROV;
         case DQ_PRIO_USER:
         case DQ_PRIO_GROUP_WRITE:   return DQ_CL_USER;
         case DQ_PRIO_CONFIG_WRITE:  return DQ_CL_CFG;
@@ -169,6 +169,11 @@ void dq_init(void) {
         s_dq[i].slave_id = g_config.dali_slave_ids[i];
         /* Per-class capacity and gateway depth. USER is sized to one button's
          * full fan-out so a press is never refused by a background burst. */
+        /* Provisioning is strictly sequential — each bisect step depends on the
+         * previous answer — so depth 1. It gets its own class because while a
+         * slave is being commissioned the scheduler must ship THESE frames and
+         * nothing else; they are the commissioning sequence. */
+        s_dq[i].cl[DQ_CL_PROV] = (dq_class_t){ .cap = 2u,           .depth = 1u            };
         s_dq[i].cl[DQ_CL_USER] = (dq_class_t){ .cap = DQ_CLASS_MAX, .depth = DQ_DEPTH_USER };
         s_dq[i].cl[DQ_CL_CFG]  = (dq_class_t){ .cap = 3u,           .depth = DQ_DEPTH_CFG  };
         s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 2u,           .depth = DQ_DEPTH_BG   };
@@ -357,19 +362,26 @@ void dq_tick(void) {
         dq_slave_t *s = &s_dq[i];
         if (!s->in_use) continue;
 
-        /* Provisioning is highest priority AND bus-exclusive: while a slave is
-         * being commissioned the scheduler admits nothing else — work waits and
-         * drains once provisioning finishes. */
-        if (dali_provision_busy_slave(s->slave_id)) continue;
-
         /* can_submit is false once a transaction is in flight, so at most one
          * command per tick per slave goes out regardless. */
         if (!mbq_client_can_submit(s->slave_id)) continue;
+
+        /* Provisioning is bus-exclusive: while a slave is being commissioned the
+         * scheduler ships the commissioning frames AND NOTHING ELSE, so nothing
+         * can interleave with the binary search (a stray DTR0 write mid-bisect
+         * would corrupt it). Note this must still ship the PROV class — the
+         * sequence now runs on the controller and travels through this very
+         * queue, so gating it out entirely deadlocks the run. */
+        if (dali_provision_busy_slave(s->slave_id)) {
+            ship_class(s, DQ_CL_PROV);
+            continue;
+        }
 
         /* Priority ladder, consulted in order. Each step applies its own class
          * depth, so background work stops filling the gateway two slots before
          * user work does and a button press is never more than ~2 frame times
          * behind background traffic. */
+        if (ship_class(s, DQ_CL_PROV)) continue;   /* commissioning steps */
         if (ship_class(s, DQ_CL_USER)) continue;   /* discrete presses / HA commands */
         if (ship_delta(s))             continue;   /* dim ramps, one step at a time */
         if (ship_class(s, DQ_CL_CFG))  continue;   /* config writes */
@@ -421,7 +433,8 @@ void dq_debug_print(int slave_id) {
         for (uint8_t j = 0; j < 64; j++) if (s->delta[j])  { dsum += s->delta[j]; dn++; }
         for (uint8_t j = 0; j < 16; j++) if (s->gdelta[j]) { dsum += s->gdelta[j]; dn++; }
         cdc_out_printf("dq slave %u: inflight=%u\n", s->slave_id, s->outstanding);
-        cdc_out_printf("  pending/class: user=%u/%u cfg=%u/%u bg=%u/%u  (depth %u/%u/%u)\n",
+        cdc_out_printf("  pending/class: prov=%u/%u user=%u/%u cfg=%u/%u bg=%u/%u  (depth %u/%u/%u)\n",
+                       s->cl[DQ_CL_PROV].n, s->cl[DQ_CL_PROV].cap,
                        s->cl[DQ_CL_USER].n, s->cl[DQ_CL_USER].cap,
                        s->cl[DQ_CL_CFG].n,  s->cl[DQ_CL_CFG].cap,
                        s->cl[DQ_CL_BG].n,   s->cl[DQ_CL_BG].cap,
