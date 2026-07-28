@@ -81,6 +81,14 @@ typedef struct {
     /* diagnostics */
     uint32_t c_submitted, c_completed, c_failed, c_lost, c_reboots, c_timeouts;
     uint32_t c_polls;   /* read-only status-poll transactions issued */
+
+    /* Per-transaction timing window (bench; reset by mbq_client_txn_stats_reset).
+     * t_issue is stamped when the FC23 is handed to the Modbus layer, so the
+     * measured span includes queueing behind other producers and transport
+     * retries — which is exactly what "is this Modbus-bound?" needs to know. */
+    absolute_time_t t_issue;
+    uint32_t w_n, w_min, w_max, w_fail, w_busy;
+    uint64_t w_sum;
 } slave_t;
 
 static slave_t s_sl[MAX_DALI_SLAVES];
@@ -106,6 +114,17 @@ static uint8_t stat_resp(const slave_t *s, uint8_t k) {
 
 static void mbq_fc23_cb(int res, uint8_t *buf, void *ctx) {
     slave_t *s = (slave_t *)ctx;
+    /* Transaction timing window: stamp the span before anything else. */
+    uint64_t dt = (uint64_t)absolute_time_diff_us(s->t_issue, get_absolute_time());
+    uint32_t dt32 = (dt > 0xFFFFFFFFull) ? 0xFFFFFFFFu : (uint32_t)dt;
+    if (s->w_n == 0 || dt32 < s->w_min) s->w_min = dt32;
+    if (dt32 > s->w_max) s->w_max = dt32;
+    s->w_sum += dt32;
+    s->w_n++;
+    if (res <= 0) {
+        s->w_fail++;
+        if (res < 0 && buf && buf[2] == 0x06u) s->w_busy++;
+    }
     s->cb_res = res;
     s->cb_len = 0;
     if (res > 0 && buf) {
@@ -180,6 +199,25 @@ void mbq_client_txn_counts(uint8_t slave_id, uint32_t *submits, uint32_t *polls)
     if (polls)   *polls   = s ? s->c_polls     : 0u;
 }
 
+void mbq_client_txn_stats(uint8_t slave_id, mbq_txn_stats_t *out) {
+    if (!out) return;
+    memset(out, 0, sizeof *out);
+    slave_t *s = slave_for(slave_id);
+    if (!s || s->w_n == 0) return;
+    out->n      = s->w_n;
+    out->us_min = s->w_min;
+    out->us_max = s->w_max;
+    out->us_avg = (uint32_t)(s->w_sum / s->w_n);
+    out->n_fail = s->w_fail;
+    out->n_busy = s->w_busy;
+}
+
+void mbq_client_txn_stats_reset(uint8_t slave_id) {
+    slave_t *s = slave_for(slave_id);
+    if (!s) return;
+    s->w_n = 0; s->w_min = 0; s->w_max = 0; s->w_sum = 0; s->w_fail = 0; s->w_busy = 0;
+}
+
 bool mbq_client_can_submit(uint8_t slave_id) {
     slave_t *s = slave_for(slave_id);
     if (!s) return false;
@@ -190,6 +228,7 @@ bool mbq_client_can_submit(uint8_t slave_id) {
  * tx_slot=k records that this txn's read-back should confirm slot k. */
 static void issue_submit(slave_t *s, uint8_t k) {
     s->cb_fired = false;
+    s->t_issue  = get_absolute_time();
     bool ok = modbus_read_write_multiple_registers(
         s->slave_id, MBQ_STAT_BASE, MBQ_SLOTS,
         (uint16_t)(MBQ_CMD_BASE + 2u * k), MBQ_CMD_BYTES, s->slot[k].cmd,
@@ -204,6 +243,7 @@ static void issue_submit(slave_t *s, uint8_t k) {
 /* Issue a read-only poll of all 8 status regs. */
 static void issue_poll(slave_t *s) {
     s->cb_fired = false;
+    s->t_issue  = get_absolute_time();
     bool ok = modbus_read_write_multiple_registers(
         s->slave_id, MBQ_STAT_BASE, MBQ_SLOTS, MBQ_CMD_BASE, 0, NULL, mbq_fc23_cb, s);
     if (!ok) { s->next_at = make_timeout_time_ms(MBQ_POLL_MS); return; }

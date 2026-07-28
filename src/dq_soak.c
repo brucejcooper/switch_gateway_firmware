@@ -29,6 +29,7 @@
 /* DALI wire constants used by the probe (the gateway's dali.h equivalents). */
 #define DALI_ADDR_SET_DTR0        0xA3u   /* special command: addr byte = 0xA3, data = value */
 #define DALI_CMD_QUERY_DTR0       0x98u   /* QUERY CONTENT DTR0 (IEC 62386-102) */
+#define SOAK_DALI_NAK             0x01u   /* gateway DALI_RESP_NAK: no backward frame */
 
 /* Stride for the value walk: odd ⇒ coprime with 256 ⇒ all 256 values before a
  * repeat, and adjacent pairs never collide. */
@@ -156,7 +157,12 @@ static void soak_cb(uint8_t slave, mbq_result_t r, uint8_t response8, void *ctx)
     S.seq_last_done = rec->seq;
 
     if (!rec->is_query) {
-        if (r == MBQ_R_COMPLETE)      S.n_set_ok++;
+        /* A no-answer forward frame (KIND_CMD) is completed by the gateway as
+         * FAILED/DALI_RESP_NAK — "no backward frame" is the normal, successful
+         * outcome for a fire-and-forget send (dali_queue.h). Only a genuine bus
+         * error (collision/bus fault) or LOST is a failure here. */
+        if (r == MBQ_R_COMPLETE
+            || (r == MBQ_R_FAILED && response8 == SOAK_DALI_NAK)) S.n_set_ok++;
         else if (r == MBQ_R_LOST)   { S.n_lost++; miss_log(rec->seq, 0, 0, 3); }
         else                        { S.n_set_fail++; miss_log(rec->seq, 0, response8, 1); }
     } else {
@@ -273,6 +279,7 @@ bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs) {
     S.next_is_query = false;
     S.t_start = get_absolute_time();
     mbq_client_txn_counts(slave, &S.tx0_submits, &S.tx0_polls);
+    mbq_client_txn_stats_reset(slave);
     S.running = true;
     LOG_INFO("soak", "start slave=%u addr=%u depth=%u pairs=%lu",
              slave, addr, depth, (unsigned long)pairs);
@@ -367,8 +374,17 @@ void dq_soak_report(void) {
     printf("  %-22s %lu submit + %lu poll = %lu\n", "modbus txns",
            (unsigned long)txs, (unsigned long)txp, (unsigned long)(txs + txp));
     if (S.n_submit)
-        print_rate("txns per command", (uint64_t)(txs + txp) * 100u, S.n_submit, "");
+        print_rate("txns per command", (uint64_t)(txs + txp), S.n_submit, "");
     print_rate("txn rate", (uint64_t)(txs + txp) * 1000000u, el_us, "txn/s");
+    mbq_txn_stats_t ts;
+    mbq_client_txn_stats(S.slave, &ts);
+    if (ts.n) {
+        print_ms("txn time avg", ts.us_avg);
+        print_ms("txn time min", ts.us_min);
+        print_ms("txn time max", ts.us_max);
+        printf("  %-22s %lu fail (%lu device-busy) of %lu\n", "txn failures",
+               (unsigned long)ts.n_fail, (unsigned long)ts.n_busy, (unsigned long)ts.n);
+    }
 
     printf(" pacing (why we weren't submitting):\n");
     uint64_t tt = (uint64_t)S.t_queue_full + S.t_tx_busy + S.t_ready;

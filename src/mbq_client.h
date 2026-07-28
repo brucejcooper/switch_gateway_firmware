@@ -83,5 +83,23 @@ uint8_t mbq_client_inflight(uint8_t slave_id);
  * Modbus-bound or DALI-bound. Either pointer may be NULL. */
 void mbq_client_txn_counts(uint8_t slave_id, uint32_t *submits, uint32_t *polls);
 
+/* Per-transaction wall time for `slave_id`, measured from the moment the FC23 is
+ * handed to the Modbus layer to the moment its callback fires — so it INCLUDES
+ * time spent queued behind other producers' Modbus actions, and any retry the
+ * transport did. Bench instrumentation for "is the command path Modbus-bound?".
+ * `n` is the number of completed transactions, times in µs; also reports how many
+ * ended in a transport failure (timeout / exception) and how many of those were
+ * DEVICE_BUSY (0x06). Any pointer may be NULL. */
+typedef struct {
+    uint32_t n;
+    uint32_t us_min, us_max, us_avg;
+    uint32_t n_fail, n_busy;
+} mbq_txn_stats_t;
+void mbq_client_txn_stats(uint8_t slave_id, mbq_txn_stats_t *out);
+
+/* Zero the per-transaction timing accumulators (not the lifetime counters), so a
+ * bench run measures only its own window. */
+void mbq_client_txn_stats_reset(uint8_t slave_id);
+
 /* Dump per-slave client state to the console (dev CLI). slave_id < 0 = all. */
 void mbq_client_debug_print(int slave_id);
