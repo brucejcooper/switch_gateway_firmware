@@ -24,6 +24,7 @@
 #include "lighting_actions.h"
 #include "dali_queue.h"
 #include "dq_soak.h"
+#include "dali_state.h"
 #include "dirty_poll.h"
 #include "serial_protocol.h"
 #include "dali_provision.h"
@@ -139,6 +140,7 @@ int main(void) {
 
     /* Dirty poll init before full scan */
     dirty_poll_init();
+    dali_state_init();
     dali_provision_init();
     dq_init();   /* per-slave gateway command-queue driver state */
 
@@ -229,6 +231,7 @@ int main(void) {
         lighting_cfg_query_tick();      /* submit config queries into the gateway queue */
         dq_tick();                      /* drive the gateway command queue (FC23) */
         dq_soak_tick();                 /* bench: queue soak probe (idle unless started) */
+        dali_state_tick();              /* controller-owned DALI world model (task 05) */
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();

@@ -26,6 +26,7 @@ add_executable(light_switch
     src/mapping.c
     src/lighting_actions.c
     src/dali_queue.c
+    src/dali_state.c
     src/mbq_client.c
     src/dq_soak.c
     src/dirty_poll.c
@@ -274,6 +275,7 @@ if(OTA_APP_LAYOUT)
         src/config.c
         src/mapping.c
         src/lighting_actions.c
+        src/dali_state.c
         src/dali_queue.c
         src/mbq_client.c
         src/dq_soak.c

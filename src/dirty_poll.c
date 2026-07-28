@@ -10,6 +10,8 @@
  */
 
 #include "dirty_poll.h"
+#include "dali_state.h"
+#include "dali_queue.h"
 #include "modbus.h"
 #include "state_cache.h"
 #include "lighting_actions.h"
@@ -374,7 +376,15 @@ void dirty_poll_tick(void) {
             }
         }
 
-        if (dp->active && dp->state == DPOLL_IDLE) {
+        /* Task 05: the dirty-mask / block0 / background-check reads that used to
+         * live here are GONE. They read gateway registers (0x0104 dirty, 0x0000
+         * block0, 0x0100 present, 0x0110 group masks) that the gateway strip
+         * removes. Level, status, presence and groups are now learned by
+         * querying the ballasts through the command queue — see dali_state.c,
+         * driven from the main loop. What remains in this file is the relay
+         * board (a different device entirely) and the gateway sysinfo poll,
+         * neither of which the strip touches. */
+        if (false && dp->active && dp->state == DPOLL_IDLE) {
             if (now_ms - dp->last_poll_ms >= DIRTY_POLL_INTERVAL_MS) {
                 dp->last_poll_ms = now_ms;
                 /* Advance state only if the read queued; a dropped action never
@@ -387,7 +397,7 @@ void dirty_poll_tick(void) {
             }
         }
 
-        if (!dp->active && dp->state == DPOLL_IDLE) {
+        if (false && !dp->active && dp->state == DPOLL_IDLE) {
             if (now_ms - dp->last_bg_ms >= BACKGROUND_CHECK_MS) {
                 dp->last_bg_ms = now_ms;
                 dirty_poll_background_check(slave_id);
@@ -501,93 +511,38 @@ static void read_all_group_masks(uint8_t slave_id, uint8_t idx) {
 
 /* ── Blocking startup full scan ──────────────────────────────────────────── */
 
+/* Startup / post-provision discovery. Task 05: this used to read the gateway's
+ * present bitmap, block0 and group-mask registers over FC03/FC04. Those
+ * registers are going away with the gateway strip, so discovery is now a DALI
+ * interrogation driven by dali_state (QUERY STATUS / ACTUAL LEVEL / GROUPS per
+ * address, through the command queue). Kept blocking because every caller —
+ * boot, `scan`, post-provisioning — expects the cache populated on return. */
 void dirty_poll_full_scan(uint8_t slave_id) {
     int idx = state_cache_slave_idx(slave_id);
     if (idx < 0) return;
+    LOG_INFO("dirty", "slave %u full scan (DALI interrogation)", slave_id);
+    dali_state_request_full_scan(slave_id);
 
-    LOG_DBG("dirty", "Full scan: slave %u", slave_id);
-
-    /* Trigger firmware scan */
-    {
-        static sync_ctx_t ctx;
-        static uint16_t   dummy[1];
-        ctx = (sync_ctx_t){ false, false, dummy, 1 };
-        modbus_set_holding_register(slave_id, DALI_SCAN_TRIGGER_REG,
-                                    0x0001, sync_read_cb, &ctx);
-        absolute_time_t dl = make_timeout_time_ms(500);
-        while (!ctx.done && absolute_time_diff_us(get_absolute_time(), dl) > 0)
-            modbus_poll();
+    /* 64 addresses x up to 4 queries, one in flight at a time; a NAK for an
+     * absent address resolves in one query. Bounded so a wedged bus cannot hang
+     * boot forever. */
+    absolute_time_t deadline = make_timeout_time_ms(45000u);
+    while (dali_state_scan_busy(slave_id)
+           && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
+        modbus_poll();
+        dq_tick();
+        dali_state_tick();
     }
-    sleep_ms(200);
+    if (dali_state_scan_busy(slave_id))
+        LOG_WARN("dirty", "slave %u full scan timed out", slave_id);
 
-    /* Present bitmask — also a gateway reachability signal. */
-    uint16_t present_regs[4] = {0};
-    gateway_report(slave_id, idx,
-                   sync_read(slave_id, DALI_PRESENT_START, 4, present_regs));
-    uint64_t present_mask =
-        ((uint64_t)present_regs[0])       |
-        ((uint64_t)present_regs[1] << 16) |
-        ((uint64_t)present_regs[2] << 32) |
-        ((uint64_t)present_regs[3] << 48);
-    s_dp[idx].last_present = present_mask;
-
-    /* Block 0 in 16-register chunks (FC03 holding regs post refactor). */
-    LOG_DBG("dirty",
-             "slave=%u: full scan reading BLOCK0 arc/status for all %d ballasts (holding regs %u..%u)",
-             slave_id, DALI_ADDR_COUNT, (unsigned)DALI_BLOCK0_START,
-             (unsigned)(DALI_BLOCK0_START + DALI_ADDR_COUNT - 1));
-    uint16_t regs[DALI_ADDR_COUNT];
-    bool b0_chunk_ok[4];
-    for (uint16_t chunk = 0; chunk < 4; chunk++) {
-        uint16_t off = chunk * DALI_MAX_CHUNK;
-        b0_chunk_ok[chunk] =
-            sync_read_holding(slave_id, DALI_BLOCK0_START + off, DALI_MAX_CHUNK, regs + off);
-        if (!b0_chunk_ok[chunk])
-            LOG_WARN("dirty", "block0 chunk %u failed", chunk);
+    uint64_t present = 0;
+    for (uint8_t a = 0; a < DALI_ADDR_COUNT; a++) {
+        dali_ballast_state_t *b = state_cache_get_dali((uint8_t)idx, a);
+        if (b && b->present) present |= (uint64_t)1 << a;
     }
-    for (int a = 0; a < DALI_ADDR_COUNT; a++) {
-        bool present = (present_mask & ((uint64_t)1 << a)) != 0;
-        state_cache_set_dali_present((uint8_t)idx, (uint8_t)a, present);
-        if (!present) continue;
-        if (!b0_chunk_ok[a / DALI_MAX_CHUNK]) continue;   /* don't cache uninit/garbage arc */
-        state_cache_set_dali_arc((uint8_t)idx, (uint8_t)a,
-                                  regs[a] & 0xFF,
-                                  (regs[a] >> 8) & 0xFF);
-    }
-
-    /* Per-ballast config (min/max/power-on/sys-fail/fade) is owned over raw
-     * DALI: don't read any gateway bank (they no longer exist — the gateway
-     * returns ILLEGAL DATA ADDRESS at 0x0040-0x00FF). Queue every present
-     * ballast for the background raw-DALI config sweep (lighting_cfg_query_*);
-     * the cache fills over the next few seconds and each ballast re-emits
-     * state_dali as its config lands. */
-    LOG_INFO("dirty",
-             "slave=%u: queueing %d present ballasts for background raw config sweep",
-             slave_id, DALI_ADDR_COUNT);
-    lighting_cfg_query_mark_mask(slave_id, present_mask);
-
-    /* Group membership masks (FC03 0x0110-0x014F). Must be read before the
-     * per-ballast emit loop below so that lighting_emit_dali_state's group
-     * derivation sees populated membership masks. */
-    read_all_group_masks(slave_id, (uint8_t)idx);
-
-    /* Emit per-ballast state events for every present ballast so the bridge
-     * gets initial state without having to wait for the first dirty bit.
-     * This also drives Layer-2 group-state derivation since membership masks
-     * are now loaded. */
-    for (int a = 0; a < DALI_ADDR_COUNT; a++) {
-        if (!(present_mask & ((uint64_t)1 << a))) continue;
-        if (!b0_chunk_ok[a / DALI_MAX_CHUNK]) continue;   /* don't emit uninit/garbage arc */
-        uint8_t arc    = regs[a] & 0xFF;
-        uint8_t status = (regs[a] >> 8) & 0xFF;
-        lighting_emit_dali_state(slave_id, (uint8_t)a, arc, status);
-    }
-
-    /* fix #6: emit scan_complete — bridge uses this to set per-ballast availability */
-    lighting_emit_scan_complete(slave_id, present_mask);
-
-    LOG_INFO("dirty", "Full scan slave %u complete — present=0x%016llX",
-             slave_id, (unsigned long long)present_mask);
+    s_dp[idx].last_present = present;
+    lighting_emit_scan_complete(slave_id, present);
 }
 
 void dirty_poll_background_check(uint8_t slave_id) {

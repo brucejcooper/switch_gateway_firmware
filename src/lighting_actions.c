@@ -4,6 +4,7 @@
 #include "modbus.h"
 #include "state_cache.h"
 #include "dirty_poll.h"
+#include "dali_state.h"
 #include "config.h"
 #include "mapping.h"
 #include "log.h"
@@ -574,6 +575,7 @@ bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
      * the cache claiming a state the hardware never received. */
     cache_predict_dali(slave_id, dali_addr, on);
     dirty_poll_mark_active(slave_id);
+    dali_state_mark_dirty(slave_id, dali_addr);   /* read back what actually happened */
     return true;
 }
 
@@ -600,6 +602,7 @@ bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
     LOG_INFO("light", "dali %u.%u step %s",
              slave_id, dali_addr, up ? "up" : "down");
     dirty_poll_mark_active(slave_id);
+    dali_state_mark_dirty(slave_id, dali_addr);
     return true;
 }
 
@@ -623,6 +626,7 @@ bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
     LOG_INFO("light", "dali %u.%u bri=%u", slave_id, dali_addr, arc);
     cache_predict_dali(slave_id, dali_addr, arc > 0);
     dirty_poll_mark_active(slave_id);
+    dali_state_mark_dirty(slave_id, dali_addr);
     return true;
 }
 
@@ -644,6 +648,7 @@ bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
     LOG_INFO("light", "group %u.G%u bri=%u", slave_id, group, arc);
     cache_predict_group(slave_id, group, arc > 0);
     dirty_poll_mark_active(slave_id);
+    dali_state_mark_dirty_group(slave_id, group);
     return true;
 }
 
@@ -664,6 +669,7 @@ bool lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
              slave_id, group, on ? "on" : "off");
     cache_predict_group(slave_id, group, on);
     dirty_poll_mark_active(slave_id);
+    dali_state_mark_dirty_group(slave_id, group);
     return true;
 }
 
@@ -682,6 +688,7 @@ bool lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {
     LOG_INFO("light", "group %u.G%u step %s",
              slave_id, group, up ? "up" : "down");
     dirty_poll_mark_active(slave_id);
+    dali_state_mark_dirty_group(slave_id, group);
     return true;
 }
 

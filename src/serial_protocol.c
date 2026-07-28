@@ -13,6 +13,7 @@
 #include "lighting_actions.h"
 #include "dali_queue.h"
 #include "dq_soak.h"
+#include "dali_state.h"
 #include "mapping.h"
 #include "button_fsm.h"
 #include "config.h"
@@ -670,6 +671,7 @@ static void cmd_help(void) {
     printf("dq [slave]                                 dump command-queue client state + counters\n");
     printf("soak [<slave> <addr> [n=] [depth=] [path=direct|bg|user]] | stop   queue soak\n");
     printf("busload [reset]                            RS-485 bus occupancy, split per slave\n");
+    printf("dstate [slave]                             DALI world model: presence, sweep, verify marks\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
     printf("provision <slave> {all|new|<addr>}         commission: all / incremental / re-provision collided <addr>\n");
@@ -2069,6 +2071,13 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "soak") == 0) {
         cmd_soak(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "dstate") == 0) {
+        char *ss2 = strtok_r(NULL, " \t", &saveptr);
+        long sl = -1;
+        if (ss2 && !parse_int_range_auto(ss2, 0, 247, &sl)) { txt_err("invalid_slave"); return; }
+        dali_state_debug_print((int)sl);
         return;
     }
     if (strcasecmp(cmd, "busload") == 0) {
