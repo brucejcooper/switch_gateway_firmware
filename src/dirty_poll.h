@@ -15,12 +15,6 @@ void dirty_poll_tick(void);
  * uses. */
 void dirty_poll_arm_scan(uint8_t slave_id);
 
-/* Blocking full scan — waits for the interrogation to finish. ONLY for the CLI
- * `scan`, where the operator wants the result printed on return. Feeds the
- * watchdog (a scan on a populated bus runs well past 5 s) and bails out early if
- * the gateway stops answering, so an absent slave costs a moment rather than the
- * whole deadline. */
-void dirty_poll_full_scan(uint8_t slave_id);
 
 /* 60s background presence + status anomaly check */
 void dirty_poll_background_check(uint8_t slave_id);

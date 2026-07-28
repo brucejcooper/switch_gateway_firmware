@@ -117,7 +117,8 @@ void lighting_emit_presence(uint8_t slave_id,
                              uint64_t appeared, uint64_t disappeared);
 void lighting_emit_fault(uint8_t slave_id, uint8_t addr,
                           bool lamp_fail, bool power_cycle);
-/* fix #6: emitted by dirty_poll_full_scan() so bridge can set availability */
+/* Emitted when a full DALI interrogation completes (dirty_poll_tick notices
+ * the transition), so the bridge can set per-ballast availability. */
 void lighting_emit_scan_complete(uint8_t slave_id, uint64_t present_mask);
 
 /* Emitted by dirty_poll when a DALI gateway's reachability changes (online =

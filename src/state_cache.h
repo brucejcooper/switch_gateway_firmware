@@ -48,7 +48,8 @@ void state_cache_set_dali_commanded_on(uint8_t slave_idx, uint8_t addr, bool on)
 /* Returns slave index for a given slave_id, or -1 if unknown */
 int  state_cache_slave_idx(uint8_t slave_id);
 
-/* Per-slave DALI group membership cache, populated by dirty_poll_full_scan.
+/* Per-slave DALI group membership cache, populated by the DALI interrogation
+ * (dali_state.c, QUERY GROUPS 0-7 / 8-15).
  * group_members[g] is a 64-bit mask of ballasts in group g. */
 void     state_cache_set_dali_group(uint8_t slave_idx, uint8_t group, uint64_t mask);
 uint64_t state_cache_get_dali_group(uint8_t slave_idx, uint8_t group);

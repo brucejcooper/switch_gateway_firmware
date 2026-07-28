@@ -4,7 +4,6 @@
  * Fixes applied:
  *   #1  Removed dead blocking_read_input_regs() with C++ lambda syntax
  *   #5  Correct Modbus response frame size checks (include CRC bytes)
- *   #6  dirty_poll_full_scan() now emits scan_complete via lighting_emit_scan_complete()
  *   #7  dirty_poll_tick() skips slaves being provisioned
  *   #8  Deadtime is baud-rate-correct (was hardcoded for 9600)
  */
@@ -13,7 +12,6 @@
 #include "dali_state.h"
 #include "dali_queue.h"
 #include "mbq_client.h"
-#include "core1.h"   /* wd_feed — this file blocks past the watchdog period */
 #include "modbus.h"
 #include "state_cache.h"
 #include "lighting_actions.h"
@@ -47,6 +45,7 @@ typedef struct {
     uint8_t       fail_count;    /* consecutive read failures */
     uint32_t      last_cfg_ms;   /* last steady-state config-rotation mark (task 03) */
     uint8_t       cfg_cursor;    /* round-robin ballast for config re-reads */
+    bool          scanning;      /* a full interrogation is in progress */
 } dpoll_t;
 
 static dpoll_t s_dp[MAX_DALI_SLAVES];
@@ -202,6 +201,16 @@ static void gwdiag_cb(int res, uint8_t *buf, void *ctx) {
 
 
 /* ── Tick ────────────────────────────────────────────────────────────────── */
+/* Arm a full DALI interrogation and return immediately. Every caller uses this —
+ * boot, the CLI `scan`, and dcom after a commissioning run. Completion is
+ * noticed in dirty_poll_tick(), which emits the scan-complete event, so no
+ * caller has to wait for or report the result. */
+void dirty_poll_arm_scan(uint8_t slave_id) {
+    if (state_cache_slave_idx(slave_id) < 0) return;
+    LOG_INFO("dirty", "slave %u full scan armed", slave_id);
+    dali_state_request_full_scan(slave_id);
+}
+
 void dirty_poll_tick(void) {
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
@@ -227,6 +236,24 @@ void dirty_poll_tick(void) {
 
         /* fix #7: do not poll slaves being provisioned */
         if (dali_provision_busy_slave(slave_id)) continue;
+
+        /* Scan completion. Every scan is asynchronous now — boot, the CLI and
+         * post-provisioning all just ARM one — so completion has to be noticed
+         * here rather than by whoever started it. Emitting from one place also
+         * means all three paths notify HA identically. */
+        if (dali_state_scan_busy(slave_id)) {
+            dp->scanning = true;
+        } else if (dp->scanning) {
+            dp->scanning = false;
+            uint64_t present = 0;
+            for (uint8_t a = 0; a < DALI_ADDR_COUNT; a++) {
+                dali_ballast_state_t *b = state_cache_get_dali((uint8_t)i, a);
+                if (b && b->present) present |= (uint64_t)1 << a;
+            }
+            dp->last_present = present;
+            LOG_INFO("dirty", "slave %u scan complete", slave_id);
+            lighting_emit_scan_complete(slave_id, present);
+        }
 
         /* Low-frequency gateway sysinfo read (uptime / reboots / reset reason),
          * gated by the configurable interval (0 = disabled). Fires independently
@@ -293,60 +320,5 @@ typedef struct {
 
 /* ── Blocking startup full scan ──────────────────────────────────────────── */
 
-/* Startup / post-provision discovery. Task 05: this used to read the gateway's
- * present bitmap, block0 and group-mask registers over FC03/FC04. Those
- * registers are going away with the gateway strip, so discovery is now a DALI
- * interrogation driven by dali_state (QUERY STATUS / ACTUAL LEVEL / GROUPS per
- * address, through the command queue). Kept blocking because every caller —
- * boot, `scan`, post-provisioning — expects the cache populated on return. */
-void dirty_poll_arm_scan(uint8_t slave_id) {
-    if (state_cache_slave_idx(slave_id) < 0) return;
-    LOG_INFO("dirty", "slave %u full scan armed (non-blocking)", slave_id);
-    dali_state_request_full_scan(slave_id);
-}
 
-void dirty_poll_full_scan(uint8_t slave_id) {
-    int idx = state_cache_slave_idx(slave_id);
-    if (idx < 0) return;
-    LOG_INFO("dirty", "slave %u full scan (DALI interrogation)", slave_id);
-    dali_state_request_full_scan(slave_id);
-
-    /* 64 addresses x up to 4 queries, one in flight at a time. An ABSENT address
-     * costs one query; a PRESENT one costs four — so the duration scales with how
-     * much gear is actually on the bus: ~4.9 s for a single ballast, ~15 s for a
-     * full 64.
-     *
-     * MUST feed the watchdog. At boot this is called before watchdog_enable() so
-     * it does not matter, but `scan` and the post-provisioning re-scan run at
-     * RUNTIME against a live 5 s watchdog — and a bus with more than a handful of
-     * present ballasts takes longer than that. Without this the controller
-     * reboots in the middle of a scan, which on the bench was hidden only because
-     * one ballast happens to finish in 4.87 s. Same reasoning as cli_mb_wait();
-     * wd_feed is core-1-gated, so a genuine core-1 wedge still reboots. */
-    absolute_time_t deadline = make_timeout_time_ms(45000u);
-    while (dali_state_scan_busy(slave_id)
-           && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
-        modbus_poll();
-        dq_tick();
-        dali_state_tick();
-        wd_feed();
-        /* Gateway not answering: stop waiting. Every query to it will fail, so
-         * the scan can only ever burn the whole deadline — measured at 45 s for
-         * one absent slave, which is why this must not be on the boot path. */
-        if (mbq_client_consec_fail(slave_id) >= 3u) {
-            LOG_WARN("dirty", "slave %u not answering — abandoning scan", slave_id);
-            break;
-        }
-    }
-    if (dali_state_scan_busy(slave_id))
-        LOG_WARN("dirty", "slave %u full scan timed out", slave_id);
-
-    uint64_t present = 0;
-    for (uint8_t a = 0; a < DALI_ADDR_COUNT; a++) {
-        dali_ballast_state_t *b = state_cache_get_dali((uint8_t)idx, a);
-        if (b && b->present) present |= (uint64_t)1 << a;
-    }
-    s_dp[idx].last_present = present;
-    lighting_emit_scan_complete(slave_id, present);
-}
 

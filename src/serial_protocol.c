@@ -1606,16 +1606,15 @@ static void cmd_scan(char **saveptr) {
     int idx = state_cache_slave_idx((uint8_t)slave);
     if (idx < 0) { txt_err("invalid_slave"); return; }
 
-    LOG_INFO("cli", "scan slave %d (blocking)", slave);
-    printf("scanning slave %d...\n", slave);
-    dirty_poll_full_scan((uint8_t)slave);
-    int present = 0;
-    for (int a = 0; a < DALI_ADDR_COUNT; a++) {
-        dali_ballast_state_t *b =
-            state_cache_get_dali((uint8_t)idx, (uint8_t)a);
-        if (b && b->present) present++;
-    }
-    printf("scan complete: %d ballasts present\n", present);
+    /* Asynchronous. This used to block until the interrogation finished, which
+     * on a populated bus is many seconds — and unlike boot, `scan` gets typed on
+     * a LIVE system where someone may be at a wall switch. Blocking here stalls
+     * the main loop, so buttons stop responding for the duration. Arm it and let
+     * the main loop drive it; `dstate` shows progress and a scan-complete event
+     * goes to HA when it finishes. */
+    LOG_INFO("cli", "scan slave %d (async)", slave);
+    dirty_poll_arm_scan((uint8_t)slave);
+    printf("scanning slave %d — async; watch `dstate %d`\n", slave, slave);
 }
 
 /* ── discover ──────────────────────────────────────────────────────────── */
