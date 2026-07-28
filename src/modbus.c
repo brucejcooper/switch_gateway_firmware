@@ -114,6 +114,18 @@ static absolute_time_t       s_op_deadline;   /* hard deadline for the whole in-
 static uint32_t              s_drop_count = 0;    /* actions dropped on a full queue */
 static uint32_t              s_recover_count = 0; /* forced SM recoveries (wedge watchdog) */
 
+/* ── Bus-occupancy accounting (bench instrumentation) ─────────────────────────
+ * Who is actually using the RS-485 bus, and for how long. A transaction's
+ * occupancy is measured from the moment it leaves the action queue until the SM
+ * returns to IDLE — so it includes its retries and the post-frame dead time,
+ * i.e. the real cost of that transaction to every other producer. Zero cost when
+ * nobody reads it; reset + read via modbus_busload_*(). */
+static absolute_time_t       s_bl_window;         /* start of the measurement window */
+static absolute_time_t       s_bl_act_start;      /* current transaction's start */
+static uint64_t              s_bl_busy_us;        /* total bus-occupied time in the window */
+static uint32_t              s_bl_txns;
+static modbus_busload_slave_t s_bl[MODBUS_BUSLOAD_SLAVES];
+
 static bool modbus_rx_valid(void) { return true; }
 
 static const char *modbus_de_mode_str[MODBUS_DE_MAX] = { "tx", "always" };
@@ -437,6 +449,41 @@ static void start_action_tx(void) {
     }
 }
 
+/* Charge the just-finished transaction's bus occupancy to its slave. Called on
+ * every path that returns the SM to IDLE (normal completion and forced
+ * recovery), so the accounting can't silently lose time. */
+static void busload_account(void) {
+    uint64_t us = (uint64_t)absolute_time_diff_us(s_bl_act_start, get_absolute_time());
+    s_bl_busy_us += us;
+    s_bl_txns++;
+    uint8_t dev = currentAction.device;
+    for (uint8_t i = 0; i < MODBUS_BUSLOAD_SLAVES; i++) {
+        if (s_bl[i].txns && s_bl[i].slave != dev) continue;
+        s_bl[i].slave = dev;
+        s_bl[i].txns++;
+        s_bl[i].us += us;
+        return;
+    }
+    /* More distinct slaves than buckets: fold the overflow into the last one. */
+    s_bl[MODBUS_BUSLOAD_SLAVES - 1].txns++;
+    s_bl[MODBUS_BUSLOAD_SLAVES - 1].us += us;
+}
+
+void modbus_busload_reset(void) {
+    memset(s_bl, 0, sizeof s_bl);
+    s_bl_busy_us = 0;
+    s_bl_txns    = 0;
+    s_bl_window  = get_absolute_time();
+}
+
+void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
+                        modbus_busload_slave_t *per) {
+    if (window_us) *window_us = (uint64_t)absolute_time_diff_us(s_bl_window, get_absolute_time());
+    if (busy_us)   *busy_us   = s_bl_busy_us;
+    if (txns)      *txns      = s_bl_txns;
+    if (per)       memcpy(per, s_bl, sizeof s_bl);
+}
+
 /* ── Poll loop ───────────────────────────────────────────────────────────── */
 void modbus_poll(void) {
     /* Stuck-state watchdog: a transaction must complete within MODBUS_OP_MAX_MS.
@@ -456,6 +503,7 @@ void modbus_poll(void) {
         gpio_put(UART_DE_PIN, 0);
         modbus_action_cb_t cb = currentAction.callback;
         currentAction.callback = NULL;          /* one-shot; don't double-fire */
+        busload_account();
         bus_state = MODBUS_IDLE;
         if (cb) cb(0, buf, currentAction.ctx);  /* deliver as a timeout */
         return;
@@ -485,6 +533,7 @@ void modbus_poll(void) {
 
     case MODBUS_IDLE:
         if (queue_try_remove(&action_queue, &currentAction)) {
+            s_bl_act_start  = get_absolute_time();
             s_attempts_left = MODBUS_MAX_RETRIES;
             s_busy_left     = DALI_BUSY_RETRIES;
             s_retry_pending = false;
@@ -576,6 +625,7 @@ void modbus_poll(void) {
                 s_retry_pending = false;
                 start_action_tx();   /* re-send the same request */
             } else {
+                busload_account();
                 bus_state = MODBUS_IDLE;
             }
         }

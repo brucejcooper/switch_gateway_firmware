@@ -664,6 +664,7 @@ static void cmd_help(void) {
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dq [slave]                                 dump command-queue client state + counters\n");
     printf("soak [<slave> <addr> [n=] [depth=]] | stop  queue soak: verified DTR0 write/read pairs\n");
+    printf("busload [reset]                            RS-485 bus occupancy, split per slave\n");
     printf("dim <slave> <addr> {up|down}               step one ballast\n");
     printf("dim <slave> g<group> {up|down}             step one group\n");
     printf("provision <slave> {all|new|<addr>}         commission: all / incremental / re-provision collided <addr>\n");
@@ -1359,6 +1360,36 @@ static void cmd_dq(char **saveptr) {
     dq_debug_print((int)slave);
 }
 
+/* `busload [reset]` — who is using the RS-485 bus. Prints the share of wall time
+ * the bus was occupied since the last reset, split per slave. The point of the
+ * split is that a slave being retried into the ground (a dead board, three
+ * attempts a poll) costs the same bus time as real work, and that cost is
+ * invisible in every other view. */
+static void cmd_busload(char **saveptr) {
+    char *a1 = strtok_r(NULL, " \t", saveptr);
+    if (a1 && strcasecmp(a1, "reset") == 0) { modbus_busload_reset(); txt_ok(); return; }
+
+    uint64_t win = 0, busy = 0;
+    uint32_t txns = 0;
+    modbus_busload_slave_t per[MODBUS_BUSLOAD_SLAVES];
+    modbus_busload_get(&win, &busy, &txns, per);
+    if (win == 0) win = 1;
+
+    printf("busload: window %lu.%02lu s, bus busy %lu%% (%lu txns, %lu.%02lu ms avg)\n",
+           (unsigned long)(win / 1000000u), (unsigned long)((win % 1000000u) / 10000u),
+           (unsigned long)(busy * 100u / win), (unsigned long)txns,
+           (unsigned long)(txns ? (busy / txns) / 1000u : 0u),
+           (unsigned long)(txns ? ((busy / txns) % 1000u) / 10u : 0u));
+    for (uint8_t i = 0; i < MODBUS_BUSLOAD_SLAVES; i++) {
+        if (!per[i].txns) continue;
+        printf("  slave %-3u %5lu txns  %3lu%% of bus  %lu.%02lu ms avg\n",
+               per[i].slave, (unsigned long)per[i].txns,
+               (unsigned long)(per[i].us * 100u / win),
+               (unsigned long)((per[i].us / per[i].txns) / 1000u),
+               (unsigned long)(((per[i].us / per[i].txns) % 1000u) / 10u));
+    }
+}
+
 /* `soak [<slave> <addr> [n=<pairs>] [depth=<1-8>]] | stop` — bench queue soak.
  * Bare = report the running/last run. Hammers the gateway command queue with
  * alternating SET DTR0 / QUERY CONTENT DTR0 pairs and verifies every answer
@@ -2001,6 +2032,10 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "soak") == 0) {
         cmd_soak(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "busload") == 0) {
+        cmd_busload(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "dim") == 0) {

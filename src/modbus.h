@@ -37,6 +37,30 @@ void modbus_poll(void);
 /* Total actions dropped because the action queue was full (diagnostics). */
 uint32_t modbus_drop_count(void);
 
+/* ── Bus-occupancy accounting (bench instrumentation) ─────────────────────────
+ * Answers "who is using the RS-485 bus, and how much of it is left?". Each
+ * transaction is charged from leaving the action queue until the SM returns to
+ * IDLE — including its retries and the post-frame dead time, i.e. what it really
+ * costs every other producer. A dead slave being retried is therefore visible as
+ * the bus hog it is. Call modbus_busload_reset() to start a window, then
+ * modbus_busload_get() to read it. */
+#define MODBUS_BUSLOAD_SLAVES 6u
+
+typedef struct {
+    uint8_t  slave;
+    uint32_t txns;
+    uint64_t us;
+} modbus_busload_slave_t;
+
+void modbus_busload_reset(void);
+
+/* window_us = wall time since the reset; busy_us = bus-occupied time within it;
+ * txns = transactions completed; `per` (if non-NULL) receives
+ * MODBUS_BUSLOAD_SLAVES per-slave buckets (txns == 0 marks an unused bucket).
+ * Any pointer may be NULL. */
+void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
+                        modbus_busload_slave_t *per);
+
 /* ── Enqueue API ─────────────────────────────────────────────────────────────
  * Each returns true if the action was queued, false if the action queue was full
  * and it was dropped (in which case the callback will NEVER fire). Stateful

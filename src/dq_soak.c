@@ -20,7 +20,7 @@
 #include "dq_soak.h"
 #include "dali_queue.h"     /* DQ_ANSWER */
 #include "mbq_client.h"
-#include "config.h"
+#include "modbus.h"
 #include "log.h"
 #include "pico/time.h"
 #include <string.h>
@@ -280,6 +280,7 @@ bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs) {
     S.t_start = get_absolute_time();
     mbq_client_txn_counts(slave, &S.tx0_submits, &S.tx0_polls);
     mbq_client_txn_stats_reset(slave);
+    modbus_busload_reset();   /* the run's report includes who else used the bus */
     S.running = true;
     LOG_INFO("soak", "start slave=%u addr=%u depth=%u pairs=%lu",
              slave, addr, depth, (unsigned long)pairs);
@@ -384,6 +385,27 @@ void dq_soak_report(void) {
         print_ms("txn time max", ts.us_max);
         printf("  %-22s %lu fail (%lu device-busy) of %lu\n", "txn failures",
                (unsigned long)ts.n_fail, (unsigned long)ts.n_busy, (unsigned long)ts.n);
+    }
+
+    /* Bus share: the soak can only run as fast as the share of the RS-485 bus it
+     * actually gets, so the report names the competition rather than leaving a
+     * slow result unexplained. */
+    {
+        uint64_t win = 0, busy = 0;
+        uint32_t bt = 0;
+        modbus_busload_slave_t per[MODBUS_BUSLOAD_SLAVES];
+        modbus_busload_get(&win, &busy, &bt, per);
+        if (win == 0) win = 1;
+        printf("  %-22s %lu%% busy over %lu txns\n", "RS-485 bus",
+               (unsigned long)(busy * 100u / win), (unsigned long)bt);
+        for (uint8_t i = 0; i < MODBUS_BUSLOAD_SLAVES; i++) {
+            if (!per[i].txns) continue;
+            printf("    slave %-3u %5lu txns %3lu%% of wall  %lu.%02lu ms avg\n",
+                   per[i].slave, (unsigned long)per[i].txns,
+                   (unsigned long)(per[i].us * 100u / win),
+                   (unsigned long)((per[i].us / per[i].txns) / 1000u),
+                   (unsigned long)(((per[i].us / per[i].txns) % 1000u) / 10u));
+        }
     }
 
     printf(" pacing (why we weren't submitting):\n");
