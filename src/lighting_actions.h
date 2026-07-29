@@ -51,6 +51,14 @@ typedef enum {
     ANY_ON_PROBE_UNKNOWN = 2,    /* no probe for this button / failed / timed out */
 } any_on_probe_res_t;
 
+/* Blocking any-on probe for ONE DALI address (ballast or group selector byte),
+ * asking the gear directly with QUERY LAMP POWER ON — the same ground truth the
+ * button's press-time probe uses, so a CLI toggle and a button toggle agree.
+ * TEXT CLI ONLY: it spins the bus, like the other cli_mb_wait helpers.
+ * Returns false if unresolved; *any_on is then untouched. */
+bool               lighting_any_on_probe_sync(uint8_t slave_id, uint8_t addr_byte,
+                                              bool *any_on);
+
 void               lighting_any_on_probe_start(uint8_t fixture, uint8_t button);
 any_on_probe_res_t lighting_any_on_probe_get(uint8_t fixture, uint8_t button);
 void               lighting_any_on_probe_tick(void);

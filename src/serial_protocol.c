@@ -959,19 +959,29 @@ static void cmd_dali(char **saveptr) {
                  * no error. The per-ballast path handled toggle properly; only
                  * groups were wrong.
                  *
-                 * NOTE the asymmetry this leaves: a BUTTON toggle resolves via
-                 * the press-time any-on probe (QUERY LAMP POWER ON straight to
-                 * the gear — see button_fsm.c resolve_any_on), whereas this
-                 * CLI/HA path resolves from the cached membership state. The
-                 * cache is trustworthy now that the controller owns it and
-                 * learns it from the ballasts, but the two paths deciding "is
-                 * it on?" by different means is worth unifying. */
+                 * A toggle now READS THEN WRITES, exactly as a button press
+                 * does: QUERY LAMP POWER ON straight to the group selector, and
+                 * invert whatever the gear reports. It used to invert the cached
+                 * membership state, which is the staleness the button's probe
+                 * was introduced to defeat — a gateway reboot loses the masks
+                 * and the cache then answers confidently and wrongly. */
                 int t = parse_on_off_toggle(val);
                 if (t < 0) { txt_err("bad_arg"); return; }
-                int gidx = state_cache_slave_idx((uint8_t)slave);
-                bool on = (t == 2)
-                        ? !(gidx >= 0 && state_cache_dali_group_any_on((uint8_t)gidx, (uint8_t)group))
-                        : (t == 1);
+                bool on;
+                if (t == 2) {
+                    bool any;
+                    uint8_t gb = (uint8_t)(0x81u | (((uint8_t)group & 0x0Fu) << 1));
+                    if (!lighting_any_on_probe_sync((uint8_t)slave, gb, &any)) {
+                        /* Refuse rather than guess — guessing is what the cache
+                         * did, and a wrong guess drives the lights the wrong way. */
+                        txt_err("probe_unresolved");
+                        return;
+                    }
+                    printf("any_on=%s (probe)\n", any ? "true" : "false");
+                    on = !any;
+                } else {
+                    on = (t == 1);
+                }
                 lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, on);
             }
             else if (strcasecmp(key, "members") == 0 || strcasecmp(key, "add") == 0 ||
@@ -989,7 +999,25 @@ static void cmd_dali(char **saveptr) {
             }
             else { txt_err("bad_field"); return; }
         } else {
-            int r = dali_apply_kv((uint8_t)slave, (uint8_t)addr, key, val);
+            /* Resolve a toggle HERE, by asking the ballast, before delegating.
+             * dali_apply_kv is shared with the JSON/intercore path, which runs
+             * in the main loop and must not block — so the blocking probe cannot
+             * live inside it. The CLI resolves to a concrete true/false and the
+             * shared code just applies it. */
+            const char *v = val;
+            char        resolved[6];
+            if (strcasecmp(key, "on") == 0 && strcasecmp(val, "toggle") == 0) {
+                bool any;
+                uint8_t ab = (uint8_t)((((uint8_t)addr & 0x3Fu) << 1) | 0x01u);
+                if (!lighting_any_on_probe_sync((uint8_t)slave, ab, &any)) {
+                    txt_err("probe_unresolved");
+                    return;
+                }
+                printf("any_on=%s (probe)\n", any ? "true" : "false");
+                snprintf(resolved, sizeof resolved, "%s", any ? "false" : "true");
+                v = resolved;
+            }
+            int r = dali_apply_kv((uint8_t)slave, (uint8_t)addr, key, v);
             if (r == 0)  { txt_err("bad_field");   return; }
             if (r == -1) { txt_err("not_present"); return; }
             if (r == -2) return;   /* transport error already printed */
@@ -1262,6 +1290,11 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
         return 1;
     }
     if (strcasecmp(key, "on") == 0) {
+        /* "toggle" here is the JSON/intercore path only — the CLI resolves it by
+         * probing the gear before calling in (see cmd_dali). This one stays
+         * cache-based because it runs in the main loop, where a blocking probe
+         * would stall Modbus, MQTT and the watchdog feed. HA normally sends an
+         * explicit on/off, so this path is the rare one. */
         bool on = (strcasecmp(val, "toggle") == 0) ? !(b && b->commanded_on)
                 : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
                    strcasecmp(val, "on") == 0);

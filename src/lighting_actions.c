@@ -224,6 +224,37 @@ static void probe_finish(bool valid, bool any_on, const char *why) {
                                                    get_absolute_time()) / 1000));
 }
 
+/* Synchronous single-address any-on probe, for the TEXT CLI only.
+ *
+ * Same question the button's press-time probe asks, same opcode, same reading of
+ * the answer — kept here rather than reimplemented in serial_protocol.c so the
+ * two paths cannot drift on what "on" means. The button's version is async and
+ * walks a binding's targets; this one blocks on a single address, which is what
+ * a human-typed command wants.
+ *
+ * BLOCKS (dq_submit_sync spins the bus). Callable from the CLI, never from the
+ * main-loop or intercore command paths — see the warning on dq_submit_sync.
+ *
+ * Returns false if the probe did not resolve (backlog full, deadline, dropped);
+ * the caller must then refuse rather than guess, because guessing is exactly
+ * what the cached-state toggle did. */
+bool lighting_any_on_probe_sync(uint8_t slave_id, uint8_t addr_byte, bool *any_on) {
+    dq_result_t res;
+    uint8_t     ans;
+    if (!dq_submit_sync(slave_id, addr_byte, PROBE_QUERY_OPCODE, DQ_ANSWER, 0,
+                        true, PROBE_DEADLINE_MS, &res, &ans))
+        return false;
+    switch (res) {
+    case DQ_RES_OK:              /* answered — it is on */
+    case DQ_RES_ERR:             /* garbled = collision of answers — >=1 on */
+        *any_on = true;  return true;
+    case DQ_RES_NAK:             /* nothing answered — none on */
+        *any_on = false; return true;
+    default:                     /* dropped/lost — no definitive answer */
+        return false;
+    }
+}
+
 void lighting_any_on_probe_start(uint8_t fixture, uint8_t button) {
     const mapping_record_t *rec = mapping_lookup(fixture, button);
     if (!rec) return;
