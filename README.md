@@ -169,9 +169,12 @@ Each boot, before the main loop starts, the firmware runs:
 6. **Modbus init** — UART at the persisted baud rate (19200 default).
 7. **Bus discovery** — for each configured slave, ping at 19200, fall back to
    9600, auto-reconfigure if needed (see "Baud rate setup" above).
-8. **DALI full scan** — for each TinyModbus gateway, blocking read of every
-   ballast bank + group masks, populate state cache, queue per-ballast state
-   events and a scan-complete.
+8. **DALI interrogation ARMED** — for each gateway, arm a full DALI
+   interrogation and carry on. It is *not* waited on: the main loop drives it,
+   state fills in over the next few hundred ms per ballast, and
+   `dirty_poll_tick()` emits scan-complete when it finishes. Boot reaches the
+   main loop in ~3.5 s regardless of how much gear is on the bus, or whether a
+   configured gateway is absent (which can never finish a scan at all).
 9. **Relay full sync** — read all 32 coils on the Waveshare board into the state
    cache, queue relay state events.
 10. **Button + serial init** — PIO scanner, USB-CDC text CLI.
@@ -313,7 +316,8 @@ Three sources of work, in priority order, at most one query in flight per slave:
    paced by the sweep interval — measured at **4.87 s** for 64 addresses,
    because an absent address costs a single query.
 3. **Background sweep** (`DQ_PRIO_BACKGROUND`). One ballast per
-   `dali_sweep_interval_ms` (default 10 s, 0 = off). This is a *backstop* for
+   `dali_sweep_interval_ms` (default 10 s, 0 = off; tunable from the CLI, HA and
+   the web UI). This is a *backstop* for
    what nothing tells us about — a ballast that lost power, or gear changed
    outside this controller — not the mechanism. Every 6th step probes an
    **absent** address instead, so gear that was off at boot or added later is
@@ -378,6 +382,32 @@ new contract:
 
 The canonical specification for the gateway is
 [`../TinyModbus/README.md`](../TinyModbus/README.md).
+
+### Absent slaves are backed off
+
+A slave that is not there costs `MODBUS_MAX_RETRIES`+1 attempts × the 50 ms
+response timeout — ~186 ms of bus per transaction, every time any producer polls
+it. That was measured as the **largest single contributor to worst-case command
+latency**: a Modbus transaction cannot be preempted, so a button press arriving
+behind one waits it out.
+
+After three consecutive dead transactions the transport stops putting that slave
+on the wire. Requests to it complete immediately as a timeout without
+transmitting, so producers see exactly what they saw before, minus the bus cost.
+Backoff doubles 1 s → 60 s; one **single-attempt** probe is allowed through each
+time it expires (a probe only asks "are you back?", and the retries are what make
+it expensive); any valid reply — including a Modbus exception, which is the slave
+alive and disagreeing — clears it at once.
+
+Two producer-side companions, because a skipped request completes *instantly* and
+every producer's pacing assumes a transaction costs ~25 ms of wall time: the
+world model stops generating sweep work for a down gateway, and `mbq_client`
+slows its active-slot poll from 5 ms to 1 s. Without those the bus was spared but
+the main loop churned — ~12 000 pointless requests in 76 s.
+
+Measured, idle bus: worst case **236 ms → 89 ms**, with *two* absent slaves
+configured rather than the one that produced the 236. `busload` reports the
+backed-off slave count and skipped-transaction count.
 
 ### Scheduler model (task 05)
 
