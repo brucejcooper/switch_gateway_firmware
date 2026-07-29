@@ -404,8 +404,14 @@ static void advance(ds_slave_t *d) {
              * changes. Group membership is only re-read on a full scan. */
             commit_ballast(d, d->addr, d->got_level, d->got_status, false, 0);
             d->verify &= ~bit;
-            /* Still ramping? Keep watching until it settles, so the cached level
-             * is the ballast's final one and not a point on the way there. */
+            /* Still ramping? Keep re-reading at FADE_POLL_MS until it settles,
+             * and PUBLISH EACH SAMPLE. Every one is a real measured level, so HA
+             * gets a live ramp rather than a jump at the end — that is wanted.
+             *
+             * What must never be published is a level we only ASSUMED: the
+             * requested value before the ballast has clamped it to its own
+             * min/max. See the "bri" branch of dali_apply_kv, which deliberately
+             * reports nothing and lets these reads speak. */
             if (d->got_status & STATUS_FADE_RUNNING) {
                 if (!(d->fade_watch & bit)) {
                     d->fade_watch |= bit;

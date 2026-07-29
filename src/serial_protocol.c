@@ -945,6 +945,12 @@ static void cmd_dali(char **saveptr) {
         txt_ok();
         return;
     }
+    /* Emit only when a key produced a value we actually KNOW. A brightness set
+     * does not: the ballast clamps and fades, so its real level arrives later via
+     * the verification read, which publishes then. This mirrors the emit_now
+     * discipline the JSON path already used — the CLI used to emit
+     * unconditionally, republishing a stale or predicted level. */
+    bool emit_now = false;
     do {
         char *eq = strchr(kv, '=');
         if (!eq) { txt_err("bad_arg expected key=value"); return; }
@@ -952,6 +958,10 @@ static void cmd_dali(char **saveptr) {
         const char *key = kv, *val = eq + 1;
         if (is_group) {
             if (strcasecmp(key, "bri") == 0)
+                /* No emit: the group's reported brightness is derived from its
+                 * members' cached levels, and those are still the pre-command
+                 * ones until each member's verification read settles. Publishing
+                 * now would show the old value, then jump. */
                 lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)atoi(val));
             else if (strcasecmp(key, "on") == 0) {
                 /* "toggle" used to match none of the true-ish spellings and so
@@ -983,6 +993,7 @@ static void cmd_dali(char **saveptr) {
                     on = (t == 1);
                 }
                 lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, on);
+                emit_now = true;   /* on/off endpoint is known */
             }
             else if (strcasecmp(key, "members") == 0 || strcasecmp(key, "add") == 0 ||
                      strcasecmp(key, "remove") == 0) {
@@ -996,6 +1007,7 @@ static void cmd_dali(char **saveptr) {
                 else if (strcasecmp(key, "add") == 0)     mask |= bits;
                 else                                      mask &= ~bits;
                 dali_group_set_members((uint8_t)slave, (uint8_t)group, mask);
+                emit_now = true;   /* membership is controller-owned, so known */
             }
             else { txt_err("bad_field"); return; }
         } else {
@@ -1021,11 +1033,14 @@ static void cmd_dali(char **saveptr) {
             if (r == 0)  { txt_err("bad_field");   return; }
             if (r == -1) { txt_err("not_present"); return; }
             if (r == -2) return;   /* transport error already printed */
+            if (r == 1)  emit_now = true;   /* a value worth reporting now */
         }
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
     dirty_poll_mark_active((uint8_t)slave);
-    if (is_group) emit_state_group((uint8_t)slave, (uint8_t)group);
-    else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
+    if (emit_now) {
+        if (is_group) emit_state_group((uint8_t)slave, (uint8_t)group);
+        else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
+    }
     txt_ok();
 }
 
@@ -1286,8 +1301,15 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
     if (strcasecmp(key, "bri") == 0) {
         uint8_t lvl = (uint8_t)atoi(val);
         lighting_dali_set_level(slave, addr, lvl);
-        if (idx >= 0) state_cache_set_dali_arc((uint8_t)idx, addr, lvl, b ? b->status_byte : 0);
-        return 1;
+        /* The requested level is NOT written to the cache and NOT published.
+         * A ballast clamps to its own min/max (and its physical minimum, which
+         * can be far above the request) and may fade there over seconds, so the
+         * number asked for is frequently not the number the light ends up at.
+         * Publishing it made HA show the request, then jump when the real level
+         * arrived. Only the verification read publishes, once the fade settles —
+         * see commit_ballast()/fade_watch in dali_state.c.
+         * Returns 2 = applied, nothing known to report yet. */
+        return 2;
     }
     if (strcasecmp(key, "on") == 0) {
         /* "toggle" reaches here only from the JSON/intercore path — the CLI
