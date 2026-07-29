@@ -625,25 +625,19 @@ bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
     return true;
 }
 
-/* Synchronously record the on/off intent so a follow-up toggle (e.g. a rapid
- * button press) reads the commanded state immediately, before — and regardless
- * of — the async dirty-poll refresh.  The dirty-poll re-syncs the intent from
- * the next *stable* read, so mid-fade reads can't clobber an in-flight toggle. */
-static void cache_predict_dali(uint8_t slave_id, uint8_t dali_addr, bool on) {
-    int idx = state_cache_slave_idx(slave_id);
-    if (idx >= 0) state_cache_set_dali_commanded_on((uint8_t)idx, dali_addr, on);
-}
-
-static void cache_predict_group(uint8_t slave_id, uint8_t group, bool on) {
-    int idx = state_cache_slave_idx(slave_id);
-    if (idx < 0) return;
-    uint64_t mask = state_cache_get_dali_group((uint8_t)idx, group);
-    while (mask) {
-        uint8_t a = (uint8_t)__builtin_ctzll(mask);
-        mask &= mask - 1;
-        state_cache_set_dali_commanded_on((uint8_t)idx, a, on);
-    }
-}
+/* NOTHING PREDICTS STATE ANY MORE.
+ *
+ * There used to be a pair of cache_predict_* helpers that recorded on/off INTENT
+ * the moment a command was sent, plus a 0.7 s settle window in state_cache.c
+ * during which a real read was not allowed to overwrite that intent. It existed
+ * so a rapid second toggle read the commanded state rather than a not-yet-updated
+ * level.
+ *
+ * All three toggle paths now ask the gear directly (QUERY LAMP POWER ON) instead
+ * of consulting the cache, so nothing needed the intent — and the cache is only
+ * ever written from a measured read. A group's on/level are likewise derived from
+ * its members' measured levels: on if any member's arc level is non-zero, level
+ * the maximum of them. */
 
 bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
     if (dali_provision_busy_slave(slave_id)) {
@@ -677,7 +671,6 @@ bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
      * reads the new state, then mark the slave active so dirty-poll confirms the
      * exact level.  Gated on a successful enqueue so a dropped write can't leave
      * the cache claiming a state the hardware never received. */
-    cache_predict_dali(slave_id, dali_addr, on);
     dirty_poll_mark_active(slave_id);
     dali_state_mark_dirty(slave_id, dali_addr);   /* read back what actually happened */
     return true;
@@ -728,7 +721,6 @@ bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
         return false;
     }
     LOG_INFO("light", "dali %u.%u bri=%u", slave_id, dali_addr, arc);
-    cache_predict_dali(slave_id, dali_addr, arc > 0);
     dirty_poll_mark_active(slave_id);
     dali_state_mark_dirty(slave_id, dali_addr);
     return true;
@@ -750,7 +742,6 @@ bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
         return false;
     }
     LOG_INFO("light", "group %u.G%u bri=%u", slave_id, group, arc);
-    cache_predict_group(slave_id, group, arc > 0);
     dirty_poll_mark_active(slave_id);
     dali_state_mark_dirty_group(slave_id, group);
     return true;
@@ -771,7 +762,6 @@ bool lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
     }
     LOG_INFO("light", "group %u.G%u %s",
              slave_id, group, on ? "on" : "off");
-    cache_predict_group(slave_id, group, on);
     dirty_poll_mark_active(slave_id);
     dali_state_mark_dirty_group(slave_id, group);
     return true;

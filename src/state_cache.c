@@ -40,24 +40,6 @@ void state_cache_set_dali_arc(uint8_t slave_idx, uint8_t addr,
     s_dali[slave_idx][addr].arc_level   = arc;
     s_dali[slave_idx][addr].status_byte = status;
     s_dali[slave_idx][addr].fading      = fading;
-    /* Re-sync the on/off intent from a stable read (catches external changes) —
-     * but only once the command settle window has elapsed.  Within the window
-     * the just-commanded intent is authoritative, so a stale read (taken between
-     * command-send and fade-start) or a mid-fade read can't clobber a rapid
-     * in-flight toggle.  Rapid tapping keeps extending cmd_time, so the intent
-     * stays command-driven until the user stops. */
-    #define DALI_CMD_SETTLE_US 700000  /* 0.7 s */
-    if (!fading &&
-        absolute_time_diff_us(s_dali[slave_idx][addr].cmd_time, get_absolute_time())
-            > DALI_CMD_SETTLE_US) {
-        s_dali[slave_idx][addr].commanded_on = (arc > 0);
-    }
-}
-
-void state_cache_set_dali_commanded_on(uint8_t slave_idx, uint8_t addr, bool on) {
-    if (slave_idx >= MAX_DALI_SLAVES || addr >= DALI_ADDR_COUNT) return;
-    s_dali[slave_idx][addr].commanded_on = on;
-    s_dali[slave_idx][addr].cmd_time     = get_absolute_time();
 }
 
 void state_cache_set_dali_config(uint8_t slave_idx, uint8_t addr,
@@ -97,7 +79,12 @@ bool state_cache_dali_group_any_on(uint8_t slave_idx, uint8_t group) {
         mask &= mask - 1;
         if (a >= DALI_ADDR_COUNT) continue;
         dali_ballast_state_t *b = &s_dali[slave_idx][a];
-        if (b->present && b->commanded_on) return true;
+        /* MEASURED, not intended: a member counts as on because its last read
+         * arc level was non-zero, never because we asked it to be on. Using the
+         * commanded intent here made a group report on the instant a command was
+         * sent, before any ballast had confirmed it — an inferred value on a
+         * topic that must only carry measured ones. */
+        if (b->present && b->arc_level > 0) return true;
     }
     return false;
 }

@@ -915,10 +915,13 @@ static void cmd_relay(char **saveptr) {
         const char *val = eq + 1;
         bool on = (strcasecmp(val, "toggle") == 0) ? !state_cache_get_relay_on((uint8_t)ch)
                 : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
+        /* No predictive write and no emit here. relay_write_cb caches and emits
+         * when the Modbus write is ACKed — that ACK is the confirmation. The
+         * predictive write was worse than redundant: on a FAILED write nothing
+         * corrected it, so the cache (and HA) kept the requested state until the
+         * next coil poll happened to disagree, up to RELAY_POLL_INTERVAL_MS later. */
         lighting_set_relay((uint8_t)ch, on);
-        state_cache_set_relay((uint8_t)ch, on);   /* predictive — write cb confirms async */
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
-    emit_state_relay((uint8_t)ch);
     txt_ok();
 }
 
@@ -992,8 +995,13 @@ static void cmd_dali(char **saveptr) {
                 } else {
                     on = (t == 1);
                 }
+                /* No emit: a group's on/level are DERIVED from its members'
+                 * measured levels, and none of them has been re-read yet.
+                 * Publishing here would push a value computed from pre-command
+                 * levels. lighting_group_set_on_off marks every member for
+                 * verification; those reads publish the member states and each
+                 * one recomputes and republishes the group. */
                 lighting_group_set_on_off((uint8_t)slave, (uint8_t)group, on);
-                emit_now = true;   /* on/off endpoint is known */
             }
             else if (strcasecmp(key, "members") == 0 || strcasecmp(key, "add") == 0 ||
                      strcasecmp(key, "remove") == 0) {
@@ -1292,12 +1300,13 @@ static void emit_state_cfg(void) {
 }
 
 /* Apply one DALI key=value to a ballast (shared by set_dali JSON + `dali` CLI).
- * State keys (on/bri) predictively update the cached arc so the immediate
- * report is accurate; the dirty-poll later confirms.  Config keys go through
- * dali_cfg_set.  Returns 1 ok, 0 unknown key, -1 not present, -2 transport err. */
+ * NOTHING HERE PREDICTS. State keys (on/bri) command the ballast and return 2 —
+ * "applied, nothing measured yet" — so no value is cached or published until a
+ * verification read reports what the gear actually did. Config keys go through
+ * dali_cfg_set, which has always worked this way.  Returns 1 ok, 0 unknown key, -1 not present, -2 transport err. */
 static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const char *val) {
-    int idx = state_cache_slave_idx(slave);
-    dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
+    /* No cached-state reads needed: nothing here predicts a level any more, so
+     * there is no old value to carry forward. */
     if (strcasecmp(key, "bri") == 0) {
         uint8_t lvl = (uint8_t)atoi(val);
         lighting_dali_set_level(slave, addr, lvl);
@@ -1325,11 +1334,13 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
         bool on = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
                    strcasecmp(val, "on") == 0);
         lighting_set_on_off(slave, addr, on);
-        if (!on) {
-            /* Off: the resulting level is definitively 0 — emit it now. */
-            if (idx >= 0) state_cache_set_dali_arc((uint8_t)idx, addr, 0u, b ? b->status_byte : 0);
-            return 1;
-        }
+        /* Not even OFF is written ahead of the read. The endpoint is certainly
+         * level 0, but with a fade time the light is NOT there yet, and a cache
+         * that says 0 while the lamp is still ramping down is an inferred value
+         * on a topic that must only carry measured ones. The verification read
+         * marked by lighting_set_on_off reports the real level, including each
+         * step of the ramp. */
+        return 2;   /* applied — nothing measured yet to report */
         /* On: GOTO_LAST_ACTIVE restores a level the controller does NOT know.
          * Don't assume it (the old code guessed max_level/254) — commanded_on is
          * already set by lighting_set_on_off, and the dirty-poll reports the real
@@ -2419,8 +2430,9 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         bool on = (c->set_relay.on == IC_TRI_TOGGLE) ? !state_cache_get_relay_on(ch)
                                                      : (c->set_relay.on == IC_TRI_ON);
         lighting_set_relay(ch, on);
-        state_cache_set_relay(ch, on);   /* predictive; write cb confirms async */
-        emit_state_relay(ch);
+        /* No predictive write and no emit: relay_write_cb caches and emits on the
+         * write ACK, and a failed write must not leave HA showing the requested
+         * state. Emitting here would publish the PRE-command cached value anyway. */
         break;
     }
     case IC_CMD_SET_DALI: {
@@ -2509,7 +2521,16 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
             }
             any = true;
         }
-        if (any) { dirty_poll_mark_active(slave); emit_state_group(slave, group); }
+        if (any) {
+            dirty_poll_mark_active(slave);
+            /* Only a MEMBERSHIP change is publishable straight away — that is
+             * controller-owned state. on/bri are derived from member levels that
+             * have not been re-read yet, so they are left to the member
+             * verification reads, which recompute the group as each lands. This
+             * unconditional emit was the first of the two publishes seen per
+             * group command, and it carried pre-command values. */
+            if (c->set_group.fields & IC_GRP_F_MEMBERS) emit_state_group(slave, group);
+        }
         break;
     }
     case IC_CMD_SET_CFG: {
