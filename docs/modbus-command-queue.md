@@ -68,8 +68,9 @@ its own.
 **2 registers**, not 4 bytes. Getting those units wrong is not a rejected request:
 it silently arms the FOLLOWING slot too, with whatever memory sat after the
 command buffer as its payload — a real command the queue will faithfully execute.
-The controller keeps `MBQ_CMD_REGS` and a `_Static_assert` next to
-`MBQ_CMD_BYTES` for exactly this reason (see task 07).
+Both sides therefore express this in `MBQ_CMD_REGS` rather than a literal — the
+controller when it builds the FC23 write, the slave when it derives `first_slot`
+and `n_slots` — with a `_Static_assert` tying it to `MBQ_CMD_BYTES` (see task 07).
 
 ## Ordering
 
