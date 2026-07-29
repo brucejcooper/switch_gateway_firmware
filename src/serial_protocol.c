@@ -2475,7 +2475,11 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
             /* IC_TRI_TOGGLE used to compare unequal to IC_TRI_ON and so silently
              * meant OFF — the same bug the CLI group path carried until it was
              * fixed, never fixed here. A toggle now probes the group and applies
-             * the inverse asynchronously. */
+             * the inverse asynchronously.
+             *
+             * Reached from the HTTP API / web UI. HA cannot send a toggle: its
+             * JSON light schema carries only {"state":"ON"|"OFF"} and
+             * ha_bridge maps anything that is not "ON" to OFF. */
             if (c->set_group.on == IC_TRI_TOGGLE) {
                 lighting_toggle_async(slave, group, true);
             } else {

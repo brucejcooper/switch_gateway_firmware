@@ -53,8 +53,9 @@ typedef enum {
 
 /* Toggle a ballast (is_group false) or group ASYNCHRONOUSLY: probe the gear with
  * QUERY LAMP POWER ON and apply the inverse when the answer lands, all through
- * the normal queue. For the intercore/HA path, which runs in the main loop and
- * must never block. An unresolved probe does nothing and warns — it does not
+ * the normal queue. For the intercore path, which runs in the main loop and must
+ * never block — reached today by the HTTP API / web UI, not by Home Assistant,
+ * which resolves its own toggles and only ever sends explicit ON/OFF. An unresolved probe does nothing and warns — it does not
  * fall back to cached state. Returns false if no probe slot is free or the queue
  * refused the submit. */
 bool               lighting_toggle_async(uint8_t slave_id, uint8_t target,

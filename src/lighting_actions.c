@@ -224,11 +224,19 @@ static void probe_finish(bool valid, bool any_on, const char *why) {
                                                    get_absolute_time()) / 1000));
 }
 
-/* ── Asynchronous toggle (HA / intercore path) ───────────────────────────────
+/* ── Asynchronous toggle (intercore path) ────────────────────────────────────
  * The CLI can block on a probe; the intercore path cannot — it runs in the main
  * loop, where spinning the bus would stall Modbus, MQTT and the watchdog feed.
- * So an HA toggle becomes: submit the same QUERY LAMP POWER ON through the
+ * So a toggle here becomes: submit the same QUERY LAMP POWER ON through the
  * normal queue, and apply the inverse when the answer arrives.
+ *
+ * WHO ACTUALLY REACHES THIS: the HTTP API / web UI (/api/dali, /api/group with
+ * on:"toggle"), and any client that pushes IC_TRI_TOGGLE. NOT Home Assistant.
+ * We publish "schema":"json" light entities, whose command payloads are strictly
+ * {"state":"ON"} / {"state":"OFF"}; HA resolves light.toggle ITSELF from the
+ * state we publish, and ha_bridge's inbound parser only recognises "ON" anyway.
+ * So HA toggle correctness rests on the accuracy of our state topic — i.e. on
+ * the verification reads — not on this code.
  *
  * Safe to submit the follow-up command from inside the completion callback:
  * dq_tick() drives mbq_client_tick() (which fires callbacks) BEFORE its ship
