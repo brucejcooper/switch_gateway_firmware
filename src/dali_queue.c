@@ -51,6 +51,7 @@
 #define DQ_CLASS_MAX     8u   /* per-class ring capacity (max over the classes) */
 #define DQ_DEPTH_USER    4u   /* gateway slots a user command may fill to */
 #define DQ_DEPTH_CFG     3u
+#define DQ_DEPTH_READ    3u   /* verification reads: a command's outcome to HA */
 #define DQ_DEPTH_BG      2u   /* background never gets deeper than this */
 
 /* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
@@ -94,14 +95,26 @@ typedef struct {
 
 /* Class index. dq_prio_t maps onto these — the ladder is unchanged, only its
  * storage is partitioned. */
-typedef enum { DQ_CL_PROV = 0, DQ_CL_USER, DQ_CL_CFG, DQ_CL_BG, DQ_CL_COUNT } dq_class_id_t;
+typedef enum { DQ_CL_PROV = 0, DQ_CL_USER, DQ_CL_CFG, DQ_CL_READ, DQ_CL_BG,
+               DQ_CL_COUNT } dq_class_id_t;
 
+/* DQ_CL_READ exists because DQ_PRIO_LEVEL_READ used to fall through `default:`
+ * into DQ_CL_BG alongside DQ_PRIO_BACKGROUND. dali_state.c chose between the two
+ * with a ternary and a comment promising "verification reads outrank the sweep",
+ * but the two were the same class, so they did not. Verification reads carry a
+ * command's real outcome to HA and must not queue behind a rotating refresh.
+ *
+ * Ranked BELOW config writes: those are user-initiated changes, and a follow-up
+ * read should not displace one. GROUP_WRITE still shares DQ_CL_USER, and that is
+ * deliberate rather than an oversight — a group command IS a user action and
+ * wants exactly the user class's storage and depth. */
 static dq_class_id_t class_of(dq_prio_t p) {
     switch (p) {
         case DQ_PRIO_PROVISION:     return DQ_CL_PROV;
         case DQ_PRIO_USER:
         case DQ_PRIO_GROUP_WRITE:   return DQ_CL_USER;
         case DQ_PRIO_CONFIG_WRITE:  return DQ_CL_CFG;
+        case DQ_PRIO_LEVEL_READ:    return DQ_CL_READ;
         default:                    return DQ_CL_BG;
     }
 }
@@ -176,6 +189,10 @@ void dq_init(void) {
         s_dq[i].cl[DQ_CL_PROV] = (dq_class_t){ .cap = 2u,           .depth = 1u            };
         s_dq[i].cl[DQ_CL_USER] = (dq_class_t){ .cap = DQ_CLASS_MAX, .depth = DQ_DEPTH_USER };
         s_dq[i].cl[DQ_CL_CFG]  = (dq_class_t){ .cap = 3u,           .depth = DQ_DEPTH_CFG  };
+        /* Verification reads arrive per touched ballast, so a group command's
+         * fan-out can mark several at once — hence a wider ring than the sweep,
+         * which only ever has one rotation entry outstanding. */
+        s_dq[i].cl[DQ_CL_READ] = (dq_class_t){ .cap = 4u,           .depth = DQ_DEPTH_READ };
         s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 2u,           .depth = DQ_DEPTH_BG   };
         mbq_client_add_slave(s_dq[i].slave_id);
     }
@@ -249,12 +266,6 @@ static uint8_t pending_total(const dq_slave_t *s) {
     uint8_t n = 0;
     for (uint8_t i = 0; i < DQ_CL_COUNT; i++) n = (uint8_t)(n + s->cl[i].n);
     return n;
-}
-
-bool dq_busy(uint8_t slave_id) {
-    dq_slave_t *s = slave_for(slave_id);
-    if (!s) return false;
-    return pending_total(s) > 0 || any_delta(s) || mbq_client_busy(slave_id);
 }
 
 /* ── driver internals ────────────────────────────────────────────────────── */
@@ -385,6 +396,7 @@ void dq_tick(void) {
         if (ship_class(s, DQ_CL_USER)) continue;   /* discrete presses / HA commands */
         if (ship_delta(s))             continue;   /* dim ramps, one step at a time */
         if (ship_class(s, DQ_CL_CFG))  continue;   /* config writes */
+        if (ship_class(s, DQ_CL_READ)) continue;   /* verification reads */
         ship_class(s, DQ_CL_BG);                   /* sweeps, rotation queries */
     }
 }
@@ -433,12 +445,14 @@ void dq_debug_print(int slave_id) {
         for (uint8_t j = 0; j < 64; j++) if (s->delta[j])  { dsum += s->delta[j]; dn++; }
         for (uint8_t j = 0; j < 16; j++) if (s->gdelta[j]) { dsum += s->gdelta[j]; dn++; }
         cdc_out_printf("dq slave %u: inflight=%u\n", s->slave_id, s->outstanding);
-        cdc_out_printf("  pending/class: prov=%u/%u user=%u/%u cfg=%u/%u bg=%u/%u  (depth %u/%u/%u)\n",
+        cdc_out_printf("  pending/class: prov=%u/%u user=%u/%u cfg=%u/%u read=%u/%u bg=%u/%u"
+                       "  (depth %u/%u/%u/%u)\n",
                        s->cl[DQ_CL_PROV].n, s->cl[DQ_CL_PROV].cap,
                        s->cl[DQ_CL_USER].n, s->cl[DQ_CL_USER].cap,
                        s->cl[DQ_CL_CFG].n,  s->cl[DQ_CL_CFG].cap,
+                       s->cl[DQ_CL_READ].n, s->cl[DQ_CL_READ].cap,
                        s->cl[DQ_CL_BG].n,   s->cl[DQ_CL_BG].cap,
-                       DQ_DEPTH_USER, DQ_DEPTH_CFG, DQ_DEPTH_BG);
+                       DQ_DEPTH_USER, DQ_DEPTH_CFG, DQ_DEPTH_READ, DQ_DEPTH_BG);
         cdc_out_printf("  dim delta: %d target(s), net %d steps, cursor=%u\n",
                        dn, dsum, s->delta_cursor);
         cdc_out_printf("  counters: submitted=%lu ok=%lu nak=%lu err=%lu dropped=%lu "

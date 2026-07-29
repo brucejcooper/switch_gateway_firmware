@@ -46,7 +46,6 @@ void dali_state_tick(void);
  *   _mark_all         every present ballast (broadcast, or an unknown target) */
 void dali_state_mark_dirty(uint8_t slave_id, uint8_t addr);
 void dali_state_mark_dirty_group(uint8_t slave_id, uint8_t group);
-void dali_state_mark_all(uint8_t slave_id);
 
 /* Arm a full discovery pass for a slave: presence + groups + level/status for
  * every address (config follows via the existing config-query rotation). Used at

@@ -18,6 +18,8 @@
 #include "button_fsm.h"
 #include "config.h"
 #include "state_cache.h"
+#include "button_actions.h"
+#include "net/ha_bridge.h"
 #include "dirty_poll.h"
 #include "bus_discovery.h"
 #include "modbus.h"
@@ -904,7 +906,7 @@ static void cmd_relay(char **saveptr) {
     int ch = 0;
     if (!parse_int_range(cs, 0, RELAY_COUNT - 1, &ch)) { txt_err("out_of_range"); return; }
     char *kv = strtok_r(NULL, " \t", saveptr);
-    if (!kv) { emit_state_relay((uint8_t)ch); return; }   /* get */
+    if (!kv) { emit_state_relay((uint8_t)ch); txt_ok(); return; }   /* get */
     do {
         char *eq = strchr(kv, '=');
         if (!eq) { txt_err("bad_arg expected key=value"); return; }
@@ -917,6 +919,7 @@ static void cmd_relay(char **saveptr) {
         state_cache_set_relay((uint8_t)ch, on);   /* predictive — write cb confirms async */
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
     emit_state_relay((uint8_t)ch);
+    txt_ok();
 }
 
 /* dali <slave> <addr|gN> [key=value ...] — bare = get; key=value = set.
@@ -939,6 +942,7 @@ static void cmd_dali(char **saveptr) {
     if (!kv) {   /* get */
         if (is_group) emit_state_group((uint8_t)slave, (uint8_t)group);
         else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
+        txt_ok();
         return;
     }
     do {
@@ -994,6 +998,7 @@ static void cmd_dali(char **saveptr) {
     dirty_poll_mark_active((uint8_t)slave);
     if (is_group) emit_state_group((uint8_t)slave, (uint8_t)group);
     else          emit_state_dali((uint8_t)slave, (uint8_t)addr);
+    txt_ok();
 }
 
 /* tombstone dali <slave> <addr> | group <slave> <grp> | gw <slave>
@@ -1029,7 +1034,7 @@ static void cmd_tombstone(char **saveptr) {
  *       relay_slaves=1,2  dali_slaves=2,3  (comma lists). fw_version is read-only. */
 static void cmd_cfg(char **saveptr) {
     char *kv = strtok_r(NULL, " \t", saveptr);
-    if (!kv) { emit_state_cfg(); return; }
+    if (!kv) { emit_state_cfg(); txt_ok(); return; }
     bool any = false;
     do {
         char *eq = strchr(kv, '=');
@@ -1058,6 +1063,7 @@ static void cmd_cfg(char **saveptr) {
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
     if (any && !config_save()) { txt_err("save_failed"); return; }
     emit_state_cfg();
+    txt_ok();
 }
 
 /* ── btn <fixture> <button> [tap|press|release] ────────────────────────────
@@ -1132,6 +1138,16 @@ static unsigned long now_ms_u(void) {
  * the get/predictive paths; the unsolicited dirty-poll path goes through the
  * lighting event ring + levt_to_ic in serial_poll(). USB CDC carries no JSON —
  * it is a human text CLI only (see `show`). */
+/* NOTE for all emit_state_* below: these publish to CORE 1 (MQTT/HA) via the
+ * intercore queue. They print NOTHING to the console.
+ *
+ * That is a hangover from when the Python host bridge consumed this CLI's JSON
+ * over the serial wire — emitting the report WAS the reply. Since the on-board
+ * bridge moved to core 1 (2026-06-09) the report goes to a channel the human at
+ * the terminal cannot see, so every CLI verb using these looked like it did
+ * nothing: `dali 3 0 on=true` switched the light and printed not a byte. Text
+ * command handlers must therefore finish with txt_ok() or txt_err(); the JSON /
+ * intercore path in ic_dispatch_cmd must NOT, since nothing is listening there. */
 static void emit_state_dali(uint8_t slave, uint8_t addr) {
     int idx = state_cache_slave_idx(slave);
     dali_ballast_state_t *b = idx >= 0 ? state_cache_get_dali((uint8_t)idx, addr) : NULL;
@@ -1167,9 +1183,6 @@ static void emit_state_group(uint8_t slave, uint8_t group) {
     intercore_push_event(&ev);
 }
 
-/* Set a DALI group's full membership mask.  Writes the changed group-mask
- * registers (0x0110+); the gateway diffs old vs new and issues the DALI
- * ADD/REMOVE-from-group commands.  Updates the cache predictively. */
 /* Set a DALI group's membership.
  *
  * Task 05: this used to write the gateway's group-mask registers (0x0110+) and
@@ -1442,6 +1455,12 @@ static void cmd_busload(char **saveptr) {
 
     uint32_t rt = 0, rb = 0;
     modbus_busload_retries(&rt, &rb);
+
+    /* Queue-overflow drops. Both counters are incremented on hot paths that must
+     * not log (the button PIO/IRQ path and the MQTT process pump), so this is the
+     * only place they become visible — until now they were counted and never
+     * read by anything, which made a real loss of presses or HA commands
+     * completely silent. Non-zero here is always worth investigating. */
     cdc_out_printf("busload: window %lu.%02lu s, bus busy %lu%% (%lu txns, %lu.%02lu ms avg)\n",
            (unsigned long)(win / 1000000u), (unsigned long)((win % 1000000u) / 10000u),
            (unsigned long)(busy * 100u / win), (unsigned long)txns,
@@ -1468,6 +1487,14 @@ static void cmd_busload(char **saveptr) {
                (unsigned long)((per[i].us / per[i].txns) / 1000u),
                (unsigned long)(((per[i].us / per[i].txns) % 1000u) / 10u));
     }
+    /* Printed unconditionally, including when zero: a line that only appears on
+     * failure cannot be told apart from a counter nobody wired up, which is what
+     * these two were until now. Seeing 0 is the point. Both are incremented on
+     * hot paths that must not log (the button PIO/IRQ path, the MQTT pump), so
+     * this is the only place they surface. */
+    cdc_out_printf("  queue drops: %lu button event(s), %lu HA command(s)\n",
+                   (unsigned long)button_raw_drop_count(),
+                   (unsigned long)ha_bridge_cmd_drop_count());
 }
 
 /* `soak [<slave> <addr> [n=<pairs>] [depth=<1-8>]] | stop` — bench queue soak.

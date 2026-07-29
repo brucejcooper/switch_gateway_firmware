@@ -840,21 +840,6 @@ bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
     return enqueue(&a);
 }
 
-/* New: FC16 Write Multiple Registers.  `data` is the big-endian register bytes
- * (count*2 of them); count registers written starting at addr. */
-bool modbus_write_multiple_registers(uint8_t dev, uint16_t addr, uint16_t count,
-                                     const uint8_t *data,
-                                     modbus_action_cb_t cb, void *ctx) {
-    if (count == 0 || (size_t)count * 2u > MODBUS_WR_PAYLOAD_MAX) return false;
-    modbus_action_t a = {
-        .action = ACTION_WRITE_MULTI_REG, .device = dev,
-        .wr_address = addr, .wr_count = count, .wr_len = (uint8_t)(count * 2u),
-        .callback = cb, .ctx = ctx,
-    };
-    memcpy(a.wr_payload, data, (size_t)count * 2u);
-    return enqueue(&a);
-}
-
 /* New: FC23 Read/Write Multiple Registers.  The slave writes wr_count registers
  * at wr_addr (data = big-endian bytes), THEN reads rd_count registers at rd_addr;
  * the response carries the post-write read block.  wr_count may be 0 for a

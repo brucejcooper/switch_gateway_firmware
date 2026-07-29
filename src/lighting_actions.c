@@ -372,19 +372,6 @@ void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr) {
     s_cfgq_pending[idx] |= ((uint64_t)1 << addr);
 }
 
-void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask) {
-    int idx = state_cache_slave_idx(slave_id);
-    if (idx < 0) return;
-    s_cfgq_pending[idx] |= mask;
-}
-
-bool lighting_cfg_query_busy(void) {
-    if (s_cfgq.active) return true;
-    for (int i = 0; i < MAX_DALI_SLAVES; i++)
-        if (s_cfgq_pending[i]) return true;
-    return false;
-}
-
 /* Write the accumulated fields into the cache and re-emit state_dali. A field
  * that didn't answer keeps its cached value (a partial read never zeroes good
  * config). Called once all CFGQ_NFIELDS have been attempted for one ballast. */
@@ -745,24 +732,6 @@ void lighting_emit_group_state_if_changed(uint8_t slave_id, uint8_t group) {
     push_evt(&e);
     LOG_INFO("light", "group %u.G%u state on=%s bri=%u",
              slave_id, group, on_now ? "true" : "false", bri_now);
-}
-
-void lighting_emit_presence(uint8_t slave_id,
-                             uint64_t appeared, uint64_t disappeared) {
-    levt_t e = {
-        .type     = LEVT_PRESENCE,
-        .presence = { slave_id, appeared, disappeared }
-    };
-    push_evt(&e);
-}
-
-void lighting_emit_fault(uint8_t slave_id, uint8_t addr,
-                          bool lamp_fail, bool power_cycle) {
-    levt_t e = {
-        .type  = LEVT_FAULT,
-        .fault = { slave_id, addr, lamp_fail, power_cycle }
-    };
-    push_evt(&e);
 }
 
 /* fix #6: scan_complete — bridge uses present_mask to set per-ballast availability */

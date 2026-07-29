@@ -112,11 +112,6 @@ bool dq_add_delta(uint8_t slave_id, bool is_group, uint8_t addr, int8_t steps);
  * iteration. */
 void dq_tick(void);
 
-/* True if slave_id has any command pending in the backlog or in flight at the
- * gateway. Producers that must serialise against the queue (e.g. a probe that
- * needs the bus quiet) can gate on this. */
-bool dq_busy(uint8_t slave_id);
-
 /* Blocking submit-and-wait, for the text CLI (dali_raw / read_mem). Submits one
  * command and spins the bus (modbus_poll + dq_tick) until its result is
  * collected or `timeout_ms` elapses. Returns true on a result (fills *result /

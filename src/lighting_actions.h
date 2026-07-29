@@ -64,9 +64,7 @@ void               lighting_any_on_probe_tick(void);
  * refreshed config. (Stage 3 routes these queries through the id-tagged gateway
  * command queue; see lighting_actions.c.) */
 void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr);   /* one ballast */
-void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask); /* boot sweep */
 void lighting_cfg_query_tick(void);
-bool lighting_cfg_query_busy(void);   /* pending work or a sequence in flight */
 
 /* Per-ballast config fields writable over raw DALI (task 03, Phase B). */
 typedef enum {
@@ -113,10 +111,6 @@ bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc);
 void lighting_emit_relay_state(uint8_t channel, bool on);
 void lighting_emit_dali_state(uint8_t slave_id, uint8_t addr,
                                uint8_t arc, uint8_t status);
-void lighting_emit_presence(uint8_t slave_id,
-                             uint64_t appeared, uint64_t disappeared);
-void lighting_emit_fault(uint8_t slave_id, uint8_t addr,
-                          bool lamp_fail, bool power_cycle);
 /* Emitted when a full DALI interrogation completes (dirty_poll_tick notices
  * the transition), so the bridge can set per-ballast availability. */
 void lighting_emit_scan_complete(uint8_t slave_id, uint64_t present_mask);

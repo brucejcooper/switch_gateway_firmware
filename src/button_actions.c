@@ -16,8 +16,11 @@
 #include <stdint.h>
 
 static volatile uint32_t s_btn_drops = 0;
-uint32_t button_raw_drop_count(void) { return s_btn_drops; }
 
+/* Raw button events dropped because the core-0 queue was full. Counted, never
+ * logged — this runs in the PIO/IRQ path where a printf would be worse than the
+ * drop. Surfaced by the `busload` CLI command. */
+uint32_t button_raw_drop_count(void) { return s_btn_drops; }
 #define SER_PIN       6
 #define CLK_PIN       7
 #define COL_PIN_BASE  8

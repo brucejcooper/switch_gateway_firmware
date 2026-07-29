@@ -335,7 +335,6 @@ void dcom_tick(void) {
 
 dcom_state_t dcom_state(void)   { return s.state; }
 uint8_t      dcom_count(void)   { return s.count; }
-uint8_t      dcom_slave(void)   { return s.slave_id; }
 bool         dcom_busy(void)    { return s.active; }
 const char  *dcom_phase_name(void) {
     return (s.phase <= P_TERMINATE) ? PHASE_NAME[s.phase] : "?";

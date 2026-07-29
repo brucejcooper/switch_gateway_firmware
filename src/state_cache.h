@@ -60,5 +60,3 @@ bool     state_cache_dali_group_any_on(uint8_t slave_idx, uint8_t group);
 /* Max arc level across present members; 0 if no member is on. */
 uint8_t  state_cache_dali_group_max_bri(uint8_t slave_idx, uint8_t group);
 
-/* Returns true if any light mapped to (fixture,button) is currently on */
-bool state_cache_any_on(uint8_t fixture, uint8_t button);

@@ -111,17 +111,6 @@ bool modbus_get_input_registers(uint8_t device_id, uint16_t addr,
                                  uint16_t count,
                                  modbus_action_cb_t cb, void *ctx);
 
-/* ── New: FC16 / FC23 for the gateway command queue (task 04) ───────────────
- * FC16 writes `count` registers (big-endian bytes in `data`, count*2 of them)
- * at `addr`.  FC23 writes wr_count registers at wr_addr THEN reads rd_count at
- * rd_addr in one transaction — the response carries the post-write read block
- * (the queue's submit-N / collect-N-1 pipeline).  Both cap the write side at
- * MODBUS_WR_PAYLOAD_MAX bytes (8 registers) and return false (dropped, cb never
- * fires) if that is exceeded or the register counts are zero. */
-bool modbus_write_multiple_registers(uint8_t device_id, uint16_t addr,
-                                     uint16_t count, const uint8_t *data,
-                                     modbus_action_cb_t cb, void *ctx);
-
 bool modbus_read_write_multiple_registers(uint8_t device_id,
                                           uint16_t rd_addr, uint16_t rd_count,
                                           uint16_t wr_addr, uint16_t wr_count,

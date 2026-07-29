@@ -178,12 +178,6 @@ void dali_state_mark_dirty_group(uint8_t slave_id, uint8_t group) {
     d->verify |= members & d->present;
 }
 
-void dali_state_mark_all(uint8_t slave_id) {
-    ds_slave_t *d = slave_for(slave_id);
-    if (!d) return;
-    d->verify |= d->present;
-}
-
 void dali_state_request_full_scan(uint8_t slave_id) {
     ds_slave_t *d = slave_for(slave_id);
     if (!d) return;
@@ -348,7 +342,11 @@ static bool issue(ds_slave_t *d) {
     uint8_t addr_byte = (uint8_t)(((d->addr & 0x3Fu) << 1) | 0x01u);
     uint16_t g = next_gen(d);
     /* Verification reads outrank the sweep: a command's real outcome must reach
-     * HA promptly, while a background refresh can wait behind anything. */
+     * HA promptly, while a background refresh can wait behind anything. This now
+     * holds — DQ_PRIO_LEVEL_READ has its own scheduler class. Until task 07 it
+     * fell through into the background class alongside DQ_PRIO_BACKGROUND, so
+     * this ternary picked between two names for the same queue and the comment
+     * promised an ordering the code did not deliver. */
     dq_prio_t prio = d->is_scan ? DQ_PRIO_BACKGROUND : DQ_PRIO_LEVEL_READ;
     if (!dq_submit(d->slave_id, prio, addr_byte, OPCODE[d->step],
                    DQ_ANSWER, 0, true, ds_cb, (void *)(uintptr_t)g))

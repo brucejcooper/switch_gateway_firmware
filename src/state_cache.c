@@ -116,33 +116,3 @@ uint8_t state_cache_dali_group_max_bri(uint8_t slave_idx, uint8_t group) {
     return max;
 }
 
-bool state_cache_any_on(uint8_t fixture, uint8_t button) {
-    const mapping_record_t *rec = mapping_lookup(fixture, button);
-    if (!rec) return false;
-    for (int i = 0; i < rec->target_count; i++) {
-        uint8_t slave = rec->targets[i].slave;
-        uint8_t addr  = rec->targets[i].addr;
-        switch (slave_kind(slave)) {
-        case SLAVE_KIND_RELAY:
-            if (state_cache_get_relay_on(addr)) return true;
-            break;
-        case SLAVE_KIND_DALI: {
-            int idx = state_cache_slave_idx(slave);
-            if (idx < 0) break;
-            if (TARGET_IS_GROUP(rec->targets[i])) {
-                if (state_cache_dali_group_any_on((uint8_t)idx,
-                                                   TARGET_GROUP_NUM(rec->targets[i])))
-                    return true;
-            } else {
-                dali_ballast_state_t *b = state_cache_get_dali(
-                    (uint8_t)idx, TARGET_BALLAST_ADDR(rec->targets[i]));
-                if (b && b->commanded_on) return true;
-            }
-            break;
-        }
-        default:
-            break;
-        }
-    }
-    return false;
-}

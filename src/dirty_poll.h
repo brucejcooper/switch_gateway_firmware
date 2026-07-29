@@ -15,10 +15,6 @@ void dirty_poll_tick(void);
  * uses. */
 void dirty_poll_arm_scan(uint8_t slave_id);
 
-
-/* 60s background presence + status anomaly check */
-void dirty_poll_background_check(uint8_t slave_id);
-
 /* Re-emit each relay + DALI slave's CURRENT reachability as a gateway-state
  * event. Reachability is tracked here as a one-shot transition (online→offline
  * fires once), so resync must replay it: on every MQTT (re)connect core 1's
@@ -27,24 +23,18 @@ void dirty_poll_background_check(uint8_t slave_id);
  * lighting_resync_emit(). */
 void dirty_poll_emit_gateway_states(void);
 
-#define DIRTY_POLL_INTERVAL_MS   100u    /* fast dirty-mask poll while active */
-#define DIRTY_ACTIVE_WINDOW_MS   2000u   /* stay active this long after the last command/change */
-#define DIRTY_SWEEP_MS           1000u   /* regular cheap dirty-mask sweep while idle */
-#define BACKGROUND_CHECK_MS      60000u  /* heavy presence/group/fault scan */
 /* Steady-state config-over-raw rotation: mark one present ballast per gateway
  * for a background raw config re-read this often. ~14 s × 64 ballasts ≈ 15 min
  * for full coverage — enough to catch an external recommissioning without
  * loading the bus. */
 #define DALI_CFG_ROTATE_MS       14000u
 
-/* TinyModbus register addresses. Only BLOCK0 (live arc level / status) is read
- * from the gateway now — the config banks (min/max/power-on/sys-fail/fade,
- * formerly 0x0040/0x0080/0x00C0) were retired in task 04 and config is read via
- * raw DALI queries. Presence/dirty are FC04 input registers. */
-#define DALI_BLOCK0_START     0x0000u  /* FC03 holding: status | brightness */
-#define DALI_PRESENT_START    0x0100u  /* FC04 input, 4 regs */
-#define DALI_DIRTY_START      0x0104u  /* FC04 input, 4 regs, read-clears */
+/* The gateway's sysinfo block — the ONLY register range this module still reads.
+ *
+ * Everything else that used to be listed here is gone with the task-05 gateway
+ * strip: BLOCK0 arc/status (0x0000), presence (0x0100), the read-clearing dirty
+ * mask (0x0104), the group masks (0x0110) and the scan trigger (0x1F00). The
+ * gateway caches nothing now, so live state comes from raw DALI queries via
+ * dali_state.c and those addresses return ILLEGAL DATA ADDRESS. The four polling
+ * intervals that paced the dirty-mask sweep went with them. */
 #define DALI_SYSINFO_START    0x0310u  /* FC04 input, 4 regs: uptime(2) boot_count reset_reason */
-#define DALI_GROUP_MASK_START 0x0110u  /* FC03 holding, 4 regs/group * 16 groups = 64 regs */
-#define DALI_SCAN_TRIGGER_REG 0x1F00u   /* relocated in task 04 (was 0x1010) */
-#define DALI_MAX_CHUNK        16u

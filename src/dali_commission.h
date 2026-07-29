@@ -56,6 +56,5 @@ void dcom_tick(void);
 
 dcom_state_t dcom_state(void);
 uint8_t      dcom_count(void);        /* ballasts addressed so far this run */
-uint8_t      dcom_slave(void);
 bool         dcom_busy(void);
 const char  *dcom_phase_name(void);   /* current phase, for status reporting */

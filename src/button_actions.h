@@ -6,7 +6,6 @@
  * (defined in button_fsm.h) instead of calling lua_schedule_btn_change(). */
 void buttongrid_init(void);
 
-/* Count of raw button events dropped because the FSM queue was full — a lost
- * press/release. Counted (not logged) because this is the PIO scan path.
- * Should stay 0; a non-zero value means the FSM drain is being starved. */
+/* Raw button events dropped on a full core-0 queue. A climbing count means
+ * presses are being lost; shown by `busload`. */
 uint32_t button_raw_drop_count(void);
