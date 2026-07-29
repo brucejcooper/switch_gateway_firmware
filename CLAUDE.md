@@ -358,7 +358,15 @@ Permanent diagnostics, read with `get_input <slave> 0x0300 16`:
 `reg0 rx_overflow` (FIFO overflow / lost byte) · `reg1 frame_error` (USART
 framing/parity) · `reg2 crc_error` (frame arrived, CRC≠0; foreign-slave frames
 excluded) · `reg3 frames_ok` (denominator) · `reg4 last_fail_len` · `reg5..12`
-the bytes of the last CRC-failed frame. Counters are zeroed on gateway reset.
+the bytes of the last CRC-failed frame · **`reg13` internal fault count** ·
+**`reg14` `[tm_err_t | tm_fault_site_t]` of the first internal fault**.
+Counters are zeroed on gateway reset.
+
+**reg13/reg14 (2026-07-29)** are the gateway's own invariant breaks — errors
+raised where no caller could act on them (a bad slot index in the DALI completion
+ISR, a refused command launch; see `TinyModbus/src/errors.h`). A healthy gateway
+reads **0** for its whole uptime. Non-zero reg13 means a queue slot may be
+stranded EXECUTING or a DALI launch was skipped; reg14 names which site.
 Use them to confirm any RX fix keeps `crc_error`/`frame_error` flat under load.
 
 ### Gateway sysinfo / reboot diagnostics (FC04 `0x0310`, 4-register read) — 2026-06-16
