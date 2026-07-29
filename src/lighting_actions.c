@@ -224,6 +224,84 @@ static void probe_finish(bool valid, bool any_on, const char *why) {
                                                    get_absolute_time()) / 1000));
 }
 
+/* ── Asynchronous toggle (HA / intercore path) ───────────────────────────────
+ * The CLI can block on a probe; the intercore path cannot — it runs in the main
+ * loop, where spinning the bus would stall Modbus, MQTT and the watchdog feed.
+ * So an HA toggle becomes: submit the same QUERY LAMP POWER ON through the
+ * normal queue, and apply the inverse when the answer arrives.
+ *
+ * Safe to submit the follow-up command from inside the completion callback:
+ * dq_tick() drives mbq_client_tick() (which fires callbacks) BEFORE its ship
+ * loop reads the class rings, and dq_mbq_cb releases the trampoline before
+ * invoking the user callback — so the new command lands in a ring the loop has
+ * not visited yet, using a trampoline that is already free.
+ *
+ * A slot is held only for the flight of one query. An unresolved probe does
+ * NOTHING rather than guessing, and says so — the same rule as the CLI. */
+#define TOGGLE_SLOTS 4
+
+static struct {
+    bool     busy;
+    uint8_t  slave;
+    uint8_t  target;     /* short address, or group number */
+    bool     is_group;
+    uint16_t gen;        /* rejects a late answer from a superseded probe */
+} s_tog[TOGGLE_SLOTS];
+
+static void toggle_cb(uint8_t slave, dq_result_t res, uint8_t answer, void *ctx) {
+    (void)slave; (void)answer;
+    uint32_t tok = (uint32_t)(uintptr_t)ctx;
+    uint8_t  ix  = (uint8_t)(tok >> 16);
+    if (ix >= TOGGLE_SLOTS) return;
+    if (!s_tog[ix].busy || s_tog[ix].gen != (uint16_t)tok) return;   /* stale */
+
+    uint8_t slave_id = s_tog[ix].slave, target = s_tog[ix].target;
+    bool    is_group = s_tog[ix].is_group;
+    s_tog[ix].busy = false;
+
+    bool any_on;
+    switch (res) {
+    case DQ_RES_OK:                  /* answered — something is on */
+    case DQ_RES_ERR:  any_on = true;  break;   /* garbled = collision — >=1 on */
+    case DQ_RES_NAK:  any_on = false; break;   /* nothing answered — none on */
+    default:
+        LOG_WARN("light", "toggle %u.%s%u unresolved — not acting",
+                 slave_id, is_group ? "G" : "", target);
+        return;
+    }
+    LOG_INFO("light", "toggle %u.%s%u any_on=%d (probe) -> %s",
+             slave_id, is_group ? "G" : "", target, any_on, any_on ? "off" : "on");
+    if (is_group) lighting_group_set_on_off(slave_id, target, !any_on);
+    else          lighting_set_on_off(slave_id, target, !any_on);
+}
+
+bool lighting_toggle_async(uint8_t slave_id, uint8_t target, bool is_group) {
+    uint8_t ix = 0xFFu;
+    for (uint8_t i = 0; i < TOGGLE_SLOTS; i++) if (!s_tog[i].busy) { ix = i; break; }
+    if (ix == 0xFFu) {
+        LOG_WARN("light", "toggle %u.%s%u dropped — no probe slot",
+                 slave_id, is_group ? "G" : "", target);
+        return false;
+    }
+    uint8_t addr_byte = is_group ? (uint8_t)(0x81u | ((target & 0x0Fu) << 1))
+                                 : (uint8_t)(((target & 0x3Fu) << 1) | 0x01u);
+    uint16_t g = next_query_gen();
+    s_tog[ix].busy     = true;
+    s_tog[ix].slave    = slave_id;
+    s_tog[ix].target   = target;
+    s_tog[ix].is_group = is_group;
+    s_tog[ix].gen      = g;
+    void *ctx = (void *)(uintptr_t)(((uint32_t)ix << 16) | g);
+    if (!dq_submit(slave_id, DQ_PRIO_USER, addr_byte, PROBE_QUERY_OPCODE,
+                   DQ_ANSWER, 0, true, toggle_cb, ctx)) {
+        s_tog[ix].busy = false;
+        LOG_WARN("light", "toggle %u.%s%u dropped — queue full",
+                 slave_id, is_group ? "G" : "", target);
+        return false;
+    }
+    return true;
+}
+
 /* Synchronous single-address any-on probe, for the TEXT CLI only.
  *
  * Same question the button's press-time probe asks, same opcode, same reading of

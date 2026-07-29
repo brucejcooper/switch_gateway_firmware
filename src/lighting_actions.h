@@ -51,6 +51,15 @@ typedef enum {
     ANY_ON_PROBE_UNKNOWN = 2,    /* no probe for this button / failed / timed out */
 } any_on_probe_res_t;
 
+/* Toggle a ballast (is_group false) or group ASYNCHRONOUSLY: probe the gear with
+ * QUERY LAMP POWER ON and apply the inverse when the answer lands, all through
+ * the normal queue. For the intercore/HA path, which runs in the main loop and
+ * must never block. An unresolved probe does nothing and warns — it does not
+ * fall back to cached state. Returns false if no probe slot is free or the queue
+ * refused the submit. */
+bool               lighting_toggle_async(uint8_t slave_id, uint8_t target,
+                                         bool is_group);
+
 /* Blocking any-on probe for ONE DALI address (ballast or group selector byte),
  * asking the gear directly with QUERY LAMP POWER ON — the same ground truth the
  * button's press-time probe uses, so a CLI toggle and a button toggle agree.

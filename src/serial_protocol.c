@@ -1290,13 +1290,17 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
         return 1;
     }
     if (strcasecmp(key, "on") == 0) {
-        /* "toggle" here is the JSON/intercore path only — the CLI resolves it by
-         * probing the gear before calling in (see cmd_dali). This one stays
-         * cache-based because it runs in the main loop, where a blocking probe
-         * would stall Modbus, MQTT and the watchdog feed. HA normally sends an
-         * explicit on/off, so this path is the rare one. */
-        bool on = (strcasecmp(val, "toggle") == 0) ? !(b && b->commanded_on)
-                : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
+        /* "toggle" reaches here only from the JSON/intercore path — the CLI
+         * resolves it with a blocking probe before calling in (see cmd_dali).
+         * This path runs in the main loop and must not block, so it hands off to
+         * the ASYNC probe: query the gear, apply the inverse when the answer
+         * lands. It used to invert cached commanded_on, which is the staleness
+         * the button's probe exists to defeat. */
+        if (strcasecmp(val, "toggle") == 0) {
+            if (!lighting_toggle_async(slave, addr, false)) return -2;
+            return 2;   /* applied later — nothing to report yet */
+        }
+        bool on = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 ||
                    strcasecmp(val, "on") == 0);
         lighting_set_on_off(slave, addr, on);
         if (!on) {
@@ -2468,7 +2472,15 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
             lighting_group_set_level(slave, group, c->set_group.bri);
             any = true;
         } else if (c->set_group.fields & IC_GRP_F_ON) {
-            lighting_group_set_on_off(slave, group, c->set_group.on == IC_TRI_ON);
+            /* IC_TRI_TOGGLE used to compare unequal to IC_TRI_ON and so silently
+             * meant OFF — the same bug the CLI group path carried until it was
+             * fixed, never fixed here. A toggle now probes the group and applies
+             * the inverse asynchronously. */
+            if (c->set_group.on == IC_TRI_TOGGLE) {
+                lighting_toggle_async(slave, group, true);
+            } else {
+                lighting_group_set_on_off(slave, group, c->set_group.on == IC_TRI_ON);
+            }
             any = true;
         }
         if (any) { dirty_poll_mark_active(slave); emit_state_group(slave, group); }
