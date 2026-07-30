@@ -2371,6 +2371,9 @@ static bool levt_to_ic(const levt_t *e, ic_event_t *ic) {
         ic->dali.sys_fail  = b ? b->sys_fail_level   : 0;
         ic->dali.fade_rate = b ? b->fade_rate        : 0;
         ic->dali.fade_time = b ? b->fade_time        : 0;
+        /* Those six are placeholders until a raw config read has landed. Tell
+         * core 1 so it can stay silent rather than publishing zeros as fact. */
+        ic->dali.cfg_known = b ? b->cfg_known : false;
         return true;
     }
     case LEVT_PRESENCE:

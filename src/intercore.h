@@ -80,7 +80,11 @@ typedef struct {
          * time so core 1 needs no cache of its own). status is the raw DALI
          * status byte (bit1 lamp_fail, bit4 fading); arc 0 = off. */
         struct { uint8_t slave, addr, arc, status,
-                         min, max, power_on, sys_fail, fade_rate, fade_time; } dali;
+                         min, max, power_on, sys_fail, fade_rate, fade_time;
+                 /* false = config not read yet; core 1 must NOT publish the
+                  * config topic, because the six fields above are placeholders
+                  * rather than measurements. */
+                 bool cfg_known; } dali;
         /* Group derived state + present-member mask (intersect with present on
          * the consumer if needed). */
         struct { uint8_t slave, group, bri; bool on; uint64_t members; } group;

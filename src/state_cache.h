@@ -17,6 +17,12 @@ typedef struct {
     uint8_t fade_rate;
     uint8_t fade_time;
     bool    present;
+    /* True once a raw config read has actually landed for this ballast. Until
+     * then its six config fields are ZERO because nobody has asked the gear yet
+     * — not because the ballast reports zeros — so they must not be published.
+     * Publishing them would assert min=0/max=0 as fact for a device we have not
+     * finished interrogating. */
+    bool    cfg_known;
     bool    fading;
 } dali_ballast_state_t;
 
@@ -24,6 +30,12 @@ void state_cache_init(void);
 
 /* Relay */
 void state_cache_set_relay(uint8_t ch, bool on);
+
+/* True once a coil READ has landed for this channel. Until then the cached
+ * false is a default, not a measurement, so nothing about the channel may be
+ * published — a failed boot coil sync must not put 32 confident "OFF"s on the
+ * broker. Set by state_cache_set_relay (every writer is a read or a write-ACK). */
+bool state_cache_relay_known(uint8_t ch);
 bool state_cache_get_relay_on(uint8_t ch);
 
 /* DALI — slave_idx is 0-based index into g_config.dali_slave_ids */

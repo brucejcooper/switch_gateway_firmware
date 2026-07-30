@@ -13,8 +13,18 @@ void state_cache_init(void) {
     memset(s_dali_groups,  0, sizeof(s_dali_groups));
 }
 
+static uint32_t s_relay_known;   /* bit per channel: a real value has landed */
+
+bool state_cache_relay_known(uint8_t ch) {
+    return ch < RELAY_COUNT && (s_relay_known & ((uint32_t)1 << ch)) != 0;
+}
+
 void state_cache_set_relay(uint8_t ch, bool on) {
-    if (ch < RELAY_COUNT) s_relay[ch] = on;
+    if (ch >= RELAY_COUNT) return;
+    s_relay[ch] = on;
+    /* Every caller is a coil READ or a write ACK, never a request, so reaching
+     * here means this channel's value is now known rather than defaulted. */
+    s_relay_known |= ((uint32_t)1 << ch);
 }
 
 bool state_cache_get_relay_on(uint8_t ch) {
@@ -53,6 +63,7 @@ void state_cache_set_dali_config(uint8_t slave_idx, uint8_t addr,
     b->power_on_level = power_on;
     b->sys_fail_level = sys_fail;
     b->fade_rate      = fade_rate;
+    b->cfg_known      = true;   /* a real read landed */
     b->fade_time      = fade_time;
 }
 

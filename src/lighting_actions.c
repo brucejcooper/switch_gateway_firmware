@@ -906,8 +906,13 @@ void lighting_resync_emit(void) {
      * forever (relays have no per-channel presence to fall back on). */
     dirty_poll_emit_gateway_states();
 
-    /* Per-relay state from cache */
+    /* Per-relay state, but ONLY for channels whose value we have actually read.
+     * The boot coil sync can fail (it logs "relay sync: read failed" and leaves
+     * the cache at its default false); republishing that here would put 32
+     * confident "OFF"s on the broker for a board we never heard from. Unknown
+     * channels stay silent until a coil read or a write ACK fills them in. */
     for (uint8_t ch = 0; ch < RELAY_COUNT; ch++) {
+        if (!state_cache_relay_known(ch)) continue;
         levt_t e = { .type = LEVT_RELAY,
                      .relay = { .ch = ch,
                                 .on = state_cache_get_relay_on(ch) } };

@@ -857,11 +857,18 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         else snprintf(pl, sizeof pl,
             "{\"state\":\"ON\",\"color_mode\":\"brightness\",\"brightness\":%u}", e->dali.arc);
         mqtt_app_publish(top, pl, strlen(pl), true);
-        snprintf(top, sizeof top, "%s/dali/%u/%u/config", P, e->dali.slave, e->dali.addr);
-        snprintf(pl, sizeof pl,
-            "{\"min\":%u,\"max\":%u,\"power_on\":%u,\"sys_fail\":%u,\"fade_rate\":%u,\"fade_time\":%u}",
-            e->dali.min, e->dali.max, e->dali.power_on, e->dali.sys_fail, e->dali.fade_rate, e->dali.fade_time);
-        mqtt_app_publish(top, pl, strlen(pl), true);
+        /* Config only once it has actually been read from the gear. Before that
+         * the six fields are zeros nobody measured, and publishing them would
+         * assert min=0/max=0 for a ballast we have not finished interrogating.
+         * HA's number entities simply stay unpopulated until the boot config
+         * sweep reaches this address — progressive disclosure, not a placeholder. */
+        if (e->dali.cfg_known) {
+            snprintf(top, sizeof top, "%s/dali/%u/%u/config", P, e->dali.slave, e->dali.addr);
+            snprintf(pl, sizeof pl,
+                "{\"min\":%u,\"max\":%u,\"power_on\":%u,\"sys_fail\":%u,\"fade_rate\":%u,\"fade_time\":%u}",
+                e->dali.min, e->dali.max, e->dali.power_on, e->dali.sys_fail, e->dali.fade_rate, e->dali.fade_time);
+            mqtt_app_publish(top, pl, strlen(pl), true);
+        }
         break;
     case IC_EVT_GROUP: {
         snprintf(top, sizeof top, "%s/group/%u/%u/state", P, e->group.slave, e->group.group);
