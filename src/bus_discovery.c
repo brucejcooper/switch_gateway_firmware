@@ -18,6 +18,7 @@
 
 #include "bus_discovery.h"
 #include "modbus.h"
+#include "core1.h"   /* wd_feed */
 #include "log.h"
 #include "pico/time.h"
 #include <string.h>
@@ -45,6 +46,12 @@ static bool wait_done(disc_ctx_t *c) {
     absolute_time_t dl = make_timeout_time_ms(DISC_TIMEOUT_MS);
     while (!c->done && absolute_time_diff_us(get_absolute_time(), dl) > 0) {
         modbus_poll();
+        /* This is the dominant blocking cost of boot — DISC_TIMEOUT_MS per ping,
+         * two bauds, per configured slave — and the watchdog is armed before we
+         * get here. Feed so a bus full of absent slaves cannot trip it, while a
+         * genuine hang (this loop never advancing, or core 1 dying underneath us,
+         * which wd_feed checks) still does. */
+        wd_feed();
     }
     return c->done && c->ok;
 }

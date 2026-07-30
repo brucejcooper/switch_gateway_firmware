@@ -106,14 +106,38 @@ int main(void) {
     intercore_init();
     core1_launch();
 
-    if (!fs_init())
-        LOG_ERR("boot", "fs_init failed — persistence unavailable");
-
+    /* Watchdog armed HERE, before anything slow, rather than at main-loop entry.
+     *
+     * main() clears the bootloader's watchdog-armed jump above (it must — the
+     * bootloader gives 8 s and boot legitimately needs longer), and until now
+     * nothing replaced it until the main loop started. Everything between was
+     * unprotected: fs_init's first-boot format, and above all the BLOCKING slave
+     * discovery, which costs 2 s per configured-but-absent slave (a 1 s
+     * DISC_TIMEOUT_MS at each of two bauds) and so can run to ~9 s on a bus where
+     * nothing answers. A hang in that window produced no reset, no strike counted
+     * by the bootloader, and no BOOTSEL — just a device that pings (the W5100S
+     * answers ICMP in hardware) and does nothing else.
+     *
+     * Legitimately-slow discovery does not trip it: the blocking waits feed via
+     * wd_feed(), which is also what makes this safe to arm this early — core 1 is
+     * already launched above, so the heartbeat gating is live, and the 15 s grace
+     * covers its startup. (The DALI ballast interrogation is NOT in this window;
+     * dirty_poll_arm_scan returns immediately and the main loop drives it.) */
+    /* Read the reset cause BEFORE arming. watchdog_enable() writes the scratch
+     * magic that watchdog_enable_caused_reboot() tests, so arming first would
+     * make a reset from the BOOTLOADER's watchdog (which never wrote that magic)
+     * start reporting as ours. */
     if (watchdog_enable_caused_reboot()) {
         LOG_INFO("boot", "Rebooted by Watchdog");
     } else {
         LOG_INFO("boot", "Clean boot");
     }
+
+    watchdog_enable(5000, 1);
+    s_core1_grace_until = make_timeout_time_ms(CORE1_GRACE_MS);
+
+    if (!fs_init())
+        LOG_ERR("boot", "fs_init failed — persistence unavailable");
 
     /* Load persistent config and mappings */
     config_load();
@@ -128,7 +152,10 @@ int main(void) {
 
     /* Bus discovery: probe each configured slave at the canonical baud,
      * recovering factory-default 9600-baud slaves to 19200 if needed.
-     * Runs before watchdog_enable and before any DALI/relay scan. */
+     * Blocking, and the dominant cost of boot: DISC_TIMEOUT_MS per ping at each
+     * of two bauds, per configured slave. The watchdog is armed by now and
+     * wait_done() feeds it, so an absent bus is slow but not fatal. Runs before
+     * any DALI/relay scan. */
     LOG_INFO("boot", "bus discovery: relay_count=%u dali_count=%u",
              g_config.relay_slave_count, g_config.dali_slave_count);
     for (int i = 0; i < g_config.relay_slave_count; i++) {
@@ -163,6 +190,7 @@ int main(void) {
         absolute_time_t dl = make_timeout_time_ms(1000);
         while (!ctx.done && absolute_time_diff_us(get_absolute_time(), dl) > 0) {
             modbus_poll();
+            wd_feed();   /* bounded at 1 s, but the watchdog is live now */
         }
         if (ctx.ok) {
             for (int ch = 0; ch < 32; ch++) {
@@ -215,9 +243,6 @@ int main(void) {
     memcpy(snap.fw_url,   g_config.fw_url,   sizeof snap.fw_url);
     intercore_set_snapshot(&snap);
     core1_config_ready();   /* core 1 may now bring up netif + MQTT */
-
-    watchdog_enable(5000, 1);
-    s_core1_grace_until = make_timeout_time_ms(CORE1_GRACE_MS);
 
     /* Announce over USB */
     sleep_ms(100);
