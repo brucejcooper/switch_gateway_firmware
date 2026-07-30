@@ -767,8 +767,11 @@ static void cmd_show(char **saveptr) {
         char *cs = strtok_r(NULL, " \t", saveptr);
         if (!cs) {
             for (int ch = 0; ch < RELAY_COUNT; ch++) {
+                /* "unread" is not "off". The cached false is a default until a
+                 * coil read or a write ACK fills it in. */
                 printf("relay %d: %s\n", ch,
-                       state_cache_get_relay_on((uint8_t)ch) ? "on" : "off");
+                       !state_cache_relay_known((uint8_t)ch) ? "unread"
+                       : state_cache_get_relay_on((uint8_t)ch) ? "on" : "off");
             }
             return;
         }
@@ -777,7 +780,8 @@ static void cmd_show(char **saveptr) {
             txt_err("out_of_range"); return;
         }
         printf("relay %d: %s\n", ch,
-               state_cache_get_relay_on((uint8_t)ch) ? "on" : "off");
+               !state_cache_relay_known((uint8_t)ch) ? "unread"
+               : state_cache_get_relay_on((uint8_t)ch) ? "on" : "off");
         return;
     }
 
@@ -906,13 +910,26 @@ static void cmd_relay(char **saveptr) {
     int ch = 0;
     if (!parse_int_range(cs, 0, RELAY_COUNT - 1, &ch)) { txt_err("out_of_range"); return; }
     char *kv = strtok_r(NULL, " \t", saveptr);
-    if (!kv) { emit_state_relay((uint8_t)ch); txt_ok(); return; }   /* get */
+    if (!kv) {   /* get */
+        /* Never read means never published — the cached false is a default, not
+         * a measurement. Same rule lighting_resync_emit follows. */
+        if (!state_cache_relay_known((uint8_t)ch)) { txt_err("not_read_yet"); return; }
+        emit_state_relay((uint8_t)ch);
+        txt_ok();
+        return;
+    }
     do {
         char *eq = strchr(kv, '=');
         if (!eq) { txt_err("bad_arg expected key=value"); return; }
         *eq = '\0';
         if (strcasecmp(kv, "on") != 0) { txt_err("bad_field"); return; }
         const char *val = eq + 1;
+        /* A toggle needs a known starting point. Inverting the default false on a
+         * channel we have never read is a guess, and a 50/50 one. */
+        if (strcasecmp(val, "toggle") == 0 && !state_cache_relay_known((uint8_t)ch)) {
+            txt_err("not_read_yet");
+            return;
+        }
         bool on = (strcasecmp(val, "toggle") == 0) ? !state_cache_get_relay_on((uint8_t)ch)
                 : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
         /* No predictive write and no emit here. relay_write_cb caches and emits
@@ -1014,8 +1031,9 @@ static void cmd_dali(char **saveptr) {
                 if      (strcasecmp(key, "members") == 0) mask = bits;
                 else if (strcasecmp(key, "add") == 0)     mask |= bits;
                 else                                      mask &= ~bits;
+                /* No emit: membership is only known once QUERY GROUPS confirms
+                 * it, which dali_group_set_members arms. */
                 dali_group_set_members((uint8_t)slave, (uint8_t)group, mask);
-                emit_now = true;   /* membership is controller-owned, so known */
             }
             else { txt_err("bad_field"); return; }
         } else {
@@ -1279,9 +1297,14 @@ static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_ma
         }
         dali_state_mark_scan(slave, a);   /* confirm by reading it back */
     }
-    /* Optimistic local update; the re-interrogation above is the authority and
-     * will correct it if a write did not take. */
-    state_cache_set_dali_group((uint8_t)idx, group, new_mask);
+    /* NO optimistic cache write. dali_state_mark_scan above re-reads QUERY GROUPS
+     * for every touched ballast, and commit_ballast writes the measured mask —
+     * that is the only writer. Recording new_mask here would publish membership
+     * we had merely requested, and a write that silently failed would sit in the
+     * cache (and in HA) until something else happened to re-read it.
+     * lighting_emit_group_state_if_changed now compares members, so the read-back
+     * publishes the new list on its own. */
+    (void)idx;
 }
 
 static void emit_state_cfg(void) {
@@ -2430,6 +2453,10 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
     case IC_CMD_SET_RELAY: {
         uint8_t ch = c->set_relay.ch;
         if (ch >= RELAY_COUNT) { LOG_WARN("cli", "ic set_relay reject: ch=%u", ch); break; }
+        if (c->set_relay.on == IC_TRI_TOGGLE && !state_cache_relay_known(ch)) {
+            LOG_WARN("cli", "relay %u toggle ignored — state never read", ch);
+            break;
+        }
         bool on = (c->set_relay.on == IC_TRI_TOGGLE) ? !state_cache_get_relay_on(ch)
                                                      : (c->set_relay.on == IC_TRI_ON);
         lighting_set_relay(ch, on);

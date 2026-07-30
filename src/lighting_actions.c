@@ -54,9 +54,15 @@ typedef struct {
     };
 } levt_t;
 
-/* Per-slave/group debounce cache — last emitted (on, bri) for each group.
- * Zero-init: all groups start as { on=false, bri=0 }. */
-static struct { bool on; uint8_t bri; } s_group_prev[MAX_DALI_SLAVES][16];
+/* Per-slave/group debounce cache — last emitted (on, bri, members) per group.
+ * Zero-init: all groups start as { on=false, bri=0, members=0 }.
+ *
+ * `members` is in the comparison because it is part of the published payload.
+ * Without it a membership change that happened not to alter on/bri never
+ * re-published, so the only thing that ever put a new member list on the broker
+ * was an immediate optimistic emit from the setter — publishing the mask we had
+ * ASKED for. With members compared here, the QUERY GROUPS read-back is enough. */
+static struct { bool on; uint8_t bri; uint64_t members; } s_group_prev[MAX_DALI_SLAVES][16];
 
 static levt_t  s_evts[EVT_QUEUE_SIZE];
 static uint8_t s_evt_head = 0;
@@ -824,15 +830,24 @@ void lighting_emit_dali_state(uint8_t slave_id, uint8_t addr,
     LOG_DBG("light", "emit dali %u.%u arc=%u status=0x%02x",
             slave_id, addr, arc, status);
 
-    /* Walk every group containing this ballast and let the group emit helper
-     * decide whether to publish a derived state_group event. */
+    /* Offer EVERY group to the emit helper, not just the ones currently
+     * containing this ballast.
+     *
+     * Membership-scoping this walk had a hole: when a ballast is REMOVED from a
+     * group, the read-back that discovers the removal has already cleared the
+     * bit, so the group it just left was skipped and never re-published — a group
+     * emptied of its last member kept its stale member list and derived on/bri in
+     * HA. It went unnoticed because the setter used to publish an optimistic list
+     * immediately; with that gone (state must be measured) the gap became live.
+     *
+     * Unconditional is also simply correct: this ballast's level can change a
+     * group's derived max_bri whether or not it is still a member, and
+     * lighting_emit_group_state_if_changed compares (on, bri, members) so
+     * nothing is published unless something actually moved. 16 cheap
+     * comparisons against one DALI transaction is not a cost worth optimising. */
     if (idx >= 0 && addr < DALI_ADDR_COUNT) {
-        uint64_t bit = ((uint64_t)1) << addr;
-        for (uint8_t g = 0; g < 16; g++) {
-            if (state_cache_get_dali_group((uint8_t)idx, g) & bit) {
-                lighting_emit_group_state_if_changed(slave_id, g);
-            }
-        }
+        for (uint8_t g = 0; g < 16; g++)
+            lighting_emit_group_state_if_changed(slave_id, g);
     }
 }
 
@@ -844,12 +859,15 @@ void lighting_emit_group_state_if_changed(uint8_t slave_id, uint8_t group) {
     bool    on_now  = state_cache_dali_group_any_on((uint8_t)slave_idx, group);
     uint8_t bri_now = state_cache_dali_group_max_bri((uint8_t)slave_idx, group);
 
-    if (s_group_prev[slave_idx][group].on  == on_now &&
-        s_group_prev[slave_idx][group].bri == bri_now) {
+    uint64_t mem_now = state_cache_get_dali_group((uint8_t)slave_idx, group);
+    if (s_group_prev[slave_idx][group].on      == on_now &&
+        s_group_prev[slave_idx][group].bri     == bri_now &&
+        s_group_prev[slave_idx][group].members == mem_now) {
         return;
     }
-    s_group_prev[slave_idx][group].on  = on_now;
-    s_group_prev[slave_idx][group].bri = bri_now;
+    s_group_prev[slave_idx][group].on      = on_now;
+    s_group_prev[slave_idx][group].bri     = bri_now;
+    s_group_prev[slave_idx][group].members = mem_now;
 
     levt_t e = {
         .type  = LEVT_GROUP,
