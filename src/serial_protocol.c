@@ -2467,32 +2467,6 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         }
         break;
     }
-    case IC_CMD_SEED_DALI_CFG: {
-        /* Warm start: adopt a per-ballast config read back from its retained
-         * MQTT topic at boot, so HA's numbers stay populated before the raw
-         * config sweep confirms them. Adopt ONLY while our cache is still unread
-         * (all config fields zero); once the sweep, dirty-poll or a set fills it,
-         * the measured value is authoritative. An all-zero seed is ignored
-         * (nothing to warm — and this breaks any publish->echo->seed loop, since
-         * our own re-emit makes the cache non-zero). Raw config is the only path
-         * now, so the seed is always in effect. */
-        uint8_t slave = c->seed_dali_cfg.slave, addr = c->seed_dali_cfg.addr;
-        int idx = state_cache_slave_idx(slave);
-        if (idx < 0 || addr > 63) break;
-        dali_ballast_state_t *b = state_cache_get_dali((uint8_t)idx, addr);
-        if (!b || !b->present) break;
-        bool cache_unread = (b->min_level | b->max_level | b->power_on_level |
-                             b->sys_fail_level | b->fade_rate | b->fade_time) == 0;
-        uint8_t mn = c->seed_dali_cfg.min,      mx = c->seed_dali_cfg.max,
-                po = c->seed_dali_cfg.power_on, sf = c->seed_dali_cfg.sys_fail,
-                fr = c->seed_dali_cfg.fade_rate, ft = c->seed_dali_cfg.fade_time;
-        if (cache_unread && (mn | mx | po | sf | fr | ft) != 0) {
-            state_cache_set_dali_config((uint8_t)idx, addr, mx, mn, po, sf, fr, ft);
-            emit_state_dali(slave, addr);
-            LOG_DBG("cli", "warm-start seed dali %u.%u min=%u max=%u", slave, addr, mn, mx);
-        }
-        break;
-    }
     case IC_CMD_SET_GROUP: {
         uint8_t slave = c->set_group.slave, group = c->set_group.group;
         if (state_cache_slave_idx(slave) < 0 || group > 15) {

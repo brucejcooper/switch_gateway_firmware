@@ -489,6 +489,25 @@ void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr) {
     s_cfgq_pending[idx] |= ((uint64_t)1 << addr);
 }
 
+/* Mark a whole set of ballasts for a raw config read at once — the BOOT SWEEP.
+ *
+ * The rotation in dirty_poll.c only marks one ballast per DALI_CFG_ROTATE_MS
+ * (~14 s), so a cold start would leave HA's config numbers at zero for ~15
+ * minutes on a full bus, one ballast filling in at a time. This arms every
+ * present ballast the moment the boot scan knows who is there, so the numbers
+ * come from the GEAR within seconds.
+ *
+ * This function existed and was never called; the gap it leaves was instead
+ * papered over by adopting our own retained MQTT config back into the cache at
+ * boot (IC_CMD_SEED_DALI_CFG, now deleted) — the controller treating itself as a
+ * source of truth about the bus. It is the source, not a sink: state comes from
+ * reading the devices. */
+void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask) {
+    int idx = state_cache_slave_idx(slave_id);
+    if (idx < 0) return;
+    s_cfgq_pending[idx] |= mask;
+}
+
 /* Write the accumulated fields into the cache and re-emit state_dali. A field
  * that didn't answer keeps its cached value (a partial read never zeroes good
  * config). Called once all CFGQ_NFIELDS have been attempted for one ballast. */

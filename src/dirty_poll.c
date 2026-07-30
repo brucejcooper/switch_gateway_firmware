@@ -252,6 +252,10 @@ void dirty_poll_tick(void) {
             }
             dp->last_present = present;
             LOG_INFO("dirty", "slave %u scan complete", slave_id);
+            /* Presence is now known, so read every present ballast's config from
+             * the gear straight away instead of waiting out the 14 s-per-ballast
+             * rotation. Lowest priority, so it yields to anything real. */
+            lighting_cfg_query_mark_mask(slave_id, present);
             lighting_emit_scan_complete(slave_id, present);
         }
 

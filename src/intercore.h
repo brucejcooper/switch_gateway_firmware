@@ -186,7 +186,6 @@ typedef enum {
     IC_CMD_OTA_END,       /* download complete at `total_len` -> ota_stage_finish(); replies IC_EVT_OTA_STATUS */
     IC_CMD_OTA_ABORT,     /* discard the in-flight staging session -> ota_stage_abort() */
     IC_CMD_OTA_CONFIRM,   /* mark the active image good -> ota_stage_confirm() */
-    IC_CMD_SEED_DALI_CFG, /* warm start: adopt a retained per-ballast config into the cache */
 } ic_cmd_type_t;
 
 typedef struct {
@@ -227,11 +226,6 @@ typedef struct {
          * (image + fw_trailer), for ota_stage_finish(). */
         struct { uint32_t total_len; } ota_end;
         /* IC_CMD_OTA_BEGIN/OTA_ABORT/OTA_CONFIRM carry no payload. */
-        /* IC_CMD_SEED_DALI_CFG: a retained per-ballast config read back from MQTT
-         * at boot (warm start). Core 0 adopts it only while its own cache is still
-         * unread (all-zero) — the raw config sweep's measured values then win. */
-        struct { uint8_t slave, addr, min, max, power_on, sys_fail,
-                 fade_rate, fade_time; } seed_dali_cfg;
     };
 } ic_cmd_t;
 

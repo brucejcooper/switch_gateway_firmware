@@ -635,8 +635,17 @@ static void disc_fw_check(void) {
 static void subscribe_all(void) {
     const char *P = mqtt_app_prefix();
     static const char *const filt[] = {
+        /* COMMANDS ONLY. Every filter here is something asking us to DO
+         * something; none is a topic we ourselves publish. The controller is the
+         * source of bus state, not a sink for it — it learns levels and config by
+         * reading the gear, never by reading its own retained messages back.
+         *
+         * "dali/+/+/config" used to be here, so the broker replayed our retained
+         * per-ballast config at boot and core 0 adopted it (IC_CMD_SEED_DALI_CFG).
+         * That made stale, possibly-wrong values — a swapped or externally
+         * reconfigured ballast — reappear as fact. The boot config sweep armed at
+         * scan-complete reads the real values from the gear instead. */
         "relay/+/set", "dali/+/+/config/+/set", "dali/+/+/set",
-        "dali/+/+/config",   /* warm start: adopt retained per-ballast config at boot */
         "group/+/+/members/set", "group/+/+/set",
         "provision/+/start/all", "provision/+/start/unaddressed",
         "provision/+/start/address", "provision/+/start/target", "provision/+/abort",
@@ -1144,26 +1153,6 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             else if (!strcmp(f, "fade_rate")) { c.set_dali.fields = IC_DALI_F_FADE_RATE; c.set_dali.fade_rate = v; }
             else if (!strcmp(f, "fade_time")) { c.set_dali.fields = IC_DALI_F_FADE_TIME; c.set_dali.fade_time = v; }
             if (c.set_dali.fields) ic_push_cmd(&c);
-        } else if (ns == 4 && !strcmp(seg[3], "config")) {
-            /* Warm start (task 03): adopt the retained per-ballast config back into
-             * core 0's cache so HA's config numbers stay populated before the raw
-             * sweep confirms. Core 0 ignores this once its cache is filled, so the
-             * echo of our own re-publishes is a harmless no-op. An empty payload
-             * (a tombstone) carries nothing to adopt. */
-            if (pn == 0) return;
-            jsmn_parser jp; jsmntok_t tk[24]; jsmn_init(&jp);
-            int nt = jsmn_parse(&jp, pay, strlen(pay), tk, 24);
-            if (nt < 1) return;
-            c.type = IC_CMD_SEED_DALI_CFG;
-            c.seed_dali_cfg.slave = s; c.seed_dali_cfg.addr = a;
-            int i;
-            if ((i = jfind(pay, tk, nt, "min"))       >= 0) c.seed_dali_cfg.min       = (uint8_t)jint(pay, &tk[i]);
-            if ((i = jfind(pay, tk, nt, "max"))       >= 0) c.seed_dali_cfg.max       = (uint8_t)jint(pay, &tk[i]);
-            if ((i = jfind(pay, tk, nt, "power_on"))  >= 0) c.seed_dali_cfg.power_on  = (uint8_t)jint(pay, &tk[i]);
-            if ((i = jfind(pay, tk, nt, "sys_fail"))  >= 0) c.seed_dali_cfg.sys_fail  = (uint8_t)jint(pay, &tk[i]);
-            if ((i = jfind(pay, tk, nt, "fade_rate")) >= 0) c.seed_dali_cfg.fade_rate = (uint8_t)jint(pay, &tk[i]);
-            if ((i = jfind(pay, tk, nt, "fade_time")) >= 0) c.seed_dali_cfg.fade_time = (uint8_t)jint(pay, &tk[i]);
-            ic_push_cmd(&c);
         }
         return;
     }

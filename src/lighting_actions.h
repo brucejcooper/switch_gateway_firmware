@@ -81,6 +81,11 @@ void               lighting_any_on_probe_tick(void);
  * writes state_cache_set_dali_config, and re-emits state_dali so HA sees the
  * refreshed config. (Stage 3 routes these queries through the id-tagged gateway
  * command queue; see lighting_actions.c.) */
+/* Arm a raw config read for every ballast in `mask` (the boot sweep). Called
+ * when a scan establishes presence, so HA's config numbers are populated from
+ * the gear in seconds rather than over the ~15 min rotation. */
+void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask);
+
 void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr);   /* one ballast */
 void lighting_cfg_query_tick(void);
 
