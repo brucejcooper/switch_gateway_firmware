@@ -15,7 +15,9 @@ export function renderRelays(state) {
   };
 
   const rows = new Map();
-  const sig = relays.length;
+  // Re-render signature: length AND which channels are known — a channel going
+  // from unread to known swaps a badge for a toggle, which patching cannot do.
+  const sig = relays.length + ':' + relays.map((r) => (r.known ? '1' : '0')).join('');
 
   const cells = relays.map((r) => { const row = relayRow(r); rows.set(r.ch, row); return row.el; });
   const head = h('div', { class: 'row between' });
@@ -33,7 +35,11 @@ export function renderRelays(state) {
 
   const update = (st) => {
     const list = st.relays || [];
-    if (list.length !== sig) return false; // channel count changed
+    // Recompute the same signature: a full re-render is needed if the channel
+    // count changed OR if any channel crossed between unread and known, since
+    // that swaps a badge for a toggle and patching cannot do it.
+    const cur = list.length + ':' + list.map((r) => (r.known ? '1' : '0')).join('');
+    if (cur !== sig) return false;
     renderHead(boardsOffline(st));
     for (const r of list) { const row = rows.get(r.ch); if (row) row.update(r); }
     return true;
@@ -42,11 +48,18 @@ export function renderRelays(state) {
 }
 
 function relayRow(r) {
-  const toggle = onToggle(!!r.on, '/api/relay', { ch: r.ch });
+  // An unread channel gets no toggle: the controller refuses a toggle it cannot
+  // base on a measured value, so offering the control would just produce an
+  // error. Show why instead.
+  const toggle = r.known ? onToggle(!!r.on, '/api/relay', { ch: r.ch })
+                         : badge('unread', 'warn');
   const el = h('div', { class: 'row between', style: { background: 'var(--bg)', padding: '8px 10px', borderRadius: '6px' } },
     h('strong', {}, 'CH ', String(r.ch)),
     toggle,
   );
-  const update = (rr) => { toggle.setAttribute('aria-pressed', rr.on ? 'true' : 'false'); };
+  const update = (rr) => {
+    if (!rr.known || !r.known) return;   // known-ness changed: ask for a re-render
+    toggle.setAttribute('aria-pressed', rr.on ? 'true' : 'false');
+  };
   return { el, update };
 }

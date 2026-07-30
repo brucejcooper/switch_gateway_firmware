@@ -7,7 +7,7 @@
 // with the renderer in src/net/web_state.c.
 //
 // Wire shape:
-//   relays: [bool, ...]                         index = channel
+//   relays: [bool|null, ...]                    index = channel; null = unread
 //   dali: { "<slave>": {
 //             online: bool,
 //             ballasts: [ {on,bri,min,max,power_on,sys_fail,fade_rate,fade_time,fading,lamp_fail} | null, ... ],  // index = address
@@ -49,7 +49,11 @@ export function decodeState(s) {
   }
 
   return {
-    relays: (s.relays || []).map((on, ch) => ({ ch, on: !!on })),
+    // on === null means the channel has never been read (see web_state.c
+    // SEC_RELAY). Keep that distinct from false rather than collapsing it with
+    // !!on, so the UI can show "unread" instead of a confident "off".
+    relays: (s.relays || []).map((on, ch) => ({ ch, on: on === null ? null : !!on,
+                                                known: on !== null })),
     ballasts,
     groups,
     gateways,

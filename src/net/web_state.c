@@ -354,16 +354,23 @@ static int unit_at(const web_render_cursor_t *cur, char *out, size_t cap,
         next->sec = SEC_DONE;
         return render_tail(out, cap);
 
-    /* relays: booleans, index = channel (up to the highest channel ever seen). */
+    /* relays: index = channel, ALWAYS RELAY_COUNT entries — the board's channel
+     * count is fixed and known, so the array's length should not depend on what
+     * we happen to have heard from.
+     *
+     * null = never read. Previously the array was truncated at the highest
+     * channel ever seen and every entry was a boolean, so a channel below that
+     * high-water mark which had never reported rendered "false" — the cached
+     * default presented as a measurement. That needed a failed boot coil sync
+     * plus a later single-channel write ACK to show up, but it is the same
+     * "unread is not off" bug already fixed in the CLI and the MQTT paths. */
     case SEC_RELAY: {
-        int rmax = -1;
-        for (int ch = RELAY_COUNT - 1; ch >= 0; ch--)
-            if (S.relay_known & (1u << ch)) { rmax = ch; break; }
-        if ((int)cur->i <= rmax) {
+        if (cur->i < RELAY_COUNT) {
             uint16_t ch = cur->i;
             next->i = ch + 1; next->started = true;
-            return snprintf(out, cap, "%s%s", cur->started ? "," : "",
-                            S.relay_on[ch] ? "true" : "false");
+            const char *v = !(S.relay_known & (1u << ch)) ? "null"
+                          : S.relay_on[ch] ? "true" : "false";
+            return snprintf(out, cap, "%s%s", cur->started ? "," : "", v);
         }
         next->sec = SEC_RB_OPEN; return 0;
     }
