@@ -476,9 +476,25 @@ static void disc_controller(uint8_t k) {
     }
 }
 
+/* Seed every gateway UNAVAILABLE at the start of discovery.
+ *
+ * This published "online" until now — asserting reachability for a gateway we
+ * had not heard from on this connection, and relying on the resync that follows
+ * discovery to correct it. Two problems: it is a guess, and it is a guess that
+ * propagates, because relay and ballast entities declare availability_mode "all"
+ * across [controller, gateway, ballast] — so an optimistic gateway made all of
+ * its devices appear available, with whatever state was retained from the last
+ * run.
+ *
+ * Offline is the honest default: the entities exist (discovery publishes all 64
+ * ballasts, all 32 relay channels, every group and plate regardless of what is
+ * actually out there) but HA greys them out until something answers. Each layer
+ * then turns itself on as it proves itself — dirty_poll's first successful read
+ * publishes gateway online, and the scan_complete sweep publishes per-ballast
+ * online/offline from the measured present mask. */
 static void seed_gateway_avail(uint8_t slave) {
     snprintf(s_top, sizeof s_top, "%s/gateway/%u/availability", mqtt_app_prefix(), slave);
-    pub_str(s_top, "online", true);
+    pub_str(s_top, "offline", true);
 }
 
 /* ── incremental discovery cursor ────────────────────────────────────────── */

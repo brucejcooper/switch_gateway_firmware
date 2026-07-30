@@ -73,7 +73,14 @@ static uint8_t  s_gd_idx[MAX_DALI_SLAVES];   /* callback ctx → dali-slave inde
 void dirty_poll_init(void) {
     memset(s_dp, 0, sizeof(s_dp));
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
-        s_dp[i].reachable = true;   /* optimistic; offline only after failures */
+        /* UNREACHABLE until it answers. Starting true asserted that a gateway we
+         * have never heard from is online, which HA then believed — and because
+         * ballast entities declare availability_mode "all" over
+         * [controller, gateway, ballast], one optimistic gateway made every
+         * ballast under it look available too. Nothing gates polling on this
+         * flag, so starting false cannot stall discovery; the first successful
+         * read flips it. */
+        s_dp[i].reachable = false;
         s_dirty_ctx_slave[i] = g_config.dali_slave_ids[i];
         for (int a = 0; a < DALI_ADDR_COUNT; a++) {
             s_bctx[i][a].slave_id = g_config.dali_slave_ids[i];
@@ -82,7 +89,7 @@ void dirty_poll_init(void) {
     }
     memset(s_rp, 0, sizeof(s_rp));
     for (int i = 0; i < MAX_RELAY_SLAVES; i++) {
-        s_rp[i].reachable = true;   /* optimistic, same as DALI gateways */
+        s_rp[i].reachable = false;   /* same rule as DALI gateways above */
         s_rp_idx[i]       = (uint8_t)i;
     }
     memset(s_gd, 0, sizeof(s_gd));
@@ -104,7 +111,7 @@ static void relay_health_cb(int res, uint8_t *buf, void *ctx) {
         rp->fail_count = 0;
         if (!rp->reachable) {
             rp->reachable = true;
-            LOG_INFO("dirty", "relay board %u reachable again", slave);
+            LOG_INFO("dirty", "relay board %u reachable", slave);
             lighting_emit_gateway_state(slave, true);
         }
         /* buf[2] = byte count, buf[3..] = coil bytes (one bit per channel). */
