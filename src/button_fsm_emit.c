@@ -8,6 +8,7 @@
 
 #include <string.h>
 #include "intercore.h"
+#include "button_fsm.h"   /* shared prototype for emit_button_event */
 #include "log.h"
 
 /*

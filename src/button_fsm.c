@@ -17,7 +17,6 @@
 #include <string.h>
 
 /* forward declaration — implemented in button_fsm_emit.c */
-void emit_button_event(uint8_t fixture, uint8_t button, const char *action);
 
 queue_t g_btn_raw_queue;
 

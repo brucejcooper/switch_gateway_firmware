@@ -201,11 +201,6 @@ void mbq_client_add_slave(uint8_t slave_id) {
     LOG_WARN("mbq", "no room to register slave %u", slave_id);
 }
 
-bool mbq_client_busy(uint8_t slave_id) {
-    slave_t *s = slave_for(slave_id);
-    if (!s) return false;
-    return s->tx != TX_IDLE || any_owned_slot(s);
-}
 
 uint8_t mbq_client_inflight(uint8_t slave_id) {
     slave_t *s = slave_for(slave_id);

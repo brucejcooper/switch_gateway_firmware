@@ -64,10 +64,6 @@ bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
  * a resubmit queued by a reboot. Call every main-loop iteration. */
 void mbq_client_tick(void);
 
-/* True if `slave_id` has any owned slot still pending/executing/uncollected, or a
- * transaction in flight. Producers that must serialise against the queue gate on
- * this. */
-bool mbq_client_busy(uint8_t slave_id);
 
 /* Number of `slave_id`'s 8 gateway slots the client believes are occupied —
  * armed, written-but-unconfirmed, or confirmed active. This is the controller's
