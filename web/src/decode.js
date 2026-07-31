@@ -34,8 +34,11 @@ export function decodeState(s) {
     const slave = Number(key);
     const sd = dali[key] || {};
     gateways.push({ slave, online: !!sd.online, kind: 'dali' });
+    /* Keep EVERY address, nulls included. null means nothing answered there;
+     * the entry is kept as present:false so the Lights tab can decide whether
+     * to show it. Dropping them here would take that choice away from the UI. */
     (sd.ballasts || []).forEach((b, addr) => {
-      if (!b) return; // null = unavailable
+      if (!b) { ballasts.push({ slave, addr, present: false, on: false, bri: 0 }); return; }
       ballasts.push({
         slave, addr, present: true,
         on: !!b.on, bri: b.bri,

@@ -222,13 +222,7 @@ void web_render_begin(web_render_cursor_t *cur) {
     cur->i = 0; cur->started = false; cur->seq = S.seq;
 }
 
-/* Highest seen DALI short address / group for a slave index, or -1 if none.
- * Defines the indexed-array length so positions stay stable as devices drop. */
-static int ballast_max(int si) {
-    int m = -1;
-    for (int a = 0; a < DALI_ADDR_COUNT; a++) if (S.ball[si][a].seen) m = a;
-    return m;
-}
+/* Map a DALI slave INDEX (position in the configured list) to its slave id. */
 static int slave_id_for(int idx) {
     const ic_snapshot_t *sn = intercore_snapshot();
     return (sn && idx < sn->dali_count) ? sn->dali_slaves[idx] : 0;
@@ -383,8 +377,16 @@ static int unit_at(const web_render_cursor_t *cur, char *out, size_t cap,
                 cur->si ? "," : "", slave_id_for(si),
                 S.gw_online[si] ? "true" : "false");
         case DSUB_BALLASTS: {
-            int bmax = ballast_max(si);
-            if ((int)cur->i <= bmax) {
+            /* ALL 64 short addresses, not up to the highest one that answered.
+             * A DALI bus has addresses 0-63 whether or not gear sits at them,
+             * and which of those to SHOW is a presentation choice — the UI has
+             * a toggle for it. The wire format reports the address space as it
+             * is; unseen addresses serialise as null below.
+             *
+             * Same truncation that hid groups 10-15 and the unread relay
+             * channels: an array cut at its high-water mark cannot express
+             * "nothing here", only "nothing here yet". */
+            if (cur->i < DALI_ADDR_COUNT) {
                 int a = cur->i;
                 ws_ballast_t *b = &S.ball[si][a];
                 next->i = a + 1; next->started = true;
