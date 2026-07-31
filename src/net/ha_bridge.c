@@ -15,6 +15,7 @@
 #include "ha_bridge.h"
 #include "mqtt_app.h"
 #include "intercore.h"
+#include "dali_provision.h"   /* prov_state_name */
 #include "web_state.h"   /* fan-out: feed the web read model from the event drain */
 #include "ping.h"        /* IC_EVT_PING_REQ is routed here, not published */
 #include "ota.h"         /* IC_EVT_OTA_ACK/OTA_STATUS are routed here, not published */
@@ -701,13 +702,7 @@ static void sweep_step(void) {
 }
 
 /* ── event -> MQTT state translation ─────────────────────────────────────── */
-static const char *const PROV_STATE_STR[] = {
-    "idle", "clearing", "scanning", "terminating", "initialising", "randomising",
-    "searching", "assigning", "verifying", "withdrawing", "complete", "error"
-};
-static const char *prov_state_str(uint8_t s) {
-    return s < sizeof PROV_STATE_STR / sizeof PROV_STATE_STR[0] ? PROV_STATE_STR[s] : "unknown";
-}
+/* prov_state_name() lives in dali_provision.h, beside the enum. */
 
 /* Decode the gateway's RSTCTRL.RSTFR byte (FC04 0x0310 reg3) to a short string.
  * A cold boot sets several flags at once, so report the most diagnostic one. */
@@ -964,7 +959,7 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         json_escape(e->provision.msg, msg, sizeof msg);
         snprintf(top, sizeof top, "%s/provision/%u/status", P, e->provision.slave);
         snprintf(pl, sizeof pl, "{\"state\":\"%s\",\"msg\":\"%s\",\"devices_found\":%u}",
-                 prov_state_str(e->provision.state), msg, e->provision.count);
+                 prov_state_name(e->provision.state), msg, e->provision.count);
         mqtt_app_publish(top, pl, strlen(pl), true);
         break;
     }

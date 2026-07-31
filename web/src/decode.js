@@ -14,7 +14,7 @@
 //             groups:   [ {on,bri,members:[addr,...]} | null, ... ]                                              // index = group number
 //          }, ... }
 //   mappings: [ {fixture,button,targets:[{slave,addr}|{slave,group}]}, ... ]
-//   provision: [ {slave,state,count}, ... ]
+//   provision: [ {slave,state,state_text,count,msg}, ... ]
 //   cfg: {...}   seq: N
 
 export function decodeState(s) {

@@ -4,6 +4,7 @@
 
 #include "web_state.h"
 #include "intercore.h"
+#include "dali_provision.h"   /* prov_state_name */
 #include "netif.h"         /* netif_get_ip — live (DHCP-leased) address */
 #include "state_cache.h"   /* RELAY_COUNT, DALI_ADDR_COUNT */
 #include "mapping.h"       /* MAX_FIXTURES, MAX_BUTTONS, MAX_TARGETS_PER_BTN, TARGET_* */
@@ -456,9 +457,30 @@ static int unit_at(const web_render_cursor_t *cur, char *out, size_t cap,
         for (uint16_t s = cur->i; s < MAX_DALI_SLAVES; s++) {
             if (!S.prov[s].seen) continue;
             next->i = s + 1; next->started = true;
-            return snprintf(out, cap, "%s{\"slave\":%d,\"state\":%u,\"count\":%u}",
+            /* state kept numeric for compatibility, plus the label and the
+             * human-readable message. The message was already stored here and
+             * simply never serialised — it is the part that says WHY a run
+             * failed ("Error: no ballasts found"), which a bare 11 does not. */
+            /* Escape for JSON: the message is device-authored but does carry
+             * quotes (e.g. addresses in prose), and an unescaped one would make
+             * the whole /api/state document unparseable. */
+            char em[IC_PROV_MSG_MAX * 2];
+            {
+                const char *src = S.prov[s].msg;
+                size_t o = 0;
+                for (; *src && o + 2 < sizeof em; src++) {
+                    if (*src == '"' || *src == '\\') em[o++] = '\\';
+                    else if ((unsigned char)*src < 0x20) continue;   /* drop controls */
+                    em[o++] = *src;
+                }
+                em[o] = '\0';
+            }
+            return snprintf(out, cap,
+                "%s{\"slave\":%d,\"state\":%u,\"state_text\":\"%s\","
+                "\"count\":%u,\"msg\":\"%s\"}",
                 cur->started ? "," : "", slave_id_for(s),
-                S.prov[s].state, S.prov[s].count);
+                S.prov[s].state, prov_state_name(S.prov[s].state),
+                S.prov[s].count, em);
         }
         next->sec = SEC_TAIL; return 0;
     }

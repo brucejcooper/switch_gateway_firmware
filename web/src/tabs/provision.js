@@ -3,8 +3,20 @@ import { saver, badge, num } from '../util.js';
 
 // Provision tab: per-gateway commissioning controls. State/count come from the
 // poll; this view is re-rendered on poll so progress updates live.
-const STATE_LABEL = { 0: 'idle', 1: 'running', 2: 'complete', 3: 'error' };
-const STATE_KIND = { 0: 'muted', 1: 'warn', 2: 'ok', 3: 'bad' };
+// The label comes from the DEVICE (state_text), not a table here. The table
+// that used to live here was { 0:idle, 1:running, 2:complete, 3:error } — the
+// GATEWAY's old 4-value commission status word. Provisioning moved to the
+// controller and its prov_run_state_t has 12 states, so those numbers stopped
+// meaning what this claimed: a run at state 2 is "scanning" and was shown as a
+// green "complete", state 3 is "terminating" and was shown as a red "error",
+// and state 11 (the real error) fell off the end as a bare "state 11".
+//
+// Only the colour is decided here, from the text, so a new state added on the
+// device shows up correctly without touching this file.
+const kindFor = (t) => (t === 'error' ? 'bad'
+                      : t === 'complete' ? 'ok'
+                      : t === 'idle' || t === 'unknown' ? 'muted'
+                      : 'warn');
 
 export function renderProvision(state) {
   const gateways = state.gateways || [];
@@ -34,10 +46,13 @@ export function renderProvision(state) {
       h('div', { class: 'row between' },
         h('strong', {}, 'Gateway slave ', String(g.slave)),
         h('div', { class: 'row' },
-          badge(STATE_LABEL[st] || ('state ' + st), STATE_KIND[st] || 'muted'),
+          badge(p.state_text || ('state ' + st), kindFor(p.state_text)),
           p.count != null ? badge('count ' + p.count) : null,
         ),
       ),
+      // The device's own explanation — "Error: no ballasts found" says what a
+      // red badge alone cannot.
+      p.msg ? h('div', { class: 'sub', style: { marginTop: '6px' } }, p.msg) : null,
       h('div', { class: 'row', style: { marginTop: '10px' } }, all, fresh, abort),
       h('div', { class: 'row', style: { marginTop: '8px' } },
         h('span', { class: 'muted' }, 'Address'), addrInput, reprov),

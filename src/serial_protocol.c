@@ -315,24 +315,9 @@ static void print_mapping(const mapping_record_t *r) {
     printf("\n");
 }
 
-/* Provisioning state name, matching serial_protocol_provision.c */
-static const char *prov_state_name(prov_run_state_t s) {
-    switch (s) {
-    case PROV_STATE_IDLE:          return "idle";
-    case PROV_STATE_CLEARING:      return "clearing";
-    case PROV_STATE_SCANNING_USED: return "scanning";
-    case PROV_STATE_TERMINATING:   return "terminating";
-    case PROV_STATE_INITIALISING:  return "initialising";
-    case PROV_STATE_RANDOMISING:   return "randomising";
-    case PROV_STATE_SEARCHING:     return "searching";
-    case PROV_STATE_ASSIGNING:     return "assigning";
-    case PROV_STATE_VERIFYING:     return "verifying";
-    case PROV_STATE_WITHDRAWING:   return "withdrawing";
-    case PROV_STATE_COMPLETE:      return "complete";
-    case PROV_STATE_ERROR:         return "error";
-    default:                       return "unknown";
-    }
-}
+/* prov_state_name() is shared, in dali_provision.h beside the enum — there were
+ * three separate copies of this table (here, ha_bridge.c, and none at all for
+ * the web UI, which is why it showed a bare number). */
 
 /* Parse a single "<slave>:<addr>" pair into a mapping_target_t. addr may be
  * a decimal short-address (0-63) or "G<group>" (group 0-15). Returns true
