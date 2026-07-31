@@ -60,7 +60,7 @@ set_source_files_properties(
     PROPERTIES COMPILE_OPTIONS "-w")
 
 # ── FW_VERSION = base + git describe (tag/hash + -dirty), refreshed each build ──
-set(FW_BASE_VERSION "2.0.0")
+set(FW_BASE_VERSION "2.0.1")
 file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/generated)
 set(GEN_VERSION_ARGS
     -DSRC_DIR=${CMAKE_CURRENT_LIST_DIR}
