@@ -86,6 +86,48 @@ export function renderDocs() {
         ['<prefix>/update/state', 'Installed and available firmware versions.'],
       ])),
 
+    sec('Home Assistant',
+      p('Nothing to configure in HA beyond pointing this device at the same broker. ' +
+        'It publishes MQTT auto-discovery on startup and on every reconnect, so the ' +
+        'entities appear on their own.'),
+      p('Discovery is published to ', code('homeassistant/<component>/<object_id>/config'),
+        '. The device also subscribes to ', code('homeassistant/status'),
+        ' — HA\u2019s birth message — and re-publishes everything when HA restarts, so ' +
+        'entities survive an HA restart without touching the controller.'),
+      mut('Entities are created for the whole address space, not just what is present: ' +
+          'all 64 short addresses per gateway, all 16 groups, all 32 relay channels. ' +
+          'Ones that have not answered show as unavailable, so a ballast you plug in ' +
+          'later simply becomes available rather than needing a re-discovery.'),
+      table(['Entity', 'HA type · object id'], [
+        ['Ballast', 'light · lighting_dali_<slave>_<addr>'],
+        ['Ballast setting', 'number · lighting_dali_<slave>_<addr>_<field> (min, max, power_on, sys_fail, fade_rate, fade_time)'],
+        ['Group', 'light · lighting_group_<slave>_<group>'],
+        ['Group members', 'text · lighting_group_<slave>_<group>_members'],
+        ['Relay channel', 'switch · lighting_relay_<ch>'],
+        ['Wall button', 'event · press, release, click, long_press'],
+        ['Button binding', 'text · lighting_binding_<fixture>_<button>'],
+        ['Button stuck', 'binary_sensor · per plate'],
+        ['Commissioning', 'sensor · lighting_prov_<slave>_state / _msg / _count, plus a target number'],
+        ['Gateway diagnostics', 'sensor · lighting_gwdiag_<slave>_uptime / _reboots / _reset'],
+        ['Firmware', 'update · lighting_fw_update, with a lighting_fw_check button'],
+        ['Controller settings', 'number/switch · lighting_cfg_<key>'],
+        ['Reboot', 'button · lighting_reboot'],
+      ]),
+      p(h('strong', {}, 'Devices in HA. '),
+        'Entities are grouped under one device per physical thing: ',
+        code('lighting_controller'), ' for the controller itself, ',
+        code('lighting_dali_gw_<slave>'), ' for each DALI gateway (its ballasts, ' +
+        'groups, commissioning and diagnostics hang off it), and one per wall plate.'),
+      p(h('strong', {}, 'Availability is hierarchical. '),
+        'A ballast is shown available only if the controller, its gateway AND the ' +
+        'ballast itself are all online — HA is told to require all three. So pulling ' +
+        'a gateway greys out everything behind it rather than leaving stale entities ' +
+        'looking live.'),
+      p(h('strong', {}, 'Toggling from HA. '),
+        'HA resolves light.toggle itself from the state we publish and sends an ' +
+        'explicit ON or OFF, so a toggle is only as correct as the reported state — ' +
+        'which is why levels are read back from the gear rather than assumed.')),
+
     sec('REST API',
       mut('HTTP Basic auth on every route — set the password on the Password tab. ' +
           'Bodies are JSON. Reads are GET, everything else POST.'),
