@@ -29,6 +29,18 @@ export async function getOta() {
   return res.json();
 }
 
+// Called after every SUCCESSFUL write. main.js uses it to re-read /api/state
+// immediately instead of waiting out the poll interval.
+//
+// The device applies a command and republishes the result in well under a
+// second (measured: a group toggle's ballast read and all three derived group
+// states land in the same second as the request). The visible lag was purely
+// this UI's 1.5 s poll. So look sooner — do NOT predict the new value locally.
+// Everything rendered here still comes from a device read; the only thing that
+// changes is when we ask.
+let afterWrite = null;
+export function setAfterWrite(fn) { afterWrite = fn; }
+
 // POST a JSON body to `path`. Resolves to the parsed response (or {ok:true}
 // when the body is empty) and rejects on non-2xx / 401.
 export async function post(path, obj) {
@@ -47,5 +59,6 @@ export async function post(path, obj) {
   if (!res.ok || (data && data.ok === false)) {
     throw new Error((data && data.error) || 'HTTP ' + res.status);
   }
+  if (afterWrite) afterWrite();   // success only — a rejected write changed nothing
   return data || { ok: true };
 }

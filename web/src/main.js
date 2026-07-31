@@ -1,6 +1,6 @@
 import './style.css';
 import { h, mount } from './dom.js';
-import { getState } from './api.js';
+import { setAfterWrite, getState } from './api.js';
 import { renderDashboard } from './tabs/dashboard.js';
 import { renderLights } from './tabs/lights.js';
 import { renderGroups } from './tabs/groups.js';
@@ -69,6 +69,17 @@ function init() {
 
   poll();
   setInterval(poll, POLL_MS);
+
+  /* After a successful write, read back promptly rather than waiting up to
+   * POLL_MS. Two reads: one now, which usually already carries the new value
+   * because the device is sub-second, and one a little later to catch a command
+   * whose verification read had not landed yet (a DALI transaction is ~70 ms,
+   * and a ballast mid-fade keeps reporting until it settles).
+   *
+   * Costs two extra requests per user action, not a faster background poll for
+   * everyone — which matters here because the W5100S has only two sockets spare
+   * for the web server. */
+  setAfterWrite(() => { poll(); setTimeout(poll, 400); });
 }
 
 function fromHash() {
@@ -123,7 +134,18 @@ function refreshLive() {
   }
 }
 
+/* Single-flight. Three things now ask for a poll — the 1.5 s interval and the
+ * two after-write reads — and without this they can overlap: a slow response
+ * could land after a newer one and overwrite fresher state with staler, and
+ * concurrent requests compete for the two W5100S sockets the web server has.
+ * A request arriving mid-poll sets a flag and runs once the current one
+ * finishes, so requests coalesce instead of stacking. */
+let polling = false;
+let pollAgain = false;
+
 async function poll() {
+  if (polling) { pollAgain = true; return; }
+  polling = true;
   try {
     const s = await getState();
     const wasEmpty = app.state == null;
@@ -138,6 +160,9 @@ async function poll() {
     } else {
       setBanner('Device unreachable — retrying…', 'warn');
     }
+  } finally {
+    polling = false;
+    if (pollAgain) { pollAgain = false; poll(); }
   }
 }
 
