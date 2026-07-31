@@ -229,12 +229,6 @@ static int ballast_max(int si) {
     for (int a = 0; a < DALI_ADDR_COUNT; a++) if (S.ball[si][a].seen) m = a;
     return m;
 }
-static int group_max(int si) {
-    int m = -1;
-    for (int g = 0; g < (int)WEB_GROUPS; g++) if (S.grp[si][g].seen) m = g;
-    return m;
-}
-
 static int slave_id_for(int idx) {
     const ic_snapshot_t *sn = intercore_snapshot();
     return (sn && idx < sn->dali_count) ? sn->dali_slaves[idx] : 0;
@@ -410,8 +404,16 @@ static int unit_at(const web_render_cursor_t *cur, char *out, size_t cap,
             next->sub = DSUB_GROUPS; next->i = 0; next->started = false;
             return snprintf(out, cap, "],\"groups\":[");
         case DSUB_GROUPS: {
-            int gmax = group_max(si);
-            if ((int)cur->i <= gmax) {
+            /* ALWAYS all WEB_GROUPS slots, never truncated at the highest one
+             * seen. A DALI bus has 16 groups, always — there is no create step,
+             * you make a group by adding members — so a UI that lists only the
+             * populated ones offers no way to build a new one. Emitting up to
+             * group_max() meant a bus using G0/G1/G7/G9 served exactly 10
+             * entries, and groups 10-15 could never be reached.
+             *
+             * Unseen slots serialise as null (below), which the UI decodes to an
+             * empty group rather than dropping — same rule as the relay array. */
+            if (cur->i < WEB_GROUPS) {
                 int g = cur->i;
                 ws_group_t *gp = &S.grp[si][g];
                 next->i = g + 1; next->started = true;
