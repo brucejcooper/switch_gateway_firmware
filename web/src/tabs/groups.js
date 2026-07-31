@@ -1,7 +1,7 @@
 import { h } from '../dom.js';
 import { post } from '../api.js';
 import { toastErr } from '../toast.js';
-import { onToggle, saver, num } from '../util.js';
+import { onToggle, saver, num, badge } from '../util.js';
 
 // Groups tab. Live: each group card patches its toggle/slider in place on poll
 // (the members editor is left alone so edits aren't clobbered). Full re-render
@@ -9,16 +9,22 @@ import { onToggle, saver, num } from '../util.js';
 export function renderGroups(state) {
   const sortG = (l) => l.slice().sort((a, b) => (a.slave - b.slave) || (a.group - b.group));
   const groups = sortG(state.groups || []);
-  if (!groups.length) return h('div', { class: 'card sub' }, 'No groups defined.');
+  if (!groups.length) return h('div', { class: 'card sub' }, 'No DALI gateways.');
 
   const keyOf = (g) => g.slave + ':' + g.group;
-  const sig = groups.map(keyOf).join('|');
+  /* The signature includes emptiness, not just identity: the set of groups is
+   * now fixed at 16 per bus so the keys never change, but a group gaining its
+   * first member (or losing its last) adds or removes the "empty" badge, and
+   * update() only patches the toggle/slider/checkboxes. Without this the badge
+   * would go stale the moment you built a group. */
+  const sigOf = (l) => l.map((g) => keyOf(g) + (g.empty ? 'e' : '')).join('|');
+  const sig = sigOf(groups);
   const cards = new Map();
   const nodes = groups.map((g) => { const c = groupCard(g); cards.set(keyOf(g), c); return c.el; });
 
   const update = (st) => {
     const list = sortG(st.groups || []);
-    if (list.map(keyOf).join('|') !== sig) return false;
+    if (sigOf(list) !== sig) return false;
     for (const g of list) { const c = cards.get(keyOf(g)); if (c) c.update(g); }
     return true;
   };
@@ -61,6 +67,10 @@ function groupCard(g) {
   const el = h('div', { class: 'card' },
     h('div', { class: 'row between' },
       h('strong', {}, 'Slave ', String(g.slave), ' · Group ', String(g.group)),
+      /* All 16 groups per bus are listed whether or not they have members —
+       * ticking a member here is what creates one. Flag the empty ones so the
+       * populated groups are still easy to pick out of the list. */
+      g.empty ? badge('empty', 'muted') : null,
       toggle,
     ),
     h('div', { class: 'row', style: { marginTop: '8px' } }, h('span', { class: 'grow' }, slider), briVal),

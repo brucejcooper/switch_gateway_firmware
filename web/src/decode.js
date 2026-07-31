@@ -11,7 +11,9 @@
 //   dali: { "<slave>": {
 //             online: bool,
 //             ballasts: [ {on,bri,min,max,power_on,sys_fail,fade_rate,fade_time,fading,lamp_fail} | null, ... ],  // index = address
-//             groups:   [ {on,bri,members:[addr,...]} | null, ... ]                                              // index = group number
+//             groups:   [ {on,bri,members:[addr,...]} | null, ... ]  index = group
+//                       null = no members yet; decoded to an entry with
+//                       empty:true rather than dropped, so all 16 are listed
 //          }, ... }
 //   mappings: [ {fixture,button,targets:[{slave,addr}|{slave,group}]}, ... ]
 //   provision: [ {slave,state,state_text,count,msg}, ... ]
@@ -42,9 +44,19 @@ export function decodeState(s) {
         fading: !!b.fading, lamp_fail: !!b.lamp_fail,
       });
     });
+    /* Keep EVERY group slot, including the ones the device has never emitted.
+     * A null here means "no members yet", not "does not exist" — DALI has 16
+     * groups per bus, always, and there is no create step: you make a group by
+     * adding members to it. Dropping the nulls meant the UI only listed groups
+     * that already had members, so there was no way to build a new one. */
     (sd.groups || []).forEach((g, group) => {
-      if (!g) return;
-      groups.push({ slave, group, on: !!g.on, bri: g.bri, members: g.members || [] });
+      groups.push({
+        slave, group,
+        on: !!(g && g.on),
+        bri: g ? g.bri : 0,
+        members: (g && g.members) || [],
+        empty: !g || !(g.members || []).length,
+      });
     });
   }
 
