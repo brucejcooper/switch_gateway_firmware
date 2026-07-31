@@ -95,6 +95,16 @@ export function renderFirmware() {
       });
   };
 
-  refresh();
+  /* Deferred, NOT called directly. renderFirmware() returns `card` and main.js
+   * mounts it only after that return, so a synchronous refresh() ran while the
+   * card was still detached — its `if (!card.isConnected) return` guard fired
+   * every time and the "Loading…" placeholder was never replaced. This tab could
+   * not have loaded at all.
+   *
+   * setTimeout(0) puts the first fetch in the next task, by which point the
+   * mount above has happened and the guard passes. The guard is still worth
+   * keeping: it stops a late response from a tab the user has already navigated
+   * away from drawing into a detached node. */
+  setTimeout(refresh, 0);
   return card;
 }
