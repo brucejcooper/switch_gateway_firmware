@@ -6,21 +6,47 @@ import { onToggle, saver, num, badge } from '../util.js';
 // Groups tab. Live: each group card patches its toggle/slider in place on poll
 // (the members editor is left alone so edits aren't clobbered). Full re-render
 // if the set of groups changes.
-export function renderGroups(state) {
+/* Whether the empty group slots are on screen. Module-level so the choice
+ * survives the re-render each poll triggers — view state, not device state.
+ * One flag for the tab rather than per-bus (unlike Lights): this is a flat list
+ * of group cards, not per-gateway sections. */
+let showEmpty = false;
+
+export function renderGroups(state, reload) {
   const sortG = (l) => l.slice().sort((a, b) => (a.slave - b.slave) || (a.group - b.group));
   const groups = sortG(state.groups || []);
   if (!groups.length) return h('div', { class: 'card sub' }, 'No DALI gateways.');
 
   const keyOf = (g) => g.slave + ':' + g.group;
+
+  /* All 16 slots per bus arrive from the device; which to draw is a
+   * presentation choice. Default to the groups that actually have members —
+   * the empty ones matter when you are BUILDING a group and are noise
+   * otherwise, exactly as with unused ballast addresses. */
+  const visible = (g) => !g.empty || showEmpty;
+  const shown  = groups.filter(visible);
+  const hidden = groups.length - shown.length;
   /* The signature includes emptiness, not just identity: the set of groups is
    * now fixed at 16 per bus so the keys never change, but a group gaining its
    * first member (or losing its last) adds or removes the "empty" badge, and
    * update() only patches the toggle/slider/checkboxes. Without this the badge
    * would go stale the moment you built a group. */
-  const sigOf = (l) => l.map((g) => keyOf(g) + (g.empty ? 'e' : '')).join('|');
+  const sigOf = (l) => l.filter(visible).map((g) => keyOf(g) + (g.empty ? 'e' : '')).join('|');
   const sig = sigOf(groups);
   const cards = new Map();
-  const nodes = groups.map((g) => { const c = groupCard(g); cards.set(keyOf(g), c); return c.el; });
+
+  const showBtn = h('button', { class: 'btn small' },
+                    showEmpty ? 'Hide empty' : 'Show all 16 per bus');
+  showBtn.addEventListener('click', () => { showEmpty = !showEmpty; reload(); });
+  const header = h('div', { class: 'card row between' },
+    h('strong', {}, 'Groups'),
+    h('div', { class: 'row' },
+      hidden ? h('span', { class: 'muted' }, String(hidden) + ' empty') : null,
+      showBtn));
+
+  const nodes = [header, ...shown.map((g) => {
+    const c = groupCard(g); cards.set(keyOf(g), c); return c.el;
+  })];
 
   const update = (st) => {
     const list = sortG(st.groups || []);
