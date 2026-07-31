@@ -12,6 +12,7 @@ import { renderMqtt } from './tabs/mqtt.js';
 import { renderProvision } from './tabs/provision.js';
 import { renderFirmware } from './tabs/firmware.js';
 import { renderPassword } from './tabs/password.js';
+import { renderDocs } from './tabs/docs.js';
 
 const POLL_MS = 1500;
 
@@ -30,6 +31,7 @@ const TABS = [
   { id: 'provision', label: 'Provision', render: renderProvision, live: true },
   { id: 'firmware', label: 'Firmware', render: renderFirmware, live: false },
   { id: 'password', label: 'Password', render: renderPassword, live: false },
+  { id: 'docs', label: 'Docs', render: renderDocs, live: false },
 ];
 
 const app = {
@@ -41,28 +43,50 @@ const app = {
 function init() {
   const root = document.getElementById('app');
 
-  const tabBar = h('nav', { class: 'tabs' });
+  /* Side navigation rather than a horizontal tab strip. Twelve tabs overflowed
+   * the width on any screen, so the strip scrolled sideways — tabs you could not
+   * see and had to discover by dragging. A vertical list shows them all at once,
+   * is permanently on screen from 900px up, and collapses behind a hamburger
+   * below that. */
+  const nav = h('nav', { class: 'sidenav' });
   const banner = h('div', {});
   const content = h('main', {});
   const fw = h('span', { class: 'fw' }, '');
 
   const tabButtons = TABS.map((t) => {
     const b = h('button', { type: 'button' }, t.label);
-    b.addEventListener('click', () => setActive(t.id, true));
+    b.addEventListener('click', () => { setActive(t.id, true); closeDrawer(); });
     return b;
   });
-  tabBar.append(...tabButtons);
+  nav.append(...tabButtons);
+
+  const burger = h('button', {
+    class: 'burger', type: 'button', 'aria-label': 'Menu', 'aria-expanded': 'false',
+  }, '\u2630');
+  const scrim = h('div', { class: 'scrim' });
+  burger.addEventListener('click', () => {
+    root.classList.contains('nav-open') ? closeDrawer() : openDrawer();
+  });
+  scrim.addEventListener('click', closeDrawer);
+  /* Escape closes the drawer: it covers the content on mobile, so there must be
+   * a way out that does not depend on hitting the scrim. */
+  document.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') closeDrawer();
+  });
 
   mount(root,
-    h('header', { class: 'top' },
+    h('aside', { class: 'side' },
       h('div', { class: 'brand' }, h('h1', {}, 'Light Switch'), fw),
-      tabBar,
-    ),
-    banner,
-    content,
+      nav),
+    scrim,
+    h('div', { class: 'col' },
+      h('header', { class: 'top' }, burger, h('span', { class: 'ttl' }, '')),
+      banner,
+      content),
   );
 
-  app.el = { content, banner, fw, tabButtons };
+  app.el = { content, banner, fw, tabButtons, burger, root,
+             ttl: root.querySelector('.ttl') };
 
   setActive(fromHash() || 'dashboard', false);
   window.addEventListener('hashchange', () => setActive(fromHash() || 'dashboard', false));
@@ -82,6 +106,16 @@ function init() {
   setAfterWrite(() => { poll(); setTimeout(poll, 400); });
 }
 
+function openDrawer() {
+  app.el.root.classList.add('nav-open');
+  app.el.burger.setAttribute('aria-expanded', 'true');
+}
+function closeDrawer() {
+  if (!app.el.root) return;
+  app.el.root.classList.remove('nav-open');
+  app.el.burger.setAttribute('aria-expanded', 'false');
+}
+
 function fromHash() {
   const id = location.hash.replace(/^#/, '');
   return TABS.some((t) => t.id === id) ? id : null;
@@ -93,7 +127,11 @@ function setActive(id, viaClick) {
     history.replaceState(null, '', '#' + id);
   }
   TABS.forEach((t, i) => {
-    app.el.tabButtons[i].classList.toggle('active', t.id === id);
+    const on = t.id === id;
+    app.el.tabButtons[i].classList.toggle('active', on);
+    /* The header shows the active tab's name. With the nav off-screen on mobile
+     * there is otherwise nothing telling you where you are. */
+    if (on && app.el.ttl) app.el.ttl.textContent = t.label;
   });
   renderActive();
 }
