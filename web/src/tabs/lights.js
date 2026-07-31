@@ -25,7 +25,17 @@ export function renderLights(state) {
   const nodes = [];
   for (const [slave, list] of bySlave) {
     const rowEls = list.map((b) => { const r = ballastRow(b); rows.set(keyOf(b), r); return r.el; });
-    nodes.push(h('div', { class: 'card' }, h('h3', {}, 'Slave ', String(slave)), rowEls));
+    /* Rescan: re-interrogate this gateway now instead of waiting for the
+     * background sweep to come round. A newly powered ballast is otherwise
+     * only noticed when the rotation reaches its address. Asynchronous on the
+     * device — the row appears on a later poll, not when this returns, which is
+     * why the toast says "started" rather than claiming a result. */
+    const scan = h('button', { class: 'btn small' }, 'Rescan');
+    scan.addEventListener('click', saver('/api/scan', () => ({ slave }),
+                                         { okMsg: 'Scan started' }));
+    nodes.push(h('div', { class: 'card' },
+      h('div', { class: 'row between' }, h('h3', {}, 'Slave ', String(slave)), scan),
+      rowEls));
   }
 
   const update = (st) => {

@@ -190,6 +190,7 @@ typedef enum {
     IC_CMD_OTA_END,       /* download complete at `total_len` -> ota_stage_finish(); replies IC_EVT_OTA_STATUS */
     IC_CMD_OTA_ABORT,     /* discard the in-flight staging session -> ota_stage_abort() */
     IC_CMD_OTA_CONFIRM,   /* mark the active image good -> ota_stage_confirm() */
+    IC_CMD_SCAN,          /* re-interrogate one DALI gateway -> dirty_poll_arm_scan() */
 } ic_cmd_type_t;
 
 typedef struct {
@@ -230,6 +231,11 @@ typedef struct {
          * (image + fw_trailer), for ota_stage_finish(). */
         struct { uint32_t total_len; } ota_end;
         /* IC_CMD_OTA_BEGIN/OTA_ABORT/OTA_CONFIRM carry no payload. */
+        /* IC_CMD_SCAN: which DALI gateway to re-interrogate. Asynchronous on
+         * core 0 — the reply is the eventual scan_complete/presence events, not
+         * an ack, so a newly powered ballast appears without waiting for the
+         * background sweep to reach it. */
+        struct { uint8_t slave; } scan;
     };
 } ic_cmd_t;
 

@@ -33,9 +33,11 @@
 prov_status_t g_prov_status = { .run_state = PROV_STATE_IDLE };
 
 static struct {
-    bool    active;
-    uint8_t slave_id;
-    bool    reported;   /* progress published at least once this run */
+    bool        active;
+    uint8_t     slave_id;
+    bool        reported;   /* progress published at least once this run */
+    prov_mode_t mode;       /* what was asked for — decides whether "found none"
+                             * is a failure or simply nothing to do */
 } s;
 
 /* ── Helpers ────────────────────────────────────────────────────────────── */
@@ -83,6 +85,7 @@ bool dali_provision_start(uint8_t slave_id, prov_mode_t mode,
     memset(&s, 0, sizeof(s));
     s.active   = true;
     s.slave_id = slave_id;
+    s.mode     = mode;
 
     g_prov_status.slave_id      = slave_id;
     g_prov_status.devices_found = 0;
@@ -157,7 +160,26 @@ void dali_provision_tick(void) {
         set_status(PROV_STATE_ERROR, "Aborted");
         break;
     case DCOM_ERR_NO_BALLASTS:
-        set_status(PROV_STATE_ERROR, "Error: no ballasts found");
+        /* Finding nothing means different things per mode.
+         *
+         * PROV_UNADDRESSED issues INITIALISE with INIT_DATA_NO_SHORT, which
+         * includes ONLY gear that has no short address. On a fully-commissioned
+         * bus that correctly matches nothing, so zero found is the expected
+         * result — "there is nothing new to add", not a failure. Reporting it as
+         * an error meant incremental provisioning ALWAYS looked broken on a
+         * healthy bus, which is exactly what it looked like from the UI.
+         *
+         * PROV_ALL should have matched every ballast, so zero is a real fault
+         * (bad wiring, no bus power, gear not responding to the search).
+         * PROV_ADDRESS targeting an address with nothing at it is also worth
+         * flagging — that is the check that proves a re-provision cannot touch
+         * gear it was not aimed at. */
+        if (s.mode == PROV_UNADDRESSED) {
+            set_status(PROV_STATE_COMPLETE,
+                       "No unaddressed ballasts — nothing to commission");
+        } else {
+            set_status(PROV_STATE_ERROR, "Error: no ballasts found");
+        }
         break;
     case DCOM_ERR_VERIFY:
         set_status(PROV_STATE_ERROR, "Error: repeated verify failures");

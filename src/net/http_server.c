@@ -393,6 +393,11 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
      * manifest has been fetched, and while an OTA is already running). */
     if (strcmp(path, "/api/ota/check") == 0)   { fwupdate_announce(); resp_ok(c); return; }
     if (strcmp(path, "/api/ota/install") == 0) { fwupdate_install();  resp_ok(c); return; }
+    if (strcmp(path, "/api/scan") == 0) {
+        cmd.type = IC_CMD_SCAN;
+        cmd.scan.slave = (uint8_t)jint_key(body, tk, nt, "slave", 0);
+        push_cmd_resp(c, &cmd); return;
+    }
     if (strcmp(path, "/api/relay") == 0) {
         cmd.type = IC_CMD_SET_RELAY;
         cmd.set_relay.ch = (uint8_t)jint_key(body, tk, nt, "ch", 0);

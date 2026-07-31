@@ -2435,6 +2435,18 @@ static bool levt_to_ic(const levt_t *e, ic_event_t *ic) {
  * and only on infrequent commands. */
 static void ic_dispatch_cmd(const ic_cmd_t *c) {
     switch (c->type) {
+    case IC_CMD_SCAN: {
+        uint8_t slave = c->scan.slave;
+        if (state_cache_slave_idx(slave) < 0) {
+            LOG_WARN("cli", "ic scan reject: slave=%u not configured", slave); break; }
+        /* Same call the `scan` CLI verb makes, and asynchronous for the same
+         * reason: on a populated bus an interrogation is many seconds, and this
+         * arrives on a LIVE system where someone may be at a wall switch.
+         * Blocking here would stall the main loop and freeze the buttons. */
+        LOG_INFO("cli", "ic scan slave %u (async)", slave);
+        dirty_poll_arm_scan(slave);
+        break;
+    }
     case IC_CMD_SET_RELAY: {
         uint8_t ch = c->set_relay.ch;
         if (ch >= RELAY_COUNT) { LOG_WARN("cli", "ic set_relay reject: ch=%u", ch); break; }
