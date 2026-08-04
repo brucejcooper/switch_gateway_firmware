@@ -105,9 +105,27 @@ static int slave_idx(uint8_t id) {
  * which have 8 KB to play with. */
 #define DISC_BUF 64
 
+/* The prefix for HA DISCOVERY ids — object_ids, unique_ids and device
+ * identifiers. Deliberately the SAME string as the MQTT topic prefix.
+ *
+ * These used to be hardcoded "lighting_...", while every state and command
+ * topic already derived from mqtt_app_prefix(). Two controllers on one broker
+ * could therefore be given separate topic namespaces and STILL collide: both
+ * published discovery to homeassistant/light/lighting_dali_3_0/config, so the
+ * entity's state_topic pointed at whichever wrote last, both re-published on
+ * every reconnect and on homeassistant/status, and identical unique_ids made HA
+ * treat them as one entity. Slave numbering is per-controller, so
+ * lighting_dali_3_0 was genuinely ambiguous between two boxes.
+ *
+ * Reusing the topic prefix means ONE thing to set per controller rather than
+ * two that could disagree — and with the default prefix "lighting" every id
+ * comes out byte-identical to before, so existing installs keep their entities,
+ * history and automations untouched. */
+static const char *idp(void) { return mqtt_app_prefix(); }
+
 static void disc_plate_event(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
+    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF], objid[DISC_BUF];
     /* No value_template: HA's MQTT *event* platform parses the raw payload as
      * JSON and takes event_type from it (and any extra keys as attributes). A
      * value_template would be applied first and its *result* must itself be a
@@ -116,31 +134,33 @@ static void disc_plate_event(uint8_t fix, uint8_t btn) {
      * already sends {"event_type":"press"} (see ha_bridge_publish_event), which
      * is exactly what the platform wants. */
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_switch_%02u_btn_%u\",\"name\":\"Button %u\","
+        "{\"unique_id\":\"%s_switch_%02u_btn_%u\",\"name\":\"Button %u\","
         "\"state_topic\":\"%s/button/%u/%u\","
         "\"event_types\":[\"press\",\"release\",\"click\",\"long_press\",\"long_press_repeat\",\"stuck\",\"unstuck\"],"
-        "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"",
+        "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"", idp(),
         fix, btn, btn + 1, P, fix, btn, P);
-    snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
+    snprintf(ids, sizeof ids, "%s_switch_plate_%02u", idp(), fix);
     snprintf(name, sizeof name, "Fixture %02u", fix + 1);
-    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", "lighting_controller");
-    snprintf(objid, sizeof objid, "lighting_switch_%02u_btn_%u", fix, btn);
+    snprintf(via, sizeof via, "%s_controller", idp());
+    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", via);
+    snprintf(objid, sizeof objid, "%s_switch_%02u_btn_%u", idp(), fix, btn);
     pub_cfg("event", objid);
 }
 
 static void disc_plate_binding(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
+    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_binding_%02u_btn_%u\",\"name\":\"Button %u Binding\","
+        "{\"unique_id\":\"%s_binding_%02u_btn_%u\",\"name\":\"Button %u Binding\","
         "\"command_topic\":\"%s/binding/%u/%u/set\",\"state_topic\":\"%s/binding/%u/%u/state\","
         "\"pattern\":\"%s\",\"availability_topic\":\"%s/availability\","
-        "\"entity_category\":\"config\",\"icon\":\"mdi:link-variant\"",
+        "\"entity_category\":\"config\",\"icon\":\"mdi:link-variant\"", idp(),
         fix, btn, btn + 1, P, fix, btn, P, fix, btn, BINDING_PATTERN, P);
-    snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
+    snprintf(ids, sizeof ids, "%s_switch_plate_%02u", idp(), fix);
     snprintf(name, sizeof name, "Fixture %02u", fix + 1);
-    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", "lighting_controller");
-    snprintf(objid, sizeof objid, "lighting_binding_%02u_btn_%u", fix, btn);
+    snprintf(via, sizeof via, "%s_controller", idp());
+    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", via);
+    snprintf(objid, sizeof objid, "%s_binding_%02u_btn_%u", idp(), fix, btn);
     pub_cfg("text", objid);
     snprintf(s_top, sizeof s_top, "%s/binding/%u/%u/state", P, fix, btn);
     pub_str(s_top, "", true);
@@ -154,17 +174,18 @@ static uint8_t s_stuck_mask[MAX_FIX];
 
 static void disc_plate_stuck(uint8_t fix) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
+    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_switch_%02u_stuck\",\"name\":\"Button Stuck\","
+        "{\"unique_id\":\"%s_switch_%02u_stuck\",\"name\":\"Button Stuck\","
         "\"state_topic\":\"%s/plate/%u/stuck\","
         "\"device_class\":\"problem\",\"entity_category\":\"diagnostic\","
-        "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-hold\"",
+        "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-hold\"", idp(),
         fix, P, fix, P);
-    snprintf(ids, sizeof ids, "lighting_switch_plate_%02u", fix);
+    snprintf(ids, sizeof ids, "%s_switch_plate_%02u", idp(), fix);
     snprintf(name, sizeof name, "Fixture %02u", fix + 1);
-    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", "lighting_controller");
-    snprintf(objid, sizeof objid, "lighting_switch_%02u_stuck", fix);
+    snprintf(via, sizeof via, "%s_controller", idp());
+    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", via);
+    snprintf(objid, sizeof objid, "%s_switch_%02u_stuck", idp(), fix);
     pub_cfg("binary_sensor", objid);
     snprintf(s_top, sizeof s_top, "%s/plate/%u/stuck", P, fix);
     pub_str(s_top, s_stuck_mask[fix] ? "ON" : "OFF", true);
@@ -172,20 +193,21 @@ static void disc_plate_stuck(uint8_t fix) {
 
 static void disc_relay(uint8_t slave, uint8_t ch) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], objid[DISC_BUF];
+    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_relay_%u\",\"name\":null,"
+        "{\"unique_id\":\"%s_relay_%u\",\"name\":null,"
         "\"state_topic\":\"%s/relay/%u/state\",\"command_topic\":\"%s/relay/%u/set\","
         "\"state_value_template\":\"{{ value_json.state }}\","
         "\"payload_on\":\"{\\\"state\\\":\\\"ON\\\"}\","
         "\"payload_off\":\"{\\\"state\\\":\\\"OFF\\\"}\","
         "\"availability\":[{\"topic\":\"%s/availability\"},"
-        "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"",
+        "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"", idp(),
         ch, P, ch, P, ch, P, P, slave);
-    snprintf(ids, sizeof ids, "lighting_relay_%u", ch);
+    snprintf(ids, sizeof ids, "%s_relay_%u", idp(), ch);
     snprintf(name, sizeof name, "Relay Channel %u", ch);
-    dev(n, ids, name, MFR_WAVE, "Relay Channel", "lighting_relay_board");
-    snprintf(objid, sizeof objid, "lighting_relay_%u", ch);
+    snprintf(via, sizeof via, "%s_relay_board", idp());
+    dev(n, ids, name, MFR_WAVE, "Relay Channel", via);
+    snprintf(objid, sizeof objid, "%s_relay_%u", idp(), ch);
     pub_cfg("switch", objid);
 }
 
@@ -193,18 +215,18 @@ static void disc_ballast(uint8_t slave, uint8_t addr) {
     const char *P = mqtt_app_prefix();
     char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_dali_%u_%u\",\"name\":null,\"schema\":\"json\","
+        "{\"unique_id\":\"%s_dali_%u_%u\",\"name\":null,\"schema\":\"json\","
         "\"state_topic\":\"%s/dali/%u/%u/state\",\"command_topic\":\"%s/dali/%u/%u/set\","
         "\"supported_color_modes\":[\"brightness\"],\"brightness_scale\":254,"
         "\"availability\":[{\"topic\":\"%s/availability\"},"
         "{\"topic\":\"%s/gateway/%u/availability\"},"
-        "{\"topic\":\"%s/dali/%u/%u/availability\"}],\"availability_mode\":\"all\"",
+        "{\"topic\":\"%s/dali/%u/%u/availability\"}],\"availability_mode\":\"all\"", idp(),
         slave, addr, P, slave, addr, P, slave, addr, P, P, slave, P, slave, addr);
-    snprintf(ids, sizeof ids, "lighting_dali_%u_%u", slave, addr);
+    snprintf(ids, sizeof ids, "%s_dali_%u_%u", idp(), slave, addr);
     snprintf(name, sizeof name, "DALI %u.%02u", slave, addr);
-    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
     dev(n, ids, name, MFR_MECH, "DALI Ballast", gw);
-    snprintf(objid, sizeof objid, "lighting_dali_%u_%u", slave, addr);
+    snprintf(objid, sizeof objid, "%s_dali_%u_%u", idp(), slave, addr);
     pub_cfg("light", objid);
     snprintf(s_top, sizeof s_top, "%s/dali/%u/%u/availability", P, slave, addr);
     pub_str(s_top, "offline", true);
@@ -220,21 +242,21 @@ static void disc_ballast_cfg(uint8_t slave, uint8_t addr, uint8_t k) {
     const char *P = mqtt_app_prefix();
     char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_dali_%u_%u_%s\",\"name\":\"%s\","
+        "{\"unique_id\":\"%s_dali_%u_%u_%s\",\"name\":\"%s\","
         "\"command_topic\":\"%s/dali/%u/%u/config/%s/set\","
         "\"state_topic\":\"%s/dali/%u/%u/config\",\"value_template\":\"{{ value_json.%s }}\","
         "\"min\":%d,\"max\":%d,\"step\":1,\"mode\":\"box\","
         "\"availability\":[{\"topic\":\"%s/availability\"},"
         "{\"topic\":\"%s/gateway/%u/availability\"},"
         "{\"topic\":\"%s/dali/%u/%u/availability\"}],\"availability_mode\":\"all\","
-        "\"entity_category\":\"config\"",
+        "\"entity_category\":\"config\"", idp(),
         slave, addr, F[k].key, F[k].name, P, slave, addr, F[k].key,
         P, slave, addr, F[k].key, F[k].lo, F[k].hi, P, P, slave, P, slave, addr);
-    snprintf(ids, sizeof ids, "lighting_dali_%u_%u", slave, addr);
+    snprintf(ids, sizeof ids, "%s_dali_%u_%u", idp(), slave, addr);
     snprintf(name, sizeof name, "DALI %u.%02u", slave, addr);
-    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
     dev(n, ids, name, MFR_MECH, "DALI Ballast", gw);
-    snprintf(objid, sizeof objid, "lighting_dali_%u_%u_%s", slave, addr, F[k].key);
+    snprintf(objid, sizeof objid, "%s_dali_%u_%u_%s", idp(), slave, addr, F[k].key);
     pub_cfg("number", objid);
 }
 
@@ -242,17 +264,17 @@ static void disc_group_light(uint8_t slave, uint8_t grp) {
     const char *P = mqtt_app_prefix();
     char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_group_%u_%u\",\"name\":null,\"schema\":\"json\","
+        "{\"unique_id\":\"%s_group_%u_%u\",\"name\":null,\"schema\":\"json\","
         "\"state_topic\":\"%s/group/%u/%u/state\",\"command_topic\":\"%s/group/%u/%u/set\","
         "\"supported_color_modes\":[\"brightness\"],\"brightness_scale\":254,"
         "\"availability\":[{\"topic\":\"%s/availability\"},"
-        "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"",
+        "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"", idp(),
         slave, grp, P, slave, grp, P, slave, grp, P, P, slave);
-    snprintf(ids, sizeof ids, "lighting_group_%u_%u", slave, grp);
+    snprintf(ids, sizeof ids, "%s_group_%u_%u", idp(), slave, grp);
     snprintf(name, sizeof name, "DALI Group %u.%u", slave, grp);
-    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
     dev(n, ids, name, MFR_MECH, "DALI Group", gw);
-    snprintf(objid, sizeof objid, "lighting_group_%u_%u", slave, grp);
+    snprintf(objid, sizeof objid, "%s_group_%u_%u", idp(), slave, grp);
     pub_cfg("light", objid);
     snprintf(s_top, sizeof s_top, "%s/group/%u/%u/state", P, slave, grp);
     pub_str(s_top, "{\"state\":\"OFF\"}", true);
@@ -262,18 +284,18 @@ static void disc_group_members(uint8_t slave, uint8_t grp) {
     const char *P = mqtt_app_prefix();
     char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_group_%u_%u_members\",\"name\":\"Members\","
+        "{\"unique_id\":\"%s_group_%u_%u_members\",\"name\":\"Members\","
         "\"command_topic\":\"%s/group/%u/%u/members/set\","
         "\"state_topic\":\"%s/group/%u/%u/members/state\","
         "\"pattern\":\"%s\",\"availability\":[{\"topic\":\"%s/availability\"},"
         "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\","
-        "\"entity_category\":\"config\",\"icon\":\"mdi:format-list-bulleted\"",
+        "\"entity_category\":\"config\",\"icon\":\"mdi:format-list-bulleted\"", idp(),
         slave, grp, P, slave, grp, P, slave, grp, MEMBERS_PATTERN, P, P, slave);
-    snprintf(ids, sizeof ids, "lighting_group_%u_%u", slave, grp);
+    snprintf(ids, sizeof ids, "%s_group_%u_%u", idp(), slave, grp);
     snprintf(name, sizeof name, "DALI Group %u.%u", slave, grp);
-    snprintf(gw, sizeof gw, "lighting_dali_gw_%u", slave);
+    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
     dev(n, ids, name, MFR_MECH, "DALI Group", gw);
-    snprintf(objid, sizeof objid, "lighting_group_%u_%u_members", slave, grp);
+    snprintf(objid, sizeof objid, "%s_group_%u_%u_members", idp(), slave, grp);
     pub_cfg("text", objid);
     snprintf(s_top, sizeof s_top, "%s/group/%u/%u/members/state", P, slave, grp);
     pub_str(s_top, "", true);
@@ -282,7 +304,7 @@ static void disc_group_members(uint8_t slave, uint8_t grp) {
 static void disc_prov(uint8_t slave, uint8_t k) {
     const char *P = mqtt_app_prefix();
     char gwids[DISC_BUF], gwname[DISC_BUF], objid[DISC_BUF], status[DISC_BUF];
-    snprintf(gwids, sizeof gwids, "lighting_dali_gw_%u", slave);
+    snprintf(gwids, sizeof gwids, "%s_dali_gw_%u", idp(), slave);
     snprintf(gwname, sizeof gwname, "DALI Gateway %u", slave);
     snprintf(status, sizeof status, "%s/provision/%u/status", P, slave);
 
@@ -296,28 +318,28 @@ static void disc_prov(uint8_t slave, uint8_t k) {
 
     switch (k) {
     case 0:
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_state\","
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_prov_%u_state\","
             "\"name\":\"Commission State\",\"state_topic\":\"%s\","
-            "\"value_template\":\"{{ value_json.state }}\",\"icon\":\"mdi:lightning-bolt-circle\"",
+            "\"value_template\":\"{{ value_json.state }}\",\"icon\":\"mdi:lightning-bolt-circle\"", idp(),
             slave, status);
         PROV_TAIL("diagnostic");
-        snprintf(objid, sizeof objid, "lighting_prov_%u_state", slave); pub_cfg("sensor", objid);
+        snprintf(objid, sizeof objid, "%s_prov_%u_state", idp(), slave); pub_cfg("sensor", objid);
         break;
     case 1:
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_msg\","
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_prov_%u_msg\","
             "\"name\":\"Commission Status\",\"state_topic\":\"%s\","
-            "\"value_template\":\"{{ value_json.msg }}\",\"icon\":\"mdi:text-box-outline\"",
+            "\"value_template\":\"{{ value_json.msg }}\",\"icon\":\"mdi:text-box-outline\"", idp(),
             slave, status);
         PROV_TAIL("diagnostic");
-        snprintf(objid, sizeof objid, "lighting_prov_%u_msg", slave); pub_cfg("sensor", objid);
+        snprintf(objid, sizeof objid, "%s_prov_%u_msg", idp(), slave); pub_cfg("sensor", objid);
         break;
     case 2:
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_count\","
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_prov_%u_count\","
             "\"name\":\"Devices Found\",\"state_topic\":\"%s\","
-            "\"value_template\":\"{{ value_json.devices_found }}\",\"icon\":\"mdi:counter\"",
+            "\"value_template\":\"{{ value_json.devices_found }}\",\"icon\":\"mdi:counter\"", idp(),
             slave, status);
         PROV_TAIL("diagnostic");
-        snprintf(objid, sizeof objid, "lighting_prov_%u_count", slave); pub_cfg("sensor", objid);
+        snprintf(objid, sizeof objid, "%s_prov_%u_count", idp(), slave); pub_cfg("sensor", objid);
         break;
     case 3: case 4: case 5: case 6: {
         static const char *suf[]  = { "all", "unaddressed", "address", "abort" };
@@ -327,21 +349,21 @@ static void disc_prov(uint8_t slave, uint8_t k) {
                                       "mdi:lightbulb-on", "mdi:stop-circle" };
         static const char *cmd[]  = { "start/all", "start/unaddressed", "start/address", "abort" };
         int b = k - 3;
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_%s\",\"name\":\"%s\","
-            "\"command_topic\":\"%s/provision/%u/%s\",\"payload_press\":\"PRESS\",\"icon\":\"%s\"",
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_prov_%u_%s\",\"name\":\"%s\","
+            "\"command_topic\":\"%s/provision/%u/%s\",\"payload_press\":\"PRESS\",\"icon\":\"%s\"", idp(),
             slave, suf[b], nm[b], P, slave, cmd[b], icon[b]);
         PROV_TAIL("config");
-        snprintf(objid, sizeof objid, "lighting_prov_%u_%s", slave, suf[b]); pub_cfg("button", objid);
+        snprintf(objid, sizeof objid, "%s_prov_%u_%s", idp(), slave, suf[b]); pub_cfg("button", objid);
         break;
     }
     case 7:
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_prov_%u_target\","
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_prov_%u_target\","
             "\"name\":\"Target Address\",\"command_topic\":\"%s/provision/%u/start/target\","
             "\"state_topic\":\"%s/provision/%u/target_state\","
-            "\"min\":0,\"max\":63,\"step\":1,\"mode\":\"box\",\"icon\":\"mdi:numeric\"",
+            "\"min\":0,\"max\":63,\"step\":1,\"mode\":\"box\",\"icon\":\"mdi:numeric\"", idp(),
             slave, P, slave, P, slave);
         PROV_TAIL("config");
-        snprintf(objid, sizeof objid, "lighting_prov_%u_target", slave); pub_cfg("number", objid);
+        snprintf(objid, sizeof objid, "%s_prov_%u_target", idp(), slave); pub_cfg("number", objid);
         break;
     case 8:
         snprintf(s_top, sizeof s_top, "%s/provision/%u/target_state", P, slave);
@@ -356,13 +378,13 @@ static void disc_prov(uint8_t slave, uint8_t k) {
 }
 
 /* Per-gateway diagnostic sensors (uptime / reboots / reset reason), grouped
- * under the EXISTING gateway device (lighting_dali_gw_<slave>, the same device
+ * under the EXISTING gateway device (<prefix>_dali_gw_<slave>, the same device
  * disc_prov creates) — they're attributes of that gateway, not a new device.
  * k 0..2 = the three sensors, k 3 = seed an initial retained state. */
 static void disc_gw_diag(uint8_t slave, uint8_t k) {
     const char *P = mqtt_app_prefix();
     char gwids[DISC_BUF], gwname[DISC_BUF], objid[DISC_BUF], diag[DISC_BUF];
-    snprintf(gwids, sizeof gwids, "lighting_dali_gw_%u", slave);
+    snprintf(gwids, sizeof gwids, "%s_dali_gw_%u", idp(), slave);
     snprintf(gwname, sizeof gwname, "DALI Gateway %u", slave);
     snprintf(diag, sizeof diag, "%s/gateway/%u/diag", P, slave);
 
@@ -376,29 +398,29 @@ static void disc_gw_diag(uint8_t slave, uint8_t k) {
 
     switch (k) {
     case 0:
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_gwdiag_%u_uptime\","
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_gwdiag_%u_uptime\","
             "\"name\":\"Uptime\",\"state_topic\":\"%s\","
             "\"value_template\":\"{{ value_json.uptime }}\","
             "\"unit_of_measurement\":\"s\",\"device_class\":\"duration\","
-            "\"icon\":\"mdi:timer-outline\"", slave, diag);
+            "\"icon\":\"mdi:timer-outline\"", idp(), slave, diag);
         GWD_TAIL();
-        snprintf(objid, sizeof objid, "lighting_gwdiag_%u_uptime", slave); pub_cfg("sensor", objid);
+        snprintf(objid, sizeof objid, "%s_gwdiag_%u_uptime", idp(), slave); pub_cfg("sensor", objid);
         break;
     case 1:
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_gwdiag_%u_reboots\","
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_gwdiag_%u_reboots\","
             "\"name\":\"Reboots\",\"state_topic\":\"%s\","
             "\"value_template\":\"{{ value_json.reboots }}\","
-            "\"icon\":\"mdi:restart\"", slave, diag);
+            "\"icon\":\"mdi:restart\"", idp(), slave, diag);
         GWD_TAIL();
-        snprintf(objid, sizeof objid, "lighting_gwdiag_%u_reboots", slave); pub_cfg("sensor", objid);
+        snprintf(objid, sizeof objid, "%s_gwdiag_%u_reboots", idp(), slave); pub_cfg("sensor", objid);
         break;
     case 2:
-        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"lighting_gwdiag_%u_reset\","
+        snprintf(s_pl, PL_CAP, "{\"unique_id\":\"%s_gwdiag_%u_reset\","
             "\"name\":\"Reset Reason\",\"state_topic\":\"%s\","
             "\"value_template\":\"{{ value_json.reset_reason }}\","
-            "\"icon\":\"mdi:information-outline\"", slave, diag);
+            "\"icon\":\"mdi:information-outline\"", idp(), slave, diag);
         GWD_TAIL();
-        snprintf(objid, sizeof objid, "lighting_gwdiag_%u_reset", slave); pub_cfg("sensor", objid);
+        snprintf(objid, sizeof objid, "%s_gwdiag_%u_reset", idp(), slave); pub_cfg("sensor", objid);
         break;
     case 3:
         /* Seed a retained state so the entities populate before the first
@@ -435,45 +457,47 @@ static void disc_controller(uint8_t k) {
     if (k >= CFG_NUM_N + CFG_SENS_N) {
         /* relay_byteswap switch — reverses Waveshare 32CH coil read-back order. */
         int n = snprintf(s_pl, PL_CAP,
-            "{\"unique_id\":\"lighting_cfg_relay_byteswap\",\"name\":\"Relay Byte-Swap\","
+            "{\"unique_id\":\"%s_cfg_relay_byteswap\",\"name\":\"Relay Byte-Swap\","
             "\"command_topic\":\"%s/config/relay_byteswap/set\",\"state_topic\":\"%s/config/state\","
             "\"value_template\":\"{{ value_json.relay_byteswap }}\","
             "\"payload_on\":\"1\",\"payload_off\":\"0\",\"state_on\":\"1\",\"state_off\":\"0\","
             "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
-            "\"icon\":\"mdi:swap-horizontal\"",
+            "\"icon\":\"mdi:swap-horizontal\"", idp(),
             P, P, P);
         pcat(n,
-            ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+            ",\"device\":{\"identifiers\":[\"%s_controller\"],"
             "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-        pub_cfg("switch", "lighting_cfg_relay_byteswap");
+            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+        { char oid[DISC_BUF];
+          snprintf(oid, sizeof oid, "%s_cfg_relay_byteswap", idp());
+          pub_cfg("switch", oid); }
         return;
     }
     if (k < CFG_NUM_N) {
         int n = snprintf(s_pl, PL_CAP,
-            "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\","
+            "{\"unique_id\":\"%s_cfg_%s\",\"name\":\"%s\","
             "\"command_topic\":\"%s/config/%s/set\",\"state_topic\":\"%s/config/state\","
             "\"value_template\":\"{{ value_json.%s }}\",\"min\":%d,\"max\":%d,\"step\":%d,"
-            "\"mode\":\"box\",\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\"",
+            "\"mode\":\"box\",\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\"", idp(),
             CFG_NUM[k].key, CFG_NUM[k].name, P, CFG_NUM[k].key, P, CFG_NUM[k].key,
             CFG_NUM[k].lo, CFG_NUM[k].hi, CFG_NUM[k].step, P);
         pcat(n,
-            ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+            ",\"device\":{\"identifiers\":[\"%s_controller\"],"
             "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-        snprintf(objid, sizeof objid, "lighting_cfg_%s", CFG_NUM[k].key); pub_cfg("number", objid);
+            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+        snprintf(objid, sizeof objid, "%s_cfg_%s", idp(), CFG_NUM[k].key); pub_cfg("number", objid);
     } else {
         int b = k - (int)CFG_NUM_N;
         int n = snprintf(s_pl, PL_CAP,
-            "{\"unique_id\":\"lighting_cfg_%s\",\"name\":\"%s\",\"state_topic\":\"%s/config/state\","
+            "{\"unique_id\":\"%s_cfg_%s\",\"name\":\"%s\",\"state_topic\":\"%s/config/state\","
             "\"value_template\":\"{{ value_json.%s }}\",\"availability_topic\":\"%s/availability\","
-            "\"entity_category\":\"diagnostic\",\"icon\":\"%s\"",
+            "\"entity_category\":\"diagnostic\",\"icon\":\"%s\"", idp(),
             CFG_SENS[b].key, CFG_SENS[b].name, P, CFG_SENS[b].key, P, CFG_SENS[b].icon);
         pcat(n,
-            ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+            ",\"device\":{\"identifiers\":[\"%s_controller\"],"
             "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-        snprintf(objid, sizeof objid, "lighting_cfg_%s", CFG_SENS[b].key); pub_cfg("sensor", objid);
+            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+        snprintf(objid, sizeof objid, "%s_cfg_%s", idp(), CFG_SENS[b].key); pub_cfg("sensor", objid);
     }
 }
 
@@ -596,16 +620,18 @@ static inline bool ic_push_cmd(const ic_cmd_t *c) {
 static void disc_system_reboot(void) {
     const char *P = mqtt_app_prefix();
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_reboot\",\"name\":\"Reboot\","
+        "{\"unique_id\":\"%s_reboot\",\"name\":\"Reboot\","
         "\"command_topic\":\"%s/system/reboot\",\"payload_press\":\"PRESS\","
         "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
-        "\"device_class\":\"restart\",\"icon\":\"mdi:restart\"",
+        "\"device_class\":\"restart\",\"icon\":\"mdi:restart\"", idp(),
         P, P);
     pcat(n,
-        ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+        ",\"device\":{\"identifiers\":[\"%s_controller\"],"
         "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-    pub_cfg("button", "lighting_reboot");
+        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+    { char oid[DISC_BUF];
+          snprintf(oid, sizeof oid, "%s_reboot", idp());
+          pub_cfg("button", oid); }
 }
 
 /* Firmware 'update' entity on the controller device — mirrors the brewery
@@ -619,16 +645,18 @@ static void disc_system_reboot(void) {
 static void disc_fw_update(void) {
     const char *P = mqtt_app_prefix();
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_fw_update\",\"name\":\"Firmware\","
+        "{\"unique_id\":\"%s_fw_update\",\"name\":\"Firmware\","
         "\"state_topic\":\"%s/update/state\",\"command_topic\":\"%s/update/install\","
         "\"payload_install\":\"INSTALL\",\"device_class\":\"firmware\","
-        "\"entity_category\":\"config\",\"value_template\":\"{{ value_json | tojson }}\"",
+        "\"entity_category\":\"config\",\"value_template\":\"{{ value_json | tojson }}\"", idp(),
         P, P);
     pcat(n,
-        ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+        ",\"device\":{\"identifiers\":[\"%s_controller\"],"
         "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-    pub_cfg("update", "lighting_fw_update");
+        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+    { char oid[DISC_BUF];
+          snprintf(oid, sizeof oid, "%s_fw_update", idp());
+          pub_cfg("update", oid); }
 }
 
 /* "Check for Updates" button on the controller device — forces an immediate
@@ -637,16 +665,18 @@ static void disc_fw_update(void) {
 static void disc_fw_check(void) {
     const char *P = mqtt_app_prefix();
     int n = snprintf(s_pl, PL_CAP,
-        "{\"unique_id\":\"lighting_fw_check\",\"name\":\"Check for Updates\","
+        "{\"unique_id\":\"%s_fw_check\",\"name\":\"Check for Updates\","
         "\"command_topic\":\"%s/update/check\",\"payload_press\":\"CHECK\","
         "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
-        "\"icon\":\"mdi:cloud-refresh\"",
+        "\"icon\":\"mdi:cloud-refresh\"", idp(),
         P, P);
     pcat(n,
-        ",\"device\":{\"identifiers\":[\"lighting_controller\"],"
+        ",\"device\":{\"identifiers\":[\"%s_controller\"],"
         "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}");
-    pub_cfg("button", "lighting_fw_check");
+        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+    { char oid[DISC_BUF];
+          snprintf(oid, sizeof oid, "%s_fw_check", idp());
+          pub_cfg("button", oid); }
 }
 
 static void subscribe_all(void) {
@@ -795,9 +825,9 @@ static void tombstone_ballast(uint8_t slave, uint8_t addr) {
     const char *P = mqtt_app_prefix();
     static const char *const F[] = { "min","max","power_on","sys_fail","fade_rate","fade_time" };
     char tp[96];
-    snprintf(tp, sizeof tp, "homeassistant/light/lighting_dali_%u_%u/config", slave, addr); tomb(tp);
+    snprintf(tp, sizeof tp, "homeassistant/light/%s_dali_%u_%u/config", idp(), slave, addr); tomb(tp);
     for (unsigned i = 0; i < 6; i++) {
-        snprintf(tp, sizeof tp, "homeassistant/number/lighting_dali_%u_%u_%s/config", slave, addr, F[i]);
+        snprintf(tp, sizeof tp, "homeassistant/number/%s_dali_%u_%u_%s/config", idp(), slave, addr, F[i]);
         tomb(tp);
     }
     snprintf(tp, sizeof tp, "%s/dali/%u/%u/state", P, slave, addr);        tomb(tp);
@@ -809,14 +839,14 @@ static void tombstone_ballast(uint8_t slave, uint8_t addr) {
 static void tombstone_group(uint8_t slave, uint8_t grp) {
     const char *P = mqtt_app_prefix();
     char tp[96];
-    snprintf(tp, sizeof tp, "homeassistant/light/lighting_group_%u_%u/config", slave, grp);        tomb(tp);
-    snprintf(tp, sizeof tp, "homeassistant/text/lighting_group_%u_%u_members/config", slave, grp); tomb(tp);
+    snprintf(tp, sizeof tp, "homeassistant/light/%s_group_%u_%u/config", idp(), slave, grp);        tomb(tp);
+    snprintf(tp, sizeof tp, "homeassistant/text/%s_group_%u_%u_members/config", idp(), slave, grp); tomb(tp);
     snprintf(tp, sizeof tp, "%s/group/%u/%u/state", P, slave, grp);         tomb(tp);
     snprintf(tp, sizeof tp, "%s/group/%u/%u/members/state", P, slave, grp); tomb(tp);
     LOG_INFO("mqtt", "tombstoned group %u.%u", slave, grp);
 }
 
-/* Clears the whole gateway HA device `lighting_dali_gw_<slave>` — its diagnostic
+/* Clears the whole gateway HA device `<prefix>_dali_gw_<slave>` — its diagnostic
  * + provisioning discovery configs (disc_gw_diag / disc_prov) and the gateway-
  * scoped data topics — so no ghost device is left after retirement. Its ballasts
  * and groups are separate HA devices, retired individually. ~15 empty retained
@@ -827,24 +857,24 @@ static void tombstone_group(uint8_t slave, uint8_t grp) {
 static void tombstone_gateway(uint8_t slave) {
     const char *P = mqtt_app_prefix();
     char tp[96];
-    /* Diagnostic sensors (disc_gw_diag) — device lighting_dali_gw_<slave>. */
+    /* Diagnostic sensors (disc_gw_diag) — device <prefix>_dali_gw_<slave>. */
     static const char *const gwdiag[] = { "uptime", "reboots", "reset" };
     for (unsigned i = 0; i < 3; i++) {
-        snprintf(tp, sizeof tp, "homeassistant/sensor/lighting_gwdiag_%u_%s/config", slave, gwdiag[i]);
+        snprintf(tp, sizeof tp, "homeassistant/sensor/%s_gwdiag_%u_%s/config", idp(), slave, gwdiag[i]);
         tomb(tp);
     }
     /* Provisioning entities (disc_prov) — same device. */
     static const char *const prov_sensor[] = { "state", "msg", "count" };
     for (unsigned i = 0; i < 3; i++) {
-        snprintf(tp, sizeof tp, "homeassistant/sensor/lighting_prov_%u_%s/config", slave, prov_sensor[i]);
+        snprintf(tp, sizeof tp, "homeassistant/sensor/%s_prov_%u_%s/config", idp(), slave, prov_sensor[i]);
         tomb(tp);
     }
     static const char *const prov_btn[] = { "all", "unaddressed", "address", "abort" };
     for (unsigned i = 0; i < 4; i++) {
-        snprintf(tp, sizeof tp, "homeassistant/button/lighting_prov_%u_%s/config", slave, prov_btn[i]);
+        snprintf(tp, sizeof tp, "homeassistant/button/%s_prov_%u_%s/config", idp(), slave, prov_btn[i]);
         tomb(tp);
     }
-    snprintf(tp, sizeof tp, "homeassistant/number/lighting_prov_%u_target/config", slave); tomb(tp);
+    snprintf(tp, sizeof tp, "homeassistant/number/%s_prov_%u_target/config", idp(), slave); tomb(tp);
     /* Gateway-scoped retained data topics. */
     snprintf(tp, sizeof tp, "%s/gateway/%u/availability", P, slave);   tomb(tp);
     snprintf(tp, sizeof tp, "%s/gateway/%u/diag", P, slave);           tomb(tp);
