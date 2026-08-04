@@ -7,7 +7,7 @@
  * offsets from flash base (0x00000000). XIP addresses are flash base
  * 0x10000000 + offset (see PART_XIP() below).
  *
- * TRUE-ROLLBACK PHASE: re-carves the app-sized portion of flash (previously
+ * TRUE-ROLLBACK PHASE: carves the app-sized portion of flash (
  * one 896 KB active slot + one 832 KB staging slot) into THREE EQUAL 576 KB
  * slots — active, staging, and a new BACKUP region — so the bootloader can
  * restore the previous good image after a bad commit instead of halting

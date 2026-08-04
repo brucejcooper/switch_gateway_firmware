@@ -1,5 +1,5 @@
 /*
- * dq_soak.c — command-queue soak/throughput probe (task 07). See dq_soak.h.
+ * dq_soak.c — command-queue soak/throughput probe. See dq_soak.h.
  *
  * Stimulus: alternating SET DTR0 / QUERY CONTENT DTR0 against one ballast.
  * The query's answer must equal the byte the immediately preceding SET wrote,

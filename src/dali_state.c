@@ -1,5 +1,5 @@
 /*
- * dali_state.c — the controller's DALI world model (task 05). See dali_state.h.
+ * dali_state.c — the controller's DALI world model. See dali_state.h.
  *
  * One sweep state machine per DALI slave. Each holds at most ONE query in flight
  * (like the config-query rotation it sits beside), so it paces itself against

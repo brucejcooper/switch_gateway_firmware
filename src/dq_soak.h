@@ -1,6 +1,6 @@
 #pragma once
 /*
- * dq_soak.h — command-queue soak/throughput probe (task 07).
+ * dq_soak.h — command-queue soak/throughput probe.
  *
  * A bench instrument, not a product feature. It hammers one gateway's command
  * queue with an ALTERNATING WRITE/READ pair whose read answer is fully

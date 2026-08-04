@@ -45,7 +45,7 @@
  * state longer than this it is wedged — a missed DE-release alarm, an endless RX
  * dribble keeping the inter-byte timeout fresh, or a torn state transition. The
  * poll loop force-recovers to IDLE so commands resume instead of stopping
- * forever (the failure mode that previously needed a reboot). */
+ * forever. */
 #define MODBUS_OP_MAX_MS           400u
 
 #define UART_ID      uart1

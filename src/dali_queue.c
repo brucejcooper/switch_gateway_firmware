@@ -1,9 +1,9 @@
 /*
  * dali_queue.c — DALI adapter over the generic Modbus command-queue client
- * (task 06, queue v2). See dali_queue.h for the model.
+ * See dali_queue.h for the model.
  *
  * This layer is DALI-SPECIFIC and sits ABOVE the DALI-agnostic mbq_client:
- *   1. a per-slave PULL SCHEDULER (task 05 phase 1): storage partitioned by
+ *   1. a per-slave PULL SCHEDULER: storage partitioned by
  *      priority class rather than one shared FIFO, plus per-ballast dim-step
  *      COUNTERS that hold no commands at all. dq_tick walks the priority ladder
  *      and ships at most one command per tick per slave, applying that class's
@@ -29,7 +29,7 @@
 #include "cdc_out.h"
 #include <stdio.h>
 
-/* ── Scheduler shape (task 05 phase 1) ───────────────────────────────────────
+/* ── Scheduler shape ────────────────────────────────────────────────────────
  * There is no single FIFO backlog any more. Two reasons, both measured:
  *
  * 1. A shared pool lets background work occupy the storage a button press needs
@@ -98,11 +98,8 @@ typedef struct {
 typedef enum { DQ_CL_PROV = 0, DQ_CL_USER, DQ_CL_CFG, DQ_CL_READ, DQ_CL_BG,
                DQ_CL_COUNT } dq_class_id_t;
 
-/* DQ_CL_READ exists because DQ_PRIO_LEVEL_READ used to fall through `default:`
- * into DQ_CL_BG alongside DQ_PRIO_BACKGROUND. dali_state.c chose between the two
- * with a ternary and a comment promising "verification reads outrank the sweep",
- * but the two were the same class, so they did not. Verification reads carry a
- * command's real outcome to HA and must not queue behind a rotating refresh.
+/* DQ_CL_READ is its own class so verification reads do not queue behind the
+ * rotating refresh: they carry a command's real outcome to HA.
  *
  * Ranked BELOW config writes: those are user-initiated changes, and a follow-up
  * read should not displace one. GROUP_WRITE still shares DQ_CL_USER, and that is

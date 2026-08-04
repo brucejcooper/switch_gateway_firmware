@@ -43,7 +43,7 @@ typedef struct {
     uint8_t       next_ballast;
     bool          reachable;     /* gateway responding to Modbus */
     uint8_t       fail_count;    /* consecutive read failures */
-    uint32_t      last_cfg_ms;   /* last steady-state config-rotation mark (task 03) */
+    uint32_t      last_cfg_ms;   /* last steady-state config-rotation mark */
     uint8_t       cfg_cursor;    /* round-robin ballast for config re-reads */
     bool          scanning;      /* a full interrogation is in progress */
 } dpoll_t;
@@ -295,7 +295,7 @@ void dirty_poll_tick(void) {
             }
         }
 
-        /* Task 05: the dirty-mask / block0 / background-check reads that used to
+        /* The dirty-mask / block0 / background-check reads that would
          * live here are GONE. They read gateway registers (0x0104 dirty, 0x0000
          * block0, 0x0100 present, 0x0110 group masks) that the gateway strip
          * removes. Level, status, presence and groups are now learned by

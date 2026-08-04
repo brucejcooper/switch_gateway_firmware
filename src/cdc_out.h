@@ -4,7 +4,7 @@
 /*
  * cdc_out — non-blocking, core-safe output ring for the USB-CDC console.
  *
- * Why this exists: log_emit() (and core-1 net code) used to printf() straight to
+ * Why this exists: printf() straight to
  * the USB-CDC stdout, which BLOCKS the calling core when the host isn't draining
  * the FIFO fast enough.  Under a `log dbg` firehose that stall tripped the 5 s
  * watchdog and rebooted the controller (see CLAUDE.md / the Jun-16 reboots).

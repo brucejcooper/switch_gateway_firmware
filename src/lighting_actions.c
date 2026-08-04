@@ -11,7 +11,7 @@
 #include "pico/time.h"
 #include <string.h>
 
-/* TinyModbus register addresses (task 04):
+/* TinyModbus register addresses:
  *   0x0000 + addr  per-ballast brightness bank (FC06 low byte = DAPC level,
  *                  0 = off, 1–254 proportional, 255 = no change)
  *   0x1000-0x1007  command-queue submit window (FC10/FC23; see dali_queue.c)
@@ -19,7 +19,7 @@
  * DAPC and OFF go through the per-ballast brightness bank. Everything else
  * (GOTO_LAST_ACTIVE / UP / DOWN, group commands, config DTR0+SET, raw queries)
  * is submitted through the id-tagged command queue (dali_queue.c). The legacy
- * single-slot 0x1000/0x1001/0x0108 channel was removed in task 04. */
+ * queue carries every raw command. */
 
 /* ── State event queue — written here, drained by serial_poll() ──────────── */
 /* We use a simple ring buffer rather than the pico queue_t here because all
@@ -140,7 +140,7 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
     }
 }
 
-/* ── Raw DALI commands via the gateway command queue (task 04) ─────────────────
+/* ── Raw DALI commands via the gateway command queue ──────────────────────────
  * Broadcast/group/specialty DALI sends (GOTO_LAST_ACTIVE, UP/DOWN, group
  * on/off/level/step, config DTR0+SET) go through the id-tagged gateway command
  * queue (dali_queue.c) instead of the old single-slot 0x1000/0x0108 FIFO. Each
@@ -152,7 +152,7 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
  * Per-ballast OFF and DAPC level do NOT come here — they use the per-ballast
  * brightness bank (0x0000+addr) directly. Raw sends are fire-and-forget (no
  * completion callback: a NAK is the normal outcome of a no-answer send); the
- * driver logs backlog-full drops. Id-tagging retired the shared-result-register
+ * driver logs backlog-full drops. Self-describing slots remove the shared-result-register
  * interlocks and settle-gate the single-slot path needed. */
 static bool raw_submit(uint8_t slave, dq_prio_t prio, uint8_t addr, uint8_t data,
                        uint8_t flags, uint8_t dtr0, bool idempotent) {
@@ -389,7 +389,7 @@ any_on_probe_res_t lighting_any_on_probe_get(uint8_t fixture, uint8_t button) {
 /* Query each target through the gateway command queue, sequentially, short-
  * circuiting on the first "on". Each query is an ordinary expects-answer command
  * with its own id, so there is no contention with the raw path or the config
- * query SM (id-tagging retired the shared-result-register interlocks). A clean
+ * query SM. A clean
  * answer (OK) or a collision-garbled one (ERR — several on-members answering the
  * same group frame at once) both mean "≥1 on"; a NAK means none on this target. */
 void lighting_any_on_probe_tick(void) {
@@ -433,7 +433,7 @@ void lighting_any_on_probe_tick(void) {
 
 /* ── Config-over-raw query state machine ──────────────────────────────────────
  * Fills the per-ballast config cache (min/max/power-on/sys-fail/fade) with raw
- * DALI queries — the only config path now the gateway config banks are retired.
+ * DALI queries — the only config path; the gateway serves no config banks.
  * Ballasts to (re)read are held in a per-slave pending bitmap; each pending
  * ballast runs a 5-query sequence through the gateway command queue, then the
  * accumulated fields are written to the cache and re-emitted as state_dali.
@@ -613,7 +613,7 @@ void lighting_cfg_query_tick(void) {
  * stores whatever DTR0 holds. The gateway command queue carries this as ONE
  * indivisible entry — the DQ_DTR0 flag makes it emit 0xA3<value> back-to-back
  * before the SET, so no other DTR-touching frame can interleave (the atomicity
- * the single-slot FIFO used to get by occupying two adjacent slots). SET opcodes
+ * one slot carries the pair). SET opcodes
  * verified against IEC 62386-102 / TinyModbus dali.h: MIN 0x2B, MAX 0x2A,
  * POWER ON 0x2D, SYS FAIL 0x2C, FADE RATE 0x2F, FADE TIME 0x2E. */
 bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
@@ -652,15 +652,9 @@ bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
 
 /* NOTHING PREDICTS STATE ANY MORE.
  *
- * There used to be a pair of cache_predict_* helpers that recorded on/off INTENT
- * the moment a command was sent, plus a 0.7 s settle window in state_cache.c
- * during which a real read was not allowed to overwrite that intent. It existed
- * so a rapid second toggle read the commanded state rather than a not-yet-updated
- * level.
- *
- * All three toggle paths now ask the gear directly (QUERY LAMP POWER ON) instead
- * of consulting the cache, so nothing needed the intent — and the cache is only
- * ever written from a measured read. A group's on/level are likewise derived from
+ * All three toggle paths ask the gear directly (QUERY LAMP POWER ON) rather
+ * than consulting the cache, and the cache is only ever written from a measured
+ * read — nothing records intent. A group's on/level are likewise derived from
  * its members' measured levels: on if any member's arc level is non-zero, level
  * the maximum of them. */
 
@@ -677,9 +671,9 @@ bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
         uint8_t addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
         ok = raw_submit(slave_id, DQ_PRIO_USER, addr_byte, 0x0Au, 0, 0, true);
     } else {
-        /* OFF — DAPC level 0 as a queued frame. This used to write 0 to the
+        /* OFF — DAPC level 0 as a queued frame, rather than writing 0 to the
          * gateway's per-ballast brightness bank (FC06 0x0000+addr) and let the
-         * gateway synthesise the DAPC; task 05 removes that register, so the
+         * gateway and having it synthesise the DAPC: the
          * controller emits the frame itself. Address byte is DAPC form (bit 0
          * clear); idempotent — re-sending level 0 has no cumulative effect. */
         uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
@@ -736,7 +730,7 @@ bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
     }
     /* DAPC as a queued frame (address byte in DAPC form — bit 0 clear — and the
      * arc level as the data byte). Replaces the gateway's per-ballast brightness
-     * bank, which task 05 removes; the ballast still clamps to its own min/max,
+     * bank; the ballast clamps to its own min/max,
      * so the read-back remains the authority on what actually happened.
      * Idempotent: re-sending the same level has no cumulative effect. */
     uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
@@ -837,8 +831,7 @@ void lighting_emit_dali_state(uint8_t slave_id, uint8_t addr,
      * group, the read-back that discovers the removal has already cleared the
      * bit, so the group it just left was skipped and never re-published — a group
      * emptied of its last member kept its stale member list and derived on/bri in
-     * HA. It went unnoticed because the setter used to publish an optimistic list
-     * immediately; with that gone (state must be measured) the gap became live.
+     * HA.
      *
      * Unconditional is also simply correct: this ballast's level can change a
      * group's derived max_bri whether or not it is still a member, and

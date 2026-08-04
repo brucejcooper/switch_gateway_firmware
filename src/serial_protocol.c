@@ -1058,7 +1058,7 @@ static void cmd_dali(char **saveptr) {
 /* tombstone dali <slave> <addr> | group <slave> <grp> | gw <slave>
  * Retire a removed device: core 1 publishes empty retained payloads to its
  * discovery + data topics so HA drops the entity and the broker holds no stale
- * retained state (task 03, Phase C). Operator-driven — removal is a deliberate
+ * retained state. Operator-driven — removal is a deliberate
  * decommission, not a transient DALI dropout (which is availability). */
 static void cmd_tombstone(char **saveptr) {
     char *kind = strtok_r(NULL, " \t", saveptr);
@@ -1147,7 +1147,7 @@ static void cmd_btn(char **saveptr) {
  * dali_cfg_field maps a field name to an INTERNAL (base,high) encoding — the
  * `base` values 0x0040/0x0080/0x00C0 are just a compact way to identify the
  * field pair (min|max, power_on|sys_fail, fade_rate|fade_time); they are NOT
- * gateway register addresses (the gateway config banks were retired in task 04).
+ * gateway register addresses (the gateway serves no config banks).
  * dali_cfg_set translates (base,high) into a DALI field enum and writes it via a
  * raw DTR0+SET queue entry (lighting_dali_cfg_write). The ballast may clamp a
  * value (e.g. min to its physical minimum); the query-back rescan then reflects
@@ -1239,11 +1239,8 @@ static void emit_state_group(uint8_t slave, uint8_t group) {
 
 /* Set a DALI group's membership.
  *
- * Task 05: this used to write the gateway's group-mask registers (0x0110+) and
- * let the GATEWAY diff old-vs-new and emit the ADD/REMOVE FROM GROUP frames.
- * That cache is being removed, and it was also the root of the group-toggle bug
- * — a rebooted gateway lost the masks and the diff had nothing to work from.
- * The controller now diffs against its own cache and emits the frames itself.
+ * The controller diffs membership against its own cache and emits the
+ * ADD/REMOVE FROM GROUP frames itself; the gateway holds no masks.
  *
  * ADD TO GROUP is 0x60|g and REMOVE FROM GROUP is 0x70|g, both SET-class so
  * they go send-twice, addressed to each ballast whose membership changed. They
@@ -1333,8 +1330,7 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
          * resolves it with a blocking probe before calling in (see cmd_dali).
          * This path runs in the main loop and must not block, so it hands off to
          * the ASYNC probe: query the gear, apply the inverse when the answer
-         * lands. It used to invert cached commanded_on, which is the staleness
-         * the button's probe exists to defeat. */
+         * lands. */
         if (strcasecmp(val, "toggle") == 0) {
             if (!lighting_toggle_async(slave, addr, false)) return -2;
             return 2;   /* applied later — nothing to report yet */
@@ -1711,10 +1707,9 @@ static void cmd_scan(char **saveptr) {
     int idx = state_cache_slave_idx((uint8_t)slave);
     if (idx < 0) { txt_err("invalid_slave"); return; }
 
-    /* Asynchronous. This used to block until the interrogation finished, which
-     * on a populated bus is many seconds — and unlike boot, `scan` gets typed on
-     * a LIVE system where someone may be at a wall switch. Blocking here stalls
-     * the main loop, so buttons stop responding for the duration. Arm it and let
+    /* Asynchronous: an interrogation on a populated bus is many seconds, and
+     * `scan` gets typed on a LIVE system where someone may be at a wall switch.
+     * Blocking would stall the main loop and freeze the buttons. Arm it and let
      * the main loop drive it; `dstate` shows progress and a scan-complete event
      * goes to HA when it finishes. */
     LOG_INFO("cli", "scan slave %d (async)", slave);

@@ -1,8 +1,8 @@
 /*
  * dali_provision.c — operator-facing driver for a DALI commissioning run.
  *
- * Task 05: the commissioning SEQUENCE moved to the controller
- * (dali_commission.c) as ordinary queued DALI frames. It used to live in the
+ * The commissioning SEQUENCE runs on the controller
+ * (dali_commission.c) as ordinary queued DALI frames, not in the
  * gateway behind MBREG_COMMISSION — write a mode word, poll a status word until
  * terminal — and that register goes away with the gateway strip.
  *
@@ -115,8 +115,8 @@ void dali_provision_abort(void) {
 }
 
 /* ── Tick ──────────────────────────────────────────────────────────────────
- * Task 05: the commissioning sequence itself now runs on the controller
- * (dali_commission.c) as queued DALI frames. What used to be "write a mode to
+ * The commissioning sequence itself runs on the controller
+ * (dali_commission.c) as queued DALI frames. Rather than "write a mode to
  * MBREG_COMMISSION, then poll its status word every 500 ms" is now just
  * mirroring the local state machine's progress into the operator-facing status
  * that the CLI, MQTT topics and HA entities already consume — that surface is

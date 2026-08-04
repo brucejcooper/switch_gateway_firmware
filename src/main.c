@@ -260,7 +260,7 @@ int main(void) {
         lighting_cfg_query_tick();      /* submit config queries into the gateway queue */
         dq_tick();                      /* drive the gateway command queue (FC23) */
         dq_soak_tick();                 /* bench: queue soak probe (idle unless started) */
-        dali_state_tick();              /* controller-owned DALI world model (task 05) */
+        dali_state_tick();              /* controller-owned DALI world model */
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();

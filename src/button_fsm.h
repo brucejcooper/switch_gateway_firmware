@@ -31,6 +31,6 @@ void button_fsm_tick(void);
 
 /* Defined in button_fsm_emit.c, called from button_fsm.c. Declared here rather
  * than as a bare extern inside button_fsm.c so the two sides share one
- * prototype — a signature change on either was previously invisible to the
+ * prototype, so a signature change on either side is caught by the
  * compiler. `action` is a literal: press/release/click/long_press/unstuck. */
 void emit_button_event(uint8_t fixture, uint8_t button, const char *action);

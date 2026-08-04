@@ -1,6 +1,6 @@
 #pragma once
 /*
- * mbq_client.h — controller-side generic Modbus command-queue client (task 06,
+ * mbq_client.h — controller-side generic Modbus command-queue client (
  * queue v2). The controller mirror of the gateway's mbq_slots protocol.
  *
  * DALI-AGNOSTIC. It carries OPAQUE 4-byte commands to a slave's 8-slot queue and

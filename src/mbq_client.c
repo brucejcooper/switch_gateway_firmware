@@ -1,5 +1,5 @@
 /*
- * mbq_client.c — controller-side generic Modbus command-queue client (task 06,
+ * mbq_client.c — controller-side generic Modbus command-queue client (
  * queue v2). DALI-agnostic; see mbq_client.h and docs/modbus-command-queue.md.
  *
  * One slave_t per Modbus slave, each an OPTIMISTIC 8-slot cache + a single-in-

@@ -1,6 +1,6 @@
 #pragma once
 /*
- * dali_commission.h — controller-side DALI commissioning (task 05).
+ * dali_commission.h — controller-side DALI commissioning.
  *
  * The IEC 62386-102 binary-search address assignment, driven from the
  * controller as ordinary queued DALI frames. It used to live in the gateway

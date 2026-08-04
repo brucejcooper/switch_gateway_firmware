@@ -8,7 +8,7 @@
  * Each function enqueues a Modbus action.  The callback updates state_cache
  * and pushes a state_event for serial_poll() to emit to HA.
  *
- * These replace the Lua coroutine bindings that previously linked button
+ * These link button
  * events to Modbus writes.
  */
 
@@ -76,7 +76,7 @@ void               lighting_any_on_probe_tick(void);
 /* ── Config-over-raw queries ──────────────────────────────────────────────────
  * Fill the controller's per-ballast config cache (min/max/power-on/sys-fail/
  * fade) from raw DALI queries — the only config path now that the gateway's
- * BLOCK1-3 register banks are retired. Ballasts are marked via a per-slave
+ * Config is read over raw DALI. Ballasts are marked via a per-slave
  * pending bitmap; the tick walks it, runs the 5-query sequence per ballast,
  * writes state_cache_set_dali_config, and re-emits state_dali so HA sees the
  * refreshed config. (Stage 3 routes these queries through the id-tagged gateway
@@ -89,7 +89,7 @@ void lighting_cfg_query_mark_mask(uint8_t slave_id, uint64_t mask);
 void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr);   /* one ballast */
 void lighting_cfg_query_tick(void);
 
-/* Per-ballast config fields writable over raw DALI (task 03, Phase B). */
+/* Per-ballast config fields writable over raw DALI. */
 typedef enum {
     DALI_CFG_MIN = 0,
     DALI_CFG_MAX,
@@ -100,7 +100,7 @@ typedef enum {
     DALI_CFG_FIELD_COUNT,
 } dali_cfg_field_t;
 
-/* Config write via raw DTR0-load + SET pair (task 03, Phase B). Enqueues the two
+/* Config write via raw DTR0-load + SET pair. Enqueues the two
  * frames back-to-back on the raw FIFO as an indivisible unit (nothing else can
  * take the slot between them — the FIFO is strictly ordered and the probe /
  * config-query SMs both wait while it is non-empty), then schedules a query-back
