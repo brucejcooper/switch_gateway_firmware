@@ -31,10 +31,6 @@ void dirty_poll_emit_gateway_states(void);
 
 /* The gateway's sysinfo block — the ONLY register range this module still reads.
  *
- * Everything else that used to be listed here is gone with the task-05 gateway
- * strip: BLOCK0 arc/status (0x0000), presence (0x0100), the read-clearing dirty
- * mask (0x0104), the group masks (0x0110) and the scan trigger (0x1F00). The
- * gateway caches nothing now, so live state comes from raw DALI queries via
- * dali_state.c and those addresses return ILLEGAL DATA ADDRESS. The four polling
- * intervals that paced the dirty-mask sweep went with them. */
+ * The gateway caches nothing, so live state comes from raw DALI queries via
+ * dali_state.c; its cache addresses return ILLEGAL DATA ADDRESS. */
 #define DALI_SYSINFO_START    0x0310u  /* FC04 input, 4 regs: uptime(2) boot_count reset_reason */

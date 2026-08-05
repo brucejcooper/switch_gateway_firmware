@@ -1,7 +1,7 @@
 #pragma once
 /*
  * dali_queue.h — DALI adapter over the generic Modbus command-queue client
- * (task 06, queue v2).
+ *
  *
  * This is the DALI-SPECIFIC layer. It owns the per-slave PRIORITY SCHEDULER and
  * the producer API; the transaction layer beneath it is mbq_client.c (opaque
@@ -43,7 +43,7 @@
  * submits the highest-priority pending command first; within a class it is FIFO.
  * Classes marked "reserved" have no queue client yet (that transport still lives
  * elsewhere — group masks via FC03, level reads via dirty_poll, provisioning via
- * the commission register) and are placeholders for task 05. */
+ */
 typedef enum {
     DQ_PRIO_PROVISION = 0,  /* reserved: provisioning is bus-exclusive via the busy-gate */
     DQ_PRIO_USER,           /* brightness/on-off/step + group commands + the any-on probe */

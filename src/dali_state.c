@@ -343,10 +343,7 @@ static bool issue(ds_slave_t *d) {
     uint16_t g = next_gen(d);
     /* Verification reads outrank the sweep: a command's real outcome must reach
      * HA promptly, while a background refresh can wait behind anything. This now
-     * holds — DQ_PRIO_LEVEL_READ has its own scheduler class. Until task 07 it
-     * fell through into the background class alongside DQ_PRIO_BACKGROUND, so
-     * this ternary picked between two names for the same queue and the comment
-     * promised an ordering the code did not deliver. */
+     * holds: DQ_PRIO_LEVEL_READ has its own scheduler class. */
     dq_prio_t prio = d->is_scan ? DQ_PRIO_BACKGROUND : DQ_PRIO_LEVEL_READ;
     if (!dq_submit(d->slave_id, prio, addr_byte, OPCODE[d->step],
                    DQ_ANSWER, 0, true, ds_cb, (void *)(uintptr_t)g))

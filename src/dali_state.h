@@ -1,8 +1,8 @@
 #pragma once
 /*
- * dali_state.h — the controller's DALI world model (task 05).
+ * dali_state.h — the controller's DALI world model.
  *
- * This is the "controller owns all state" half of task 05. Every fact about a
+ * The controller owns all bus state. Every fact about a
  * ballast — presence, arc level, status, group membership — is learned here by
  * QUERYING THE BALLAST through the command queue, and held in the controller's
  * state cache. Nothing is read from a gateway register, because the gateway is

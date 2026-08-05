@@ -51,8 +51,8 @@ core-1 wedge (not a network outage) is what triggers a reboot.
 
 **State is never assumed.** Core 0 only updates its state cache from hardware
 readback — DALI queries sent to the ballasts themselves — never from the
-commands it sent. Since task 05 the gateway caches nothing, so the ballasts are
-the only authority.
+commands it sent. The gateway caches nothing, so the ballasts are the only
+authority.
 This correctly handles DALI min/max level clamping and ballast-side fade curves.
 
 **Discovery is republished on every connect.** On each MQTT (re)connect core 1
@@ -347,34 +347,25 @@ reached.
 
 #### TinyModbus register contract
 
-The `task-1-flag-driven` refactor of the TinyModbus firmware moved the
-per-ballast cache from input registers to holding registers and retired
-several action / DTR-setter registers. The Pico's master code follows the
-new contract:
+The gateway caches nothing about the bus. It serves a DALI command queue and its
+own diagnostics; every value the controller reports comes from a DALI query it
+issued and got an answer to.
 
-- **Live arc-level bank (FC03 read, FC06/FC10 write) at `0x0000–0x003F`**
-  (status | brightness). Writing the low byte (DAPC level 0–254) is how the
-  Pico drives per-ballast level changes and OFF — the firmware caches
-  predictively and dispatches the DAPC asynchronously.
-- **Per-ballast config banks at `0x0040–0x00FF` are RETIRED (task 04).** The
-  gateway no longer stores min/max/power-on/sys-fail/fade — FC03 reads and
-  writes there return ILLEGAL DATA ADDRESS. The controller owns config: it
-  **reads** each field with raw DALI queries (the config-query state machine in
-  `lighting_actions.c`, routed through the command queue) and **writes** it with
-  a DTR0+SET pair submitted as one queue command. Controller and gateway are a
-  **matched firmware set** (queue v2, task 06) — deploy both together.
-- **DALI command queue (queue v2)** — the primary path for group/broadcast/
-  specialty sends and all raw queries. 8-slot command block (FC10/FC23 write) at
+- **DALI command queue** — the only path for level changes, group/broadcast and
+  specialty sends, and all raw queries. 8-slot command block (FC10/FC23 write) at
   `0x1000–0x100F`, per-slot status block at `0x1010–0x1017` (served under both
   FC03 and FC04), FC23 (`0x17`). See "DALI command queue: adapter + generic
   client" below and `../TinyModbus/README.md`. The CLI `dali_raw` / `read_mem`
   go through the queue via `dq_submit_sync`.
-- **Everything else is GONE (task 05).** The arc/status bank, presence and
-  dirty bitmaps, group masks, scan trigger, rescan interval and the commission
-  register all return ILLEGAL DATA ADDRESS. Group membership is now read with
-  `QUERY GROUPS` and written with `ADD/REMOVE FROM GROUP` frames; commissioning
-  runs in `dali_commission.c`. The only surviving action registers are
-  slave-addr `0x1F02`, baud `0x1F03` and system-reset `0x1F05`.
+- **Per-ballast config** is controller-owned: it **reads** each field with raw
+  DALI queries (the config-query state machine in `lighting_actions.c`, routed
+  through the command queue) and **writes** it with a DTR0+SET pair submitted as
+  one queue command. Controller and gateway are a **matched firmware set** —
+  deploy both together.
+- **Group membership** is read with `QUERY GROUPS` and written with
+  `ADD/REMOVE FROM GROUP` frames; commissioning runs in `dali_commission.c`.
+  The action registers are slave-addr `0x1F02`, baud `0x1F03` and system-reset
+  `0x1F05`.
 - **Gateway recovery:** `0x1F05` (write `0xA5A5`) software-resets a wedged
   gateway (CLI `gw_reboot`). RX error counters live at FC04 `0x0300`; uptime /
   boot-count / reset-reason at FC04 `0x0310` (read `get_input <slave> 0x0310 4`
@@ -409,7 +400,7 @@ Measured, idle bus: worst case **236 ms → 89 ms**, with *two* absent slaves
 configured rather than the one that produced the 236. `busload` reports the
 backed-off slave count and skipped-transaction count.
 
-### Scheduler model (task 05)
+### Scheduler model
 
 The queue client is fed by a **pull scheduler**, not a shared backlog. Storage is
 partitioned by priority class, and each class carries **its own gateway depth**:
@@ -449,7 +440,7 @@ a rate-limited counter (`refused=` in `dq`), not a warning per event.
 ### DALI command queue: adapter + generic client (`dali_queue.c` / `mbq_client.c`)
 
 Every group/broadcast/specialty DALI send and every raw query goes through a
-**two-layer** command queue (queue v2, task 06):
+**two-layer** command queue:
 
 1. **`mbq_client.c` — the generic, DALI-agnostic client.** It mirrors the
    gateway's **8-slot self-describing lifecycle protocol**: it carries opaque
@@ -483,7 +474,7 @@ is being commissioned the scheduler admits nothing else on it) → **user action
 (brightness/on-off/step + group commands + the any-on probe) → group-membership
 writes → **config writes** (DTR0+SET) → level/status reads → **background** (config
 rotation). Classes with no queue client yet (group writes, level reads — they use
-FC03 / dirty_poll today) are reserved placeholders for task 05. In-flight depth is
+FC03 / dirty_poll today) are reserved placeholders. In-flight depth is
 capped at **2–3 per slave** (`DQ_INFLIGHT_MAX`, well below the gateway's 8) so a
 backlog of background work never fills all 8 slots ahead of a fresh user command —
 the depth cap is what keeps the priority ladder meaningful above the client.
@@ -507,7 +498,7 @@ alive-reconcile gate — the corruption modes those existed to manage cannot ari
 because nothing is inferred from an id sequence. (boot_count / the FC04 sysinfo
 block remain, purely as an HA diagnostic in `dirty_poll.c`.)
 
-**Scheduler (task 05 phase 1).** There is no shared backlog. Storage is
+**Scheduler.** There is no shared backlog. Storage is
 partitioned by priority class — user 8 entries (one button's full fan-out), cfg
 3, bg 2 — and each class carries **its own gateway depth** (user 4, cfg 3, bg 2).
 That matters because the *gateway* executes strictly FIFO with no priority, so a
@@ -535,13 +526,12 @@ its counters (submitted / ok / nak / err / dropped / refused / coalesced / steps
 Bare = all DALI slaves. For throughput and correctness under load, see
 [`busload` and `soak`](#measuring-the-command-path-busload-and-soak).
 
-**Submit length (task 07).** A submit's FC23 write count is in **registers**, and
-the gateway derives `n_slots = wr_count / 2` from it — so a one-command submit
+**Submit length.** A submit's FC23 write count is in **registers**, and the
+gateway derives `n_slots = wr_count / 2` from it — so a one-command submit
 declares `MBQ_CMD_REGS` (2), not `MBQ_CMD_BYTES` (4). Declaring bytes there does
 not fail the request: it arms the *next* slot as well, using whatever memory
-followed the command buffer as a second, real DALI frame. That shipped in task 06
-and is fixed here; `MBQ_CMD_REGS` and a `_Static_assert` now sit beside
-`MBQ_CMD_BYTES` so the units cannot drift apart again.
+followed the command buffer as a second, real DALI frame. `MBQ_CMD_REGS` and a
+`_Static_assert` sit beside `MBQ_CMD_BYTES` so the units cannot drift apart.
 
 **Subsystems on the queue.** Every former single-slot producer rides it: the raw
 command path (button on/off/step, group commands, config DTR0+SET), the **any-on
@@ -869,9 +859,8 @@ gateway is up).
 ### Per-ballast config source + warm start
 
 The per-ballast config (`min`/`max`/`power_on`/`sys_fail`/`fade_rate`/`fade_time`)
-is **owned by the controller over raw DALI** — the gateway's config banks were
-retired in task 04, so this is the only path (the `dali_raw_cfg` dual-path flag
-was removed). Config is **read** with raw DALI queries (`QUERY
+is **owned by the controller over raw DALI** — the gateway stores none of it.
+Config is **read** with raw DALI queries (`QUERY
 MIN/MAX/POWER-ON/SYSTEM-FAILURE LEVEL`, `QUERY FADE TIME/FADE RATE`) at boot (a
 sweep of every present ballast) and refreshed by a slow background rotation, and
 **written** with `DTR0`-load + `SET` sequences that are verified by a query-back
@@ -1189,7 +1178,7 @@ logs on the same port under the `net` / `mqtt` / `core1` tags.
 ### Measuring the command path: `busload` and `soak`
 
 Two bench instruments answer "is the comms path healthy, and how fast can it
-actually go?" (task 07). Both are dev-grade CLI only — no MQTT surface.
+actually go?" Both are dev-grade CLI only — no MQTT surface.
 
 **`busload [reset]`** — who is using the RS-485 bus. Each transaction is charged
 from leaving the action queue until the bus SM returns to IDLE, so the figure

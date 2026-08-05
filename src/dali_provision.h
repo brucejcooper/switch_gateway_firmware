@@ -45,10 +45,8 @@ typedef enum {
 /* Text for a prov_run_state_t, defined HERE so it cannot drift from the enum:
  * adding a state without a label now shows "unknown" rather than silently
  * shifting every label by one. Used by the MQTT bridge and the web read model —
- * ha_bridge.c used to keep its own copy, and /api/state served the raw number,
- * which is how a provisioning run that ended in ERROR (11) reached the web UI
- * looking like an opaque "State 11". Takes uint8_t because the value crosses to
- * core 1 as a plain byte in ic_event_t. */
+ * Takes uint8_t because the value crosses to core 1 as a plain byte in
+ * ic_event_t. */
 static inline const char *prov_state_name(uint8_t s) {
     static const char *const N[] = {
         "idle", "clearing", "scanning", "terminating", "initialising",

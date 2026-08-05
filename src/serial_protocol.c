@@ -953,8 +953,7 @@ static void cmd_dali(char **saveptr) {
     /* Emit only when a key produced a value we actually KNOW. A brightness set
      * does not: the ballast clamps and fades, so its real level arrives later via
      * the verification read, which publishes then. This mirrors the emit_now
-     * discipline the JSON path already used — the CLI used to emit
-     * unconditionally, republishing a stale or predicted level. */
+     * discipline the JSON path uses. */
     bool emit_now = false;
     do {
         char *eq = strchr(kv, '=');
@@ -969,17 +968,12 @@ static void cmd_dali(char **saveptr) {
                  * now would show the old value, then jump. */
                 lighting_group_set_level((uint8_t)slave, (uint8_t)group, (uint8_t)atoi(val));
             else if (strcasecmp(key, "on") == 0) {
-                /* "toggle" used to match none of the true-ish spellings and so
-                 * evaluated to FALSE — a group toggle silently meant OFF, with
-                 * no error. The per-ballast path handled toggle properly; only
-                 * groups were wrong.
+                /*
                  *
                  * A toggle now READS THEN WRITES, exactly as a button press
                  * does: QUERY LAMP POWER ON straight to the group selector, and
-                 * invert whatever the gear reports. It used to invert the cached
-                 * membership state, which is the staleness the button's probe
-                 * was introduced to defeat — a gateway reboot loses the masks
-                 * and the cache then answers confidently and wrongly. */
+                 * invert whatever the gear reports, rather than a cached
+                 * membership state a gateway reboot could have lost. */
                 int t = parse_on_off_toggle(val);
                 if (t < 0) { txt_err("bad_arg"); return; }
                 bool on;
@@ -2502,10 +2496,8 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
             lighting_group_set_level(slave, group, c->set_group.bri);
             any = true;
         } else if (c->set_group.fields & IC_GRP_F_ON) {
-            /* IC_TRI_TOGGLE used to compare unequal to IC_TRI_ON and so silently
-             * meant OFF — the same bug the CLI group path carried until it was
-             * fixed, never fixed here. A toggle now probes the group and applies
-             * the inverse asynchronously.
+            /* A toggle probes the group and applies the inverse asynchronously.
+             * Comparing against IC_TRI_ON alone would make IC_TRI_TOGGLE mean OFF.
              *
              * Reached from the HTTP API / web UI. HA cannot send a toggle: its
              * JSON light schema carries only {"state":"ON"|"OFF"} and

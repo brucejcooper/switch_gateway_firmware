@@ -3,9 +3,8 @@
  * dali_commission.h — controller-side DALI commissioning.
  *
  * The IEC 62386-102 binary-search address assignment, driven from the
- * controller as ordinary queued DALI frames. It used to live in the gateway
- * behind MBREG_COMMISSION (write a mode, poll a status word); the gateway strip
- * removes that register and its state machine, so the sequence moves here.
+ * controller as ordinary queued DALI frames. The gateway has no commission
+ * register and no commissioning state machine; it only puts frames on the wire.
  *
  * Ported from the gateway's proven implementation (TinyModbus dali_sync.c
  * OP_COMMISSION) rather than rewritten — including the two non-obvious

@@ -108,19 +108,12 @@ static int slave_idx(uint8_t id) {
 /* The prefix for HA DISCOVERY ids — object_ids, unique_ids and device
  * identifiers. Deliberately the SAME string as the MQTT topic prefix.
  *
- * These used to be hardcoded "lighting_...", while every state and command
- * topic already derived from mqtt_app_prefix(). Two controllers on one broker
- * could therefore be given separate topic namespaces and STILL collide: both
- * published discovery to homeassistant/light/lighting_dali_3_0/config, so the
- * entity's state_topic pointed at whichever wrote last, both re-published on
- * every reconnect and on homeassistant/status, and identical unique_ids made HA
- * treat them as one entity. Slave numbering is per-controller, so
- * lighting_dali_3_0 was genuinely ambiguous between two boxes.
- *
- * Reusing the topic prefix means ONE thing to set per controller rather than
- * two that could disagree — and with the default prefix "lighting" every id
- * comes out byte-identical to before, so existing installs keep their entities,
- * history and automations untouched. */
+ * Sharing the topic prefix is what lets two controllers coexist on one broker:
+ * without it both would publish discovery to the same
+ * homeassistant/light/<id>/config, and identical unique_ids would make HA treat
+ * them as one entity — slave numbering is per-controller, so an id like
+ * dali_3_0 is ambiguous between two boxes. One setting per controller rather
+ * than two that could disagree. */
 static const char *idp(void) { return mqtt_app_prefix(); }
 
 static void disc_plate_event(uint8_t fix, uint8_t btn) {
@@ -433,7 +426,7 @@ static void disc_gw_diag(uint8_t slave, uint8_t k) {
 }
 
 /* Controller-config entities. The tables live at file scope and the step bounds
- * are DERIVED from their sizes: they used to be hardcoded (k < 4, k - 4, k == 6,
+ * are DERIVED from their sizes rather than hardcoded (k < 4, k - 4, k == 6,
  * total 7), so adding a fifth number silently published nothing — the new entity
  * sat in the table but past the guard. */
 static const struct { const char *key, *name; int lo, hi, step; } CFG_NUM[] = {
@@ -687,11 +680,9 @@ static void subscribe_all(void) {
          * source of bus state, not a sink for it — it learns levels and config by
          * reading the gear, never by reading its own retained messages back.
          *
-         * "dali/+/+/config" used to be here, so the broker replayed our retained
-         * per-ballast config at boot and core 0 adopted it (IC_CMD_SEED_DALI_CFG).
-         * That made stale, possibly-wrong values — a swapped or externally
-         * reconfigured ballast — reappear as fact. The boot config sweep armed at
-         * scan-complete reads the real values from the gear instead. */
+         * Note the absence of "dali/+/+/config": subscribing to our own retained
+         * config would make stale values — a swapped or externally reconfigured
+         * ballast — reappear as fact. The boot config sweep reads the gear. */
         "relay/+/set", "dali/+/+/config/+/set", "dali/+/+/set",
         "group/+/+/members/set", "group/+/+/set",
         "provision/+/start/all", "provision/+/start/unaddressed",
@@ -810,14 +801,14 @@ static void members_csv(uint64_t mask, char *out, size_t cap) {
     out[n] = '\0';
 }
 
-/* ── Tombstones (task 03, Phase C) ────────────────────────────────────────────
+/* ── Tombstones ───────────────────────────────────────────────────────────────
  * Retire a removed device by publishing empty retained payloads to its discovery
  * and data topics: HA drops the entity and the broker keeps no stale retained
  * state. Operator-triggered only (CLI `tombstone …` -> IC_EVT_TOMBSTONE) — never
  * automatic, since a transient DALI dropout is availability (offline), not
  * removal. Each device's topic set is small and bounded, so one publish burst
  * stays within the socket TX budget. A whole-gateway retirement clears only the
- * gateway-scoped topics here; its ballasts/groups are retired individually
+ * gateway-scoped topics here; its ballasts/groups are cleared individually
  * (`tombstone dali <slave> <addr>` / `tombstone group <slave> <g>`). */
 static void tomb(const char *topic) { mqtt_app_publish(topic, "", 0, true); }
 
@@ -849,7 +840,7 @@ static void tombstone_group(uint8_t slave, uint8_t grp) {
 /* Clears the whole gateway HA device `<prefix>_dali_gw_<slave>` — its diagnostic
  * + provisioning discovery configs (disc_gw_diag / disc_prov) and the gateway-
  * scoped data topics — so no ghost device is left after retirement. Its ballasts
- * and groups are separate HA devices, retired individually. ~15 empty retained
+ * and groups are separate HA devices, cleared individually. ~15 empty retained
  * publishes; best-effort QoS0 into the ~2 KB socket (drained during a manual
  * decommission) and idempotent, so a re-run completes it if a publish was ever
  * dropped under concurrent TX. Discovery configs go first (they remove the HA
@@ -1151,7 +1142,7 @@ static void ha_on_message(const char *topic, uint16_t tlen,
         if (!strcmp(pay, "PRESS") || !strcmp(pay, "REBOOT")) {
             /* Clean shutdown: publish a retained offline now so HA greys us out
              * immediately, rather than waiting for the broker to notice the LWT
-             * after the reboot drops the TCP link (task 03, Phase C). */
+             * after the reboot drops the TCP link. */
             char av[48];
             snprintf(av, sizeof av, "%s/availability", mqtt_app_prefix());
             pub_str(av, "offline", true);

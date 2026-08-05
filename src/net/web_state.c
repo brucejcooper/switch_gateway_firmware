@@ -347,12 +347,9 @@ static int unit_at(const web_render_cursor_t *cur, char *out, size_t cap,
      * count is fixed and known, so the array's length should not depend on what
      * we happen to have heard from.
      *
-     * null = never read. Previously the array was truncated at the highest
-     * channel ever seen and every entry was a boolean, so a channel below that
-     * high-water mark which had never reported rendered "false" — the cached
-     * default presented as a measurement. That needed a failed boot coil sync
-     * plus a later single-channel write ACK to show up, but it is the same
-     * "unread is not off" bug already fixed in the CLI and the MQTT paths. */
+     * null = never read. A boolean cannot distinguish that from "off", and the
+     * cached default must never be presented as a measurement — unread is not
+     * off, the same rule the CLI and MQTT paths follow. */
     case SEC_RELAY: {
         if (cur->i < RELAY_COUNT) {
             uint16_t ch = cur->i;

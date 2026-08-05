@@ -312,45 +312,15 @@ baud=19200, duration=N)`; pass the current bus baud or the decode is garbage.
 Gotcha: captures have a **multi-second arming latency** — keep bus traffic
 flowing for the whole window and fire the event of interest a couple seconds in.
 
-## Root cause found & fixed (2026-06-05): TinyModbus RX interrupt starvation
 
-The gateway intermittently went deaf to Modbus (received bytes but never
-answered), needing a manual reset. Root cause, pinned down with a D7/PB3 firmware
-marker on the Saleae: `start_next_dali_work()` ran `pick_work()` — a scan of up to
-~192 ballast-flag entries — inside a **global `ATOMIC_BLOCK`**. On every idle
-main-loop pass it held all interrupts off for hundreds of µs, overrunning the
-USART's 2-byte RX FIFO and dropping ~25% of incoming bytes → every frame failed
-CRC → deaf. A running DALI scan set `dali_busy`, which gated that call out — which
-is why it "worked during a scan" and on the old shorted board (whose bus never
-went idle). **Not sleep, not the hardware.** Fixed in TinyModbus by moving the
-scan out of the global-interrupt-off region (commit on `main`).
+## RS-485 baud
 
-Diagnosis tip: PB3 on the gateway = logic-probe D7, a free firmware timing marker
-(`PORTB.OUTSET/OUTCLR/OUTTGL PIN3_bm`) — invaluable for bisecting where a frame is
-lost in the RX path.
+**19200 is canonical** (controller default, gateway USERROW `BAUD_INDEX=1`, probe
+baud). The ATtiny's internal RC oscillator is too marginal for reliable 38400 RX
+sampling under load — it mis-frames bytes that are clean on the wire. Watch
+`crc_error`/`frame_error` in the gateway diagnostics below to confirm any change
+keeps them flat.
 
-## Second issue (2026-06-06): 38400 RX-sampling margin → back to 19200
-
-After the starvation fix we ran at 38400 and saw **semi-frequent Modbus timeouts
-under heavy DALI load** (retries succeeded). Pinned down with RX **error counters
-added to the gateway** (FC04 `0x0300`, see below) plus a Saleae byte-for-byte
-compare:
-
-- `rx_overflow` stayed **0** — NOT FIFO overflow / not the starvation bug again.
-- `crc_error`/`frame_error` rose 1:1 with the timeouts. The frames were **clean on
-  the wire** (Saleae decoded 104/104 with valid CRC) but the ATtiny **latched
-  mis-framed bytes** — often only 7 of 8, with bytes merged — i.e. it lost
-  bit-alignment mid-frame. A receive-**sampling** failure, not the line (50 cm,
-  terminated).
-- Halving the baud to **19200** made `crc_error`/`frame_error` go to **0** over the
-  identical load (0 timeouts). 
-
-Root cause: the ATtiny's **internal-RC oscillator (~±2-3%) is marginal for 38400 RX
-sampling**; under load it tips past the UART receive tolerance → a stop bit sampled
-early → missed next start bit → frame shifts. **19200 doubles the bit-time and the
-margin, and is now the canonical baud** (controller default + probe baud, gateway
-USERROW `BAUD_INDEX=1`). This is exactly what the original code comment warned;
-the starvation bug was a *separate*, earlier fault.
 
 ### Gateway RX error counters (FC04 `0x0300`, 16-register read)
 
@@ -392,20 +362,13 @@ and emits `IC_EVT_GW_DIAG`. `ha_bridge` publishes JSON to
 (watchdog/software/external/brownout/power-on/updi) via `reset_reason_str`,
 priority-ordered so a multi-flag cold boot reports the most diagnostic cause.
 
-### DALI scan reads settings AND level (2026-06-16)
+### Scans read status, level and groups
 
-The gateway's `SYNC_READ_FULL` flag was **renamed `SYNC_READ_SETTINGS`** — it only
-re-fetches the 7 config fields (min/max/fade/power/fail/groups), NOT the live arc
-level (that's `SYNC_READ_LEVEL` = QUERY STATUS + QUERY ACTUAL LEVEL). The boot
-scan (`main.c`) and the master `SCAN_TRIGGER` (`0x1010`) now arm **both** flags;
-previously they armed settings only. Symptom that drove this: after a gateway
-reboot `regs_init()` zeroes block0, the settings scan leaves `brightness=0`, and a
-physically-ON ballast reported OFF until a command or the slow periodic re-poll
-cursor happened to touch it ("2:6 shows 0 while on"). Arming the level read makes
-a freshly-booted/rescanned gateway converge to true state on its own. The
-controller side also got a fix: `dirty_poll_full_scan` BLOCK0 (arc/status) reads
-are now guarded by a per-chunk `b0_chunk_ok[]` flag (matching BLOCK1-3), so a
-failed Modbus chunk read never emits uninitialised stack data as a brightness.
+An interrogation reads QUERY STATUS + QUERY ACTUAL LEVEL for every present
+ballast, and group membership on a full scan. It is armed at boot, by the `scan`
+CLI verb, by `POST /api/scan`, and by the Rescan button in the Lights tab — all
+asynchronous; the main loop drives them and state converges over a few seconds.
+
 
 ## Gateway recovery
 
@@ -434,17 +397,19 @@ number** (stable; the short address is not).
   `new`=incremental (un-addressed gear only), `<addr>`=**re-provision the gear at
   one collided short address** onto free addresses.
 
-### Gateway commissioning modes (`MBREG_COMMISSION` 0x1014)
-`0x0001` full · `0x0002` incremental · **`0x03YY` re-provision the gear at short
-address YY** (mode 3 — reuses the binary-search commissioner; only touches the
-colliding gear). Status read-back: `0x00xx` idle, `0x01xx` running, `0x02xx`
-complete (count), `0x03xx` error.
+### Commissioning modes
+`all` full renumber · `new` only gear without a short address · `address <N>`
+re-provision the gear at one collided short address. The sequence runs on the
+CONTROLLER (`dali_commission.c`) as ordinary queued DALI frames.
 
-**DALI gotcha that shaped this:** you can't just `INITIALISE`-by-address then
+**DALI gotcha that shapes this:** you can't just `INITIALISE`-by-address then
 `PROGRAM SHORT ADDRESS` — PROGRAM only programs the gear the binary search has
 *selected* (SEARCHADDR == its random address). So re-addressing must run the full
-`INITIALISE → RANDOMISE → SEARCHADDR bisect → PROGRAM → VERIFY → WITHDRAW`, which
-is why mode 3 lives in the gateway commissioner, not as raw controller commands.
+`INITIALISE → RANDOMISE → SEARCHADDR bisect → PROGRAM → VERIFY → WITHDRAW`.
+
+`new` finding nothing on a fully-addressed bus is the CORRECT result, reported as
+complete, not an error — INITIALISE with the no-short data byte matches nothing
+when every ballast already has an address.
 
 ### Memory bank 0 (mandatory, IEC 62386-102)
 `0x00` last-addr · `0x02` last-bank · **`0x03-0x08` GTIN** (per-product, same for
@@ -476,15 +441,13 @@ gateway BLOCK1-3) but didn't expose it; now it does.
 - Get/set go through the **unified settings protocol** (see below): config
   fields (`min max power_on sys_fail fade_rate fade_time`) are just more `v`
   keys on `set_dali`/`dali <slave> <addr> key=val`, same as `on`/`bri`.
-- Fields map to gateway holding-register **pairs** (high byte first):
-  `0x0040+addr=(min<<8)|max`, `0x0080+addr=(power_on<<8)|sys_fail`,
-  `0x00C0+addr=(fade_rate<<8)|fade_time`. A register write arms the gateway's DALI
-  `STORE DTR AS …` sequence. Set is read-modify-write (preserves the pair's other
-  field from cache) + a predictive cache update + re-emit.
+- Set goes over raw DALI as a DTR0-load + SET pair through the command queue.
+  Nothing is written to the cache or published until the query-back reports what
+  the ballast actually stored.
 - **Gotcha:** the ballast clamps out-of-range values — notably `min` to its
   **physical minimum** (`QUERY PHYSICAL MINIMUM` 0x9A; the rig's is 99), so
   `set min` below that is silently floored. A rescan reflects the actual stored
-  value (the predictive emit shows the requested value until then).
+  value; nothing is published until the read-back confirms it.
 - **Opcode fix:** `TinyModbus dali.h` had `QUERY MIN/MAX` **swapped** vs IEC 62386-102
   (`0xA1`=QUERY MAX, `0xA2`=QUERY MIN). The scan-store + controller-read swaps
   cancelled so reads looked right, but it left read and write byte-orders opposite.
@@ -510,16 +473,12 @@ emitted `state_*` is the value confirmation.
 **DALI groups** are first-class entities: `state_group` reports `on/bri/members`
 (`members` = the member short addresses), and membership is editable like any
 other value — `dali 2 g5 members=0,1` (replace) / `add=2` / `remove=1` (CLI), or
-`set_group` with `members`/`add`/`remove` arrays (JSON). The controller writes
-the desired 64-bit mask to the gateway group-mask registers (`0x0110+`, byte-
-swapped per word); the **gateway** diffs old↔new and issues the DALI
-ADD/REMOVE-from-group commands (`dali_sync_arm_group_write`). Non-empty groups
-are emitted in `resync`. A group level/on/off command also flags its members for
-a re-read on the gateway (`apply_invalidation` walks the group mask → marks each
-member `SYNC_READ_LEVEL`), so each member's `state_dali` refreshes to its actual
-level shortly after — provided membership is correct (a stale/empty group mask
-has nothing to flag, which is what made group commands look like a no-op before
-the group-mask byte-order fix).
+`set_group` with `members`/`add`/`remove` arrays (JSON). The CONTROLLER diffs
+membership against its own cache and issues the DALI ADD/REMOVE FROM GROUP
+frames itself, then re-reads each touched ballast — the measured read-back is
+what gets published, so a write that did not take cannot linger. A group
+command likewise marks every member for verification, and each member's
+measured level recomputes the group (on = any member on, brightness = max).
 
 `cfg` is the whole **controller device config**, shown in HA like everything
 else. `state_cfg` (and `hello`) also report read-only `fw_version` — built from
