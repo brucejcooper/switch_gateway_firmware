@@ -84,7 +84,18 @@ function ballastRow(b) {
     type: 'range', min: '0', max: '254', value: String(b.bri ?? 0),
     disabled: b.present === false,
   });
-  slider.addEventListener('pointerdown', () => { dragging = true; });
+  // Capture the pointer so pointerup/pointercancel land here even if the finger
+  // leaves the track. `change` alone is NOT enough to clear this: a tap that
+  // doesn't move the thumb never fires `change`, and the row's brightness would
+  // then be frozen against the poll for the rest of the page's life.
+  slider.addEventListener('pointerdown', (ev) => {
+    dragging = true;
+    try { slider.setPointerCapture(ev.pointerId); } catch (e) { /* unsupported */ }
+  });
+  const endDrag = () => { dragging = false; };
+  slider.addEventListener('pointerup', endDrag);
+  slider.addEventListener('pointercancel', endDrag);
+  slider.addEventListener('blur', endDrag);
   slider.addEventListener('input', () => { briVal.textContent = slider.value; });
   slider.addEventListener('change', async () => {
     dragging = false;
