@@ -652,7 +652,8 @@ static void cmd_help(void) {
     printf("dali <slave> <addr|gN> [key=val ...]       bare=get; keys: on bri min max\n");
     printf("                                           power_on sys_fail fade_rate fade_time\n");
     printf("                                           group (gN) also: members=0,1  add=2  remove=1\n");
-    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms fw_url\n");
+    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms\n");
+    printf("                                           fw_url (reboot to apply)\n");
     printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
     printf("tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
@@ -1078,12 +1079,12 @@ static void cmd_tombstone(char **saveptr) {
 }
 
 /* cfg [key=value ...] — controller device config; bare = get (emit state_cfg).
- * keys: long_press_ms dim_repeat_ms reversal_window_ms baud (reboot to apply)
+ * keys: long_press_ms dim_repeat_ms reversal_window_ms baud fw_url (reboot to apply)
  *       relay_slaves=1,2  dali_slaves=2,3  (comma lists). fw_version is read-only. */
 static void cmd_cfg(char **saveptr) {
     char *kv = strtok_r(NULL, " \t", saveptr);
     if (!kv) { emit_state_cfg(); txt_ok(); return; }
-    bool any = false;
+    bool any = false, deferred = false;
     do {
         char *eq = strchr(kv, '=');
         if (!eq) { txt_err("bad_arg expected key=value"); return; }
@@ -1105,13 +1106,19 @@ static void cmd_cfg(char **saveptr) {
             /* empty value clears the override (compiled-in default applies) */
             strncpy(g_config.fw_url, val, sizeof g_config.fw_url - 1);
             g_config.fw_url[sizeof g_config.fw_url - 1] = '\0';
+            /* fwupdate.c reads this from the intercore snapshot, which is built
+             * once at core1_launch — so the new URL is not live until a reboot.
+             * Without this note the next `check` silently polls the OLD url and
+             * reports no update, which reads as a broken manifest. */
+            deferred = true;
         }
         else { txt_err("bad_field"); return; }
         any = true;
     } while ((kv = strtok_r(NULL, " \t", saveptr)) != NULL);
     if (any && !config_save()) { txt_err("save_failed"); return; }
     emit_state_cfg();
-    txt_ok();
+    if (deferred) printf("ok (reboot to apply)\n");
+    else          txt_ok();
 }
 
 /* ── btn <fixture> <button> [tap|press|release] ────────────────────────────

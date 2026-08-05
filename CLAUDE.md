@@ -54,7 +54,10 @@ half-converted flash.
 **`cfg fw_url=<manifest-url>`** (CLI, persisted) overrides the compiled-in
 manifest URL — a bench device polls a local server (e.g.
 `http://<mac-ip>:8000/light_switch.json`) instead of `ota.8bitcloud.com`;
-empty value reverts to the default.
+empty value reverts to the default. **Reboot to apply** (the CLI says so):
+`fwupdate.c` reads the URL from the intercore snapshot, which core 0 builds once
+at `core1_launch()`, so a `check` before the reboot silently polls the OLD url
+and reports no update — which reads as a broken manifest.
 
 ### Flash layout (OTA build only — the default build is unaffected)
 
