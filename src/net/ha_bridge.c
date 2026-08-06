@@ -229,7 +229,13 @@ static void disc_ballast(uint8_t slave, uint8_t addr) {
 static void disc_ballast_cfg(uint8_t slave, uint8_t addr, uint8_t k) {
     static const struct { const char *key, *name; int lo, hi; } F[] = {
         { "min", "Min Level", 0, 254 }, { "max", "Max Level", 0, 254 },
-        { "power_on", "Power-On Level", 0, 254 }, { "sys_fail", "System-Failure Level", 0, 254 },
+        /* POWER ON and SYSTEM FAILURE LEVEL go to 255, not 254: IEC 62386-102
+         * defines 255 as MASK ("keep the current level"), and it is the factory
+         * default on most gear. Declaring max 254 made HA reject the measured
+         * value outright — "Invalid value for number.<x>_power_on_level: 255
+         * (range 0.0 - 254.0)" — so a stock ballast's real setting could not be
+         * displayed. Arc level itself still tops out at 254. */
+        { "power_on", "Power-On Level", 0, 255 }, { "sys_fail", "System-Failure Level", 0, 255 },
         { "fade_rate", "Fade Rate", 0, 15 }, { "fade_time", "Fade Time", 0, 15 },
     };
     const char *P = mqtt_app_prefix();
@@ -765,10 +771,22 @@ static void pub_fw_state(void) {
     char rel[256], notes[512];
     json_escape(fwupdate_release_url(), rel, sizeof rel);
     json_escape(fwupdate_notes(), notes, sizeof notes);
-    snprintf(s_pl, PL_CAP,
-        "{\"installed_version\":\"%s\",\"latest_version\":\"%s\","
-        "\"release_url\":\"%s\",\"release_summary\":\"%s\"}",
-        fwupdate_installed(), fwupdate_latest(), rel, notes);
+    /* OMIT release_url when we have none — do not publish "". HA validates the
+     * field as a URL and an empty string fails, which makes it discard the WHOLE
+     * payload ("Schema violation ... invalid url"), so installed_version and
+     * latest_version never reach the update entity and the Firmware card sits
+     * stale no matter how many times we publish. Manifests routinely carry no
+     * release_url, so this was the normal case, not an edge one. */
+    if (rel[0])
+        snprintf(s_pl, PL_CAP,
+            "{\"installed_version\":\"%s\",\"latest_version\":\"%s\","
+            "\"release_url\":\"%s\",\"release_summary\":\"%s\"}",
+            fwupdate_installed(), fwupdate_latest(), rel, notes);
+    else
+        snprintf(s_pl, PL_CAP,
+            "{\"installed_version\":\"%s\",\"latest_version\":\"%s\","
+            "\"release_summary\":\"%s\"}",
+            fwupdate_installed(), fwupdate_latest(), notes);
     snprintf(s_top, sizeof s_top, "%s/update/state", P);
     pub_str(s_top, s_pl, true);
 

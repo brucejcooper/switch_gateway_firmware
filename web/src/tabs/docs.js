@@ -53,7 +53,7 @@ export function renderDocs() {
           'Node-RED, or anything else on the broker.'),
       table(['Topic', 'Payload'], [
         ['<prefix>/dali/<slave>/<addr>/set', '{"state":"ON"} · {"state":"OFF"} · {"state":"ON","brightness":0-254}'],
-        ['<prefix>/dali/<slave>/<addr>/config/<field>/set', 'A number. Fields: min, max, power_on, sys_fail, fade_rate, fade_time'],
+        ['<prefix>/dali/<slave>/<addr>/config/<field>/set', 'A number. Fields: min, max, power_on, sys_fail (0-255, 255 = MASK/keep current), fade_rate, fade_time (0-15)'],
         ['<prefix>/group/<slave>/<group>/set', 'Same shape as a ballast. Groups are 0-15.'],
         ['<prefix>/group/<slave>/<group>/members/set', 'Comma-separated short addresses, e.g. "0,45". Empty clears the group.'],
         ['<prefix>/relay/<ch>/set', '"1" / "0". Channels 0-31.'],

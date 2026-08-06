@@ -144,8 +144,11 @@ function advanced(b, id, path) {
   const body = h('div', { class: 'grid2' },
     mk('min', 'Min'),
     mk('max', 'Max'),
-    mk('power_on', 'Power-on level'),
-    mk('sys_fail', 'System-fail level'),
+    // 255 = MASK ("keep the current level") in IEC 62386-102, and it is the
+    // factory default — capping these at 254 would refuse the value the gear
+    // actually reports.
+    mk('power_on', 'Power-on level', 255),
+    mk('sys_fail', 'System-fail level', 255),
     mk('fade_rate', 'Fade rate', 15),
     mk('fade_time', 'Fade time', 15),
   );
