@@ -255,6 +255,18 @@ details.adv summary { cursor: pointer; font-size: 13px; color: var(--accent); }
 .bind-cell .ttl { font-weight: 600; font-size: 12px; }
 .bind-cell .tgts { color: var(--muted); font-size: 11px; }
 
+/* Live button monitor: a press lights its own cell for LIVE_MS (bindings.js).
+ * The glow is what tells you which index a physical button actually is. */
+.bind-cell.live {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent) 35%, transparent);
+}
+.sub.accent { color: var(--accent); }
+@media (prefers-reduced-motion: no-preference) {
+  .bind-cell.live { transition: background 120ms ease-out, box-shadow 120ms ease-out; }
+}
+
 .members {
   display: grid;
   grid-template-columns: repeat(8, 1fr);

@@ -13,6 +13,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdarg.h>
+#include "pico/time.h"   /* to_ms_since_boot — button-log ages */
 
 #define WEB_GROUPS 16u     /* DALI groups 0..15 */
 
@@ -27,6 +28,14 @@ typedef struct {
 
 typedef struct { bool on, seen; uint8_t bri; uint64_t members; } ws_group_t;
 
+/* Recent button activity, so the Bindings tab can show which index a physical
+ * button actually is. A press is instantaneous and the UI polls every ~1.5 s, so
+ * showing "current" button state would miss almost every press — we keep a short
+ * history instead and let the UI render it. IC_EVT_BUTTON bumps S.seq like any
+ * other event, so a press always breaks the poll's 304 and arrives promptly. */
+#define WEB_BTN_LOG 12u
+typedef struct { uint8_t fixture, button, action; uint32_t t_ms; } ws_btn_t;
+
 static struct {
     uint32_t relay_known;                 /* bit per channel that has reported */
     bool     relay_on[RELAY_COUNT];
@@ -37,6 +46,10 @@ static struct {
     bool         gw_online[MAX_DALI_SLAVES];
     bool         gw_seen[MAX_DALI_SLAVES];
     ws_group_t   grp[MAX_DALI_SLAVES][WEB_GROUPS];
+
+    ws_btn_t     btn[WEB_BTN_LOG];        /* newest at btn_head-1, wrapping */
+    uint8_t      btn_head;
+    uint8_t      btn_used;
 
     struct { uint8_t count; mapping_target_t t[MAX_TARGETS_PER_BTN]; }
         map[MAX_FIXTURES][MAX_BUTTONS];
@@ -173,7 +186,16 @@ void web_state_on_event(const ic_event_t *e) {
         S.relay_byteswap     = e->cfg.relay_byteswap;
         break;
     case IC_EVT_BUTTON:
-        /* Transient UI event; nothing to cache. */
+        /* Not state — a log. Overwrites oldest; the UI only ever wants "what did
+         * I just press", so a short ring is enough and cannot grow unbounded. */
+        S.btn[S.btn_head] = (ws_btn_t){
+            .fixture = e->button.fixture,
+            .button  = e->button.button,
+            .action  = (uint8_t)e->button.action,
+            .t_ms    = to_ms_since_boot(get_absolute_time()),
+        };
+        S.btn_head = (uint8_t)((S.btn_head + 1u) % WEB_BTN_LOG);
+        if (S.btn_used < WEB_BTN_LOG) S.btn_used++;
         break;
     case IC_EVT_PING_REQ:
         /* Routed to ping_submit in the drain; never reaches the read model. */
@@ -210,6 +232,8 @@ enum {
     SEC_MAP,          /* mapping objects */
     SEC_PROV_OPEN,    /* ],"provision":[ */
     SEC_PROV,         /* provision objects */
+    SEC_BTN_OPEN,     /* ],"buttons":[ */
+    SEC_BTN,          /* recent button events, newest first */
     SEC_TAIL,         /* ],"cfg":{...},"seq":N} */
     SEC_DONE,
 };
@@ -483,7 +507,31 @@ static int unit_at(const web_render_cursor_t *cur, char *out, size_t cap,
                 S.prov[s].state, prov_state_name(S.prov[s].state),
                 S.prov[s].count, em);
         }
+        next->sec = SEC_BTN_OPEN; return 0;
+
+    case SEC_BTN_OPEN:
+        next->sec = SEC_BTN; next->i = 0; next->started = false;
+        return snprintf(out, cap, "],\"buttons\":[");
+
+    /* Newest first, so the UI can highlight [0] without scanning. `age_ms` is
+     * resolved at render time rather than shipping a device timestamp the client
+     * would have to reconcile against its own clock; the client adds whatever has
+     * elapsed since the fetch. */
+    case SEC_BTN: {
+        static const char *const act[] = { "press", "release", "click", "long_press",
+                                           "long_press_repeat", "stuck", "unstuck" };
+        if (cur->i < S.btn_used) {
+            uint8_t k = (uint8_t)((S.btn_head + WEB_BTN_LOG - 1u - cur->i) % WEB_BTN_LOG);
+            const ws_btn_t *b = &S.btn[k];
+            next->i = cur->i + 1; next->started = true;
+            return snprintf(out, cap,
+                "%s{\"fixture\":%u,\"button\":%u,\"action\":\"%s\",\"age_ms\":%lu}",
+                cur->started ? "," : "", b->fixture, b->button,
+                act[b->action <= 6 ? b->action : 0],
+                (unsigned long)(to_ms_since_boot(get_absolute_time()) - b->t_ms));
+        }
         next->sec = SEC_TAIL; return 0;
+    }
     }
     next->sec = SEC_DONE;
     return 0;

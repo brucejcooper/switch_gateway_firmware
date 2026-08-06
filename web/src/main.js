@@ -24,7 +24,7 @@ const TABS = [
   { id: 'lights', label: 'Lights', render: renderLights, live: true },
   { id: 'groups', label: 'Groups', render: renderGroups, live: true },
   { id: 'relays', label: 'Relays', render: renderRelays, live: true },
-  { id: 'bindings', label: 'Bindings', render: renderBindings, live: false },
+  { id: 'bindings', label: 'Bindings', render: renderBindings, live: true },
   { id: 'controller', label: 'Controller', render: renderController, live: false },
   { id: 'network', label: 'Network', render: renderNetwork, live: false },
   { id: 'mqtt', label: 'MQTT', render: renderMqtt, live: false },
