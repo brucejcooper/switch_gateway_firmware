@@ -334,10 +334,38 @@ flowing for the whole window and fire the event of interest a couple seconds in.
 ## RS-485 baud
 
 **19200 is canonical** (controller default, gateway USERROW `BAUD_INDEX=1`, probe
-baud). The ATtiny's internal RC oscillator is too marginal for reliable 38400 RX
-sampling under load — it mis-frames bytes that are clean on the wire. Watch
+baud). The ATtiny's internal RC oscillator is marginal for 38400 RX sampling
+under load — it mis-frames bytes that are clean on the wire.
+
+**Re-measured 2026-08-08** with the proper transceiver and `rs485 tx`, gateway
+counters zeroed by `gw_reboot 3` before each run, identical soaks at both rates:
+
+| | 19200 | 38400 |
+|---|---|---|
+| frames OK | 3048 | 3755 |
+| frame_error | **0** | 13 |
+| crc_error | **0** | 14 |
+| txn failures | 0 of 2305 | 0 of 3535 |
+| bg-path soak (250 pairs) | 24.8 s | **17.2 s** |
+| user-path soak (400 pairs) | 26.7 s | 26.6 s |
+
+So 38400 *works* — Modbus retries absorb the ~0.7 % bad frames and nothing fails
+— but it is not clean, and the win is narrow: the DALI-bound path is unchanged
+(26.7 vs 26.6 s) because pacing is 99 % "queue full, DALI-bound". Only the
+Modbus-bound background path gains. Not worth trading a zero error rate for, so
+19200 stays canonical.
+
+Note the old 8868 frame / 5162 CRC errors against 29210 frames were the **bad
+transceiver**, not the baud — the driver was the dominant fault by far. Watch
 `crc_error`/`frame_error` in the gateway diagnostics below to confirm any change
 keeps them flat.
+
+Switching baud: `set_slave_baud <s> <rate> dali` (persists to the gateway's
+USERROW) THEN `baud <rate>` on the controller. If that ever strands a gateway,
+recover over UPDI — `make -C ../TinyModbus get_config` reads USERROW, `make
+configure` rewrites it. USERROW byte 0 is `slave_addr - 2` (so `01` = slave 3),
+byte 1 is the baud index (0=9600, 1=19200, 2=38400). Reading USERROW over UPDI
+resets the chip (shows up as `reset_reason` bit5 UPDIRF).
 
 
 ### Gateway RX error counters (FC04 `0x0300`, 16-register read)
