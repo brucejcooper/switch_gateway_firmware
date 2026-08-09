@@ -29,7 +29,7 @@
  * EXECUTING + NEXT, which is all a one-frame-at-a-time DALI bus can use; the
  * status block is read in full on every submit and every poll, so each extra
  * slot costs 2 bytes (~1 ms at 19200) on EVERY transaction forever. */
-#define MBQ_SLOTS      2u   /* gateway queue depth (matches the gateway MBQ_SLOTS) */
+#define MBQ_SLOTS      3u   /* gateway queue depth (matches the gateway MBQ_SLOTS) */
 #define MBQ_CMD_BYTES  4u   /* opaque command size (32-bit, 2 Modbus registers)   */
 
 /* Terminal outcome delivered to a submitted command's callback (exactly once). */

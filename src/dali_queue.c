@@ -59,9 +59,14 @@
 #define DQ_DEPTH_CFG     2u
 #define DQ_DEPTH_READ    2u   /* verification reads: a command's outcome to HA */
 #define DQ_DEPTH_BG      1u   /* background never gets deeper than this */
-_Static_assert(DQ_DEPTH_USER <= MBQ_SLOTS && DQ_DEPTH_CFG <= MBQ_SLOTS &&
-               DQ_DEPTH_READ <= MBQ_SLOTS && DQ_DEPTH_BG < MBQ_SLOTS,
-               "class depths must fit MBQ_SLOTS, and background must leave one free");
+/* STRICTLY less than MBQ_SLOTS, for every class. A submit carries its own status
+ * read-back, so the master must already know a slot is free when it issues one —
+ * filling every slot forces a wasted read-only poll to discover the next
+ * completion, which is exactly what made a 2-slot queue slower than an 8-slot
+ * one. The spare slot is not headroom, it is the write target. */
+_Static_assert(DQ_DEPTH_USER < MBQ_SLOTS && DQ_DEPTH_CFG < MBQ_SLOTS &&
+               DQ_DEPTH_READ < MBQ_SLOTS && DQ_DEPTH_BG < MBQ_SLOTS,
+               "every class depth must leave at least one slot free to write into");
 
 /* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
  * frames (user decision, 2026-07-28). A held button emits dim repeats faster

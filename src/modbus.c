@@ -94,6 +94,21 @@ typedef struct {
 
 static modbus_de_mode_t      de_mode    = MODBUS_DE_WHENTX;
 static uint32_t              s_baud     = DEFAULT_BAUD_RATE;
+
+/* t3.5 — the inter-frame silence that DEFINES the end of an RTU frame.
+ *
+ * MODBUS over Serial Line V1.02 §2.5.1.1: a frame is over when the line has been
+ * quiet for 3.5 character times, and only then is it validated. Above 19200 the
+ * spec stops deriving the timer (servicing it per character gets expensive) and
+ * prescribes a fixed 1.750 ms. The character is 11 bits in the spec's model
+ * (start + 8 data + parity + stop, or 2 stop bits when parity is unused), so we
+ * derive from 11 even though the UART runs 8N1 — deriving from 10 would give a
+ * window 9% short of what a conformant peer may legitimately use. */
+static uint32_t t35_us(uint32_t baud) {
+    if (baud > 19200u) return 1750u;              /* spec's fixed value */
+    return baud ? (uint32_t)(38500000u / baud) : 2005u;   /* 3.5 * 11 * 1e6 / baud */
+}
+static volatile absolute_time_t rx_silence_at;
 static uint8_t              *readptr;
 static size_t                readbuf_sz;
 static size_t                readbuf_max;
@@ -331,7 +346,8 @@ static void uart_irq(void) {
     int     nread = 0;
 
     while (uart_is_readable(UART_ID)) {
-        readTimeout = make_timeout_time_us(7500);
+        readTimeout   = make_timeout_time_us(7500);
+        rx_silence_at = make_timeout_time_us(t35_us(s_baud));
         uint8_t ch  = uart_getc(UART_ID);
         if (readbuf_sz < readbuf_max) {
             *readptr++ = ch;
@@ -340,9 +356,13 @@ static void uart_irq(void) {
             readbuf_crc >>= 8;
             readbuf_crc ^= crcTable[tmp];
         }
-        if (readbuf_crc == 0 && modbus_rx_valid()) {
-            bus_state = MODBUS_RECEIVED_RESPONSE;
-        }
+        /* Deliberately NOT completing here on a zero running CRC. That finished a
+         * frame the instant its bytes happened to validate, without ever observing
+         * t3.5 — so the frame boundary was inferred from content rather than from
+         * silence, which is what RTU actually defines it by. It also meant a
+         * truncated reply whose prefix chanced to CRC-clean (1 in 65536 per byte
+         * position) would be accepted as whole. The poll loop now closes the frame
+         * on silence; see MODBUS_RECEIVING. */
         nread++;
     }
     /* Note: do NOT call LOG_* from ISR context.  If nread==0 the next
@@ -679,10 +699,15 @@ void modbus_poll(void) {
         break;
 
     case MODBUS_RECEIVING:
-        if (absolute_time_diff_us(readTimeout, get_absolute_time()) <= 0) {
-            break;
+        /* Frame ends at t3.5 of silence, per §2.5.1.1 — not at the first byte
+         * offset where the running CRC happens to reach zero. */
+        if (readbuf_sz > 0 && time_reached(rx_silence_at)) {
+            bus_state = MODBUS_RECEIVED_RESPONSE;   /* silence closed the frame */
+        } else if (absolute_time_diff_us(readTimeout, get_absolute_time()) <= 0) {
+            break;                                  /* still within the stall guard */
+        } else {
+            readbuf_sz = 0;                         /* stalled: no valid frame */
         }
-        readbuf_sz = 0;   /* timed out with no valid frame */
         /* fall through */
 
     case MODBUS_RECEIVED_RESPONSE: {
