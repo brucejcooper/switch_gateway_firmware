@@ -66,21 +66,30 @@ enum { H_OK = 0u, H_FAILED = 1u };       /* head-entry status  */
 
 /* ── policy constants ─────────────────────────────────────────────────────── */
 
-/* Estimated DALI execution time per command class (task-07 measurements), used
- * only to PACE — spinning a poll loop at main-loop speed against a gateway
- * that cannot answer for another 25 ms wastes shared bus for nothing (measured
- * ~2.4 polls per frame in the FC23 soak). A wrong estimate costs a little
- * latency or a little bus, never correctness: the result deadline, not this,
- * is what decides a command is late. */
-#define EST_SET_MS       25u
-#define EST_QUERY_MS     40u
+/* Estimated DALI execution time per command class. This is NOT only a
+ * poll-pacing hint: because gw_occupancy() holds a command's slot until its
+ * estimate expires, these numbers directly set how fast new commands are
+ * admitted, and therefore the throughput ceiling. An estimate that is N ms
+ * long costs N ms of DALI idle on every command. Correctness never depends on
+ * them — the result deadline decides lateness — but the bench does.
+ *
+ * Calibrated against the rig, not derived: the FC23 baseline ran a DTR0-SET +
+ * QUERY pair in 68.1 ms wall, and IEC 62386 puts the frame pair at ~63 ms, so
+ * ~28 ms and ~38 ms are the real per-command costs including the gateway's
+ * arbiter turnaround. The first cut used 25/40 + a 4 ms margin = 73 ms/pair and
+ * measured 74.0 — i.e. the estimator, not DALI, was the limiter. Re-measure
+ * these if the DALI bit timing or the gateway's main loop ever changes. */
+#define EST_SET_MS       26u
+#define EST_QUERY_MS     38u
 #define EST_DTR0_MS      50u
 
 /* Deliberate bias, and the direction matters (spec §5): an estimate that runs
- * LATE costs a little latency, one that runs EARLY costs an A_FULL and a whole
- * wasted transaction, which lands straight back at two transactions per DALI
- * frame. So the estimate is padded, and A_FULL pushes it out further still. */
-#define EST_MARGIN_MS     4u
+ * LATE costs latency and throughput, one that runs EARLY costs an A_FULL and a
+ * wasted transaction. Both are recoverable, so the margin is small and A_FULL
+ * pushes the estimate out further when it does fire — self-correcting beats
+ * permanently pessimistic, which is what the 4 ms margin plus a late anchor
+ * cost us (9.9 pairs/s against a 14.7 baseline). */
+#define EST_MARGIN_MS     3u
 #define EST_AFULL_PUSH_MS 12u
 
 #define PACE_MIN_MS       2u    /* floor, so an estimate that has already passed
@@ -772,13 +781,30 @@ static void bind_accepted(slave_t *s, cmd_t *c, uint8_t seq, bool predicted) {
     s->seq_known   = true;
 }
 
-/* A result just arrived, so the gateway has this instant moved on to the next
- * command in accept order. Re-anchor the remaining estimates on that observed
- * fact rather than leaving them chained off a bind time that may be several
- * frames stale — chained estimates drift, and drifting EARLY is what provokes
- * A_FULL. Ordering is by seq, which is accept order by construction. */
+/* A result just arrived, so the gateway has moved on to the next command in
+ * accept order. Re-anchor the remaining estimates on that observed fact rather
+ * than leaving them chained off a bind time that may be several frames stale —
+ * chained estimates drift. Ordering is by seq, which is accept order by
+ * construction.
+ *
+ * ANCHOR AT t_issue_us, NOT AT NOW. The result was already sitting in the
+ * gateway's response queue when it built this reply, so the command finished
+ * at the latest when our request arrived — a whole transaction before we
+ * parsed the answer. Anchoring at `now` therefore books ~12 ms of pure fiction
+ * onto every estimate, and because a fresh command is only admitted once the
+ * oldest estimate expires (gw_occupancy), that fiction is paid straight out of
+ * throughput: MEASURED 100.7 ms per soak pair against a 68 ms baseline and a
+ * ~63 ms DALI floor, i.e. 9.9 pairs/s where the FC23 path it replaces managed
+ * 14.7. One transaction per DALI frame is worthless if the frames are 50 %
+ * further apart.
+ *
+ * t_issue_us is the moment we put the request on the wire, which is an
+ * honest lower bound on when the gateway had the result, and still LATE
+ * relative to the true completion (the gateway may have finished it long
+ * before we asked). It keeps the conservative direction §5 asks for without
+ * paying a transaction of latency per command for it. */
 static void completion_reanchor(slave_t *s) {
-    uint64_t at = MBQ_NOW_US();
+    uint64_t at = s->t_issue_us ? s->t_issue_us : MBQ_NOW_US();
     for (;;) {
         cmd_t *next = NULL;
         for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
