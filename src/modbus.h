@@ -137,11 +137,6 @@ bool modbus_get_input_registers(uint8_t device_id, uint16_t addr,
 bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
                    uint8_t payload_len, modbus_action_cb_t cb, void *ctx);
 
-bool modbus_read_write_multiple_registers(uint8_t device_id,
-                                          uint16_t rd_addr, uint16_t rd_count,
-                                          uint16_t wr_addr, uint16_t wr_count,
-                                          const uint8_t *wr_data,
-                                          modbus_action_cb_t cb, void *ctx);
 
 /* ── Baud rate (new — replaces hardcoded 9600) ───────────────────────────── */
 /* Call before modbus_init() if a non-default baud rate is desired.

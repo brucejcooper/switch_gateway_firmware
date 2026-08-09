@@ -70,7 +70,6 @@ typedef enum {
     ACTION_SET_COIL              = 0x05,
     ACTION_SET_HOLDING_REGISTER  = 0x06,
     ACTION_WRITE_MULTI_REG       = 0x10,   /* new: FC16 Write Multiple Registers */
-    ACTION_READ_WRITE_MULTI_REG  = 0x17,   /* new: FC23 Read/Write Multiple Registers */
     /* The DALI command queue's one user-defined code. MODBUS Application
      * Protocol V1.1b reserves 65-72 and 100-110 for exactly this, so it is
      * conformant rather than an extension of the standard set — ordinary RTU
@@ -296,10 +295,6 @@ static void log_action_intent(const modbus_action_t *a) {
         LOG_DBG("modbus", "write multi reg slave=%u addr=%u count=%u",
                 a->device, a->wr_address, a->wr_count);
         break;
-    case ACTION_READ_WRITE_MULTI_REG:
-        LOG_DBG("modbus", "read/write multi slave=%u rd=%u/%u wr=%u/%u",
-                a->device, a->address, a->arg, a->wr_address, a->wr_count);
-        break;
     default:
         LOG_DBG("modbus", "action 0x%02x slave=%u addr=%u arg=%u",
                 (unsigned)a->action, a->device, a->address, a->arg);
@@ -521,25 +516,6 @@ static void start_action_tx(void) {
         for (uint8_t i = 0; i < currentAction.wr_len; i++)
             buf[7 + i] = currentAction.wr_payload[i];
         sz = 7u + currentAction.wr_len;
-    } else if (currentAction.action == ACTION_READ_WRITE_MULTI_REG) {
-        /* FC23: dev, fc, read-start(2), read-count(2), write-start(2),
-         * write-count(2), write-bytecount, write-data[...].  The gateway
-         * executes the write before the read, so the response returns the
-         * post-write read block (submit-N / collect-N-1 pipeline). */
-        buf[0]  = currentAction.device;
-        buf[1]  = currentAction.action;
-        buf[2]  = currentAction.address >> 8;      /* read start */
-        buf[3]  = currentAction.address & 0xFF;
-        buf[4]  = currentAction.arg >> 8;          /* read count */
-        buf[5]  = currentAction.arg & 0xFF;
-        buf[6]  = currentAction.wr_address >> 8;    /* write start */
-        buf[7]  = currentAction.wr_address & 0xFF;
-        buf[8]  = currentAction.wr_count >> 8;      /* write count */
-        buf[9]  = currentAction.wr_count & 0xFF;
-        buf[10] = currentAction.wr_len;
-        for (uint8_t i = 0; i < currentAction.wr_len; i++)
-            buf[11 + i] = currentAction.wr_payload[i];
-        sz = 11u + currentAction.wr_len;
     } else if (currentAction.action == ACTION_MBQ_V4) {
         /* Queue v4: dev, fc, [flags:3|ack:5], then 0/2/3 payload bytes — the
          * 5/7/8-byte request shapes of spec §1. No addresses or counts: the
@@ -942,24 +918,3 @@ bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
     return enqueue(&a);
 }
 
-/* New: FC23 Read/Write Multiple Registers.  The slave writes wr_count registers
- * at wr_addr (data = big-endian bytes), THEN reads rd_count registers at rd_addr;
- * the response carries the post-write read block.  wr_count may be 0 for a
- * read-only FC23 (some slaves reject that; the gateway accepts it). */
-bool modbus_read_write_multiple_registers(uint8_t dev,
-                                          uint16_t rd_addr, uint16_t rd_count,
-                                          uint16_t wr_addr, uint16_t wr_count,
-                                          const uint8_t *wr_data,
-                                          modbus_action_cb_t cb, void *ctx) {
-    if (rd_count == 0) return false;
-    if ((size_t)wr_count * 2u > MODBUS_WR_PAYLOAD_MAX) return false;
-    modbus_action_t a = {
-        .action = ACTION_READ_WRITE_MULTI_REG, .device = dev,
-        .address = rd_addr, .arg = rd_count,
-        .wr_address = wr_addr, .wr_count = wr_count,
-        .wr_len = (uint8_t)(wr_count * 2u),
-        .callback = cb, .ctx = ctx,
-    };
-    if (wr_count) memcpy(a.wr_payload, wr_data, (size_t)wr_count * 2u);
-    return enqueue(&a);
-}

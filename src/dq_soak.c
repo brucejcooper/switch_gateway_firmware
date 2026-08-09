@@ -74,7 +74,7 @@ static struct {
     bool     next_is_query;
     uint32_t pairs_done;
 
-    soak_rec_t rec[CMDQ_DEPTH];
+    soak_rec_t rec[CMDQ_DEPTH + 1u];
 
     absolute_time_t t_start, t_end;
 
@@ -96,7 +96,7 @@ static struct {
     uint32_t t_queue_full; /* gate closed: gateway queue at `depth` — DALI-bound */
     uint32_t t_tx_busy;    /* room in the queue but the Modbus SM was mid-transaction */
     uint32_t t_ready;      /* room AND the bus was free — we submitted */
-    uint32_t inflight_hist[CMDQ_DEPTH + 1];
+    uint32_t inflight_hist[CMDQ_DEPTH + 2u];
 
     /* Modbus transactions attributable to this slave over the run */
     uint32_t tx0_submits, tx0_polls;
@@ -114,14 +114,14 @@ static struct {
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
 static soak_rec_t *rec_alloc(void) {
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++)
+    for (uint8_t i = 0; i < CMDQ_DEPTH + 1u; i++)
         if (!S.rec[i].in_use) return &S.rec[i];
     return NULL;
 }
 
 static uint8_t inflight_recs(void) {
     uint8_t n = 0;
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) if (S.rec[i].in_use) n++;
+    for (uint8_t i = 0; i < CMDQ_DEPTH + 1u; i++) if (S.rec[i].in_use) n++;
     return n;
 }
 
@@ -295,7 +295,7 @@ void dq_soak_tick(void) {
 
     /* Pacing sample: why we are (or are not) submitting this instant. */
     uint8_t occupied = mbq_client_inflight(S.slave);
-    S.inflight_hist[occupied <= CMDQ_DEPTH ? occupied : CMDQ_DEPTH]++;
+    S.inflight_hist[occupied <= CMDQ_DEPTH + 1u ? occupied : CMDQ_DEPTH + 1u]++;
 
     if (S.path != SOAK_PATH_DIRECT) {
         /* Scheduler path: keep that class's storage fed and let its own depth
@@ -315,7 +315,13 @@ void dq_soak_tick(void) {
         return;
     }
 
-    if (occupied >= S.depth) { S.t_queue_full++; return; }   /* gateway queue half full — back off */
+    /* Gate on the client's OWN admission policy, not on a raw count. The
+     * client admits one command beyond the gateway's depth once the oldest is
+     * estimated complete — that is what makes a single transaction collect a
+     * result and submit the next command — and a probe that second-guesses it
+     * with its own counter would throttle exactly the behaviour gate V1
+     * measures. `depth` still caps the run for the sweep. */
+    if (occupied > S.depth) { S.t_queue_full++; return; }
     if (!mbq_client_can_submit(S.slave)) { S.t_tx_busy++; return; }
     S.t_ready++;
     submit_next();
@@ -436,7 +442,10 @@ void dq_soak_report(void) {
     }
 
     cdc_out_printf(" transport:\n");
-    cdc_out_printf("  %-22s %lu submit + %lu poll = %lu\n", "modbus txns",
+    /* Queue transactions only: the client's cold-path sysinfo/version reads are
+     * not counted here, so on a recovery-heavy run this under-reports what was
+     * actually on the wire. `busload` measures the truth. */
+    cdc_out_printf("  %-22s %lu submit + %lu poll = %lu (queue txns only)\n", "modbus txns",
            (unsigned long)txs, (unsigned long)txp, (unsigned long)(txs + txp));
     if (S.n_submit)
         print_rate("txns per command", (uint64_t)(txs + txp), S.n_submit, "");
@@ -489,7 +498,7 @@ void dq_soak_report(void) {
            (unsigned long)((uint64_t)S.t_tx_busy * 100u / tt));
     cdc_out_printf("  %-22s %lu%%\n", "submitted", (unsigned long)((uint64_t)S.t_ready * 100u / tt));
     cdc_out_printf("  inflight:");
-    for (uint8_t i = 0; i <= CMDQ_DEPTH; i++) {
+    for (uint8_t i = 0; i <= CMDQ_DEPTH + 1u; i++) {
         uint64_t pct = (uint64_t)S.inflight_hist[i] * 100u / tt;
         if (S.inflight_hist[i]) cdc_out_printf(" %u:%lu%%", i, (unsigned long)pct);
     }

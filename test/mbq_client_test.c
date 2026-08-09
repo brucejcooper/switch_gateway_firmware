@@ -66,7 +66,7 @@ void cdc_out_printf(const char *fmt, ...) {
 #define RESPQ_DEPTH 4u
 #define SLAVE 3u
 
-typedef struct { uint8_t cmd[3], len, seq; bool used; } gwcmd_t;
+typedef struct { uint8_t cmd[3], len, seq, flags; bool used; } gwcmd_t;
 typedef struct { uint8_t seq, status, resp8; } gwres_t;
 
 static struct {
@@ -80,6 +80,9 @@ static struct {
     bool     illegal_fc;     /* pre-v4 gateway: exception 0x01 to FC 0x41 */
     int      short_replies;  /* answer this many requests one byte short */
     uint32_t accepts, acks, afulls;
+    uint32_t reqs;               /* every FC 0x41 request that reached us */
+    uint64_t exec_until;         /* when the executing command finishes, 0 = idle */
+    bool     dali_running;       /* run the DALI side on a timer (throughput test) */
     uint32_t acks_piggybacked;   /* acks applied by a request that also enqueued */
     const char *ver;             /* what FC04 0x0200 reports */
 } GW;
@@ -87,7 +90,7 @@ static struct {
 static void gw_boot(bool cold) {
     memset(GW.cq, 0, sizeof GW.cq);
     memset(GW.rq, 0, sizeof GW.rq);
-    GW.cq_n = 0; GW.rq_n = 0; GW.next_seq = 1;
+    GW.cq_n = 0; GW.rq_n = 0; GW.next_seq = 1; GW.exec_until = 0;
     if (cold) GW.boot_count = 1; else GW.boot_count++;
 }
 static void gw_reset_all(void) {
@@ -129,6 +132,7 @@ bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
                    uint8_t payload_len, modbus_action_cb_t cb, void *ctx) {
     PEND.armed = true; PEND.cb = cb; PEND.ctx = ctx;
     if (!GW.present) { no_reply(); return true; }
+    GW.reqs++;
     if (GW.illegal_fc) {
         uint8_t e[5] = { (uint8_t)dev, 0xC1u, 0x01u, 0, 0 };
         reply(e, 5);
@@ -156,6 +160,7 @@ bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
             gwcmd_t *c = &GW.cq[GW.cq_n++];
             memcpy(c->cmd, payload, payload_len);
             c->len = payload_len;
+            c->flags = (uint8_t)(ctl & 0xE0u);
             c->seq = GW.next_seq;
             GW.next_seq = (GW.next_seq >= 31u) ? 1u : (uint8_t)(GW.next_seq + 1u);
             GW.accepts++;
@@ -203,12 +208,32 @@ bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
     return true;
 }
 
+/* The gateway's DALI side: execute the head of the command queue for a real
+ * frame time and push its result. Only used by the throughput test — the rule
+ * tests drive completion explicitly so their ordering is exact. Frame times are
+ * task-07's measurements, the same ones the client paces against. */
+static void gw_dali_tick(void) {
+    if (GW.cq_n == 0) { GW.exec_until = 0; return; }
+    if (GW.rq_n >= RESPQ_DEPTH) return;          /* backpressure: arbiter stalls */
+    if (GW.exec_until == 0) {
+        uint32_t ms = (GW.cq[0].flags & MBQ_QF_DTR0)   ? 50u
+                    : (GW.cq[0].flags & MBQ_QF_ANSWER) ? 40u : 25u;
+        GW.exec_until = g_now_us + (uint64_t)ms * 1000u;
+        return;
+    }
+    if (g_now_us >= GW.exec_until) {
+        gw_complete(0u, GW.cq[0].cmd[1]);        /* answer echoes the opcode */
+        GW.exec_until = 0;
+    }
+}
+
 /* Run one main-loop iteration: deliver any armed reply, then tick the client.
  * Time advances by a millisecond per iteration, because the client's pacing
  * timers are real and a loop that never advanced the clock would deadlock
  * against them exactly as a frozen main loop would. */
 static void pump(void) {
     advance_ms(1);
+    if (GW.dali_running) gw_dali_tick();
     if (PEND.armed) {
         PEND.armed = false;
         modbus_action_cb_t cb = PEND.cb;
@@ -755,6 +780,164 @@ int main(void) {
         gw_complete(0u, 0x2Au);
         run_ms(104);
         CHECK(a.n == 1 && a.resp == 0x2Au);
+    }
+
+    /* ── 12b. Every §4 path must TERMINATE when the gateway stops answering.
+     *      A command whose callback never fires does not merely go missing:
+     *      dali_queue releases its pending record only on that callback, so
+     *      the slave's whole DALI queue wedges until the controller reboots. */
+    begin("recovery terminates when the gateway goes away");
+    {
+        establish_baseline();
+        cap_t a = {0}, b = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &b));
+        pump();
+        gw_complete(0u, 0x05u);
+        CHECK(run_until_delivered(&b, 200));     /* an ack is now pending */
+
+        GW.present = false;                      /* ...and now it is gone for good */
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, false, cap_cb, &a));
+        run_ms(3000);
+        CHECK(a.n == 1);                         /* resolved, not left hanging */
+        CHECK(a.r == MBQ_R_LOST);
+        CHECK(mbq_client_inflight(SLAVE) == 0);
+    }
+
+    /* ── 12c. ...and it must do so without spinning. An unanswerable command
+     *      previously produced one transaction per main-loop pass, which is
+     *      not only wasted bus but a §6 diagnostic rendered unreadable: 29 852
+     *      "deadline expiries" for a single command makes the counter that
+     *      gate V2 reads to identify a reboot completely useless. */
+    begin("an unanswerable command neither spins nor floods the counters");
+    {
+        cap_t a = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &a));
+        pump();                                  /* accepted, then silence */
+        GW.present = false;
+        uint32_t reqs_before = GW.reqs;
+        run_ms(5000);
+        /* Nothing reaches an absent gateway, so count what the client TRIED to
+         * send by its own accounting instead. */
+        uint32_t txns = stats().enqueues + stats().polls;
+        printf("  [spin] over 5 s: %u txns, %u deadlines, %u timeouts\n",
+               txns, stats().deadlines, stats().timeouts);
+        CHECK(stats().deadlines < 10u);          /* per command, not per pass */
+        CHECK(txns < 60u);                       /* backoff, not a main-loop spin */
+        CHECK(GW.reqs == reqs_before);
+        GW.present = true;
+    }
+
+    /* ── 12d. A_FULL's reply is SEVEN bytes — the shape follows the REQUEST,
+     *      not the outcome. A parser that sized the reply off the accept
+     *      status would break only on the A_FULL path, which is the canary
+     *      path and so the one you least want also broken. */
+    begin("A_FULL still returns the 7-byte enqueue reply shape");
+    {
+        cap_t a = {0}, b = {0}, c = {0};
+        CHECK(submit(CMD_SET, true, &a));
+        CHECK(submit(CMD_SET, true, &b));
+        CHECK(GW.cq_n == CMDQ_DEPTH);
+        /* Force the third past the client's own admission gate, which is
+         * exactly what A_FULL exists to catch. */
+        int i = 0;
+        for (; i < 200 && !mbq_client_can_submit(SLAVE); i++) pump();
+        CHECK(i < 200);
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &c));
+        pump();
+        CHECK(GW.afulls == 1);
+        CHECK(stats().afull == 1);
+        CHECK(stats().proto_errors == 0);        /* the 7-byte reply parsed fine */
+        CHECK(stats().incompatible == false);
+        uint32_t accepts_before = GW.accepts;
+        gw_complete(0u, 0x01u);
+        gw_complete(0u, 0x01u);
+        /* Stay inside c's result deadline, or the R4 chase legitimately resends
+         * it again and the count stops meaning "retried once". */
+        run_ms(100);
+        CHECK(a.n == 1 && b.n == 1);
+        CHECK(GW.accepts == accepts_before + 1); /* held and retried, never dropped */
+        gw_complete(0u, 0x01u);
+        run_ms(100);
+        CHECK(c.n == 1);
+    }
+
+    /* ── 12e. THE MESSY COMBINATION: a reboot with commands actually in
+     *      flight, which is where gate V2's intermittent mis-attribution
+     *      lived. The rule tests above each drive one rule in isolation; this
+     *      one asserts the two properties that matter together — no result is
+     *      delivered to the wrong command, and nothing is left outstanding. */
+    begin("reboot with commands in flight: no mis-attribution, nothing stranded");
+    {
+        establish_baseline();
+        cap_t a = {0}, b = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, false, cap_cb, &a));
+        pump();
+        run_ms(10);
+        if (mbq_client_can_submit(SLAVE)) {
+            CHECK(mbq_client_submit(SLAVE, CMD_QUERY, false, cap_cb, &b));
+            pump();
+        }
+        CHECK(GW.cq_n >= 1);
+
+        gw_boot(false);                          /* everything in flight vanishes */
+        run_ms(MBQ_RESULT_DEADLINE_MS + 400u);
+
+        /* Neither command may come back with an answer: their results died with
+         * the epoch, and inventing one is the misattribution class v4 exists to
+         * eliminate. */
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_LOST || a.r == MBQ_R_RESULT_LOST);
+        if (b.n) CHECK(b.r == MBQ_R_LOST || b.r == MBQ_R_RESULT_LOST);
+        CHECK(mbq_client_inflight(SLAVE) == 0);  /* nothing stranded */
+        CHECK(stats().pred_faults == 0);
+        /* The reboot must be attributed to a rule, not merely survived — gate
+         * V2 reads this split to say HOW it was noticed. */
+        CHECK(stats().reboots_r2 + stats().reboots_r3 + stats().reboots_r4 >= 1u);
+    }
+
+    /* ── 13. THE NUMBER THIS PROTOCOL EXISTS TO HIT: one Modbus transaction
+     *      per DALI frame. A steady producer, a gateway executing at real
+     *      frame times, and every transaction should be an enqueue that also
+     *      carries the ack collecting the previous result. The first bench
+     *      build measured 2.04 transactions per command here — correct, fast
+     *      enough to look fine, and burning the entire benefit of the design —
+     *      so this is a RATE assertion, not a correctness one (task-07's
+     *      lesson: validate rate, not just correctness). ─────────────────── */
+    begin("steady state costs one transaction per DALI frame");
+    {
+        GW.dali_running = true;
+        static cap_t caps[64];
+        memset(caps, 0, sizeof caps);
+        uint32_t submitted = 0, done = 0, bad = 0;
+        uint32_t reqs_before = GW.reqs;
+
+        for (int i = 0; i < 4000 && submitted < 40u; i++) {
+            if (mbq_client_can_submit(SLAVE)) {
+                /* Alternate the two command classes, as the soak does. */
+                const uint8_t *c = (submitted & 1u) ? CMD_QUERY : CMD_SET;
+                if (mbq_client_submit(SLAVE, c, true, cap_cb, &caps[submitted]))
+                    submitted++;
+            }
+            pump();
+        }
+        for (int i = 0; i < 2000; i++) pump();   /* drain */
+
+        for (uint32_t i = 0; i < submitted; i++) {
+            if (caps[i].n == 1) done++;
+            if (caps[i].n != 1 || caps[i].r == MBQ_R_LOST) bad++;
+        }
+        uint32_t reqs = GW.reqs - reqs_before;
+        printf("  [rate] %u commands, %u transactions = %u.%02u txns/command\n",
+               submitted, reqs, reqs / submitted,
+               (reqs * 100u / submitted) % 100u);
+        CHECK(submitted == 40u);
+        CHECK(done == submitted);
+        CHECK(bad == 0);
+        CHECK(stats().afull == 0);          /* the estimate never ran early */
+        /* 1.0 is the target; anything at or above 1.5 means the collecting
+         * poll came back, which is the defect this test exists to catch. */
+        CHECK(reqs * 100u / submitted < 130u);
+        GW.dali_running = false;
     }
 
     if (!fail) printf("PASS: all mbq_client checks passed\n");

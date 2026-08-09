@@ -76,11 +76,37 @@ enum { H_OK = 0u, H_FAILED = 1u };       /* head-entry status  */
 #define EST_QUERY_MS     40u
 #define EST_DTR0_MS      50u
 
+/* Deliberate bias, and the direction matters (spec §5): an estimate that runs
+ * LATE costs a little latency, one that runs EARLY costs an A_FULL and a whole
+ * wasted transaction, which lands straight back at two transactions per DALI
+ * frame. So the estimate is padded, and A_FULL pushes it out further still. */
+#define EST_MARGIN_MS     4u
+#define EST_AFULL_PUSH_MS 12u
+
 #define PACE_MIN_MS       2u    /* floor, so an estimate that has already passed
                                  * still yields to the rest of the main loop   */
-#define PACE_FAIL_MS      5u    /* after a transaction that got no reply        */
-#define PACE_DOWN_MS   1000u    /* ...once the link looks dead (below)          */
+#define PACE_FAIL_MS      5u    /* first backoff after a transaction that failed */
+#define PACE_DOWN_MS   1000u    /* backoff ceiling once the link looks dead      */
 #define LINK_DOWN_FAILS   3u
+
+/* Grace given to the SCHEDULER before the client spends a transaction on a
+ * poll. When the oldest command comes due, the right next transaction is
+ * "enqueue the next command + ack the old result" — one frame doing both — but
+ * only the scheduler above knows whether there is a command to send. dq_tick
+ * drives this client BEFORE its own ship loop, so without a grace the client
+ * always wins that race and polls, and the enqueue then costs a second
+ * transaction. That is the 2.04-transactions-per-command defect. A couple of
+ * milliseconds is thousands of main-loop iterations; if no command appears in
+ * that window the backlog really is empty and the poll is the right call. */
+#define PACE_YIELD_MS     2u
+
+/* How many times one command's expired result deadline may be chased with a
+ * poll before escalating to the cold-path boot_count arbiter. Without a bound,
+ * a gateway that has stopped answering is re-polled on every main-loop pass:
+ * measured 29 852 "deadline expiries" for a single command in 30 s, which is
+ * not just wasted bus but a §6 diagnostic rendered unreadable exactly when it
+ * is needed. */
+#define MAX_DEADLINE_CHASES 3u
 
 /* A command may go back on the wire this many times (A_FULL retries excluded,
  * they are not resends of a landed command) before the client gives up and
@@ -125,6 +151,7 @@ typedef struct {
     uint8_t  st;                   /* cmd_state_t */
     uint8_t  seq;                  /* gateway-assigned; 0 until accepted */
     uint8_t  resends;
+    uint8_t  chases;               /* deadline polls spent on this command */
     bool     pred;                 /* seq was PREDICTED by R1, not read from an
                                     * accept byte — must be verified when its
                                     * result surfaces (spec §4) */
@@ -153,6 +180,19 @@ typedef enum {
 
 typedef enum { TX_QUEUE = 0, TX_SYSINFO, TX_VERSION } tx_kind_t;
 
+/* The client holds ONE MORE command than the gateway's queue is deep, and that
+ * extra slot is what buys the one-transaction-per-DALI-frame steady state.
+ *
+ * The transaction v4 exists to make possible acks the oldest result AND
+ * enqueues the next command in one frame. At the instant that request is
+ * BUILT, the master has not yet collected the oldest result — so if the local
+ * array were only CMDQ_DEPTH deep there would be nowhere to put the new
+ * command and the master would have to spend a whole separate transaction
+ * collecting first. That is exactly the 2.04-transactions-per-command the
+ * first bench run measured. The extra slot is not extra queue depth: gateway
+ * occupancy is still capped at CMDQ_DEPTH by gw_occupancy() below. */
+#define MBQ_CMD_SLOTS  (CMDQ_DEPTH + 1u)
+
 #define NO_CMD 0xFFu
 
 typedef struct {
@@ -161,7 +201,7 @@ typedef struct {
     uint8_t  st;                /* mbq_state_t */
     bool     busy;              /* a transaction is on the wire */
 
-    cmd_t    cmd[CMDQ_DEPTH];
+    cmd_t    cmd[MBQ_CMD_SLOTS];
 
     /* What the in-flight request was, so its reply can be interpreted. */
     uint8_t  tx_kind;           /* tx_kind_t */
@@ -203,6 +243,7 @@ typedef struct {
      * when awaiting results with an empty backlog", and a submit is neither). */
     uint64_t next_at_us;
     uint64_t poll_at_us;
+    uint64_t poll_yield_us;     /* grace given to the scheduler before polling */
 
     /* Modbus completion hand-off (resolved in tick, not in the callback). */
     volatile bool cb_fired;
@@ -249,7 +290,7 @@ static uint32_t est_ms(const uint8_t cmd[MBQ_CMD_BYTES]) {
 
 static cmd_t *cmd_by_seq(slave_t *s, uint8_t seq) {
     if (seq == 0) return NULL;
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++)
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
         if (s->cmd[i].st == CMD_ACCEPTED && s->cmd[i].seq == seq) return &s->cmd[i];
     return NULL;
 }
@@ -265,30 +306,78 @@ static bool seq_tracked(slave_t *s, uint8_t seq) {
 
 static uint8_t count_state(const slave_t *s, cmd_state_t st) {
     uint8_t n = 0;
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) if (s->cmd[i].st == st) n++;
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) if (s->cmd[i].st == st) n++;
     return n;
 }
 
 static uint8_t find_state(const slave_t *s, cmd_state_t st) {
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) if (s->cmd[i].st == st) return i;
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) if (s->cmd[i].st == st) return i;
     return NO_CMD;
 }
 
 static cmd_t *find_pred_bound(slave_t *s) {
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++)
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
         if (s->cmd[i].st == CMD_ACCEPTED && s->cmd[i].pred) return &s->cmd[i];
     return NULL;
 }
 
 static uint8_t inflight_count(const slave_t *s) {
     uint8_t n = 0;
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) if (s->cmd[i].st != CMD_FREE) n++;
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) if (s->cmd[i].st != CMD_FREE) n++;
     return n;
+}
+
+/* Commands the client believes are still OCCUPYING A GATEWAY COMMAND SLOT.
+ *
+ * This, not "accepts minus results", is what the in-flight cap has to be
+ * measured against. The gateway frees a command slot the moment the command
+ * COMPLETES; the result then sits in the response queue, which is a different
+ * resource with its own depth. So a command whose estimated completion has
+ * passed no longer occupies a command slot even though the master has not read
+ * its result yet — and admitting one more command at that point is precisely
+ * what lets a single transaction ack the old result and enqueue the new one.
+ *
+ * The estimate is deliberately conservative in the safe direction: it is
+ * anchored at the moment the ACCEPT REPLY was parsed, roughly half a
+ * transaction after the gateway really began executing, so it runs late. Late
+ * costs a little latency; early costs an A_FULL and a wasted transaction. */
+static uint8_t gw_occupancy(const slave_t *s) {
+    uint64_t now = MBQ_NOW_US();
+    uint8_t n = 0;
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
+        const cmd_t *c = &s->cmd[i];
+        if (c->st == CMD_PENDING || c->st == CMD_SENDING) n++;
+        else if (c->st == CMD_ACCEPTED && now < c->est_done_us) n++;
+    }
+    return n;
+}
+
+/* True if the client would accept a new command this instant, ignoring
+ * whether one is on the wire. drive() consults this to decide whether to yield
+ * a transaction slot to the scheduler instead of spending it on a poll. */
+static bool submit_room(const slave_t *s) {
+    return gw_occupancy(s) < CMDQ_DEPTH && find_state(s, CMD_FREE) != NO_CMD;
 }
 
 static void pace(slave_t *s, uint32_t ms) {
     if (ms < PACE_MIN_MS) ms = PACE_MIN_MS;
     s->next_at_us = MBQ_NOW_US() + (uint64_t)ms * 1000u;
+}
+
+/* Back off after a transaction that produced no answer, doubling with each
+ * consecutive failure up to PACE_DOWN_MS.
+ *
+ * The flat retry this replaces was the worse half of a measured defect: when
+ * the transport REFUSES an action outright (slave in backoff, action queue
+ * full) the callback fires immediately, so "wait 5 ms then retry" became a
+ * main-loop-speed spin — 8785 transactions in one bench reboot drill, at
+ * 1.6 ms average against a 50 ms wire timeout. A refusal is not a timeout and
+ * a spin is not a retry; both need the same gate, and it has to grow. */
+static void pace_backoff(slave_t *s) {
+    uint32_t ms = PACE_FAIL_MS;
+    for (uint16_t i = 1; i < s->c_consec_fail && ms < PACE_DOWN_MS; i++) ms <<= 1;
+    if (ms > PACE_DOWN_MS) ms = PACE_DOWN_MS;
+    pace(s, ms);
 }
 
 /* When the OLDEST in-flight command is estimated to finish (spec §5) — the
@@ -298,7 +387,7 @@ static void pace(slave_t *s, uint32_t ms) {
  * the main loop. */
 static uint64_t oldest_done_at(const slave_t *s) {
     uint64_t now = MBQ_NOW_US(), target = 0;
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) {
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
         if (s->cmd[i].st != CMD_ACCEPTED) continue;
         if (target == 0 || s->cmd[i].est_done_us < target) target = s->cmd[i].est_done_us;
     }
@@ -353,7 +442,7 @@ static void resend_or_lose(slave_t *s, cmd_t *c, mbq_result_t give_up_as) {
  * this is the only observable that bears on it. */
 static void dispose_tracked(slave_t *s, const cmd_t *keep) {
     uint64_t now = MBQ_NOW_US();
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) {
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
         cmd_t *c = &s->cmd[i];
         if (c == keep) continue;
         if (c->st != CMD_ACCEPTED && c->st != CMD_SENDING) continue;
@@ -400,7 +489,7 @@ static void latch_incompatible(slave_t *s, const char *why) {
     LOG_ERR("mbq", "slave %u INCOMPATIBLE (%s) — queue disabled. Controller and "
             "gateway are a matched set (queue v4); reflash the gateway.",
             s->slave_id, why);
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++)
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
         if (s->cmd[i].st != CMD_FREE) deliver(s, &s->cmd[i], MBQ_R_LOST, 0);
 }
 
@@ -528,6 +617,8 @@ static bool parse_reply(const slave_t *s, const uint8_t *b, uint8_t n, reply_t *
     return true;
 }
 
+static void completion_reanchor(slave_t *s);
+
 /* ── head processing ─────────────────────────────────────────────────────── */
 
 /* Apply the head field of a reply. Returns true if a reboot was inferred here
@@ -564,9 +655,11 @@ static bool apply_head(slave_t *s, const reply_t *r) {
          * the master calculated rather than read, and this is where that
          * calculation is confirmed against the gateway. */
         c->pred = false;
+        s->tx_deadline_seq = 0;
         if (r->hstatus == H_OK) deliver(s, c, MBQ_R_COMPLETE, r->resp8);
         else                    deliver(s, c, MBQ_R_FAILED,   r->resp8);
         s->ack_pending = r->hseq;
+        completion_reanchor(s);
         return false;
     }
 
@@ -615,9 +708,11 @@ static bool apply_head(slave_t *s, const reply_t *r) {
 static void bind_accepted(slave_t *s, cmd_t *c, uint8_t seq, bool predicted) {
     uint64_t now = MBQ_NOW_US();
     /* Pipeline model for the pacing estimate: this command starts when the one
-     * ahead of it finishes, since the gateway executes strictly FIFO. */
+     * ahead of it finishes, since the gateway executes strictly FIFO. Chained
+     * estimates compound their errors, so completion_reanchor() below resets
+     * the chain against an OBSERVED completion whenever one arrives. */
     uint64_t start = now;
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) {
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
         cmd_t *o = &s->cmd[i];
         if (o == c || o->st != CMD_ACCEPTED) continue;
         if (o->est_done_us > start) start = o->est_done_us;
@@ -626,9 +721,33 @@ static void bind_accepted(slave_t *s, cmd_t *c, uint8_t seq, bool predicted) {
     c->pred        = predicted;
     c->st          = CMD_ACCEPTED;
     c->deadline_us = now + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
-    c->est_done_us = start + (uint64_t)est_ms(c->cmd) * 1000u;
+    c->est_done_us = start + (uint64_t)(est_ms(c->cmd) + EST_MARGIN_MS) * 1000u;
     s->last_seq    = seq;
     s->seq_known   = true;
+}
+
+/* A result just arrived, so the gateway has this instant moved on to the next
+ * command in accept order. Re-anchor the remaining estimates on that observed
+ * fact rather than leaving them chained off a bind time that may be several
+ * frames stale — chained estimates drift, and drifting EARLY is what provokes
+ * A_FULL. Ordering is by seq, which is accept order by construction. */
+static void completion_reanchor(slave_t *s) {
+    uint64_t at = MBQ_NOW_US();
+    for (;;) {
+        cmd_t *next = NULL;
+        for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
+            cmd_t *c = &s->cmd[i];
+            if (c->st != CMD_ACCEPTED) continue;
+            if (c->est_done_us <= at) continue;          /* already re-anchored */
+            if (!next || c->seq < next->seq) next = c;
+        }
+        if (!next) return;
+        at += (uint64_t)(est_ms(next->cmd) + EST_MARGIN_MS) * 1000u;
+        next->est_done_us = at;
+        /* Mark it done for this pass without another flag: the loop above skips
+         * anything whose estimate is no later than `at`, which now includes it. */
+        if (at <= MBQ_NOW_US()) return;
+    }
 }
 
 /* ── resolution: a queue reply arrived ───────────────────────────────────── */
@@ -657,9 +776,14 @@ static void resolve_queue_reply(slave_t *s, const reply_t *r) {
                     (unsigned long)s->stats.afull);
             c->st = CMD_PENDING;
             c->seq = 0;
-            /* Pace the retry: the queue is full because DALI is busy, and
-             * re-offering at main-loop speed would burn shared bus to be told
-             * so again. */
+            /* The gateway really was full, so the estimate that released this
+             * enqueue ran early. Push the oldest command's estimate out before
+             * re-offering — otherwise the retry is released by the same
+             * already-expired estimate and A_FULL repeats at main-loop speed. */
+            uint64_t push = MBQ_NOW_US() + (uint64_t)EST_AFULL_PUSH_MS * 1000u;
+            for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
+                if (s->cmd[i].st == CMD_ACCEPTED && s->cmd[i].est_done_us < push)
+                    s->cmd[i].est_done_us = push;
             s->next_at_us = oldest_done_at(s);
         } else if (r->astatus == A_ACCEPTED && r->aseq != 0) {
             /* R2: the gateway pins a seq until its result is acked, and acks are
@@ -841,7 +965,7 @@ static void resolve_sysinfo(slave_t *s, const uint8_t *b, uint8_t n) {
                  * Dispose only the command that timed out. */
                 LOG_WARN("mbq", "slave %u: result deadline expired with boot_count "
                          "unchanged (%u) — gateway wedge", s->slave_id, (unsigned)bc);
-                for (uint8_t i = 0; i < CMDQ_DEPTH; i++) {
+                for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
                     cmd_t *e = &s->cmd[i];
                     if (e->st == CMD_ACCEPTED && e->seq == s->tx_deadline_seq) {
                         if (e->idempotent) resend_or_lose(s, e, MBQ_R_LOST);
@@ -898,7 +1022,10 @@ static void bootchk_give_up(slave_t *s) {
     LOG_WARN("mbq", "slave %u: boot_count unreadable — disposing conservatively",
              s->slave_id);
     s->bc_valid = false;
-    if (s->bc_reason == BC_ACKLESS && s->rec_cmd != NO_CMD) {
+    if ((s->bc_reason == BC_ACKLESS || s->bc_reason == BC_R1_EMPTY)
+        && s->rec_cmd != NO_CMD) {
+        /* Both of these are "did this command run?" questions, and the arbiter
+         * that would have answered is unreachable. Assume it might have. */
         deliver(s, &s->cmd[s->rec_cmd], MBQ_R_LOST, 0);
         s->rec_cmd = NO_CMD;
     } else if (s->bc_reason == BC_R4) {
@@ -906,6 +1033,25 @@ static void bootchk_give_up(slave_t *s) {
     }
     s->tx_deadline_seq = 0;
     s->st = S_IDLE;
+}
+
+/* Every §4 path must terminate. The R1/R1' branch resolves in a single poll
+ * when the gateway answers at all — but if it has stopped answering, nothing
+ * in the branch itself ever gives up, and the command's callback never fires.
+ * That does not merely lose the command: dali_queue releases its pending
+ * record only on that callback, so the slave's DALI queue stays wedged until
+ * the controller reboots. Bound it with the same result deadline the ack-less
+ * branch already uses, and take the ordinary conservative disposition. */
+static void recovery_give_up(slave_t *s) {
+    cmd_t *c = (s->rec_cmd != NO_CMD) ? &s->cmd[s->rec_cmd] : NULL;
+    s->rec_cmd = NO_CMD;
+    s->st = S_IDLE;
+    if (!c || c->st != CMD_SENDING) return;
+    s->stats.deadlines++;
+    LOG_WARN("mbq", "slave %u: recovery for %02X%02X timed out unresolved — "
+             "disposing", s->slave_id, c->cmd[0], c->cmd[1]);
+    if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
+    else               deliver(s, c, MBQ_R_LOST, 0);
 }
 
 static void resolve_version(slave_t *s, const uint8_t *b, uint8_t n) {
@@ -960,9 +1106,8 @@ static void resolve_failure(slave_t *s) {
         return;
     }
 
-    uint32_t ms = (s->c_consec_fail >= LINK_DOWN_FAILS) ? PACE_DOWN_MS : PACE_FAIL_MS;
     bool link_down = (s->c_consec_fail >= LINK_DOWN_FAILS);
-    pace(s, ms);
+    pace_backoff(s);
 
     if (s->tx_kind == TX_VERSION) {
         s->st = S_DRAIN;   /* identification is advisory; do not block on it */
@@ -980,10 +1125,11 @@ static void resolve_failure(slave_t *s) {
 
     if (s->tx_cmd == NO_CMD) {
         /* A poll or ack-only frame. Idempotent by construction — re-acking a
-         * popped seq is a no-op — so there is nothing to resolve, just retry.
-         * Release any deadline chase it was carrying, or the command it was
-         * chasing would never be looked at again. */
-        s->tx_deadline_seq = 0;
+         * popped seq is a no-op — so there is nothing to resolve, just retry
+         * behind the backoff above. The deadline chase it may have been
+         * carrying stays claimed: clearing it here is what let the chase
+         * re-arm on every main-loop pass and count each pass as a fresh
+         * deadline expiry. The per-command chase budget releases it instead. */
         if (s->st == S_DRAIN && ++s->drain_polls >= DRAIN_MAX_POLLS) {
             LOG_WARN("mbq", "slave %u: no answer to the epoch drain — proceeding "
                      "without a clean epoch", s->slave_id);
@@ -1002,7 +1148,6 @@ static void resolve_failure(slave_t *s) {
     s->rec_ack         = s->tx_ack;
     s->rec_deadline_us = MBQ_NOW_US() + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
     s->st              = S_RECOVERY_POLL;
-    pace(s, PACE_MIN_MS);
 }
 
 /* ── the tick ────────────────────────────────────────────────────────────── */
@@ -1128,6 +1273,12 @@ static void drive(slave_t *s) {
             return;
 
         case S_RECOVERY_POLL:
+            /* Bounded. Every other §4 path terminates; without this one the
+             * client polls a gateway that has stopped answering forever, and
+             * the command's callback never fires — which permanently wedges
+             * the slave, because dali_queue's pending record is only released
+             * by that callback. */
+            if (now >= s->rec_deadline_us) { recovery_give_up(s); return; }
             if (now < s->next_at_us) return;
             s->stats.recovery_polls++;
             /* THE ONE EXCEPTION to always-piggyback (spec §5), and it is
@@ -1161,30 +1312,52 @@ static void drive(slave_t *s) {
         return;
     }
 
-    /* A result deadline that has expired: poll once, and if the result still
-     * is not there, escalate to boot_count (R4). */
-    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) {
+    /* A result deadline that has expired: chase it with a poll, and if the
+     * result still is not there, escalate to the boot_count arbiter (R4). The
+     * chase respects the backoff gate and has a per-command budget — the
+     * absence of both is what turned one unanswerable command into ~30 000
+     * transactions and an equal number of bogus deadline expiries. */
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
         cmd_t *c = &s->cmd[i];
         if (c->st != CMD_ACCEPTED || now < c->deadline_us) continue;
-        if (s->tx_deadline_seq == c->seq) continue;   /* already chasing this one */
-        s->stats.deadlines++;
+        if (c->chases >= MAX_DEADLINE_CHASES) {
+            /* Out of budget: stop asking and let boot_count decide. */
+            s->tx_deadline_seq = c->seq;
+            s->bc_reason = BC_R4;
+            s->st = S_BOOT_CHECK;
+            return;
+        }
+        if (now < s->next_at_us) return;
+        if (c->chases == 0) s->stats.deadlines++;   /* count the command, not the poll */
+        c->chases++;
         s->tx_deadline_seq = c->seq;
         if (issue_queue_txn(s, NO_CMD)) s->st = S_AWAIT_REPLY;
         return;
     }
 
-    /* Results outstanding, or an ack still to be delivered: poll, paced at the
-     * estimated completion of the oldest in-flight command. This is the "pace,
-     * don't spin" rule — the poll costs shared bus whether or not it starves
-     * anybody. */
+    /* Results outstanding, or an ack still to be delivered. Before spending a
+     * transaction on a poll, give the scheduler its chance: if there is room
+     * for another command, the right next transaction is an enqueue that
+     * carries the ack and collects the result in the same frame, and only the
+     * layer above knows whether a command is waiting. Polling here instead is
+     * what costs the second transaction per DALI frame. */
     if (count_state(s, CMD_ACCEPTED) > 0 || s->ack_pending != 0) {
         s->st = S_DEADLINE_WAIT;
         uint64_t at = (s->next_at_us > s->poll_at_us) ? s->next_at_us : s->poll_at_us;
-        if (now < at) return;
+        if (now < at) { s->poll_yield_us = 0; return; }
+        if (submit_room(s)) {
+            if (s->poll_yield_us == 0) {
+                s->poll_yield_us = now + (uint64_t)PACE_YIELD_MS * 1000u;
+                return;
+            }
+            if (now < s->poll_yield_us) return;   /* still the scheduler's turn */
+        }
+        s->poll_yield_us = 0;
         if (issue_queue_txn(s, NO_CMD)) s->st = S_AWAIT_REPLY;
         return;
     }
 
+    s->poll_yield_us = 0;
     s->st = S_IDLE;   /* nothing owed in either direction: no traffic at all */
 }
 
@@ -1238,7 +1411,9 @@ bool mbq_client_can_submit(uint8_t slave_id) {
     if (s->busy) return false;
     if (s->st != S_IDLE && s->st != S_DEADLINE_WAIT) return false;
     if (find_state(s, CMD_PENDING) != NO_CMD) return false;
-    return find_state(s, CMD_FREE) != NO_CMD;
+    /* Admission is against ESTIMATED GATEWAY OCCUPANCY, not against how many
+     * commands the client is holding — see gw_occupancy(). */
+    return submit_room(s);
 }
 
 bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
@@ -1299,7 +1474,20 @@ void mbq_client_stats(uint8_t slave_id, mbq_stats_t *out) {
     if (!out) return;
     memset(out, 0, sizeof *out);
     slave_t *s = slave_for(slave_id);
-    if (s) *out = s->stats;
+    if (!s) return;
+    *out = s->stats;
+    /* Live figures rather than counters. respq_est is the controller's view of
+     * how much of the gateway's response queue is occupied: a command past its
+     * estimated completion has produced a result, and until the master reads
+     * and acks it that result is sitting in the response queue. It reads ~1 in
+     * steady state and climbs under `mbq no-ack`, which is what makes the
+     * backpressure drill legible from this side. */
+    uint64_t now = MBQ_NOW_US();
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
+        if (s->cmd[i].st == CMD_ACCEPTED && now >= s->cmd[i].est_done_us)
+            out->respq_est++;
+    out->unacked = (s->ack_pending != 0) ? 1u : 0u;
+    if (s->ack_pending != 0) out->respq_est++;
 }
 
 uint16_t mbq_client_consec_fail(uint8_t slave_id) {
@@ -1361,11 +1549,14 @@ void mbq_client_debug_print(int slave_id) {
                        s->slave_id, state_name(s->st), s->busy ? " (on wire)" : "",
                        s->gw_major, s->gw_minor, s->stats.boot_count,
                        s->epoch_clean ? "" : " EPOCH-UNCLEAN");
-        cdc_out_printf("  ack_pending=%u head=%u last_seq=%u%s\n",
+        mbq_stats_t live;
+        mbq_client_stats(s->slave_id, &live);
+        cdc_out_printf("  ack_pending=%u head=%u last_seq=%u%s  respq~%u occupancy=%u/%u\n",
                        s->ack_pending, s->last_head, s->last_seq,
-                       s->seq_known ? "" : " (unknown)");
+                       s->seq_known ? "" : " (no baseline)",
+                       live.respq_est, gw_occupancy(s), CMDQ_DEPTH);
         cdc_out_printf("  commands:");
-        for (uint8_t k = 0; k < CMDQ_DEPTH; k++)
+        for (uint8_t k = 0; k < MBQ_CMD_SLOTS; k++)
             cdc_out_printf(" %u:%s/seq%u", k, cmd_state_name(s->cmd[k].st), s->cmd[k].seq);
         cdc_out_printf("\n");
         cdc_out_printf("  txns: %lu enqueue + %lu poll (%lu recovery), %lu timeout, "

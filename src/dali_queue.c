@@ -66,7 +66,14 @@
  * enqueue is its own frame and needs no free slot in advance, so a class may
  * fill the queue completely — that retired constraint is what buys the
  * one-transaction-per-DALI-frame steady state. */
-#define DQ_INFLIGHT_MAX  CMDQ_DEPTH
+/* ONE MORE than the gateway's queue depth. The extra is not extra queue: it is
+ * the command that rides the transaction which also collects the oldest
+ * result, and without it that collection needs a transaction of its own —
+ * measured 2.04 Modbus transactions per DALI frame on the first bench run,
+ * worse than the FC23 path it replaced. The client caps real gateway occupancy
+ * at CMDQ_DEPTH itself (mbq_client's gw_occupancy), so this cannot overfill
+ * the gateway; it only stops the scheduler starving the pipeline. */
+#define DQ_INFLIGHT_MAX  (CMDQ_DEPTH + 1u)
 
 /* Gateway-slot depth per class, bounded by DQ_INFLIGHT_MAX (2): one EXECUTING,
  * one NEXT. The ladder still means something at that size — what matters is
@@ -77,7 +84,7 @@
 #define DQ_DEPTH_USER    DQ_INFLIGHT_MAX   /* user work may fill the queue */
 #define DQ_DEPTH_CFG     DQ_INFLIGHT_MAX
 #define DQ_DEPTH_READ    DQ_INFLIGHT_MAX   /* verification reads: an outcome to HA */
-#define DQ_DEPTH_BG      1u                /* background never gets deeper than this */
+#define DQ_DEPTH_BG      CMDQ_DEPTH        /* background never gets the pipeline slot */
 _Static_assert(DQ_DEPTH_USER <= DQ_INFLIGHT_MAX && DQ_DEPTH_CFG <= DQ_INFLIGHT_MAX &&
                DQ_DEPTH_READ <= DQ_INFLIGHT_MAX && DQ_DEPTH_BG <= DQ_INFLIGHT_MAX,
                "no class may exceed the gateway's command-queue depth");

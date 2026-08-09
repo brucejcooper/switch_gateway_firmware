@@ -65,7 +65,12 @@
  * values 0x01/0x02/0x04 — dali_queue's DQ_* aliases point here so the command
  * byte the producer builds IS the wire flags byte and nothing translates in
  * between. Getting this wrong does not fail loudly; it silently changes the
- * meaning of every command. */
+ * meaning of every command.
+ *
+ * PEER DEFINITION: TinyModbus/src/fc41.h. These constants and the status codes
+ * below are mirrored there for the gateway, in a separate repo — so nothing
+ * makes them agree except this note. Change one, change the other; the spec
+ * (QUEUE-PROTOCOL.md §1) stays the authority for both. */
 #define MBQ_QF_TWICE   0x80u   /* send the forward frame twice; no answer expected */
 #define MBQ_QF_DTR0    0x40u   /* emit 0xA3 <dtr0> back-to-back BEFORE the frame */
 #define MBQ_QF_ANSWER  0x20u   /* a backward frame is expected; capture the answer */
@@ -187,6 +192,12 @@ typedef struct {
                                * use — a DETECTED mis-binding, never silent    */
     uint32_t orphans;         /* results discarded as a previous controller
                                * epoch's leftovers (no-baseline state)         */
+    uint8_t  respq_est;       /* commands believed finished but whose result
+                               * has not been read — the controller's estimate
+                               * of gateway response-queue occupancy, which is
+                               * what climbs during the `no-ack` backpressure
+                               * drill                                         */
+    uint8_t  unacked;         /* results consumed but not yet proven popped    */
     uint32_t deadlines;       /* result deadlines that expired               */
     uint32_t afull;           /* A_FULL accept bytes (gateway queue full)    */
     uint32_t completed, failed;
