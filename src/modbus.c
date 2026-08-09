@@ -11,6 +11,7 @@
  */
 
 #include "modbus.h"
+#include "mbq_client.h"   /* MBQ_CMD_BYTES — FC65 payload size */
 #include "config.h"
 #include "log.h"
 #include "hardware/gpio.h"
@@ -71,6 +72,13 @@ typedef enum {
     ACTION_SET_HOLDING_REGISTER  = 0x06,
     ACTION_WRITE_MULTI_REG       = 0x10,   /* new: FC16 Write Multiple Registers */
     ACTION_READ_WRITE_MULTI_REG  = 0x17,   /* new: FC23 Read/Write Multiple Registers */
+    /* User-defined codes for the DALI command queue. MODBUS Application Protocol
+     * V1.1b reserves 65-72 and 100-110 for exactly this, so they are conformant
+     * rather than an extension of the standard set — ordinary RTU framing, CRC,
+     * t3.5 silence and exception replies; only the payload shape is ours.
+     * See TinyModbus/src/modbus.c FC_MBQ_ENQUEUE for the rationale. */
+    ACTION_MBQ_ENQUEUE           = 0x41,   /* FC65: enqueue 1 cmd anywhere + status */
+    ACTION_MBQ_STATUS            = 0x42,   /* FC66: status only */
 } modbus_action_type_t;
 
 /* Largest register block any FC16/FC23 write carries here is the gateway's
@@ -525,6 +533,18 @@ static void start_action_tx(void) {
         for (uint8_t i = 0; i < currentAction.wr_len; i++)
             buf[11 + i] = currentAction.wr_payload[i];
         sz = 11u + currentAction.wr_len;
+    } else if (currentAction.action == ACTION_MBQ_ENQUEUE) {
+        /* FC65: dev, fc, cmd[4]. No addresses or counts — the gateway picks the
+         * slot and the status block it returns is always the whole thing. */
+        buf[0] = currentAction.device;
+        buf[1] = currentAction.action;
+        for (uint8_t i = 0; i < MBQ_CMD_BYTES; i++)
+            buf[2 + i] = currentAction.wr_payload[i];
+        sz = 2u + MBQ_CMD_BYTES;
+    } else if (currentAction.action == ACTION_MBQ_STATUS) {
+        buf[0] = currentAction.device;   /* FC66: dev, fc — nothing else to say */
+        buf[1] = currentAction.action;
+        sz = 2;
     } else {
         buf[0] = currentAction.device;
         buf[1] = currentAction.action;
@@ -884,6 +904,20 @@ bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
  * at wr_addr (data = big-endian bytes), THEN reads rd_count registers at rd_addr;
  * the response carries the post-write read block.  wr_count may be 0 for a
  * read-only FC23 (some slaves reject that; the gateway accepts it). */
+bool modbus_mbq_enqueue(uint8_t dev, const uint8_t cmd[MBQ_CMD_BYTES],
+                        modbus_action_cb_t cb, void *ctx) {
+    modbus_action_t a = { .action = ACTION_MBQ_ENQUEUE, .device = dev,
+                          .wr_len = MBQ_CMD_BYTES, .callback = cb, .ctx = ctx };
+    memcpy(a.wr_payload, cmd, MBQ_CMD_BYTES);
+    return enqueue(&a);
+}
+
+bool modbus_mbq_status(uint8_t dev, modbus_action_cb_t cb, void *ctx) {
+    modbus_action_t a = { .action = ACTION_MBQ_STATUS, .device = dev,
+                          .callback = cb, .ctx = ctx };
+    return enqueue(&a);
+}
+
 bool modbus_read_write_multiple_registers(uint8_t dev,
                                           uint16_t rd_addr, uint16_t rd_count,
                                           uint16_t wr_addr, uint16_t wr_count,

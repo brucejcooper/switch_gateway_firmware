@@ -1,5 +1,6 @@
 #pragma once
 #include <stdbool.h>
+#include "mbq_client.h"   /* MBQ_CMD_BYTES */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -110,6 +111,14 @@ bool modbus_set_holding_register(uint8_t device_id, uint16_t addr,
 bool modbus_get_input_registers(uint8_t device_id, uint16_t addr,
                                  uint16_t count,
                                  modbus_action_cb_t cb, void *ctx);
+
+/* FC65 / FC66 — the DALI command queue's own function codes. FC65 hands the
+ * gateway one command and lets IT choose the slot, so the master never has to
+ * know a slot is free in advance; both return the whole status block. See
+ * TinyModbus/src/modbus.c for why this exists. */
+bool modbus_mbq_enqueue(uint8_t dev, const uint8_t cmd[MBQ_CMD_BYTES],
+                        modbus_action_cb_t cb, void *ctx);
+bool modbus_mbq_status(uint8_t dev, modbus_action_cb_t cb, void *ctx);
 
 bool modbus_read_write_multiple_registers(uint8_t device_id,
                                           uint16_t rd_addr, uint16_t rd_count,
