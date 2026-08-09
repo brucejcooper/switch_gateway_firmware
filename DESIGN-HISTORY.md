@@ -32,13 +32,44 @@ is a pipe for opaque commands.
 
 `0x1F02`/`0x1F03` (slave address, baud index) were relocated from `0x1012`/`0x1013`.
 
-## The command queue was an id ledger
+## The command queue was an id ledger, then a slot mirror
 
-v1 inferred a command's fate from accept/complete counters and a hashed result
-ring, reconstructed after any disruption. Every recovery-corruption bug was that
-reconstruction being subtly wrong. Replaced by self-describing slots: the master
-reads a command's fate rather than inferring it. No ledger, no
-resync/rebuild/rollback.
+**v1** inferred a command's fate from accept/complete counters and a hashed
+result ring, reconstructed after any disruption. Every recovery-corruption bug
+was that reconstruction being subtly wrong.
+
+**v2** replaced it with self-describing slots the master could read directly —
+no ledger, no resync/rebuild/rollback. But FC23 makes the master *name* the
+register it writes, so it could only submit into a slot it already knew was
+free, and it learned that from a read. Every DALI frame cost a poll that
+carried no work, then a submit: measured **1.73 Modbus transactions per command
+and 99 % RS-485 occupancy** for one saturated gateway. The client also kept an
+*optimistic mirror* of the gateway's slots, and reconciling that mirror against
+reality after a reboot or a lost reply is where task 04 spent three fix cycles.
+
+**v4** (task 08) removes both the poll and the mirror. The gateway chooses the
+slot and retains each result until the master acks it, so one transaction acks
+the previous result, collects the next and enqueues one command — **1.03
+transactions per command, 37 % occupancy**, at unchanged throughput.
+Correlation is a gateway-assigned sequence carried in the reply, so there is
+nothing on the master to reconstruct: `mbq_client` holds no mirror, and
+`resolve_ambiguous()` and the whole "idle means gone" inference are gone with
+it. Recovery is five rules (R1/R1′/R2/R3/R4) applied to observations, not a
+rebuild.
+
+`docs/modbus-command-queue.md`, the standalone specification of v2's generic
+slot pattern, was deleted in task 08 — its subject no longer exists. The
+normative reference for both halves is now `../TinyModbus/QUEUE-PROTOCOL.md`.
+
+### What the v4 bring-up cost, and the lesson
+
+Three separate defects shipped a **clean soak verdict at full throughput**
+while being badly wrong: the client polled instead of pacing (2.04
+transactions per command — worse than the v2 it replaced); the pacing estimate
+was anchored at reply-parse time rather than send time, costing 32 % of
+throughput; and a gateway reboot cascaded into thousands of spurious reboot
+declarations. **Correctness alone does not pass a queue change** — measure the
+transaction count and the bus occupancy, or a regression hides in a green run.
 
 ## Predicted state, and why it all went
 
