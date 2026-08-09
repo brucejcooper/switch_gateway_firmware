@@ -64,6 +64,7 @@ bool fw_json_get(const char *buf, const char *key, char *out, int cap) {
 #include "netif.h"
 #include "dns_resolve.h"
 #include "http_client.h"
+#include "log.h"          /* LOG_WARN — abort reasons */
 #include "ota.h"
 #include "version.h"   /* FW_VERSION — generated from git at build time */
 
@@ -83,6 +84,7 @@ bool fw_json_get(const char *buf, const char *key, char *out, int cap) {
 #endif
 
 #define FW_ACQUIRE_TIMEOUT_MS  5000u    /* bound on waiting for netif ready + socket 0 */
+#define FW_RETRY_MS           60000u    /* after an aborted check, try again this soon */
 #define FW_FETCH_TIMEOUT_MS   10000u    /* bound on the manifest GET completing */
 #define FW_BODY_CAP            1024u    /* manifest is documented as <1 KB */
 
@@ -105,6 +107,13 @@ static struct {
     uint32_t   body_len;
     bool       pending;      /* announce() forces the next eligible poll to check now */
     uint32_t   last_check_ms;
+    /* A check that aborts must NOT wait out the full hourly interval before
+     * trying again — pending is consumed on entry, so without this a single
+     * transient (socket 0 lent to the web UI, DHCP renewal guard band) silently
+     * discards the request and leaves `latest` stale for an hour. */
+    uint32_t   retry_at_ms;
+    bool       retry_armed;
+    char       last_err[40]; /* why the last check aborted; "" once one succeeds */
 
     char installed[48];
     char latest[48];
@@ -145,9 +154,18 @@ static void fw_release_sock(void) {
     }
 }
 
-static void fw_abort(void) {
+/* Every abort path lands here. It MUST say why: an aborted check leaves
+ * installed/latest looking current, so a silent failure is indistinguishable
+ * from "you are up to date" — which is exactly how a stuck socket-0 lend hid a
+ * broken update path for ten minutes on the bench. */
+static void fw_abort(const char *why) {
+    LOG_WARN("fwup", "check aborted: %s (retry in %lus)", why,
+             (unsigned long)(FW_RETRY_MS / 1000u));
+    snprintf(F.last_err, sizeof F.last_err, "%s", why);
     fw_release_sock();
-    F.phase = FS_IDLE;
+    F.phase       = FS_IDLE;
+    F.retry_at_ms = now_ms() + FW_RETRY_MS;
+    F.retry_armed = true;
 }
 
 /* httpc_get_start's on_body callback: append into s_body. Runs inside
@@ -205,6 +223,7 @@ const char *fwupdate_latest(void)      { return F.latest; }
 const char *fwupdate_latest_url(void)  { return F.latest_url; }
 const char *fwupdate_title(void)       { return F.title; }
 const char *fwupdate_release_url(void) { return F.release_url; }
+const char *fwupdate_last_error(void) { return F.last_err; }
 const char *fwupdate_notes(void)       { return F.notes; }
 
 bool fwupdate_available(void) {
@@ -258,6 +277,8 @@ int fwupdate_status_json(char *buf, int cap) {
     n = acc_str(buf, cap, n, fwupdate_latest_url());
     n = acc(buf, cap, n, ",\"title\":");
     n = acc_str(buf, cap, n, fwupdate_title());
+    n = acc(buf, cap, n, ",\"last_error\":");
+    n = acc_str(buf, cap, n, fwupdate_last_error());
     n = acc(buf, cap, n, ",\"release_url\":");
     n = acc_str(buf, cap, n, fwupdate_release_url());
     n = acc(buf, cap, n, ",\"notes\":");
@@ -269,7 +290,9 @@ int fwupdate_status_json(char *buf, int cap) {
 void fwupdate_poll(void) {
     switch (F.phase) {
     case FS_IDLE: {
-        bool due = F.pending || (now_ms() - F.last_check_ms >= FWCHECK_INTERVAL_S * 1000u);
+        bool due = F.pending
+                || (F.retry_armed && (int32_t)(now_ms() - F.retry_at_ms) >= 0)
+                || (now_ms() - F.last_check_ms >= FWCHECK_INTERVAL_S * 1000u);
         if (!due) return;
         if (ota_state() == OTA_RUNNING) return;   /* image download owns http_client + sock0 */
         if (!netif_ready()) return;
@@ -289,6 +312,7 @@ void fwupdate_poll(void) {
             return;
         }
         F.pending = false;
+        F.retry_armed = false;
         F.last_check_ms = now_ms();
         F.phase = FS_ACQUIRE_SOCK;
         F.t_ms  = now_ms();
@@ -297,7 +321,8 @@ void fwupdate_poll(void) {
 
     case FS_ACQUIRE_SOCK:
         if (!netif_ready() || !netif_ping_acquire_sock0()) {
-            if (now_ms() - F.t_ms > FW_ACQUIRE_TIMEOUT_MS) fw_abort();
+            if (now_ms() - F.t_ms > FW_ACQUIRE_TIMEOUT_MS)
+                fw_abort(netif_ready() ? "socket 0 unavailable" : "network not ready");
             return;
         }
         F.have_sock = true;
@@ -315,7 +340,7 @@ void fwupdate_poll(void) {
         uint8_t ip[4];
         dnsr_status_t s = dnsr_poll(ip);
         if (s == DNSR_PENDING) return;
-        if (s == DNSR_FAILED) { fw_abort(); return; }
+        if (s == DNSR_FAILED) { fw_abort("dns lookup failed"); return; }
         memcpy(F.ip, ip, 4);
         F.phase = FS_HTTP_START;
         return;
@@ -330,16 +355,23 @@ void fwupdate_poll(void) {
 
     case FS_FETCHING: {
         httpc_status_t st = httpc_poll();
-        if (st == HTTPC_FAILED) { fw_abort(); return; }
+        if (st == HTTPC_FAILED) { fw_abort("http request failed"); return; }
         if (st == HTTPC_PENDING) {
-            if (now_ms() - F.t_ms > FW_FETCH_TIMEOUT_MS) fw_abort();
+            if (now_ms() - F.t_ms > FW_FETCH_TIMEOUT_MS) fw_abort("manifest fetch timeout");
             return;
         }
         /* HTTPC_DONE */
-        if (httpc_status_code() == 200) {
-            s_body[F.body_len < sizeof(s_body) ? F.body_len : sizeof(s_body) - 1] = '\0';
-            fw_parse_manifest();
+        if (httpc_status_code() != 200) {
+            /* A 404/500 was previously discarded in silence, leaving the last
+             * good manifest in place and the entity reading "up to date". */
+            char why[40];
+            snprintf(why, sizeof why, "manifest http %d", httpc_status_code());
+            fw_abort(why);
+            return;
         }
+        s_body[F.body_len < sizeof(s_body) ? F.body_len : sizeof(s_body) - 1] = '\0';
+        fw_parse_manifest();
+        F.last_err[0] = '\0';        /* a clean check clears the last failure */
         fw_release_sock();
         F.phase = FS_IDLE;
         return;

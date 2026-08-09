@@ -70,6 +70,12 @@ const char *fwupdate_latest_url(void);
  * response or before the first successful check. */
 const char *fwupdate_title(void);
 const char *fwupdate_release_url(void);
+
+/* Why the last manifest check aborted ("" if the last one succeeded). An
+ * aborted check leaves installed/latest looking current, so this is the only
+ * way to tell "up to date" apart from "we never managed to ask". Surfaced in
+ * GET /api/ota as `last_error`. */
+const char *fwupdate_last_error(void);
 const char *fwupdate_notes(void);
 
 /* True once a manifest has been fetched and its version differs (any
