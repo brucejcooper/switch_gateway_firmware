@@ -81,6 +81,7 @@ static struct {
     int      short_replies;  /* answer this many requests one byte short */
     uint32_t accepts, acks, afulls;
     uint32_t acks_piggybacked;   /* acks applied by a request that also enqueued */
+    const char *ver;             /* what FC04 0x0200 reports */
 } GW;
 
 static void gw_boot(bool cold) {
@@ -92,6 +93,7 @@ static void gw_boot(bool cold) {
 static void gw_reset_all(void) {
     memset(&GW, 0, sizeof GW);
     GW.present = true;
+    GW.ver = "DALI v1.0 0011223344556677";
     gw_boot(true);
 }
 
@@ -193,7 +195,7 @@ bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
         uint8_t b[37];
         memset(b, 0, sizeof b);
         b[0] = (uint8_t)dev; b[1] = 0x04u; b[2] = 32u;
-        memcpy(b + 3, "DALI v2.0 0011223344556677", 26);
+        memcpy(b + 3, GW.ver, strlen(GW.ver));
         reply(b, 37);
         return true;
     }
@@ -304,7 +306,7 @@ int main(void) {
     CHECK(GW.rq_n == 0);                 /* both orphans acked away */
     CHECK(stats().drained);
     CHECK(stats().boot_count == 1);
-    CHECK(stats().gw_ver_major == 2);    /* parsed out of the version block */
+    CHECK(stats().gw_ver_major == 1);    /* parsed out of the version block */
 
     /* ── 2. Steady state: one transaction per DALI frame, with the ack for the
      *     previous result piggybacked on the next enqueue. ───────────────── */
@@ -576,6 +578,32 @@ int main(void) {
     run_ms(60);
     CHECK(stats().incompatible);
     CHECK(!mbq_client_can_submit(SLAVE));
+
+    /* The version half of the latch is a HARD refusal, so it gets its own
+     * check in both directions: 0.x is pre-v4 and must be refused, and the
+     * shipped 1.0 must NOT be — a constant that is wrong in that direction
+     * would silently stop the controller driving every gateway on the bus. */
+    g_case = "compat latch: pre-v4 version";
+    g_now_us = 1000000u;
+    memset(&PEND, 0, sizeof PEND);
+    gw_reset_all();
+    GW.ver = "DALI v0.2 0011223344556677";
+    mbq_client_init();
+    mbq_client_add_slave(SLAVE);
+    run_ms(60);
+    CHECK(stats().incompatible);
+    CHECK(!mbq_client_can_submit(SLAVE));
+    CHECK(GW.accepts == 0);              /* never drove its queue at all */
+
+    g_case = "compat latch: shipped v1.0 is accepted";
+    g_now_us = 1000000u;
+    memset(&PEND, 0, sizeof PEND);
+    gw_reset_all();
+    mbq_client_init();
+    mbq_client_add_slave(SLAVE);
+    run_ms(60);
+    CHECK(!stats().incompatible);
+    CHECK(mbq_client_can_submit(SLAVE));
 
     begin("compat latch: wrong reply length");
     {

@@ -162,6 +162,13 @@ void mbq_client_txn_stats(uint8_t slave_id, mbq_txn_stats_t *out);
  * a bench run measures only its own window. */
 void mbq_client_txn_stats_reset(uint8_t slave_id);
 
+/* The gateway's own queue counter block (spec §6), FC04, exactly 8 registers:
+ * accepts, a_full, executes, results, acks, stalls, q_discard, spare. Read on
+ * demand from the CLI, never polled hot — hot-path bytes are the scarce
+ * resource and the soak's probe verifies itself without them. */
+#define MBQ_GW_DIAG_ADDR  0x0320u
+#define MBQ_GW_DIAG_REGS  8u
+
 /* Per-slave protocol diagnostics (spec §6). The reboot count is split by which
  * rule noticed the reboot, because the split says HOW reboots are being seen —
  * a fleet that only ever notices them via R4 deadlines is one whose structural
@@ -204,6 +211,13 @@ uint16_t mbq_client_consec_fail(uint8_t slave_id);
  * R1/R1'; dropping the reply to an ack-less first enqueue drives the deadline
  * and boot_count corner. Returns false for an unknown slave. */
 bool mbq_client_drop_reply(uint8_t slave_id, uint16_t n);
+
+/* Bench drill knob for the backpressure gate: withhold the piggybacked ack on
+ * the next `n` requests to `slave_id`. The gateway's response queue fills, its
+ * backpressure rule stalls the DALI arbiter rather than dropping a result, and
+ * nothing is lost — resuming acks drains it and the rate recovers. Returns
+ * false for an unknown slave. */
+bool mbq_client_no_ack(uint8_t slave_id, uint16_t n);
 
 /* Dump per-slave client state to the console (dev CLI). slave_id < 0 = all. */
 void mbq_client_debug_print(int slave_id);

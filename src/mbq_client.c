@@ -95,18 +95,18 @@ enum { H_OK = 0u, H_FAILED = 1u };       /* head-entry status  */
  * refusing to ever talk to it. */
 #define DRAIN_MAX_POLLS   6u
 
-/* §8 asks the controller to refuse a non-matching queue generation at
- * discovery. FC04 0x0200 is a free-form STRING ("DALI v<maj>.<min> <serial>")
- * with no queue-generation field, and the spec never states which version
- * denotes v4 — so the version is parsed, recorded and reported here, but the
- * HARD latch is behavioural: an ILLEGAL FUNCTION reply to FC 0x41, or a reply
- * of a length the request did not call for. Those cannot false-positive,
- * whereas a guessed version constant that does not match what the gateway
- * actually reports would silently stop driving every gateway on the bus. Set
- * these to the shipped v4 gateway's version and flip GW_VER_LATCHES to 1. */
+/* The §8 compat latch's version half. FC04 0x0200 is a free-form STRING
+ * ("DALI v<maj>.<min> <serial>") rather than a numeric queue-generation field,
+ * so the mapping has to be agreed rather than derived: the v4 gateway sets
+ * FW_VER 1.0 and defines 0.x = pre-v4, MAJOR >= 1 = queue v4 (TinyModbus
+ * task-08 G4b). That is what makes this a safe hard refusal rather than a
+ * guess. The BEHAVIOURAL half latches independently and needs no agreement at
+ * all — an ILLEGAL FUNCTION reply to FC 0x41, or a reply of a length the
+ * request did not call for — and it is the backstop if a gateway ever reports
+ * a version that does not match what it actually speaks. */
 #define GW_MIN_MAJOR      1u
 #define GW_MIN_MINOR      0u
-#define GW_VER_LATCHES    0
+#define GW_VER_LATCHES    1
 
 /* ── per-slave state ──────────────────────────────────────────────────────── */
 
@@ -205,6 +205,7 @@ typedef struct {
     uint8_t  cb_len;
 
     uint16_t drop_replies;      /* bench drill knob (C3) */
+    uint16_t withhold_acks;     /* backpressure drill: suppress the piggyback ack */
 
     uint64_t t_issue_us;
     uint32_t w_n, w_min, w_max, w_fail, w_busy;
@@ -427,6 +428,11 @@ static void mbq_modbus_cb(int res, uint8_t *buf, void *ctx) {
 static bool issue_queue_txn_acked(slave_t *s, uint8_t ci, bool with_ack) {
     uint8_t payload[3];
     uint8_t plen = 0;
+    /* The backpressure drill withholds the ack so the gateway's response queue
+     * fills and its arbiter stalls (spec §2's backpressure rule). Nothing else
+     * changes: ack_pending survives and is delivered once the drill ends, so
+     * the queue drains and the run recovers to full rate. */
+    if (with_ack && s->withhold_acks > 0) { s->withhold_acks--; with_ack = false; }
     uint8_t ctl  = with_ack ? (uint8_t)(s->ack_pending & SEQ_MASK) : 0u;
 
     if (ci != NO_CMD) {
@@ -801,13 +807,16 @@ static void resolve_version(slave_t *s, const uint8_t *b, uint8_t n) {
         bool too_old = (((maj << 8) | (min & 0xFFu))
                         < ((GW_MIN_MAJOR << 8) | GW_MIN_MINOR));
         if (too_old) {
+#if GW_VER_LATCHES
+            LOG_ERR("mbq", "slave %u reports gateway v%u.%u; queue v4 needs "
+                    ">= v%u.%u", s->slave_id, maj, min, GW_MIN_MAJOR, GW_MIN_MINOR);
+            latch_incompatible(s, "gateway firmware predates queue v4");
+            return;
+#else
             LOG_WARN("mbq", "slave %u reports gateway v%u.%u, queue v4 expects "
                      ">= v%u.%u — driving it anyway; a wrong-generation gateway "
                      "will be caught by its reply shape",
                      s->slave_id, maj, min, GW_MIN_MAJOR, GW_MIN_MINOR);
-#if GW_VER_LATCHES
-            latch_incompatible(s, "gateway firmware predates queue v4");
-            return;
 #endif
         } else {
             LOG_INFO("mbq", "slave %u gateway v%u.%u", s->slave_id, maj, min);
@@ -1153,6 +1162,15 @@ void mbq_client_stats(uint8_t slave_id, mbq_stats_t *out) {
 uint16_t mbq_client_consec_fail(uint8_t slave_id) {
     slave_t *s = slave_for(slave_id);
     return s ? s->c_consec_fail : 0u;
+}
+
+bool mbq_client_no_ack(uint8_t slave_id, uint16_t n) {
+    slave_t *s = slave_for(slave_id);
+    if (!s) return false;
+    s->withhold_acks = n;
+    LOG_WARN("mbq", "slave %u: withholding the ack on the next %u requests (drill)",
+             slave_id, n);
+    return true;
 }
 
 bool mbq_client_drop_reply(uint8_t slave_id, uint16_t n) {

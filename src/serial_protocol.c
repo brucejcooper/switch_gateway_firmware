@@ -664,7 +664,8 @@ static void cmd_help(void) {
     printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dq [slave]                                 dump command-queue client state + counters\n");
-    printf("mbq [slave] | drop-reply <slave> <n>       queue transport state / §4 loss drill\n");
+    printf("mbq [slave] | gw <slave>                  queue transport state / gateway counters\n");
+    printf("mbq drop-reply|no-ack <slave> <n>          §4 loss drill / backpressure drill\n");
     printf("soak [<slave> <addr> [n=] [depth=] [path=direct|bg|user]] | stop   queue soak\n");
     printf("busload [reset]                            RS-485 bus occupancy, split per slave\n");
     printf("dstate [slave]                             DALI world model: presence, sweep, verify marks\n");
@@ -1540,6 +1541,43 @@ static void cmd_mbq(char **saveptr) {
             return;
         }
         txt_ok();
+        return;
+    }
+    if (a1 && strcasecmp(a1, "no-ack") == 0) {
+        char *ss = strtok_r(NULL, " \t", saveptr);
+        char *ns = strtok_r(NULL, " \t", saveptr);
+        long slave, n;
+        if (!parse_int_range_auto(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+        if (!parse_int_range_auto(ns, 0, 1000, &n))    { txt_err("bad_n"); return; }
+        if (!mbq_client_no_ack((uint8_t)slave, (uint16_t)n)) { txt_err("invalid_slave"); return; }
+        txt_ok();
+        return;
+    }
+    if (a1 && strcasecmp(a1, "gw") == 0) {
+        char *ss = strtok_r(NULL, " \t", saveptr);
+        long slave;
+        if (!parse_int_range_auto(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+        static cli_mb_ctx_t ctx;
+        memset(&ctx, 0, sizeof ctx);
+        modbus_get_input_registers((uint8_t)slave, MBQ_GW_DIAG_ADDR,
+                                   MBQ_GW_DIAG_REGS, cli_mb_cb, &ctx);
+        cli_mb_wait(&ctx);
+        if (cli_mb_report_fail(&ctx)) return;
+        if (ctx.frame_len < 3 + (int)(MBQ_GW_DIAG_REGS * 2u)) { txt_err("short_read"); return; }
+        const uint8_t *p = ctx.frame + 3;
+        static const char *nm[MBQ_GW_DIAG_REGS] = {
+            "accepts", "a_full", "executes", "results",
+            "acks", "stalls", "q_discard", "spare",
+        };
+        cdc_out_printf("mbq gateway counters, slave %ld (FC04 0x%04X):\n",
+                       slave, MBQ_GW_DIAG_ADDR);
+        for (unsigned i = 0; i < MBQ_GW_DIAG_REGS; i++)
+            cdc_out_printf("  %-10s %u\n", nm[i],
+                           (unsigned)(((uint16_t)p[i * 2u] << 8) | p[i * 2u + 1u]));
+        /* What each one means when it is NOT zero: a_full says the master's
+         * in-flight accounting is wrong (the cap should make it unreachable),
+         * stalls is just the backpressure rule doing its job, q_discard means
+         * malformed frames are reaching the gateway. */
         return;
     }
     long slave = -1;
