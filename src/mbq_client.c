@@ -242,6 +242,16 @@ typedef struct {
     uint8_t  drain_polls;
     uint8_t  drain_pass;        /* 1 = first sweep, 2 = the post-wait sweep */
     uint64_t drain_wait_us;     /* when the second sweep may begin */
+    /* A gateway reboot leaves results in the response queue for commands whose
+     * bindings we have just thrown away. Each one surfaces as an untracked head
+     * — R3's exact signature — so without a window R3 re-fires on every one,
+     * and each firing disposes the healthy work that replaced it, whose results
+     * are then themselves untracked. It is self-sustaining: MEASURED 3801 R3
+     * firings and 959 commands lost in one 35 s reboot drill, from ONE real
+     * reboot. During this window an untracked head is consumed as an orphan
+     * instead. Same reasoning as §4's controller-reboot drain, from the other
+     * side of the wire. */
+    uint64_t epoch_drain_us;    /* suppress repeat R3 until this passes */
     uint8_t  gw_major, gw_minor;
 
     /* Two pacing gates, deliberately separate. next_at_us holds back work the
@@ -504,6 +514,12 @@ static void note_reboot(slave_t *s, char rule, const cmd_t *keep) {
     s->ack_pending = 0;
     s->last_head   = 0;
     s->rec_cmd     = NO_CMD;
+    /* Open the drain window: everything still sitting in the gateway's response
+     * queue belongs to the epoch we just abandoned, and must be swallowed
+     * rather than re-diagnosed. One result deadline is the same bound §4 uses
+     * for the controller-reboot drain, and for the same reason — the gateway
+     * holds at most CMDQ_DEPTH commands and each finishes within a frame. */
+    s->epoch_drain_us = MBQ_NOW_US() + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
     if (keep) {
         s->last_seq  = keep->seq;
         s->seq_known = true;
@@ -750,6 +766,18 @@ static bool apply_head(slave_t *s, const reply_t *r) {
         return false;
     }
 
+    /* Already draining a dead epoch: this is a leftover, not news. Swallow it.
+     * Re-declaring the reboot here is what made one real reboot cascade into
+     * thousands (see epoch_drain_us) — each disposal orphaned the commands that
+     * had just replaced the disposed ones, so the signature regenerated itself
+     * faster than the queue could drain. */
+    if (MBQ_NOW_US() < s->epoch_drain_us) {
+        s->stats.orphans++;
+        s->ack_pending = r->hseq;
+        s->last_head   = r->hseq;
+        return false;
+    }
+
     /* R3, first clause: a head seq the master is not tracking, with a baseline
      * established and no prediction outstanding, has no other source than a
      * gateway that restarted its counter. */
@@ -856,7 +884,21 @@ static void resolve_queue_reply(slave_t *s, const reply_t *r) {
             for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
                 if (s->cmd[i].st == CMD_ACCEPTED && s->cmd[i].est_done_us < push)
                     s->cmd[i].est_done_us = push;
-            s->next_at_us = oldest_done_at(s);
+            /* Floor the gate at `push` INDEPENDENTLY of the loop above, because
+             * the case that matters most has nothing for it to push. After a
+             * gateway reboot the client has disposed its tracked commands, so
+             * no slot is CMD_ACCEPTED, oldest_done_at() falls through to its
+             * 2 ms floor, and the retry fires straight back into a gateway that
+             * is full of work we can no longer see — the very main-loop-speed
+             * repeat this push exists to prevent.
+             *
+             * Measured without the floor, on a reboot drill: 7755 A_FULL and
+             * 4263 resends in 35 s, which exhausted the per-command resend
+             * budget and disposed 225 of 240 idempotent commands as LOST —
+             * commands a reboot should have cost us nothing, since idempotent
+             * work is exactly what survives one. */
+            uint64_t gate = oldest_done_at(s);
+            s->next_at_us = (gate > push) ? gate : push;
         } else if (r->astatus == A_ACCEPTED && r->aseq != 0) {
             /* R2: the gateway pins a seq until its result is acked, and acks are
              * head-only and in order, so reaching the same value again needs 31
