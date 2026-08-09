@@ -454,6 +454,21 @@ void modbus_init(void) {
      * is the matching firmware discipline (don't listen while transmitting). */
     gpio_pull_up(UART_RX_PIN);
 
+    /* RX FIFO OFF: one interrupt per byte.
+     *
+     * t3.5 frame closing measures silence as "time since a byte was drained",
+     * which is only the same as "time since a byte arrived on the wire" if the
+     * ISR runs per byte. With the FIFO on, the SDK arms RXIM at a 4-character
+     * threshold, so during continuous reception the ISR fires every 4 bytes —
+     * 2.08 ms at 19200, LONGER than t3.5 itself (2.005 ms). The main loop then
+     * sees an apparent silence mid-frame and closes it early: measured as
+     * `short_response` and ~50%% timeout-retries on long replies.
+     *
+     * Per-byte interrupts cost 1920/s at 19200, nothing on a 125 MHz core. The
+     * trade is losing 32 bytes of hardware buffering against interrupt latency,
+     * which at 16.7 ms of holdup was never much protection anyway. */
+    uart_set_fifo_enabled(UART_ID, false);
+
     int UART_IRQ = UART_ID == uart0 ? UART0_IRQ : UART1_IRQ;
     irq_set_exclusive_handler(UART_IRQ, uart_irq);
     irq_set_enabled(UART_IRQ, true);
