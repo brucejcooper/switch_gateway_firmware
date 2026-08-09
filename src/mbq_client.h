@@ -183,7 +183,10 @@ typedef struct {
     uint32_t reboots_r2;      /* reboot inferred from a colliding accept seq */
     uint32_t reboots_r3;      /* reboot inferred from an untracked head seq  */
     uint32_t reboots_r4;      /* reboot inferred at a deadline, via boot_count */
-    uint32_t head_anomalies;  /* head changed with no ack of ours to explain it */
+    uint32_t pred_faults;     /* R1 bound a command to a seq the gateway did not
+                               * use — a DETECTED mis-binding, never silent    */
+    uint32_t orphans;         /* results discarded as a previous controller
+                               * epoch's leftovers (no-baseline state)         */
     uint32_t deadlines;       /* result deadlines that expired               */
     uint32_t afull;           /* A_FULL accept bytes (gateway queue full)    */
     uint32_t completed, failed;

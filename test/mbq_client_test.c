@@ -264,7 +264,7 @@ static const uint8_t CMD_QUERY[4] = { 0x01u, 0x98u, MBQ_QF_ANSWER, 0u };
 static void bring_up(void) {
     mbq_client_init();
     mbq_client_add_slave(SLAVE);
-    for (int i = 0; i < 100 && !mbq_client_can_submit(SLAVE); i++) pump();
+    for (int i = 0; i < 500 && !mbq_client_can_submit(SLAVE); i++) pump();
     CHECK(mbq_client_can_submit(SLAVE));
 }
 
@@ -275,6 +275,12 @@ static void begin(const char *name) {
     gw_reset_all();
     bring_up();
 }
+
+/* Run one command to completion and let its ack be confirmed, so the slave
+ * leaves the NO-BASELINE state (it has now seen an accept byte) and
+ * ack_pending is clear — which is what makes the NEXT enqueue ack-less, the
+ * "after idle" case of the §4 ambiguous corner. */
+static void establish_baseline(void);
 
 static mbq_stats_t stats(void) {
     mbq_stats_t st;
@@ -289,6 +295,16 @@ static bool submit(const uint8_t cmd[4], bool idem, cap_t *c) {
     return ok;
 }
 
+static void establish_baseline(void) {
+    static cap_t base;
+    base = (cap_t){0};
+    mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &base);
+    pump();
+    gw_complete(0u, 0x01u);
+    run_until_delivered(&base, 200);
+    run_ms(40);          /* let the ack be confirmed, clearing ack_pending */
+}
+
 int main(void) {
     /* ── 1. Registration: drain a response queue left by a previous controller
      *     epoch, then establish the boot_count baseline. An orphan result must
@@ -301,7 +317,7 @@ int main(void) {
     GW.rq[GW.rq_n++] = (gwres_t){ 8u, 0u, 0xBBu };
     mbq_client_init();
     mbq_client_add_slave(SLAVE);
-    for (int i = 0; i < 100 && !mbq_client_can_submit(SLAVE); i++) pump();
+    for (int i = 0; i < 500 && !mbq_client_can_submit(SLAVE); i++) pump();
     CHECK(mbq_client_can_submit(SLAVE));
     CHECK(GW.rq_n == 0);                 /* both orphans acked away */
     CHECK(stats().drained);
@@ -337,7 +353,7 @@ int main(void) {
         CHECK(submit(CMD_SET, true, &c));
         CHECK(GW.acks_piggybacked == piggy_before + 1);
         CHECK(GW.rq_n == 0);                     /* retention is not accumulating */
-        CHECK(stats().head_anomalies == 0);      /* the head only ever moved on our acks */
+        CHECK(stats().pred_faults == 0);
         CHECK(stats().proto_errors == 0);
     }
 
@@ -359,15 +375,20 @@ int main(void) {
         pump();                                  /* reply generated, then dropped */
         CHECK(GW.accepts == accepts_before + 1); /* it DID land at the gateway */
 
-        run_ms(49);                /* recovery poll resolves it */
+        /* The lost frame's own ack popped the only result, so the recovery
+         * poll finds an EMPTY head — branch 3 of the §4 procedure, the one
+         * genuinely ambiguous reading, resolved by a cold-path boot_count read
+         * rather than guessed at. */
+        uint32_t reads_before = stats().boot_reads;
+        run_ms(120);
+        CHECK(stats().boot_reads == reads_before + 1);
         CHECK(stats().r1_landed == 1);
         CHECK(stats().r1_never == 0);
         CHECK(GW.accepts == accepts_before + 1); /* nothing was resent */
         CHECK(stats().resends == 0);
-        /* The head moved because the LOST FRAME's ack was applied — an ack of
-         * ours, so it is not a structural anomaly and must not be counted as
-         * one. Flagging every successful R1 would make the counter useless. */
-        CHECK(stats().head_anomalies == 0);
+        /* R1's binding is a PREDICTION, and it must be verified when the result
+         * surfaces. A correct prediction must not register as a fault. */
+        CHECK(stats().pred_faults == 0);
 
         gw_complete(0u, 0x22u);
         run_ms(104);
@@ -482,6 +503,7 @@ int main(void) {
      *     8a: it landed, and the result appears while polling. */
     begin("ack-less corner: the frame landed");
     {
+        establish_baseline();                    /* seq known; nothing to ack */
         cap_t a = {0};
         uint32_t accepts_before = GW.accepts;
         mbq_client_drop_reply(SLAVE, 1);
@@ -501,6 +523,7 @@ int main(void) {
      *     boot_count read is needed for this class. */
     begin("ack-less corner: never landed, idempotent");
     {
+        establish_baseline();
         cap_t a = {0};
         uint32_t reads_before = stats().boot_reads;
         GW.present = false;
@@ -520,6 +543,7 @@ int main(void) {
      *     UNCHANGED — so it genuinely never landed and resending is safe. */
     begin("ack-less corner: never landed, non-idempotent, no reboot");
     {
+        establish_baseline();
         cap_t a = {0};
         uint32_t reads_before = stats().boot_reads;
         GW.present = false;
@@ -537,6 +561,7 @@ int main(void) {
      *     blind-resent. This is the case the whole cold-path read exists for. */
     begin("ack-less corner: never landed, non-idempotent, reboot");
     {
+        establish_baseline();
         cap_t a = {0};
         uint32_t accepts_before = GW.accepts;
         GW.present = false;
@@ -575,7 +600,7 @@ int main(void) {
     GW.illegal_fc = true;
     mbq_client_init();
     mbq_client_add_slave(SLAVE);
-    run_ms(60);
+    run_ms(400);
     CHECK(stats().incompatible);
     CHECK(!mbq_client_can_submit(SLAVE));
 
@@ -590,7 +615,7 @@ int main(void) {
     GW.ver = "DALI v0.2 0011223344556677";
     mbq_client_init();
     mbq_client_add_slave(SLAVE);
-    run_ms(60);
+    run_ms(400);
     CHECK(stats().incompatible);
     CHECK(!mbq_client_can_submit(SLAVE));
     CHECK(GW.accepts == 0);              /* never drove its queue at all */
@@ -601,7 +626,7 @@ int main(void) {
     gw_reset_all();
     mbq_client_init();
     mbq_client_add_slave(SLAVE);
-    run_ms(60);
+    run_ms(400);
     CHECK(!stats().incompatible);
     CHECK(mbq_client_can_submit(SLAVE));
 
@@ -615,6 +640,87 @@ int main(void) {
         CHECK(stats().incompatible);
         CHECK(a.n == 1 && a.r == MBQ_R_LOST);    /* the held command is released */
         CHECK(!mbq_client_can_submit(SLAVE));
+    }
+
+    /* ── 10b. The prediction R1 makes is VERIFIED, never silently trusted.
+     *      Force the gateway to assign a seq other than the predicted one and
+     *      check the mis-binding is detected and counted rather than delivering
+     *      one command's answer to another's callback — the exact
+     *      result-misattribution class that took task 04 three fix cycles. */
+    begin("R1's predicted seq is verified");
+    {
+        establish_baseline();
+        cap_t a = {0}, b = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &b));
+        pump();
+        gw_complete(0u, 0x0Bu);
+        CHECK(run_until_delivered(&b, 200));     /* now an ack is pending */
+
+        /* Make the prediction wrong AFTER the last accept the client observed,
+         * so it predicts last+1 while the gateway will assign something else.
+         * Something has to stand in for whatever would cause that in reality;
+         * the point of the test is that the client detects it, not why. */
+        GW.next_seq = 25u;
+        mbq_client_drop_reply(SLAVE, 1);
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, true, cap_cb, &a));
+        pump();                                  /* landed as seq 21, reply dropped */
+        run_ms(120);                             /* R1 binds it to the prediction */
+        CHECK(stats().r1_landed == 1);
+
+        gw_complete(0u, 0x99u);                  /* surfaces as seq 21, not the prediction */
+        run_ms(200);
+        CHECK(stats().pred_faults == 1);
+        /* The orphan's answer must never reach this command's callback — that
+         * misattribution is the whole reason the prediction is verified. Being
+         * idempotent, the command is put back on the wire instead. */
+        CHECK(!(a.n == 1 && a.resp == 0x99u));
+        CHECK(stats().resends >= 1);
+    }
+
+    /* ── 10c. Registration is DRAIN, WAIT, DRAIN AGAIN. A command the gateway
+     *      accepted before the controller died is still executing, and its
+     *      result lands AFTER the first sweep. A single-pass drain would read
+     *      it as an untracked seq and declare a gateway reboot that never
+     *      happened — on almost every controller restart. ─────────────────── */
+    g_case = "drain, wait, drain again";
+    g_now_us = 1000000u;
+    memset(&PEND, 0, sizeof PEND);
+    gw_reset_all();
+    {
+        /* A command from the dead controller's epoch, still executing. */
+        GW.cq[GW.cq_n].seq = 4u;
+        GW.cq[GW.cq_n].len = 2u;
+        GW.cq_n++;
+        GW.next_seq = 5u;
+        mbq_client_init();
+        mbq_client_add_slave(SLAVE);
+        run_ms(30);                              /* first sweep finds an empty queue */
+        gw_complete(0u, 0xEEu);                  /* ...and only now does it finish */
+        for (int i = 0; i < 500 && !mbq_client_can_submit(SLAVE); i++) pump();
+        CHECK(mbq_client_can_submit(SLAVE));
+        CHECK(GW.rq_n == 0);                     /* the late result was acked away... */
+        CHECK(GW.acks == 1);                     /* ...by the second sweep */
+        CHECK(stats().reboots_r3 == 0);          /* and NOT read as a reboot */
+        CHECK(stats().drained);
+    }
+
+    /* ── 10d. Before the first accept byte there is no baseline, and the master
+     *      must not pretend otherwise: a lost reply to that very first enqueue
+     *      resolves conservatively, because there is no seq to predict from. */
+    begin("no baseline: the first lost reply resolves conservatively");
+    {
+        cap_t a = {0};
+        uint32_t accepts_before = GW.accepts;
+        mbq_client_drop_reply(SLAVE, 1);
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, false, cap_cb, &a));
+        pump();
+        CHECK(GW.accepts == accepts_before + 1); /* it landed, but we cannot know that */
+        gw_complete(0u, 0x77u);
+        run_ms(MBQ_RESULT_DEADLINE_MS + 120u);
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_LOST);                /* non-idempotent: disposed, not guessed */
+        CHECK(stats().pred_faults == 0);         /* no prediction was ever made */
+        CHECK(stats().reboots_r3 == 0);          /* the orphan is not a reboot either */
     }
 
     /* ── 11. Sequence wrap must skip 0: "no ack" and "ack command 32" are the

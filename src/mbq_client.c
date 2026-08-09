@@ -125,6 +125,9 @@ typedef struct {
     uint8_t  st;                   /* cmd_state_t */
     uint8_t  seq;                  /* gateway-assigned; 0 until accepted */
     uint8_t  resends;
+    bool     pred;                 /* seq was PREDICTED by R1, not read from an
+                                    * accept byte — must be verified when its
+                                    * result surfaces (spec §4) */
     uint64_t deadline_us;          /* result deadline, armed at accept */
     uint64_t est_done_us;          /* estimated DALI completion, for pacing */
 } cmd_t;
@@ -145,6 +148,7 @@ typedef enum {
     BC_BASELINE = 0,  /* registration: just establish the reference           */
     BC_R4,            /* R4: a result deadline expired — reboot or wedge?     */
     BC_ACKLESS,       /* the ack-less corner, before resending a non-idempotent */
+    BC_R1_EMPTY,      /* the lost-reply poll found an empty head: R1 or R3?    */
 } bc_reason_t;
 
 typedef enum { TX_QUEUE = 0, TX_SYSINFO, TX_VERSION } tx_kind_t;
@@ -185,6 +189,8 @@ typedef struct {
     uint16_t bc_last;
 
     uint8_t  drain_polls;
+    uint8_t  drain_pass;        /* 1 = first sweep, 2 = the post-wait sweep */
+    uint64_t drain_wait_us;     /* when the second sweep may begin */
     uint8_t  gw_major, gw_minor;
 
     /* Two pacing gates, deliberately separate. next_at_us holds back work the
@@ -266,6 +272,12 @@ static uint8_t count_state(const slave_t *s, cmd_state_t st) {
 static uint8_t find_state(const slave_t *s, cmd_state_t st) {
     for (uint8_t i = 0; i < CMDQ_DEPTH; i++) if (s->cmd[i].st == st) return i;
     return NO_CMD;
+}
+
+static cmd_t *find_pred_bound(slave_t *s) {
+    for (uint8_t i = 0; i < CMDQ_DEPTH; i++)
+        if (s->cmd[i].st == CMD_ACCEPTED && s->cmd[i].pred) return &s->cmd[i];
+    return NULL;
 }
 
 static uint8_t inflight_count(const slave_t *s) {
@@ -521,21 +533,22 @@ static bool parse_reply(const slave_t *s, const uint8_t *b, uint8_t n, reply_t *
 /* Apply the head field of a reply. Returns true if a reboot was inferred here
  * (R3), so the caller does not then apply a second rule to the same reply. */
 static bool apply_head(slave_t *s, const reply_t *r) {
-    /* The head cannot change except by an ack that matches it, so a head that
-     * moved without an ack of ours to explain the move is structurally
-     * impossible. Under the always-piggyback policy of §5 this is unreachable
-     * (the ack for a head we consumed rides the very next request), which is
-     * why it is counted rather than acted on — if it ever fires, the policy or
-     * the gateway has changed and that is the finding.
-     *
-     * Not during recovery: there the head moving is the WHOLE POINT. R1's poll
-     * deliberately carries no ack precisely so that a moved head can only mean
-     * the lost frame's own ack was applied — an ack of ours that we simply
-     * never saw acknowledged. Counting that as an anomaly would flag every
-     * successful R1. */
-    if (s->st != S_RECOVERY_POLL && s->last_head != 0 &&
-        r->hseq != s->last_head && s->tx_ack != s->last_head)
-        s->stats.head_anomalies++;
+    /* R3, second clause: an unacked result cannot disappear. The head going
+     * empty while the master still holds a consumed-but-unacked result is only
+     * possible if something other than our ack emptied it — and the only thing
+     * that can is a restart. "No ack unresolved" is the qualifier that makes
+     * this decidable: if THIS request carried the ack for that result, an empty
+     * head is just the ack working.
+     * NOT during recovery. There the master is deliberately polling WITHOUT an
+     * ack, so "no ack unresolved" is true by construction on every poll, and an
+     * empty head is the genuinely ambiguous branch 3 of the lost-reply
+     * procedure — resolved against boot_count, not by declaring a reboot here. */
+    if (s->st != S_RECOVERY_POLL && r->hseq == 0 &&
+        s->ack_pending != 0 && s->tx_ack != s->ack_pending) {
+        note_reboot(s, '3', NULL);
+        s->last_head = 0;
+        return true;
+    }
 
     /* Ack confirmation: the head moving off the seq we were acking proves the
      * ack was applied. While it has not moved, keep carrying the same ack. */
@@ -546,24 +559,60 @@ static bool apply_head(slave_t *s, const reply_t *r) {
     if (r->hseq == 0 || r->hseq == s->ack_pending) return false;  /* nothing new */
 
     cmd_t *c = cmd_by_seq(s, r->hseq);
-    if (!c) {
-        /* R3: an unacked head seq the master is not tracking has no other
-         * source than a gateway that restarted its counter. */
-        note_reboot(s, '3', NULL);
-        /* Pop the orphan so it cannot block the queue behind it. */
+    if (c) {
+        /* The prediction, verified. A command bound by R1 was bound to a seq
+         * the master calculated rather than read, and this is where that
+         * calculation is confirmed against the gateway. */
+        c->pred = false;
+        if (r->hstatus == H_OK) deliver(s, c, MBQ_R_COMPLETE, r->resp8);
+        else                    deliver(s, c, MBQ_R_FAILED,   r->resp8);
         s->ack_pending = r->hseq;
-        s->last_head   = r->hseq;
-        return true;
+        return false;
     }
 
-    if (r->hstatus == H_OK) deliver(s, c, MBQ_R_COMPLETE, r->resp8);
-    else                    deliver(s, c, MBQ_R_FAILED,   r->resp8);
-    s->ack_pending = r->hseq;
-    return false;
+    /* An untracked head. Three quite different things can produce one. */
+    if (!s->seq_known) {
+        /* NO BASELINE: the gateway's counter is wherever its uptime left it and
+         * this controller has never seen an accept byte from it, so a result
+         * bearing an unknown seq is a leftover from the PREVIOUS controller
+         * epoch — the norm in this state, not evidence of anything. Consume and
+         * discard it; reading it as R3 would declare a reboot that never
+         * happened, on almost every controller restart. */
+        s->stats.orphans++;
+        s->ack_pending = r->hseq;
+        return false;
+    }
+
+    cmd_t *p = find_pred_bound(s);
+    if (p) {
+        /* A command R1 bound to a PREDICTED seq, and the seq that actually
+         * surfaced is not it. The prediction was wrong, which is a detected
+         * fault and not a reboot: silently accepting a mis-binding is exactly
+         * the result-misattribution class that took task 04 three fix cycles.
+         * Count it, say so, dispose of the command by policy, and drop the
+         * orphan result rather than handing it to the wrong callback. */
+        s->stats.pred_faults++;
+        LOG_ERR("mbq", "slave %u: predicted seq %u for command %02X%02X but the "
+                "gateway produced seq %u — mis-binding detected, disposing",
+                s->slave_id, p->seq, p->cmd[0], p->cmd[1], r->hseq);
+        p->pred = false;
+        if (p->idempotent) resend_or_lose(s, p, MBQ_R_LOST);
+        else               deliver(s, p, MBQ_R_LOST, 0);
+        s->ack_pending = r->hseq;
+        return false;
+    }
+
+    /* R3, first clause: a head seq the master is not tracking, with a baseline
+     * established and no prediction outstanding, has no other source than a
+     * gateway that restarted its counter. */
+    note_reboot(s, '3', NULL);
+    s->ack_pending = r->hseq;   /* pop the orphan so it cannot block the queue */
+    s->last_head   = r->hseq;
+    return true;
 }
 
 /* Bind a command to the seq the gateway assigned it and start its clocks. */
-static void bind_accepted(slave_t *s, cmd_t *c, uint8_t seq) {
+static void bind_accepted(slave_t *s, cmd_t *c, uint8_t seq, bool predicted) {
     uint64_t now = MBQ_NOW_US();
     /* Pipeline model for the pacing estimate: this command starts when the one
      * ahead of it finishes, since the gateway executes strictly FIFO. */
@@ -574,6 +623,7 @@ static void bind_accepted(slave_t *s, cmd_t *c, uint8_t seq) {
         if (o->est_done_us > start) start = o->est_done_us;
     }
     c->seq         = seq;
+    c->pred        = predicted;
     c->st          = CMD_ACCEPTED;
     c->deadline_us = now + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
     c->est_done_us = start + (uint64_t)est_ms(c->cmd) * 1000u;
@@ -591,9 +641,20 @@ static void resolve_queue_reply(slave_t *s, const reply_t *r) {
         if (!c) { latch_incompatible(s, "accept byte for a request that enqueued nothing"); return; }
 
         if (r->astatus == A_FULL) {
-            /* Not enqueued. The ack in the same frame WAS processed, so the head
-             * below is still meaningful; only the command goes back. */
+            /* A_FULL IS A CANARY, NOT BACK-PRESSURE (spec §4). The client
+             * decrements in-flight only on SEEING a result, while the gateway
+             * frees a command slot the moment the command completes — so the
+             * client's count always over-estimates gateway occupancy, and
+             * "the client believes there is room" implies there is room.
+             * Observing one therefore means the in-flight accounting is wrong.
+             * Recovery is still to hold the command and re-offer it, but this
+             * must never pass silently as though it were routine. */
             s->stats.afull++;
+            LOG_ERR("mbq", "slave %u: A_FULL — the in-flight cap should make this "
+                    "unreachable, so the client's accounting is wrong "
+                    "(inflight=%u of %u, total A_FULL=%lu)",
+                    s->slave_id, (unsigned)inflight_count(s), (unsigned)CMDQ_DEPTH,
+                    (unsigned long)s->stats.afull);
             c->st = CMD_PENDING;
             c->seq = 0;
             /* Pace the retry: the queue is full because DALI is busy, and
@@ -607,11 +668,11 @@ static void resolve_queue_reply(slave_t *s, const reply_t *r) {
              * pinned entry first. An accept byte carrying a seq we still track is
              * therefore proof the gateway restarted its counter. */
             if (seq_tracked(s, r->aseq)) {
-                bind_accepted(s, c, r->aseq);
+                bind_accepted(s, c, r->aseq, false);
                 note_reboot(s, '2', c);
                 rebooted = true;
             } else {
-                bind_accepted(s, c, r->aseq);
+                bind_accepted(s, c, r->aseq, false);
             }
         } else {
             latch_incompatible(s, "reserved accept status");
@@ -637,27 +698,70 @@ static void resolve_recovery_reply(slave_t *s, const reply_t *r) {
     if (!c || c->st != CMD_SENDING) { s->rec_cmd = NO_CMD; apply_head(s, r); return; }
 
     if (s->rec_ack != 0) {
-        /* R1 / R1'. The lost frame carried both an enqueue and an ack, and they
-         * travelled in ONE frame — so whether the ack was applied is an atomic
-         * landed/not-landed indicator for the whole transaction. */
+        /* THE LOST-REPLY PROCEDURE, IN EVALUATION ORDER (spec §4). R1/R1' and
+         * R3 can look at the same observation and disagree, so the order is
+         * part of the contract, not an implementation detail. First match wins.
+         *
+         * The poll that produced this reply deliberately carried NO ack, so the
+         * head's state reflects only what the lost frame itself did. */
+
+        /* 1. The head still holds the seq we tried to ack: the ack did not
+         *    apply, so the frame never arrived. R1'. */
         if (r->hseq == s->rec_ack) {
-            s->stats.r1_never++;                 /* R1': never arrived */
+            s->stats.r1_never++;
             s->rec_cmd = NO_CMD;
             /* Resend verbatim, ack included — no idempotency concern, because
              * the head proves the frame never reached the gateway. Through the
-             * shared path so it is counted and subject to the same cap as
-             * every other resend. */
+             * shared path so it is counted and capped like any other resend. */
             resend_or_lose(s, c, MBQ_R_LOST);
             apply_head(s, r);
             return;
         }
-        /* R1: the head moved past the seq we acked, so the ack was applied, so
-         * the frame landed. Its seq is the one we predicted — the single
-         * outstanding transaction rule guarantees nothing else was accepted in
-         * between. */
+
+        /* 2. The head holds a seq we are not tracking: R3, the gateway
+         *    restarted. (With no baseline yet an unknown seq is instead a
+         *    leftover from the previous controller epoch — apply_head knows the
+         *    difference, so the command is disposed conservatively and the
+         *    orphan consumed.) */
+        if (r->hseq != 0 && !cmd_by_seq(s, r->hseq)) {
+            s->rec_cmd = NO_CMD;
+            if (!s->seq_known) {
+                if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
+                else               deliver(s, c, MBQ_R_LOST, 0);
+            }
+            apply_head(s, r);   /* fires R3, or discards the orphan */
+            return;
+        }
+
+        /* 3. The head is empty: genuinely ambiguous. "The ack applied and the
+         *    queue happened to drain" and "a reboot wiped the queue" cannot be
+         *    told apart from the head alone, so this is the one R1 branch that
+         *    pays for a cold-path boot_count read — on a path that is already
+         *    exceptional. */
+        if (r->hseq == 0) {
+            /* Deliberately does NOT apply the head: whether the ack took effect
+             * is the very thing in question, so ack_pending is left alone until
+             * boot_count says which way this went. */
+            s->last_head = 0;
+            s->bc_reason = BC_R1_EMPTY;
+            s->st = S_BOOT_CHECK;
+            return;
+        }
+
+        /* 4. The head holds a DIFFERENT seq we are tracking: R1, landed. A
+         *    reboot would have emptied the response queue, so a tracked seq
+         *    proves the epoch survived, which means the ack applied, which
+         *    means the whole frame landed — ack and enqueue travel together. */
         s->stats.r1_landed++;
         s->rec_cmd = NO_CMD;
-        bind_accepted(s, c, s->seq_known ? seq_next(s->last_seq) : r->hseq);
+        if (s->seq_known) {
+            bind_accepted(s, c, seq_next(s->last_seq), true);
+        } else {
+            /* No baseline: nothing to predict from, so resolve conservatively
+             * rather than invent a seq (spec §4). */
+            if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
+            else               deliver(s, c, MBQ_R_LOST, 0);
+        }
         apply_head(s, r);
         return;
     }
@@ -671,25 +775,23 @@ static void resolve_recovery_reply(slave_t *s, const reply_t *r) {
         if (predicted != 0 && r->hseq == predicted) {
             s->stats.r1_landed++;
             s->rec_cmd = NO_CMD;
-            bind_accepted(s, c, r->hseq);
-            apply_head(s, r);                    /* the result is right there */
+            bind_accepted(s, c, r->hseq, false);  /* observed, not predicted */
+            apply_head(s, r);                     /* the result is right there */
             return;
         }
         if (cmd_by_seq(s, r->hseq)) { apply_head(s, r); return; }   /* an earlier command's */
-        if (!s->seq_known && s->epoch_clean && inflight_count(s) == 1u) {
-            /* First enqueue of a clean epoch: the response queue was drained
-             * empty and this is the only command outstanding, so nothing else
-             * on this bus could have produced a head. It is ours. (The spec
-             * says to match the "predicted seq", but on the first accept of an
-             * epoch there is nothing to predict from — the gateway's counter is
-             * its own. Exclusion is what identifies it instead.) */
-            s->stats.r1_landed++;
+        if (!s->seq_known) {
+            /* No baseline, so there is no prediction to match against and no
+             * way to tell our result from a previous epoch's. Resolve
+             * conservatively: this costs at most one command, once per
+             * controller start, and only if that first reply was lost. */
             s->rec_cmd = NO_CMD;
-            bind_accepted(s, c, r->hseq);
-            apply_head(s, r);
+            if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
+            else               deliver(s, c, MBQ_R_LOST, 0);
+            apply_head(s, r);                     /* discards the orphan */
             return;
         }
-        apply_head(s, r);                        /* unknown seq → R3 fires in there */
+        apply_head(s, r);                         /* unknown seq → R3 fires in there */
         return;
     }
 
@@ -749,6 +851,26 @@ static void resolve_sysinfo(slave_t *s, const uint8_t *b, uint8_t n) {
                 }
             }
             s->tx_deadline_seq = 0;
+            s->st = S_IDLE;
+            break;
+
+        case BC_R1_EMPTY:
+            /* Branch 3 of the lost-reply procedure. An empty head means either
+             * the lost frame's ack applied and the queue then drained, or a
+             * reboot wiped it; boot_count is the only thing that separates
+             * them. */
+            if (!c) { s->st = S_IDLE; break; }
+            s->rec_cmd = NO_CMD;
+            if (changed || first) {
+                note_reboot(s, '3', NULL);       /* wiped: R3, and c goes with it */
+            } else if (s->seq_known) {
+                s->stats.r1_landed++;            /* survived: R1, the frame landed */
+                s->ack_pending = 0;              /* ...so its ack applied too    */
+                bind_accepted(s, c, seq_next(s->last_seq), true);
+            } else {
+                if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
+                else               deliver(s, c, MBQ_R_LOST, 0);
+            }
             s->st = S_IDLE;
             break;
 
@@ -915,9 +1037,19 @@ static void handle_reply(slave_t *s) {
         case S_DRAIN:
             s->last_head = r.hseq;
             if (r.hseq == 0) {
+                s->ack_pending = 0;
+                if (s->drain_pass < 2u) {
+                    /* First sweep done. Let a result deadline pass so anything
+                     * still executing from the previous controller epoch has
+                     * surfaced, then sweep again. */
+                    s->drain_pass    = 2u;
+                    s->drain_polls   = 0;
+                    s->drain_wait_us = MBQ_NOW_US() +
+                                       (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
+                    return;
+                }
                 s->epoch_clean = true;
                 s->stats.drained = true;
-                s->ack_pending = 0;
                 s->bc_reason = BC_BASELINE;
                 s->st = S_BOOT_CHECK;
             } else if (++s->drain_polls >= DRAIN_MAX_POLLS) {
@@ -975,7 +1107,17 @@ static void drive(slave_t *s) {
             return;
 
         case S_DRAIN:
-            if (now < s->next_at_us) return;
+            /* Between the two sweeps, wait one result deadline out (spec §4).
+             * A command the gateway accepted before the controller died is
+             * still executing, and its result lands AFTER the first sweep —
+             * where a fresh controller, tracking nothing, would read it as an
+             * untracked seq and declare a gateway reboot that never happened.
+             * The gateway holds at most CMDQ_DEPTH commands and each finishes
+             * within a frame time, so nothing from the dead epoch survives a
+             * deadline of draining. The wait comes AFTER the first sweep
+             * because a response queue that was full when the controller died
+             * has the arbiter stalled until that sweep unstalls it. */
+            if (now < s->drain_wait_us || now < s->next_at_us) return;
             issue_queue_txn(s, NO_CMD);
             return;
 
@@ -1083,6 +1225,7 @@ void mbq_client_add_slave(uint8_t slave_id) {
         s->st         = S_VERSION;
         s->tx_cmd     = NO_CMD;
         s->rec_cmd    = NO_CMD;
+        s->drain_pass = 1u;
         s->next_at_us = 0;
         return;
     }
@@ -1234,10 +1377,15 @@ void mbq_client_debug_print(int slave_id) {
                        "boot reads=%lu\n",
                        (unsigned long)t->r1_landed, (unsigned long)t->r1_never,
                        (unsigned long)t->deadlines, (unsigned long)t->boot_reads);
-        cdc_out_printf("  reboots: R2=%lu R3=%lu R4=%lu (head anomalies %lu, "
-                       "protocol errors %lu)\n",
+        cdc_out_printf("  reboots: R2=%lu R3=%lu R4=%lu\n",
                        (unsigned long)t->reboots_r2, (unsigned long)t->reboots_r3,
-                       (unsigned long)t->reboots_r4, (unsigned long)t->head_anomalies,
+                       (unsigned long)t->reboots_r4);
+        /* Both should read 0 forever. A prediction fault is a detected
+         * mis-binding — the class of defect that took task 04 three cycles —
+         * and orphans past the first moments after a restart mean results are
+         * arriving that this controller cannot account for. */
+        cdc_out_printf("  faults: predicted-seq=%lu orphans=%lu protocol=%lu\n",
+                       (unsigned long)t->pred_faults, (unsigned long)t->orphans,
                        (unsigned long)t->proto_errors);
         cdc_out_printf("  results: complete=%lu failed=%lu lost=%lu result_lost=%lu\n",
                        (unsigned long)t->completed, (unsigned long)t->failed,
