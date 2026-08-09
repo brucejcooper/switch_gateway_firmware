@@ -19,9 +19,12 @@
  *
  * It BYPASSES the dali_queue priority backlog and submits straight into
  * mbq_client, and it paces itself on the queue-client's view of GATEWAY-SIDE
- * occupancy: it stops submitting once the gateway's 8-slot queue is half full
- * (SOAK_DEPTH_DEFAULT = 4 active slots), so the queue is kept fed without ever
- * relying on a BUSY rejection as flow control.
+ * occupancy: it stops submitting once the gateway holds `depth` commands, so
+ * the queue is kept fed without ever relying on a queue-full rejection as flow
+ * control. Under queue v4 the gateway's queue is CMDQ_DEPTH (2) deep, so the
+ * useful sweep is {1, 2} and a depth-3 run needs CMDQ_DEPTH raised on BOTH
+ * sides and both halves reflashed — the wire format is depth-agnostic but the
+ * two constants must agree.
  *
  * Everything it measures is reported by `soak` (see dq_soak_report): pair rate,
  * DALI frame rate, per-command latency, the Modbus transaction count that paid
@@ -31,8 +34,12 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "mbq_client.h"   /* CMDQ_DEPTH */
 
-#define SOAK_DEPTH_DEFAULT  4u   /* half of the gateway's 8 slots */
+/* Fill the gateway's command queue: at depth 2 that is "executing + next",
+ * which is what one transaction per DALI frame requires. The v2 default backed
+ * off at half of an 8-slot queue; there is no half of 2 that keeps DALI fed. */
+#define SOAK_DEPTH_DEFAULT  CMDQ_DEPTH
 
 /* Which path the probe's commands take to the gateway. The default bypasses the
  * scheduler entirely (measuring the transport); routing through the scheduler
@@ -46,7 +53,7 @@ typedef enum {
 } soak_path_t;
 
 /* Start a soak against `addr` on `slave`. `pairs` = number of set/query pairs to
- * run (0 = until `soak stop`). `depth` = max gateway-side active slots (1..8),
+ * run (0 = until `soak stop`). `depth` = max gateway-side commands (1..CMDQ_DEPTH),
  * used only on the direct path — on a scheduler path the class's own depth
  * policy governs. Returns false if a soak is already running or the slave is not
  * a DALI slave. */

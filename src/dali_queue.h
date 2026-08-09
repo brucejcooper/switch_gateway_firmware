@@ -6,8 +6,8 @@
  * This is the DALI-SPECIFIC layer. It owns the per-slave PRIORITY SCHEDULER and
  * the producer API; the transaction layer beneath it is mbq_client.c (opaque
  * 32-bit command in, terminal outcome + 8-bit response out — DALI-agnostic; see
- * mbq_client.h and docs/modbus-command-queue.md). Producers (the raw command
- * path, the any-on probe, the config-query SM) submit DALI commands into a
+ * mbq_client.h and, normatively, ../TinyModbus/QUEUE-PROTOCOL.md). Producers
+ * (the raw command path, the any-on probe, the config-query SM) submit into a
  * per-slave local backlog sorted by priority class. dq_tick() drains the
  * highest-priority pending command into a free gateway slot (via mbq_client),
  * keeping at most DQ_INFLIGHT_MAX in flight so a fresh high-priority command
@@ -21,21 +21,27 @@
  * DALI failure code (NAK / collision / bus fault), which the adapter maps to
  * DQ_RES_*.
  *
- * v2 has NO id ledger and NO reboot resync/rebuild/rollback machinery: the
- * client detects a gateway reboot from the slot statuses ("idle means gone") and
- * either resubmits an idempotent command or reports it DQ_RES_DROPPED. There is
- * nothing here to feed the gateway boot_count into — reboot recovery is entirely
- * status-driven in the client. (boot_count / the FC04 sysinfo block remain a
- * pure HA diagnostic in dirty_poll.c.)
+ * There is NO id ledger and NO reboot resync/rebuild/rollback machinery here.
+ * Reboot recovery belongs entirely to the client's §4 rules, which either
+ * resubmit an idempotent command or report it DQ_RES_DROPPED. (boot_count / the
+ * FC04 sysinfo block remain a pure HA diagnostic in dirty_poll.c; the client
+ * reads them for itself when a recovery rule needs an arbiter.)
  */
 
 #include <stdbool.h>
 #include <stdint.h>
+#include "mbq_client.h"   /* MBQ_QF_* — the wire flag bits, aliased below */
 
-/* Command flags — mirror the gateway QF_* record flags (identical bit values). */
-#define DQ_TWICE   0x01u   /* send the forward frame twice, no answer */
-#define DQ_DTR0    0x02u   /* preload DTR0 (0xA3<dtr0>) back-to-back before the frame */
-#define DQ_ANSWER  0x04u   /* expects a backward frame; deliver the 8-bit answer */
+/* Command flags. These ARE the wire bits (queue-protocol §1 packs the control
+ * flags into the top three bits of the request's first byte), so a command
+ * built here needs no translation on the way out — which is the point: the v2
+ * values were 0x01/0x02/0x04 in a payload byte, and a stack that translated
+ * between two encodings had a place for them to silently disagree, changing
+ * the meaning of every command without failing. Single definition in
+ * mbq_client.h; these are aliases so DALI callers keep reading as DALI. */
+#define DQ_TWICE   MBQ_QF_TWICE    /* send the forward frame twice, no answer */
+#define DQ_DTR0    MBQ_QF_DTR0     /* preload DTR0 (0xA3<dtr0>) before the frame */
+#define DQ_ANSWER  MBQ_QF_ANSWER   /* expects a backward frame; deliver the answer */
 
 /* Priority classes, highest first — an ordered table so re-ordering the ladder
  * is a one-line change. Mirrors the gateway's own work selector (commissioning →

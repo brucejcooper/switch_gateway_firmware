@@ -1,6 +1,5 @@
 #pragma once
 #include <stdbool.h>
-#include "mbq_client.h"   /* MBQ_CMD_BYTES */
 #include <stdint.h>
 #include <stddef.h>
 
@@ -62,6 +61,14 @@ void modbus_busload_reset(void);
 void modbus_busload_get(uint64_t *window_us, uint64_t *busy_us, uint32_t *txns,
                         modbus_busload_slave_t *per);
 
+/* Replies discarded because the frame's CRC-16 did not check out, since boot.
+ * A bad-CRC frame is treated exactly like no reply at all (retried if the
+ * action allows it), so this counter is the only place a corrupted-but-present
+ * reply becomes visible. Should be 0 on a healthy bus — compare against the
+ * gateway's own `crc_error` (FC04 0x0300 reg2) to place the fault on the
+ * controller's or the gateway's receive side. */
+uint32_t modbus_crc_error_count(void);
+
 /* Re-sends within the busload window: `timeouts` = the reply was missing or
  * invalid, `device_busy` = the slave answered exception 0x06. These distinguish
  * "the slave is slow to answer" from "the reply is being lost" — a transaction
@@ -112,19 +119,24 @@ bool modbus_get_input_registers(uint8_t device_id, uint16_t addr,
                                  uint16_t count,
                                  modbus_action_cb_t cb, void *ctx);
 
-/* FC65 / FC66 — the DALI command queue's own function codes. FC65 hands the
- * gateway one command and lets IT choose the slot, so the master never has to
- * know a slot is free in advance; both return the whole status block. See
- * TinyModbus/src/modbus.c for why this exists. */
-bool modbus_mbq_enqueue(uint8_t dev, const uint8_t cmd[MBQ_CMD_BYTES],
-                        modbus_action_cb_t cb, void *ctx);
-bool modbus_mbq_status(uint8_t dev, modbus_action_cb_t cb, void *ctx);
+/* FC 0x41 — the DALI command queue's single function code (queue v4; see
+ * TinyModbus/QUEUE-PROTOCOL.md §1). One request optionally enqueues a command
+ * and optionally acks the head of the gateway's response queue: `ctl` is the
+ * packed [flags:3|ack:5] byte and `payload` is the enqueue payload — 0 bytes
+ * (pure ack/poll, 5 B on the wire), 2 bytes `addr,data` (7 B), or 3 bytes
+ * `addr,data,dtr0` (8 B, QF_DTR0 set). The reply is correspondingly 6 or 7
+ * bytes; the caller knows which because it chose the request shape.
+ *
+ * A request that carries an enqueue payload is issued with retries DISABLED
+ * (spec §5: "no transport auto-retry of enqueue frames"). A blind re-send of a
+ * frame whose reply was merely lost enqueues the command a SECOND time — a
+ * silent double execution, which for a non-idempotent UP/DOWN step is a real
+ * defect. Resolving a lost enqueue reply is mbq_client's §4 job, and it needs
+ * to see the timeout rather than have the transport paper over it. Pure
+ * ack/poll frames keep the retries: re-acking a popped seq is a no-op. */
+bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
+                   uint8_t payload_len, modbus_action_cb_t cb, void *ctx);
 
-bool modbus_read_write_multiple_registers(uint8_t device_id,
-                                          uint16_t rd_addr, uint16_t rd_count,
-                                          uint16_t wr_addr, uint16_t wr_count,
-                                          const uint8_t *wr_data,
-                                          modbus_action_cb_t cb, void *ctx);
 
 /* ── Baud rate (new — replaces hardcoded 9600) ───────────────────────────── */
 /* Call before modbus_init() if a non-default baud rate is desired.

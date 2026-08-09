@@ -13,6 +13,7 @@
 #include "lighting_actions.h"
 #include "dali_queue.h"
 #include "dq_soak.h"
+#include "mbq_client.h"
 #include "dali_state.h"
 #include "mapping.h"
 #include "button_fsm.h"
@@ -663,6 +664,8 @@ static void cmd_help(void) {
     printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
     printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
     printf("dq [slave]                                 dump command-queue client state + counters\n");
+    printf("mbq [slave] | gw <slave>                  queue transport state / gateway counters\n");
+    printf("mbq drop-reply|no-ack <slave> <n>          §4 loss drill / backpressure drill\n");
     printf("soak [<slave> <addr> [n=] [depth=] [path=direct|bg|user]] | stop   queue soak\n");
     printf("busload [reset]                            RS-485 bus occupancy, split per slave\n");
     printf("dstate [slave]                             DALI world model: presence, sweep, verify marks\n");
@@ -1513,6 +1516,75 @@ static void cmd_dq(char **saveptr) {
     dq_debug_print((int)slave);
 }
 
+/* `mbq [<slave>]` — the queue transport's own view: FSM state, per-command
+ * binding, and the protocol counters of queue-protocol §6. Reboots are split by
+ * the rule that noticed them, because the split says HOW they are being seen —
+ * a gateway whose reboots only ever surface as R4 deadline expiries is one
+ * whose structural rules (R2/R3) are not firing, which is itself the finding.
+ *
+ * `mbq drop-reply <slave> <n>` — discard the next n replies from that slave
+ * inside the client, after transport accounting and before resolution. This is
+ * the loss drill: dropping the reply to an enqueue+ack exercises R1/R1', and
+ * dropping the reply to an ack-less first enqueue exercises the deadline and
+ * boot_count corner. It forces the REAL recovery paths on real hardware — it
+ * does not simulate them. */
+static void cmd_mbq(char **saveptr) {
+    char *a1 = strtok_r(NULL, " \t", saveptr);
+    if (a1 && strcasecmp(a1, "drop-reply") == 0) {
+        char *ss = strtok_r(NULL, " \t", saveptr);
+        char *ns = strtok_r(NULL, " \t", saveptr);
+        long slave, n;
+        if (!parse_int_range_auto(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+        if (!parse_int_range_auto(ns, 0, 1000, &n))    { txt_err("bad_n"); return; }
+        if (!mbq_client_drop_reply((uint8_t)slave, (uint16_t)n)) {
+            txt_err("invalid_slave");
+            return;
+        }
+        txt_ok();
+        return;
+    }
+    if (a1 && strcasecmp(a1, "no-ack") == 0) {
+        char *ss = strtok_r(NULL, " \t", saveptr);
+        char *ns = strtok_r(NULL, " \t", saveptr);
+        long slave, n;
+        if (!parse_int_range_auto(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+        if (!parse_int_range_auto(ns, 0, 1000, &n))    { txt_err("bad_n"); return; }
+        if (!mbq_client_no_ack((uint8_t)slave, (uint16_t)n)) { txt_err("invalid_slave"); return; }
+        txt_ok();
+        return;
+    }
+    if (a1 && strcasecmp(a1, "gw") == 0) {
+        char *ss = strtok_r(NULL, " \t", saveptr);
+        long slave;
+        if (!parse_int_range_auto(ss, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+        static cli_mb_ctx_t ctx;
+        memset(&ctx, 0, sizeof ctx);
+        modbus_get_input_registers((uint8_t)slave, MBQ_GW_DIAG_ADDR,
+                                   MBQ_GW_DIAG_REGS, cli_mb_cb, &ctx);
+        cli_mb_wait(&ctx);
+        if (cli_mb_report_fail(&ctx)) return;
+        if (ctx.frame_len < 3 + (int)(MBQ_GW_DIAG_REGS * 2u)) { txt_err("short_read"); return; }
+        const uint8_t *p = ctx.frame + 3;
+        static const char *nm[MBQ_GW_DIAG_REGS] = {
+            "accepts", "a_full", "executes", "results",
+            "acks", "stalls", "q_discard", "spare",
+        };
+        cdc_out_printf("mbq gateway counters, slave %ld (FC04 0x%04X):\n",
+                       slave, MBQ_GW_DIAG_ADDR);
+        for (unsigned i = 0; i < MBQ_GW_DIAG_REGS; i++)
+            cdc_out_printf("  %-10s %u\n", nm[i],
+                           (unsigned)(((uint16_t)p[i * 2u] << 8) | p[i * 2u + 1u]));
+        /* What each one means when it is NOT zero: a_full says the master's
+         * in-flight accounting is wrong (the cap should make it unreachable),
+         * stalls is just the backpressure rule doing its job, q_discard means
+         * malformed frames are reaching the gateway. */
+        return;
+    }
+    long slave = -1;
+    if (a1 && !parse_int_range_auto(a1, 0, 247, &slave)) { txt_err("invalid_slave"); return; }
+    mbq_client_debug_print((int)slave);
+}
+
 /* `busload [reset]` — who is using the RS-485 bus. Prints the share of wall time
  * the bus was occupied since the last reset, split per slave. The point of the
  * split is that a slave being retried into the ground (a dead board, three
@@ -1547,6 +1619,10 @@ static void cmd_busload(char **saveptr) {
     modbus_busload_backoff(&skipped, &nbo);
     cdc_out_printf("  retries: %lu timeout, %lu device-busy\n",
            (unsigned long)rt, (unsigned long)rb);
+    /* Printed even at zero: a corrupt reply is now discarded rather than acted
+     * on, so this is the only place it becomes visible, and "0" is the point. */
+    cdc_out_printf("  bad CRC: %lu reply frame(s) discarded since boot\n",
+           (unsigned long)modbus_crc_error_count());
     cdc_out_printf("  backoff: %u slave(s) backed off, %lu txns skipped (bus untouched)\n",
            nbo, (unsigned long)skipped);
     cdc_out_printf("  turnaround: avg %lu.%02lu ms, max %lu.%02lu ms over %lu replies "
@@ -2222,6 +2298,10 @@ static void handle_text_line(const char *original_line) {
     }
     if (strcasecmp(cmd, "dq") == 0) {
         cmd_dq(&saveptr);
+        return;
+    }
+    if (strcasecmp(cmd, "mbq") == 0) {
+        cmd_mbq(&saveptr);
         return;
     }
     if (strcasecmp(cmd, "soak") == 0) {
