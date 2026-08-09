@@ -198,6 +198,10 @@ typedef struct {
                                * what climbs during the `no-ack` backpressure
                                * drill                                         */
     uint8_t  unacked;         /* results consumed but not yet proven popped    */
+    uint32_t head_blocked;    /* replies seen with the head still holding a
+                               * result we have consumed but not acked — the
+                               * response queue backing up. Climbs during the
+                               * `no-ack` drill and should be 0 otherwise      */
     uint32_t deadlines;       /* result deadlines that expired               */
     uint32_t afull;           /* A_FULL accept bytes (gateway queue full)    */
     uint32_t completed, failed;

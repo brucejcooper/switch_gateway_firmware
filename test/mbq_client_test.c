@@ -79,8 +79,11 @@ static struct {
     bool     present;        /* answers at all */
     bool     illegal_fc;     /* pre-v4 gateway: exception 0x01 to FC 0x41 */
     int      short_replies;  /* answer this many requests one byte short */
+    bool     force_afull;    /* refuse enqueues without advancing the seq counter */
     uint32_t accepts, acks, afulls;
     uint32_t reqs;               /* every FC 0x41 request that reached us */
+    uint8_t  hist[64];           /* opcode of each command EXECUTED, in order */
+    uint8_t  hist_n;
     uint64_t exec_until;         /* when the executing command finishes, 0 = idle */
     bool     dali_running;       /* run the DALI side on a timer (throughput test) */
     uint32_t acks_piggybacked;   /* acks applied by a request that also enqueued */
@@ -156,7 +159,7 @@ bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
     out[n++] = 0x41u;
 
     if (payload_len) {
-        if (GW.cq_n < CMDQ_DEPTH) {
+        if (GW.cq_n < CMDQ_DEPTH && !GW.force_afull) {
             gwcmd_t *c = &GW.cq[GW.cq_n++];
             memcpy(c->cmd, payload, payload_len);
             c->len = payload_len;
@@ -222,6 +225,7 @@ static void gw_dali_tick(void) {
         return;
     }
     if (g_now_us >= GW.exec_until) {
+        if (GW.hist_n < sizeof GW.hist) GW.hist[GW.hist_n++] = GW.cq[0].cmd[1];
         gw_complete(0u, GW.cq[0].cmd[1]);        /* answer echoes the opcode */
         GW.exec_until = 0;
     }
@@ -893,6 +897,138 @@ int main(void) {
         /* The reboot must be attributed to a rule, not merely survived — gate
          * V2 reads this split to say HOW it was noticed. */
         CHECK(stats().reboots_r2 + stats().reboots_r3 + stats().reboots_r4 >= 1u);
+    }
+
+    /* ── 12f. THE GATE-V2 BENCH FAILURE, reproduced. A gateway reboot with a
+     *      SET/QUERY pair in flight came back with the query answering the
+     *      value the NEXT pair's SET had written — the two DALI frames were
+     *      reversed, because the reboot disposal re-queued both commands and
+     *      they went back out in slot order rather than in the order the
+     *      producer issued them. Deterministic on hardware: exactly one
+     *      mis-attribution per reboot. The gateway executes strictly FIFO, so
+     *      the order the client re-offers IS the order the frames happen in. */
+    begin("resends preserve producer order across a reboot");
+    {
+        establish_baseline();
+        /* Stand in for the soak's pair: a SET that must run first and a QUERY
+         * that must run second. The fake gateway answers with the opcode of
+         * whichever command it executed, so an answer of SET_OP means the
+         * ordering inverted. */
+        const uint8_t SET_OP = 0x11u, QRY_OP = 0x22u;
+        const uint8_t first[4]  = { 0xA3u, SET_OP, 0u, 0u };
+        const uint8_t second[4] = { 0x01u, QRY_OP, MBQ_QF_ANSWER, 0u };
+        cap_t x = {0}, a = {0}, b = {0};
+        int i;
+
+        /* The layout matters, and it is why this only ever showed on hardware:
+         * the two commands must end up with the EARLIER one in the HIGHER slot,
+         * which is what happens once slots start being recycled. Fill slot 0,
+         * put `first` in slot 1, then retire slot 0 and let `second` reuse it. */
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &x));
+        pump();
+        for (i = 0; i < 200 && !mbq_client_can_submit(SLAVE); i++) pump();
+        CHECK(mbq_client_submit(SLAVE, first, true, cap_cb, &a));
+        pump();
+        gw_complete(0u, 0x00u);                  /* retire the filler */
+        CHECK(run_until_delivered(&x, 300));
+        for (i = 0; i < 200 && !mbq_client_can_submit(SLAVE); i++) pump();
+        CHECK(mbq_client_submit(SLAVE, second, true, cap_cb, &b));
+        pump();
+
+        CHECK(GW.cq_n == 2);
+        CHECK(GW.cq[0].cmd[1] == SET_OP);        /* the gateway has them in order */
+        CHECK(GW.hist_n == 0);                   /* neither has executed yet */
+
+        gw_boot(false);                          /* both vanish; both are idempotent */
+        /* Only now let the DALI side run, so `hist` records exactly the frames
+         * the RESENDS produced and nothing else. */
+        GW.dali_running = true;
+        run_ms(MBQ_RESULT_DEADLINE_MS + 500u);
+        GW.dali_running = false;
+
+        uint8_t saw_first = 0, saw_second = 0, inverted = 0;
+        for (uint8_t k = 0; k < GW.hist_n; k++) {
+            if (GW.hist[k] == SET_OP) { saw_first = 1; if (saw_second) inverted = 1; }
+            if (GW.hist[k] == QRY_OP) { saw_second = 1; if (!saw_first) inverted = 1; }
+        }
+        CHECK(saw_first && saw_second);
+        CHECK(!inverted);                        /* the bench failure, in one flag */
+    }
+
+    /* ── 12g. GATE V4: withholding acks must produce BACK-PRESSURE, not double
+     *      execution. With the head unacked the client cannot see results
+     *      behind it — but the gateway is retaining them exactly as designed,
+     *      so a result deadline expiring there is R4 reading a stalled queue as
+     *      a wedged gateway and resending a command the gateway still holds.
+     *      That is a real DALI frame executed twice, reported to nobody. */
+    begin("no-ack drill: back-pressure, not double execution");
+    {
+        establish_baseline();
+        GW.dali_running = true;
+        mbq_client_no_ack(SLAVE, 500);           /* withhold for the whole run */
+        static cap_t caps[8];
+        memset(caps, 0, sizeof caps);
+        uint32_t submitted = 0;
+        uint32_t accepts_before = GW.accepts;
+        for (int i = 0; i < 1500; i++) {
+            if (submitted < 6u && mbq_client_can_submit(SLAVE)
+                && mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &caps[submitted]))
+                submitted++;
+            pump();
+        }
+        CHECK(stats().head_blocked > 0);         /* the client SAW the queue backing up */
+        /* Every accept is a DALI frame. More accepts than commands means at
+         * least one frame ran twice. */
+        printf("  [no-ack] %u commands submitted, %u accepts at the gateway\n",
+               submitted, GW.accepts - accepts_before);
+        CHECK(GW.accepts - accepts_before == submitted);
+        CHECK(stats().resends == 0);
+        CHECK(stats().afull == 0);
+        CHECK(stats().lost == 0);
+
+        /* Resuming acks must drain it and let everything complete. */
+        mbq_client_no_ack(SLAVE, 0);
+        for (int i = 0; i < 3000; i++) pump();
+        uint32_t done = 0;
+        for (uint32_t k = 0; k < submitted; k++) if (caps[k].n == 1) done++;
+        CHECK(done == submitted);                /* nothing lost, full recovery */
+        CHECK(GW.accepts - accepts_before == submitted);
+        GW.dali_running = false;
+    }
+
+    /* ── 12h. The OTHER way a prediction can be wrong: the predicted seq never
+     *      materialises at all, because the gateway never issued it. Nothing
+     *      re-examines such a prediction — apply_head only compares against a
+     *      DIFFERENT seq that surfaces — so it used to run out its deadline and
+     *      be disposed by R4's wedge branch as RESULT_LOST. That is the wrong
+     *      answer twice over: it is a prediction fault and must be counted as
+     *      one, and the command never ran, so telling the submitter it
+     *      executed (and specifically not to retry) is a lie that leaves the
+     *      cache diverged from the gear with no error surfaced anywhere. */
+    begin("a prediction that never surfaces is a counted fault, disposed LOST");
+    {
+        establish_baseline();
+        cap_t b = {0}, a = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &b));
+        pump();
+        gw_complete(0u, 0x07u);
+        CHECK(run_until_delivered(&b, 200));     /* an ack is now pending */
+
+        /* A gateway that refuses the enqueue WITHOUT advancing its seq counter,
+         * and whose reply is then lost. The ack still applied, so R1 correctly
+         * concludes the frame landed — and binds to a seq that will never
+         * exist. (gw-reviewer found a real second A_FULL path in cq_accept
+         * that does exactly this; the point here is the general property.) */
+        GW.force_afull = true;
+        mbq_client_drop_reply(SLAVE, 1);
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, false, cap_cb, &a));
+        pump();
+        GW.force_afull = false;
+
+        run_ms(MBQ_RESULT_DEADLINE_MS + 400u);
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_LOST);                /* NOT RESULT_LOST: it never ran */
+        CHECK(stats().pred_faults == 1);         /* and it is counted as a fault */
     }
 
     /* ── 13. THE NUMBER THIS PROTOCOL EXISTS TO HIT: one Modbus transaction

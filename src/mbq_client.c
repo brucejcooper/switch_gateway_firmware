@@ -150,6 +150,7 @@ typedef struct {
     bool     idempotent;
     uint8_t  st;                   /* cmd_state_t */
     uint8_t  seq;                  /* gateway-assigned; 0 until accepted */
+    uint32_t ord;                  /* producer order, preserved across resends */
     uint8_t  resends;
     uint8_t  chases;               /* deadline polls spent on this command */
     bool     pred;                 /* seq was PREDICTED by R1, not read from an
@@ -228,6 +229,7 @@ typedef struct {
     bool     bc_valid;
     uint16_t bc_last;
 
+    uint32_t next_ord;          /* monotonic submit counter, source of cmd_t.ord */
     uint8_t  drain_polls;
     uint8_t  drain_pass;        /* 1 = first sweep, 2 = the post-wait sweep */
     uint64_t drain_wait_us;     /* when the second sweep may begin */
@@ -313,6 +315,28 @@ static uint8_t count_state(const slave_t *s, cmd_state_t st) {
 static uint8_t find_state(const slave_t *s, cmd_state_t st) {
     for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) if (s->cmd[i].st == st) return i;
     return NO_CMD;
+}
+
+/* The PENDING command that must go out next — the one submitted EARLIEST, not
+ * the one in the lowest slot.
+ *
+ * This is load-bearing and it is not obvious. The gateway executes strictly
+ * FIFO in accept order, so the order the client re-offers commands in IS the
+ * order the DALI frames happen in. A reboot disposes several commands at once
+ * and re-queues the idempotent ones together; re-offering those in slot-array
+ * order silently reverses DALI frames that the producer issued in a meaningful
+ * sequence. Measured on the bench: a soak SET/QUERY pair straddling a gateway
+ * reboot came back with the query answering 0x62 where 0x01 was written — the
+ * value the NEXT pair's SET had put there, because the resent SET overtook the
+ * resent query. Deterministic, one mis-attribution per reboot, and exactly the
+ * result-misattribution class v4 exists to eliminate. */
+static uint8_t find_next_pending(const slave_t *s) {
+    uint8_t best = NO_CMD;
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
+        if (s->cmd[i].st != CMD_PENDING) continue;
+        if (best == NO_CMD || s->cmd[i].ord < s->cmd[best].ord) best = i;
+    }
+    return best;
 }
 
 static cmd_t *find_pred_bound(slave_t *s) {
@@ -641,6 +665,28 @@ static bool apply_head(slave_t *s, const reply_t *r) {
         return true;
     }
 
+    /* Results are BLOCKED, not missing. While the head still holds a result the
+     * master has consumed but not managed to ack, every result behind it is
+     * invisible — the gateway is retaining them exactly as designed. Letting
+     * the result deadline expire in that state makes R4 read a stalled queue as
+     * a wedged gateway and resend a command the gateway is still holding, which
+     * is a DOUBLE EXECUTION of a real DALI frame, reported to nobody. It is
+     * reachable deliberately (the `mbq no-ack` backpressure drill, gate V4) and
+     * accidentally (an ack whose frame keeps getting lost). The client can tell
+     * the difference, so it must: push the deadlines out while the head is
+     * known-blocked, and let them run again once it moves. */
+    if (r->hseq != 0 && r->hseq == s->ack_pending) {
+        uint64_t push = MBQ_NOW_US() + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
+        for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
+            cmd_t *c = &s->cmd[i];
+            if (c->st == CMD_ACCEPTED && c->deadline_us < push) {
+                c->deadline_us = push;
+                c->chases = 0;
+            }
+        }
+        s->stats.head_blocked++;
+    }
+
     /* Ack confirmation: the head moving off the seq we were acking proves the
      * ack was applied. While it has not moved, keep carrying the same ack. */
     if (s->ack_pending != 0 && r->hseq != s->ack_pending) s->ack_pending = 0;
@@ -967,11 +1013,33 @@ static void resolve_sysinfo(slave_t *s, const uint8_t *b, uint8_t n) {
                          "unchanged (%u) — gateway wedge", s->slave_id, (unsigned)bc);
                 for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
                     cmd_t *e = &s->cmd[i];
-                    if (e->st == CMD_ACCEPTED && e->seq == s->tx_deadline_seq) {
-                        if (e->idempotent) resend_or_lose(s, e, MBQ_R_LOST);
-                        else               deliver(s, e, MBQ_R_RESULT_LOST, 0);
-                        break;
+                    if (e->st != CMD_ACCEPTED || e->seq != s->tx_deadline_seq) continue;
+                    if (e->pred) {
+                        /* The other way a prediction can be wrong: not a
+                         * DIFFERENT seq surfacing, but the predicted one never
+                         * surfacing at all. apply_head can only catch the
+                         * former, because nothing re-examines a prediction that
+                         * simply never materialises. It is still a prediction
+                         * fault and must be counted as one, or the §6 stat only
+                         * reports half of R1 guessing wrong.
+                         *
+                         * And it disposes as LOST, not RESULT_LOST: the
+                         * prediction was the only evidence this command ever
+                         * had a seq at all, so "it never ran" is the honest
+                         * reading. RESULT_LOST would tell the submitter the
+                         * DALI frame executed — and specifically not to retry —
+                         * when it did not. */
+                        s->stats.pred_faults++;
+                        LOG_ERR("mbq", "slave %u: predicted seq %u for command "
+                                "%02X%02X never appeared — the gateway never "
+                                "issued it", s->slave_id, e->seq, e->cmd[0], e->cmd[1]);
+                        deliver(s, e, MBQ_R_LOST, 0);
+                    } else if (e->idempotent) {
+                        resend_or_lose(s, e, MBQ_R_LOST);
+                    } else {
+                        deliver(s, e, MBQ_R_RESULT_LOST, 0);
                     }
+                    break;
                 }
             }
             s->tx_deadline_seq = 0;
@@ -1301,7 +1369,7 @@ static void drive(slave_t *s) {
     /* A command waiting to be (re)sent goes first: it is either a resend of
      * something that never landed or an A_FULL retry, and either way it is
      * ahead of anything new. */
-    uint8_t pi = find_state(s, CMD_PENDING);
+    uint8_t pi = find_next_pending(s);
     if (pi != NO_CMD) {
         if (now < s->next_at_us) return;
         /* Only claim AWAIT_REPLY if something actually went out: a refusal from
@@ -1429,6 +1497,8 @@ bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
     c->idempotent = idempotent;
     c->seq        = 0;
     c->resends    = 0;
+    c->chases     = 0;
+    c->ord        = s->next_ord++;   /* producer order, kept across any resend */
     c->st         = CMD_PENDING;
 
     /* A fresh command is not subject to the pacing timer: pacing exists to stop
