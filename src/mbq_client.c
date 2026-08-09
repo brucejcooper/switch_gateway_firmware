@@ -187,7 +187,16 @@ typedef struct {
     uint8_t  drain_polls;
     uint8_t  gw_major, gw_minor;
 
-    uint64_t next_at_us;        /* pacing: nothing goes out before this */
+    /* Two pacing gates, deliberately separate. next_at_us holds back work the
+     * client OWES the gateway (a resend, a retry after a failure, an A_FULL
+     * re-offer); poll_at_us holds back the speculative POLL that collects a
+     * result. Merging them would make an R1' resend wait out a DALI frame it
+     * has no reason to wait for, and would let a freshly submitted command sit
+     * behind a poll timer — which is the throughput this design exists to
+     * gain. A fresh submit is gated by neither (spec §5 paces "on A_FULL, or
+     * when awaiting results with an empty backlog", and a submit is neither). */
+    uint64_t next_at_us;
+    uint64_t poll_at_us;
 
     /* Modbus completion hand-off (resolved in tick, not in the callback). */
     volatile bool cb_fired;
@@ -247,10 +256,6 @@ static bool seq_tracked(slave_t *s, uint8_t seq) {
     return cmd_by_seq(s, seq) != NULL;
 }
 
-static uint8_t cmd_index(slave_t *s, const cmd_t *c) {
-    return (uint8_t)(c - s->cmd);
-}
-
 static uint8_t count_state(const slave_t *s, cmd_state_t st) {
     uint8_t n = 0;
     for (uint8_t i = 0; i < CMDQ_DEPTH; i++) if (s->cmd[i].st == st) n++;
@@ -273,20 +278,21 @@ static void pace(slave_t *s, uint32_t ms) {
     s->next_at_us = MBQ_NOW_US() + (uint64_t)ms * 1000u;
 }
 
-/* Schedule the next transaction at the estimated completion of the OLDEST
- * in-flight command (spec §5). Capped at the result deadline so a bad estimate
- * can never delay the deadline machinery past the point where it should fire. */
-static void pace_on_oldest(slave_t *s) {
+/* When the OLDEST in-flight command is estimated to finish (spec §5) — the
+ * moment at which a poll has something to collect. Capped at the result
+ * deadline so a bad estimate can never delay the deadline machinery past the
+ * point where it should fire, and floored so it always yields to the rest of
+ * the main loop. */
+static uint64_t oldest_done_at(const slave_t *s) {
     uint64_t now = MBQ_NOW_US(), target = 0;
     for (uint8_t i = 0; i < CMDQ_DEPTH; i++) {
         if (s->cmd[i].st != CMD_ACCEPTED) continue;
         if (target == 0 || s->cmd[i].est_done_us < target) target = s->cmd[i].est_done_us;
     }
-    if (target == 0) { pace(s, PACE_MIN_MS); return; }
-    uint64_t cap = now + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
-    if (target > cap) target = cap;
     uint64_t floor_us = now + (uint64_t)PACE_MIN_MS * 1000u;
-    s->next_at_us = (target < floor_us) ? floor_us : target;
+    uint64_t cap      = now + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
+    if (target == 0 || target < floor_us) return floor_us;
+    return (target > cap) ? cap : target;
 }
 
 static void deliver(slave_t *s, cmd_t *c, mbq_result_t r, uint8_t resp8) {
@@ -418,10 +424,10 @@ static void mbq_modbus_cb(int res, uint8_t *buf, void *ctx) {
  * ack/poll) and the ack is always the outstanding one (spec §5, always
  * piggyback). Returns false if the Modbus action queue was full — the caller
  * leaves its state alone and retries. */
-static bool issue_queue_txn(slave_t *s, uint8_t ci) {
+static bool issue_queue_txn_acked(slave_t *s, uint8_t ci, bool with_ack) {
     uint8_t payload[3];
     uint8_t plen = 0;
-    uint8_t ctl  = (uint8_t)(s->ack_pending & SEQ_MASK);
+    uint8_t ctl  = with_ack ? (uint8_t)(s->ack_pending & SEQ_MASK) : 0u;
 
     if (ci != NO_CMD) {
         const uint8_t *c = s->cmd[ci].cmd;
@@ -450,6 +456,10 @@ static bool issue_queue_txn(slave_t *s, uint8_t ci) {
         s->stats.polls++;
     }
     return true;
+}
+
+static bool issue_queue_txn(slave_t *s, uint8_t ci) {
+    return issue_queue_txn_acked(s, ci, true);
 }
 
 static bool issue_read(slave_t *s, uint8_t kind, uint16_t addr, uint16_t regs) {
@@ -576,7 +586,7 @@ static void resolve_queue_reply(slave_t *s, const reply_t *r) {
             /* Pace the retry: the queue is full because DALI is busy, and
              * re-offering at main-loop speed would burn shared bus to be told
              * so again. */
-            pace_on_oldest(s);
+            s->next_at_us = oldest_done_at(s);
         } else if (r->astatus == A_ACCEPTED && r->aseq != 0) {
             /* R2: the gateway pins a seq until its result is acked, and acks are
              * head-only and in order, so reaching the same value again needs 31
@@ -620,8 +630,11 @@ static void resolve_recovery_reply(slave_t *s, const reply_t *r) {
         if (r->hseq == s->rec_ack) {
             s->stats.r1_never++;                 /* R1': never arrived */
             s->rec_cmd = NO_CMD;
-            c->seq = 0;
-            c->st  = CMD_PENDING;                /* resend verbatim, ack included */
+            /* Resend verbatim, ack included — no idempotency concern, because
+             * the head proves the frame never reached the gateway. Through the
+             * shared path so it is counted and subject to the same cap as
+             * every other resend. */
+            resend_or_lose(s, c, MBQ_R_LOST);
             apply_head(s, r);
             return;
         }
@@ -914,6 +927,12 @@ static void handle_reply(slave_t *s) {
 
     resolve_queue_reply(s, &r);
 
+    /* Whatever this reply settled, the next SPECULATIVE poll is worth issuing
+     * only once the oldest in-flight command could plausibly have finished. A
+     * submit arriving before then still goes out immediately — this gate is on
+     * polls alone. */
+    s->poll_at_us = oldest_done_at(s);
+
     /* An R4 poll that did not bring back the result it was chasing escalates to
      * the cold-path arbiter. */
     if (s->tx_deadline_seq != 0 && s->st != S_BOOT_CHECK) {
@@ -953,7 +972,17 @@ static void drive(slave_t *s) {
         case S_RECOVERY_POLL:
             if (now < s->next_at_us) return;
             s->stats.recovery_polls++;
-            if (issue_queue_txn(s, NO_CMD)) pace(s, PACE_MIN_MS);
+            /* THE ONE EXCEPTION to always-piggyback (spec §5), and it is
+             * load-bearing: R1 asks "did the head move past the seq the lost
+             * frame acked?". A poll that carries that same ack MOVES THE HEAD
+             * ITSELF, so the test would always answer "landed" and R1' could
+             * never fire — a genuinely lost command would be bound to a seq the
+             * gateway never issued and then quietly disposed at its deadline.
+             * §3's worked recovery is explicit that this frame is `POLL (5 B,
+             * ack 0)`; §5's blanket rule has to yield to it. The ack is not
+             * lost, only deferred: ack_pending survives and rides the first
+             * request issued after the recovery resolves. */
+            if (issue_queue_txn_acked(s, NO_CMD, s->rec_ack == 0)) pace(s, PACE_MIN_MS);
             return;
 
         default:
@@ -989,11 +1018,9 @@ static void drive(slave_t *s) {
      * anybody. */
     if (count_state(s, CMD_ACCEPTED) > 0 || s->ack_pending != 0) {
         s->st = S_DEADLINE_WAIT;
-        if (now < s->next_at_us) return;
-        if (issue_queue_txn(s, NO_CMD)) {
-            s->st = S_AWAIT_REPLY;
-            pace_on_oldest(s);
-        }
+        uint64_t at = (s->next_at_us > s->poll_at_us) ? s->next_at_us : s->poll_at_us;
+        if (now < at) return;
+        if (issue_queue_txn(s, NO_CMD)) s->st = S_AWAIT_REPLY;
         return;
     }
 

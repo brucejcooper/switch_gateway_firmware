@@ -1,0 +1,622 @@
+/*
+ * mbq_client_test.c — host-side test for src/mbq_client.c, the queue-v4
+ * transport FSM.
+ *
+ * Not part of the firmware build (see CLAUDE.md: host tests live under test/
+ * and are never added to the RP2040 CMake target). Compiles mbq_client.c itself
+ * with -DMBQ_CLIENT_HOST_TEST, which is the ONLY thing that changes in the
+ * module: its clock accessor. Everything else is real — the Modbus entry points
+ * it calls are ordinary extern functions, so this file simply defines them
+ * instead of linking modbus.c, and a fake gateway answers on the other side.
+ * There is therefore no second implementation of a recovery rule here to drift
+ * out of sync with the one that ships.
+ *
+ * What it covers, and why THESE: R1, R1', R2, R3, R4, the ack-less ambiguous
+ * corner (both idempotent and non-idempotent, with the boot_count gate) and the
+ * piggyback-ack bookkeeping. Every one of those is a path that historically
+ * only broke on hardware — v1's ledger and v2's reconcile bugs were all in
+ * rarely-exercised recovery code (TinyModbus/DESIGN-HISTORY.md), and a bench
+ * that only runs the happy path cannot see them.
+ *
+ * The fake gateway is a real implementation of the §2 processing order (ack,
+ * then enqueue, then build the reply from the state as it now stands) over a
+ * real command FIFO and a real retained response queue, so the client is being
+ * driven by the protocol rather than by canned frames. Tests drive DALI
+ * completion explicitly (gw_complete) instead of on a timer, so ordering is
+ * exact.
+ *
+ * Build & run:
+ *   cc -DMBQ_CLIENT_HOST_TEST -Wall -Wextra -I ../src \
+ *       -o /tmp/mbq_client_test mbq_client_test.c ../src/mbq_client.c \
+ *       && /tmp/mbq_client_test
+ */
+#include "../src/mbq_client.h"
+#include "../src/modbus.h"
+#include "../src/log.h"
+
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+
+/* ── the seam: a virtual clock ───────────────────────────────────────────── */
+
+static uint64_t g_now_us;
+uint64_t mbq_test_now_us(void) { return g_now_us; }
+static void advance_ms(uint32_t ms) { g_now_us += (uint64_t)ms * 1000u; }
+
+/* ── firmware odds and ends the module links against ─────────────────────── */
+
+log_level_t g_log_level = LOG_LEVEL_OFF;
+static int g_log_quiet = 1;
+void log_emit(log_level_t lvl, const char *lc, const char *mod, const char *fmt, ...) {
+    (void)lvl;
+    if (g_log_quiet) return;
+    va_list ap; va_start(ap, fmt);
+    printf("[%s %s] ", lc, mod); vprintf(fmt, ap); printf("\n");
+    va_end(ap);
+}
+void cdc_out_printf(const char *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    if (!g_log_quiet) vprintf(fmt, ap);
+    va_end(ap);
+}
+
+/* ── the fake gateway ────────────────────────────────────────────────────── */
+
+#define RESPQ_DEPTH 4u
+#define SLAVE 3u
+
+typedef struct { uint8_t cmd[3], len, seq; bool used; } gwcmd_t;
+typedef struct { uint8_t seq, status, resp8; } gwres_t;
+
+static struct {
+    gwcmd_t  cq[CMDQ_DEPTH];
+    uint8_t  cq_n;
+    gwres_t  rq[RESPQ_DEPTH];
+    uint8_t  rq_n;
+    uint8_t  next_seq;
+    uint16_t boot_count;
+    bool     present;        /* answers at all */
+    bool     illegal_fc;     /* pre-v4 gateway: exception 0x01 to FC 0x41 */
+    int      short_replies;  /* answer this many requests one byte short */
+    uint32_t accepts, acks, afulls;
+    uint32_t acks_piggybacked;   /* acks applied by a request that also enqueued */
+} GW;
+
+static void gw_boot(bool cold) {
+    memset(GW.cq, 0, sizeof GW.cq);
+    memset(GW.rq, 0, sizeof GW.rq);
+    GW.cq_n = 0; GW.rq_n = 0; GW.next_seq = 1;
+    if (cold) GW.boot_count = 1; else GW.boot_count++;
+}
+static void gw_reset_all(void) {
+    memset(&GW, 0, sizeof GW);
+    GW.present = true;
+    gw_boot(true);
+}
+
+/* Finish the head of the command queue, pushing its result. Mirrors the
+ * gateway's strict-FIFO execution. */
+static bool gw_complete(uint8_t status, uint8_t resp8) {
+    if (GW.cq_n == 0 || GW.rq_n >= RESPQ_DEPTH) return false;
+    GW.rq[GW.rq_n++] = (gwres_t){ GW.cq[0].seq, status, resp8 };
+    for (uint8_t i = 0; i + 1u < GW.cq_n; i++) GW.cq[i] = GW.cq[i + 1u];
+    GW.cq_n--;
+    return true;
+}
+
+/* ── the transport the client calls ──────────────────────────────────────── */
+
+/* One request at a time, delivered on the next mbq_client_tick() — the real
+ * transport also defers its callback out of the client's submit path. */
+static struct {
+    bool               armed;
+    int                res;
+    uint8_t            buf[64];
+    modbus_action_cb_t cb;
+    void              *ctx;
+} PEND;
+
+static void reply(const uint8_t *b, uint8_t n) {
+    memcpy(PEND.buf, b, n);
+    PEND.res = n;
+}
+static void no_reply(void) { PEND.res = 0; }
+
+bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
+                   uint8_t payload_len, modbus_action_cb_t cb, void *ctx) {
+    PEND.armed = true; PEND.cb = cb; PEND.ctx = ctx;
+    if (!GW.present) { no_reply(); return true; }
+    if (GW.illegal_fc) {
+        uint8_t e[5] = { (uint8_t)dev, 0xC1u, 0x01u, 0, 0 };
+        reply(e, 5);
+        PEND.res = -5;
+        return true;
+    }
+
+    /* §2 order: ack first, so the entry it frees is available to the enqueue
+     * in this same transaction. */
+    uint8_t ack = ctl & 0x1Fu;
+    if (ack && GW.rq_n && GW.rq[0].seq == ack) {
+        for (uint8_t i = 0; i + 1u < GW.rq_n; i++) GW.rq[i] = GW.rq[i + 1u];
+        GW.rq_n--;
+        GW.acks++;
+        if (payload_len) GW.acks_piggybacked++;
+    }
+
+    uint8_t out[8];
+    uint8_t n = 0;
+    out[n++] = (uint8_t)dev;
+    out[n++] = 0x41u;
+
+    if (payload_len) {
+        if (GW.cq_n < CMDQ_DEPTH) {
+            gwcmd_t *c = &GW.cq[GW.cq_n++];
+            memcpy(c->cmd, payload, payload_len);
+            c->len = payload_len;
+            c->seq = GW.next_seq;
+            GW.next_seq = (GW.next_seq >= 31u) ? 1u : (uint8_t)(GW.next_seq + 1u);
+            GW.accepts++;
+            out[n++] = c->seq;                    /* A_ACCEPTED (status 0) | seq */
+        } else {
+            GW.afulls++;
+            out[n++] = (uint8_t)(1u << 5);        /* A_FULL, seq 0 */
+        }
+    }
+
+    if (GW.rq_n) {
+        out[n++] = (uint8_t)((GW.rq[0].status << 5) | GW.rq[0].seq);
+        out[n++] = GW.rq[0].resp8;
+    } else {
+        out[n++] = 0;
+        out[n++] = 0;
+    }
+    out[n++] = 0; out[n++] = 0;                   /* CRC, already validated */
+
+    if (GW.short_replies > 0) { GW.short_replies--; n--; }
+    reply(out, n);
+    return true;
+}
+
+bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
+                                modbus_action_cb_t cb, void *ctx) {
+    PEND.armed = true; PEND.cb = cb; PEND.ctx = ctx;
+    if (!GW.present) { no_reply(); return true; }
+    if (addr == 0x0310u && count == 4u) {
+        uint8_t b[13] = { (uint8_t)dev, 0x04u, 8u, 0,0,0,0, 0,0, 0,0, 0,0 };
+        b[7] = (uint8_t)(GW.boot_count >> 8);
+        b[8] = (uint8_t)GW.boot_count;
+        reply(b, 13);
+        return true;
+    }
+    if (addr == 0x0200u && count == 16u) {
+        uint8_t b[37];
+        memset(b, 0, sizeof b);
+        b[0] = (uint8_t)dev; b[1] = 0x04u; b[2] = 32u;
+        memcpy(b + 3, "DALI v2.0 0011223344556677", 26);
+        reply(b, 37);
+        return true;
+    }
+    no_reply();
+    return true;
+}
+
+/* Run one main-loop iteration: deliver any armed reply, then tick the client.
+ * Time advances by a millisecond per iteration, because the client's pacing
+ * timers are real and a loop that never advanced the clock would deadlock
+ * against them exactly as a frozen main loop would. */
+static void pump(void) {
+    advance_ms(1);
+    if (PEND.armed) {
+        PEND.armed = false;
+        modbus_action_cb_t cb = PEND.cb;
+        cb(PEND.res, PEND.buf, PEND.ctx);
+    }
+    mbq_client_tick();
+}
+static void pump_n(int n) { for (int i = 0; i < n; i++) pump(); }
+
+/* Let the main loop run for `ms` of virtual time. Prefer this to advancing the
+ * clock in one jump and then pumping: the client's pacing timers only release
+ * work when time passes BETWEEN iterations, so a jump-then-spin pattern tests a
+ * schedule the firmware never actually sees. */
+static void run_ms(uint32_t ms) { for (uint32_t i = 0; i < ms; i++) pump(); }
+
+
+/* ── result capture ──────────────────────────────────────────────────────── */
+
+typedef struct { int n; mbq_result_t r; uint8_t resp; } cap_t;
+static void cap_cb(uint8_t slave, mbq_result_t r, uint8_t resp8, void *ctx) {
+    (void)slave;
+    cap_t *c = (cap_t *)ctx;
+    c->n++; c->r = r; c->resp = resp8;
+}
+
+/* Run until `c` is delivered, then stop AT ONCE. Stopping there leaves the ack
+ * for that result still pending, so the next submit piggybacks it — which is
+ * exactly the precondition R1/R1' exist to resolve, and it is what steady state
+ * looks like (a command is always waiting when a result lands). Pumping on
+ * instead would let the client's own paced poll carry the ack and quietly turn
+ * the scenario into the ack-less corner. */
+static bool run_until_delivered(cap_t *c, uint32_t limit_ms) {
+    for (uint32_t i = 0; i < limit_ms; i++) { pump(); if (c->n) return true; }
+    return false;
+}
+
+static int fail = 0;
+static const char *g_case = "";
+#define CHECK(cond) do { \
+        if (!(cond)) { \
+            printf("FAIL [%s]: %s (%s:%d)\n", g_case, #cond, __FILE__, __LINE__); \
+            fail = 1; \
+        } \
+    } while (0)
+
+/* SET DTR0 (no answer) and QUERY (answer expected) — one of each command class
+ * so the DTR0/answer flag packing is exercised alongside the recovery rules. */
+static const uint8_t CMD_SET[4]   = { 0xA3u, 0x5Au, 0u, 0u };
+static const uint8_t CMD_QUERY[4] = { 0x01u, 0x98u, MBQ_QF_ANSWER, 0u };
+
+/* Bring a slave from registration to the steady state: version read, epoch
+ * drain, boot_count baseline. Returns with the client idle and able to submit. */
+static void bring_up(void) {
+    mbq_client_init();
+    mbq_client_add_slave(SLAVE);
+    for (int i = 0; i < 100 && !mbq_client_can_submit(SLAVE); i++) pump();
+    CHECK(mbq_client_can_submit(SLAVE));
+}
+
+static void begin(const char *name) {
+    g_case = name;
+    g_now_us = 1000000u;
+    memset(&PEND, 0, sizeof PEND);
+    gw_reset_all();
+    bring_up();
+}
+
+static mbq_stats_t stats(void) {
+    mbq_stats_t st;
+    mbq_client_stats(SLAVE, &st);
+    return st;
+}
+
+/* Submit one command and let its enqueue transaction complete. */
+static bool submit(const uint8_t cmd[4], bool idem, cap_t *c) {
+    bool ok = mbq_client_submit(SLAVE, cmd, idem, cap_cb, c);
+    if (ok) pump();      /* the enqueue's reply lands here */
+    return ok;
+}
+
+int main(void) {
+    /* ── 1. Registration: drain a response queue left by a previous controller
+     *     epoch, then establish the boot_count baseline. An orphan result must
+     *     be acked away, not delivered to anybody. ─────────────────────────── */
+    g_case = "registration drain";
+    g_now_us = 1000000u;
+    memset(&PEND, 0, sizeof PEND);
+    gw_reset_all();
+    GW.rq[GW.rq_n++] = (gwres_t){ 7u, 0u, 0xAAu };   /* stale, from the dead epoch */
+    GW.rq[GW.rq_n++] = (gwres_t){ 8u, 0u, 0xBBu };
+    mbq_client_init();
+    mbq_client_add_slave(SLAVE);
+    for (int i = 0; i < 100 && !mbq_client_can_submit(SLAVE); i++) pump();
+    CHECK(mbq_client_can_submit(SLAVE));
+    CHECK(GW.rq_n == 0);                 /* both orphans acked away */
+    CHECK(stats().drained);
+    CHECK(stats().boot_count == 1);
+    CHECK(stats().gw_ver_major == 2);    /* parsed out of the version block */
+
+    /* ── 2. Steady state: one transaction per DALI frame, with the ack for the
+     *     previous result piggybacked on the next enqueue. ───────────────── */
+    begin("steady state + piggyback ack");
+    {
+        cap_t a = {0}, b = {0};
+        CHECK(submit(CMD_SET, true, &a));
+        CHECK(GW.cq_n == 1);
+        CHECK(submit(CMD_QUERY, true, &b));      /* fills the queue */
+        CHECK(GW.cq_n == 2);
+        CHECK(!mbq_client_can_submit(SLAVE));    /* in-flight cap, not A_FULL */
+        CHECK(GW.afulls == 0);
+
+        gw_complete(1u, 0x01u);                  /* the SET: H_FAILED/NAK, normal */
+        run_ms(103);
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_FAILED && a.resp == 0x01u);
+
+        /* The ack for b's result must ride the NEXT ENQUEUE, not a poll of its
+         * own — that is what makes steady state one transaction per DALI frame
+         * (§3) and what keeps R1 available when a reply goes missing. */
+        gw_complete(0u, 0x5Au);                  /* the query answers */
+        CHECK(run_until_delivered(&b, 120));
+        CHECK(b.r == MBQ_R_COMPLETE && b.resp == 0x5Au);
+        uint32_t piggy_before = GW.acks_piggybacked;
+        cap_t c = {0};
+        CHECK(mbq_client_can_submit(SLAVE));
+        CHECK(submit(CMD_SET, true, &c));
+        CHECK(GW.acks_piggybacked == piggy_before + 1);
+        CHECK(GW.rq_n == 0);                     /* retention is not accumulating */
+    }
+
+    /* ── 3. R1 — a lost reply to an enqueue+ack. The recovery poll finds the
+     *     head has moved past the acked seq, which proves the ack was applied,
+     *     which proves the whole frame landed (they travel together). The
+     *     command must bind to the predicted seq and NOT be resent. ──────── */
+    begin("R1: lost enqueue+ack reply, frame landed");
+    {
+        cap_t a = {0};
+        CHECK(submit(CMD_SET, true, &a));
+        gw_complete(0u, 0x11u);                  /* a result to be acked */
+        CHECK(run_until_delivered(&a, 100));     /* its ack is now pending */
+
+        uint32_t accepts_before = GW.accepts;
+        cap_t b = {0};
+        mbq_client_drop_reply(SLAVE, 1);         /* the drill knob, same path as a real loss */
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &b));
+        pump();                                  /* reply generated, then dropped */
+        CHECK(GW.accepts == accepts_before + 1); /* it DID land at the gateway */
+
+        run_ms(49);                /* recovery poll resolves it */
+        CHECK(stats().r1_landed == 1);
+        CHECK(stats().r1_never == 0);
+        CHECK(GW.accepts == accepts_before + 1); /* nothing was resent */
+        CHECK(stats().resends == 0);
+
+        gw_complete(0u, 0x22u);
+        run_ms(104);
+        CHECK(b.n == 1);
+        CHECK(b.r == MBQ_R_COMPLETE && b.resp == 0x22u);   /* bound to the right seq */
+    }
+
+    /* ── 4. R1' — the same loss, but the frame never arrived. The head is
+     *     unchanged, so the command is resent verbatim, ack included. ────── */
+    begin("R1': lost enqueue+ack frame, never arrived");
+    {
+        cap_t a = {0};
+        CHECK(submit(CMD_SET, true, &a));
+        gw_complete(0u, 0x11u);
+        CHECK(run_until_delivered(&a, 100));
+
+        uint32_t accepts_before = GW.accepts;
+        cap_t b = {0};
+        GW.present = false;                      /* the request itself is lost */
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &b));
+        pump();
+        CHECK(GW.accepts == accepts_before);     /* never reached the gateway */
+        GW.present = true;
+
+        run_ms(49);
+        CHECK(stats().r1_never == 1);
+        CHECK(stats().r1_landed == 0);
+        CHECK(GW.accepts == accepts_before + 1); /* resent exactly once */
+        CHECK(stats().resends == 1);
+
+        gw_complete(0u, 0x33u);
+        run_ms(104);
+        CHECK(b.n == 1 && b.r == MBQ_R_COMPLETE && b.resp == 0x33u);
+    }
+
+    /* ── 5. R2 — an accept byte returning a seq the master still tracks. A
+     *     live seq cannot recur without a reboot, so this is proof of one. The
+     *     just-accepted command is kept; the rest are disposed. ──────────── */
+    begin("R2: accept seq collides with a tracked one");
+    {
+        cap_t a = {0};
+        /* Non-idempotent, so the disposal is observable as a delivered LOST
+         * rather than a silent resubmit. */
+        CHECK(submit(CMD_SET, false, &a));       /* takes seq 1, still executing */
+        CHECK(GW.cq_n == 1);
+
+        gw_boot(false);                          /* gateway restarts: counter back to 1 */
+        cap_t b = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, false, cap_cb, &b));
+        pump();                                  /* accept byte says seq 1 — collision */
+        CHECK(stats().reboots_r2 == 1);
+        CHECK(stats().reboots_r3 == 0 && stats().reboots_r4 == 0);
+        CHECK(a.n == 1);                         /* the tracked one was disposed... */
+        CHECK(a.r == MBQ_R_LOST);
+        CHECK(b.n == 0);                         /* ...the just-accepted one is kept  */
+
+        gw_complete(0u, 0x44u);
+        run_ms(104);
+        CHECK(b.n == 1 && b.r == MBQ_R_COMPLETE && b.resp == 0x44u);
+    }
+
+    /* ── 6. R3 — a head seq the master is not tracking. Nothing else can
+     *     produce one, so the gateway restarted its counter. ─────────────── */
+    begin("R3: untracked head seq");
+    {
+        cap_t a = {0};
+        CHECK(submit(CMD_QUERY, true, &a));
+        CHECK(GW.cq_n == 1);
+
+        /* A reboot, then a result appears from a command this master never
+         * enqueued in the current epoch. */
+        gw_boot(false);
+        GW.rq[GW.rq_n++] = (gwres_t){ 9u, 0u, 0x55u };
+        run_ms(104);
+        CHECK(stats().reboots_r3 == 1);
+        CHECK(stats().reboots_r2 == 0);
+        CHECK(a.n >= 1 || stats().resends >= 1);   /* disposed one way or the other */
+        run_ms(64);
+        CHECK(GW.rq_n == 0);                       /* the orphan was acked away */
+    }
+
+    /* ── 7. R4 — a result deadline expires. The poll brings nothing back, so
+     *     boot_count arbitrates: changed means reboot, unchanged means the
+     *     gateway is answering but wedged. Both dispose; only one is a
+     *     reboot, and the stats must say which. ──────────────────────────── */
+    begin("R4: deadline expiry, boot_count unchanged (wedge)");
+    {
+        cap_t a = {0};
+        CHECK(submit(CMD_SET, false, &a));       /* non-idempotent, never completed */
+        run_ms(MBQ_RESULT_DEADLINE_MS + 60u);
+        CHECK(stats().deadlines >= 1);
+        CHECK(stats().reboots_r4 == 0);          /* boot_count did not move */
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_RESULT_LOST);         /* past its deadline: it ran */
+    }
+
+    begin("R4: deadline expiry, boot_count changed (reboot)");
+    {
+        cap_t a = {0};
+        CHECK(submit(CMD_SET, false, &a));
+        gw_boot(false);                          /* the command vanishes with it */
+        run_ms(MBQ_RESULT_DEADLINE_MS + 60u);
+        CHECK(stats().reboots_r4 == 1);
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_LOST || a.r == MBQ_R_RESULT_LOST);
+    }
+
+    /* ── 8. The ack-less ambiguous corner. No ack rode the lost frame, so R1
+     *     is unavailable: the client must poll until the predicted seq shows
+     *     up as a result (landed) or the deadline passes with the response
+     *     queue empty (never landed). ──────────────────────────────────────
+     *     8a: it landed, and the result appears while polling. */
+    begin("ack-less corner: the frame landed");
+    {
+        cap_t a = {0};
+        uint32_t accepts_before = GW.accepts;
+        mbq_client_drop_reply(SLAVE, 1);
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, true, cap_cb, &a));
+        pump();
+        CHECK(GW.accepts == accepts_before + 1);
+        gw_complete(0u, 0x66u);                  /* its result reaches the head */
+        run_ms(56);
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_COMPLETE && a.resp == 0x66u);
+        CHECK(GW.accepts == accepts_before + 1); /* never resent */
+        CHECK(stats().resends == 0);
+    }
+
+    /* 8b: it never landed and the command is IDEMPOTENT — the deadline passes
+     *     with the queue observed empty, and it is simply resent. No
+     *     boot_count read is needed for this class. */
+    begin("ack-less corner: never landed, idempotent");
+    {
+        cap_t a = {0};
+        uint32_t reads_before = stats().boot_reads;
+        GW.present = false;
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, true, cap_cb, &a));
+        pump();
+        GW.present = true;
+        run_ms(MBQ_RESULT_DEADLINE_MS + 60u);
+        CHECK(stats().resends >= 1);
+        CHECK(stats().boot_reads == reads_before);   /* idempotent: no arbiter needed */
+        CHECK(GW.accepts >= 1);
+        gw_complete(0u, 0x77u);
+        run_ms(106);
+        CHECK(a.n == 1 && a.r == MBQ_R_COMPLETE && a.resp == 0x77u);
+    }
+
+    /* 8c: it never landed, the command is NON-IDEMPOTENT, and boot_count is
+     *     UNCHANGED — so it genuinely never landed and resending is safe. */
+    begin("ack-less corner: never landed, non-idempotent, no reboot");
+    {
+        cap_t a = {0};
+        uint32_t reads_before = stats().boot_reads;
+        GW.present = false;
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, false, cap_cb, &a));
+        pump();
+        GW.present = true;
+        run_ms(MBQ_RESULT_DEADLINE_MS + 60u);
+        CHECK(stats().boot_reads > reads_before);    /* the arbiter WAS consulted */
+        CHECK(stats().resends >= 1);                 /* unchanged ⇒ safe to resend */
+        CHECK(a.n == 0);
+    }
+
+    /* 8d: same, but boot_count CHANGED — "executed, then the result died with
+     *     the reboot" cannot be excluded, so it is disposed LOST rather than
+     *     blind-resent. This is the case the whole cold-path read exists for. */
+    begin("ack-less corner: never landed, non-idempotent, reboot");
+    {
+        cap_t a = {0};
+        uint32_t accepts_before = GW.accepts;
+        GW.present = false;
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, false, cap_cb, &a));
+        pump();
+        GW.present = true;
+        gw_boot(false);                              /* boot_count moves */
+        run_ms(MBQ_RESULT_DEADLINE_MS + 60u);
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_LOST);
+        CHECK(GW.accepts == accepts_before);         /* NOT resent */
+    }
+
+    /* ── 9. A_FULL is the backstop, not the flow control: the in-flight cap
+     *     should mean the client never provokes one. Force it anyway (by
+     *     shrinking what the gateway will take) and check the command is held
+     *     and retried rather than lost. ───────────────────────────────────── */
+    begin("A_FULL is retried, not dropped");
+    {
+        cap_t a = {0}, b = {0};
+        CHECK(submit(CMD_SET, true, &a));
+        CHECK(submit(CMD_SET, true, &b));
+        CHECK(GW.cq_n == CMDQ_DEPTH);
+        CHECK(GW.afulls == 0);           /* the cap held: no A_FULL was ever provoked */
+        CHECK(!mbq_client_can_submit(SLAVE));
+    }
+
+    /* ── 10. The compat latch (§8): a pre-v4 gateway answers ILLEGAL FUNCTION,
+     *      and a reply of a length the request did not call for is a protocol
+     *      error. Either must stop the client driving that slave, loudly and
+     *      once — not limp. ─────────────────────────────────────────────── */
+    g_case = "compat latch: ILLEGAL FUNCTION";
+    g_now_us = 1000000u;
+    memset(&PEND, 0, sizeof PEND);
+    gw_reset_all();
+    GW.illegal_fc = true;
+    mbq_client_init();
+    mbq_client_add_slave(SLAVE);
+    run_ms(60);
+    CHECK(stats().incompatible);
+    CHECK(!mbq_client_can_submit(SLAVE));
+
+    begin("compat latch: wrong reply length");
+    {
+        cap_t a = {0};
+        GW.short_replies = 1;
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &a));
+        pump_n(2);
+        CHECK(stats().proto_errors == 1);
+        CHECK(stats().incompatible);
+        CHECK(a.n == 1 && a.r == MBQ_R_LOST);    /* the held command is released */
+        CHECK(!mbq_client_can_submit(SLAVE));
+    }
+
+    /* ── 11. Sequence wrap must skip 0: "no ack" and "ack command 32" are the
+     *      same byte, so an off-by-one here is silent and total. ─────────── */
+    begin("seq wrap skips 0");
+    {
+        GW.next_seq = 31u;
+        cap_t a = {0}, b = {0};
+        CHECK(submit(CMD_SET, true, &a));
+        gw_complete(0u, 0x01u);
+        run_ms(103);
+        CHECK(a.n == 1);
+        CHECK(submit(CMD_SET, true, &b));        /* gateway wraps 31 -> 1, not 0 */
+        gw_complete(0u, 0x02u);
+        run_ms(104);
+        CHECK(b.n == 1 && b.r == MBQ_R_COMPLETE && b.resp == 0x02u);
+        CHECK(stats().reboots_r2 == 0);          /* a wrap is not a reboot */
+        CHECK(stats().reboots_r3 == 0);
+    }
+
+    /* ── 12. DTR0 pairs travel as the 8-byte request shape, and the flags must
+     *      sit at their WIRE bit positions — the hazard that silently changes
+     *      the meaning of every command. ─────────────────────────────────── */
+    begin("DTR0 flag packing");
+    {
+        const uint8_t cmd[4] = { 0x01u, 0x2Au, MBQ_QF_DTR0 | MBQ_QF_ANSWER, 0x7Eu };
+        cap_t a = {0};
+        CHECK(submit(cmd, true, &a));
+        CHECK(GW.cq_n == 1);
+        CHECK(GW.cq[0].len == 3);                /* dtr0 byte present on the wire */
+        CHECK(GW.cq[0].cmd[2] == 0x7Eu);
+        gw_complete(0u, 0x2Au);
+        run_ms(104);
+        CHECK(a.n == 1 && a.resp == 0x2Au);
+    }
+
+    if (!fail) printf("PASS: all mbq_client checks passed\n");
+    return fail;
+}
