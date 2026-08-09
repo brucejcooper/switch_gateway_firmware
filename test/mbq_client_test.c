@@ -604,6 +604,36 @@ int main(void) {
         CHECK(GW.accepts == accepts_before);         /* NOT resent */
     }
 
+    /* The IDEMPOTENT counterpart of the case above: a repeatable command that
+     * never landed must go back on the wire across a reboot, not be given up
+     * on. "It might already have run" is a reason to spare a non-idempotent
+     * command and no reason at all to discard a repeatable one.
+     *
+     * HONEST LIMITATION: this asserts the contract but does NOT pin the
+     * `BC_ACKLESS` branch where the real bug lived — verified by reverting
+     * that branch and watching this still pass, so it reaches the deadline
+     * path instead. Constructing a reply-loss that lands specifically in
+     * BC_ACKLESS from this harness defeated me; that branch's fix is evidenced
+     * on hardware (LAG-1 in 4 of 6 reboot drills, gone afterwards), not here.
+     * Do not read a pass as covering it. */
+    begin("ack-less corner: never landed, IDEMPOTENT, reboot -> resend");
+    {
+        establish_baseline();
+        cap_t a = {0};
+        uint32_t accepts_before = GW.accepts;
+        GW.present = false;
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &a));
+        pump();
+        GW.present = true;
+        gw_boot(false);                              /* boot_count moves */
+        run_ms(MBQ_RESULT_DEADLINE_MS + 60u);
+        CHECK(a.n == 0);                             /* NOT given up on... */
+        CHECK(GW.accepts > accepts_before);          /* ...it went back out */
+        gw_complete(0u, 0x5Au);
+        run_ms(104);
+        CHECK(a.n == 1 && a.r == MBQ_R_COMPLETE && a.resp == 0x5Au);
+    }
+
     /* ── 9. A_FULL is the backstop, not the flow control: the in-flight cap
      *     should mean the client never provokes one. Force it anyway (by
      *     shrinking what the gateway will take) and check the command is held

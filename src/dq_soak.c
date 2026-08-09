@@ -251,16 +251,32 @@ static bool submit_next(void) {
     rec->t_submit = get_absolute_time();
     rec->in_use   = true;
 
-    /* Idempotent: both frames are safe to repeat after a gateway reboot (a SET
-     * DTR0 re-write and a query have no cumulative effect), so a reboot mid-run
-     * resubmits rather than reporting LOST — the value check still holds. */
+    /* The SET is idempotent — re-writing DTR0 with the same value has no
+     * cumulative effect, so a reboot resubmits it and the pair survives.
+     *
+     * THE QUERY IS NOT, and the earlier claim here that "the value check still
+     * holds" was wrong. Re-executing a query is harmless to the BUS, but its
+     * answer is whatever DTR0 holds AT RESEND TIME, while its expectation is
+     * pinned to a value some OTHER command wrote. Resent late — after the
+     * recovery path has run and the producer has moved on — it reads a newer
+     * pair's value and the probe scores a false mis-attribution. Measured
+     * exactly that: expect=0xA0 got=0x62, which at stride 97 is expect + 2
+     * strides, i.e. an answer from two pairs in the future.
+     *
+     * Idempotent means "safe to repeat", not "answer is time-invariant", and
+     * conflating the two is what made a correct client look like it was
+     * corrupting results. A real QUERY ACTUAL LEVEL is genuinely resendable
+     * because a fresher reading is still a right answer; this probe's query is
+     * only meaningful as half of an atomic pair, so it takes the honest
+     * disposition instead — LOST, which the probe reports separately. */
     bool sent;
     if (S.path == SOAK_PATH_DIRECT) {
-        sent = mbq_client_submit(S.slave, cmd, true, soak_cb, rec);
+        sent = mbq_client_submit(S.slave, cmd, !rec->is_query, soak_cb, rec);
     } else {
         sent = dq_submit(S.slave, S.path == SOAK_PATH_BG ? DQ_PRIO_BACKGROUND
                                                          : DQ_PRIO_USER,
-                         cmd[0], cmd[1], cmd[2], cmd[3], true, soak_dq_cb, rec);
+                         cmd[0], cmd[1], cmd[2], cmd[3], !rec->is_query,
+                         soak_dq_cb, rec);
     }
     if (!sent) {
         rec->in_use = false;

@@ -123,6 +123,13 @@ enum { H_OK = 0u, H_FAILED = 1u };       /* head-entry status  */
  * is answering but never completing anything resubmits forever and the queue
  * never drains — R4 would fire, resubmit, fire again. */
 #define MAX_RESENDS       3u
+/* Absolute lifetime of a command that keeps failing to REACH the gateway.
+ * MAX_RESENDS bounds re-executions; this bounds the wholly different case of a
+ * link that is simply down, where no frame has happened and counting attempts
+ * measures nothing but how fast we retried. Comfortably longer than a gateway
+ * restart (~1 s) and short enough that a gateway which never returns still
+ * gives every caller a terminal answer. */
+#define CMD_MAX_LIFE_MS 8000u
 
 /* Bound on the registration drain. RESPQ_DEPTH is 4, so five polls empty a
  * full queue; a gateway still producing heads after that is not draining and
@@ -167,6 +174,7 @@ typedef struct {
                                     * result surfaces (spec §4) */
     uint64_t deadline_us;          /* result deadline, armed at accept */
     uint64_t est_done_us;          /* estimated DALI completion, for pacing */
+    uint64_t born_us;              /* first submit; bounds recovery in TIME */
 } cmd_t;
 
 typedef enum {
@@ -907,7 +915,54 @@ static void resolve_queue_reply(slave_t *s, const reply_t *r) {
              * therefore proof the gateway restarted its counter. */
             if (seq_tracked(s, r->aseq)) {
                 bind_accepted(s, c, r->aseq, false);
-                note_reboot(s, '2', c);
+                /* KEEPING `c` IS ONLY SAFE IF IT IS THE OLDEST. The gateway has
+                 * already accepted it, so it is first in the new epoch's FIFO —
+                 * while every command we are about to dispose is re-offered
+                 * BEHIND it. If any of those is earlier in producer order, the
+                 * reboot has just reversed two frames whose meaning is their
+                 * order, and no amount of ordered re-offering downstream can
+                 * put `c` back where it belongs.
+                 *
+                 * That is the last gate-V2 defect: the soak submits SET(v) then
+                 * QUERY, both in flight at depth 2. When the accept that reveals
+                 * the reboot is the QUERY's, the SET is resent behind it, the
+                 * QUERY runs first and reads the DTR0 the PREVIOUS pair left in
+                 * the ballast (a gateway reboot does not clear the gear), and
+                 * the probe sees expect=0xA0 got=0x62. Exactly one per reboot,
+                 * deterministic, and invisible to the producer-order stamp
+                 * because the mis-ordered command is the one NOT being
+                 * re-offered.
+                 *
+                 * So when `c` is out of order, dispose it too and let it take
+                 * its proper place in the re-offer. It still executes once in
+                 * the gateway — we cannot recall it — but that result arrives
+                 * under a seq we no longer track and is swallowed as an orphan
+                 * by the drain window note_reboot opens. Costs one redundant
+                 * DALI frame; buys back the ordering.
+                 *
+                 * Note the test is "will actually be RE-OFFERED", not merely
+                 * "is older": a non-idempotent command is delivered LOST and
+                 * never goes back on the wire, so nothing lands behind `c` and
+                 * keeping it is correct. Only a command that will be resent
+                 * can overtake. */
+                const cmd_t *keep = c;
+                for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
+                    const cmd_t *t = &s->cmd[i];
+                    if (t == c) continue;
+                    if (t->st != CMD_ACCEPTED && t->st != CMD_SENDING) continue;
+                    if (t->ord < c->ord && t->idempotent &&
+                        t->resends < MAX_RESENDS) { keep = NULL; break; }
+                }
+                note_reboot(s, '2', keep);
+                if (!keep) {
+                    /* We DID observe the gateway assign this seq, so the new
+                     * epoch's baseline is known even though we kept nothing —
+                     * dropping it would put the slave into the no-baseline
+                     * state for no reason and cost the next lost reply its
+                     * prediction. */
+                    s->last_seq  = r->aseq;
+                    s->seq_known = true;
+                }
                 rebooted = true;
             } else {
                 bind_accepted(s, c, r->aseq, false);
@@ -1140,8 +1195,26 @@ static void resolve_sysinfo(slave_t *s, const uint8_t *b, uint8_t n) {
             if (!c) { s->st = S_IDLE; break; }
             if (changed || first) {
                 /* "Executed, then the result died with the reboot" cannot be
-                 * excluded, so the command is not repeated. */
-                deliver(s, c, MBQ_R_LOST, 0);
+                 * excluded — which is a reason not to repeat a NON-idempotent
+                 * command, and no reason at all to drop an idempotent one.
+                 * Re-running something that may already have run is precisely
+                 * what idempotent means, and §4 says so: only the
+                 * non-idempotent case disposes here.
+                 *
+                 * Dropping both was the last gate-V2 defect. The soak's SET is
+                 * idempotent; losing it left DTR0 holding the PREVIOUS pair's
+                 * value, so its paired query returned that instead and the
+                 * probe scored a stale read — measured as LAG-1 in 4 of 6
+                 * reboot drills, with the SET reported lost in the same run.
+                 * The query was never wrong; the write it depended on had been
+                 * thrown away.
+                 *
+                 * Order matters below: resend_or_lose leaves the command
+                 * CMD_PENDING, and dispose_tracked only touches ACCEPTED and
+                 * SENDING, so the resend survives the note_reboot that
+                 * follows. */
+                if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
+                else               deliver(s, c, MBQ_R_LOST, 0);
                 if (changed) note_reboot(s, '4', NULL);
             } else {
                 resend_or_lose(s, c, MBQ_R_LOST);   /* genuinely never landed */
@@ -1184,6 +1257,36 @@ static void recovery_give_up(slave_t *s) {
     s->st = S_IDLE;
     if (!c || c->st != CMD_SENDING) return;
     s->stats.deadlines++;
+
+    /* A recovery that timed out because the gateway said NOTHING AT ALL is not
+     * evidence the command needs re-executing — nothing was re-offered to
+     * anything, so no DALI frame happened. Charging it to MAX_RESENDS, which
+     * exists to bound RE-EXECUTIONS, spends the whole budget on a gateway that
+     * is merely absent for a moment.
+     *
+     * That is what a reboot looks like: the recovery bound is one result
+     * deadline (150 ms), a gateway restart takes on the order of a second, so
+     * ~10 give-ups arrive back to back and 3 resends are gone inside half a
+     * second. The command is then dropped as LOST — and for the soak's SET
+     * that leaves DTR0 holding the previous pair's value, so its paired query
+     * reads stale and the probe scores LAG-1. Measured in 3-4 of every 6
+     * reboot drills, with the log showing four "timed out unresolved" lines
+     * followed by "resent 3 times without a result — giving up".
+     *
+     * So while the link is down, re-queue WITHOUT spending the budget, and
+     * bound the command in TIME instead. The transport's exponential backoff
+     * already stops this costing bus, and CMD_MAX_LIFE_MS guarantees a
+     * terminal disposition for a gateway that never comes back — which is the
+     * property the recovery path must not lose. */
+    bool link_down = (s->c_consec_fail > 0);
+    bool too_old   = (MBQ_NOW_US() - c->born_us) >= (uint64_t)CMD_MAX_LIFE_MS * 1000u;
+
+    if (c->idempotent && link_down && !too_old) {
+        c->seq = 0;
+        c->st  = CMD_PENDING;
+        return;                       /* deliberately NOT counted as a resend */
+    }
+
     LOG_WARN("mbq", "slave %u: recovery for %02X%02X timed out unresolved — "
              "disposing", s->slave_id, c->cmd[0], c->cmd[1]);
     if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
@@ -1567,6 +1670,7 @@ bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
     c->resends    = 0;
     c->chases     = 0;
     c->ord        = s->next_ord++;   /* producer order, kept across any resend */
+    c->born_us    = MBQ_NOW_US();    /* bounds recovery in time, see CMD_MAX_LIFE_MS */
     c->st         = CMD_PENDING;
 
     /* A fresh command is not subject to the pacing timer: pacing exists to stop
