@@ -14,8 +14,14 @@
  *      response8 back to a dq_result_t for the producer's callback.
  *
  * There is NO id ledger and NO reboot resync/rebuild/rollback here — the client
- * handles gateway-reboot recovery from the slot statuses ("idle means gone"),
+ * handles gateway-reboot recovery through the queue-protocol §4 rules,
  * resubmitting idempotent commands and reporting the rest DQ_RES_DROPPED.
+ *
+ * FAIRNESS is this layer's job, not the protocol's (spec §5). Slaves with work
+ * pending are served ROUND-ROBIN from a rotating cursor, so with per-slave
+ * single-outstanding transactions any slave's wait is bounded by one
+ * transaction time per competing slave. This is what replaced spinning as the
+ * anti-starvation mechanism when the client started pacing its polls.
  */
 
 #include "dali_queue.h"
@@ -41,32 +47,40 @@
  *
  * 2. Latency comes from commands already at the GATEWAY, which executes strictly
  *    FIFO with no priority — so a queued background command delays a button by a
- *    whole DALI frame. Hence a per-class DEPTH: background may only occupy 2 of
- *    the gateway's slots, bounding that inversion to ~2 frame times, while user
- *    work may fill to 4. The task-07 soak measured the trade: depth 2 = 82 % of
- *    peak throughput, depth 4 = 96 %, and every extra slot costs ~25 ms of
- *    inversion. Background work is not latency-sensitive; buttons are.
+ *    whole DALI frame. Hence a per-class DEPTH: background may occupy only ONE
+ *    of the gateway's command slots, bounding that inversion to one frame time,
+ *    while user work may fill the queue. The task-07 soak measured the trade at
+ *    the older 8-slot depth (depth 2 = 82 % of peak throughput, depth 4 = 96 %,
+ *    each extra slot ~25 ms of inversion); at the v4 depth of 2 the ladder's
+ *    only remaining lever is keeping background out of the second slot.
+ *    Background work is not latency-sensitive; buttons are.
  *
  * Dim steps are not stored as commands at all — see the delta counters below. */
 #define DQ_CLASS_MAX     8u   /* per-class ring capacity (max over the classes) */
-/* Gateway-slot depth per class. These are bounded by MBQ_SLOTS (2): one
- * EXECUTING, one NEXT. The ladder still means something at that size — what
- * matters is that BACKGROUND may only ever hold ONE slot, so a button press
- * always finds the second one free and waits at most the DALI frame already in
- * flight. Letting background fill both would put a user command behind two
- * frames, which is the priority inversion the depth cap exists to bound. */
-#define DQ_DEPTH_USER    2u   /* gateway slots a user command may fill to */
-#define DQ_DEPTH_CFG     2u
-#define DQ_DEPTH_READ    2u   /* verification reads: a command's outcome to HA */
-#define DQ_DEPTH_BG      1u   /* background never gets deeper than this */
-/* STRICTLY less than MBQ_SLOTS, for every class. A submit carries its own status
- * read-back, so the master must already know a slot is free when it issues one —
- * filling every slot forces a wasted read-only poll to discover the next
- * completion, which is exactly what made a 2-slot queue slower than an 8-slot
- * one. The spare slot is not headroom, it is the write target. */
-_Static_assert(DQ_DEPTH_USER < MBQ_SLOTS && DQ_DEPTH_CFG < MBQ_SLOTS &&
-               DQ_DEPTH_READ < MBQ_SLOTS && DQ_DEPTH_BG < MBQ_SLOTS,
-               "every class depth must leave at least one slot free to write into");
+
+/* The scheduler's in-flight cap IS the gateway's command-queue depth. Under v4
+ * the master tracks accepts minus results and simply stops at the cap; the
+ * gateway's A_FULL is the backstop, not the flow control (task-07 lesson). Note
+ * v2 needed every class strictly BELOW the depth, because a submit carried its
+ * own status read-back and so needed a slot it already knew was free. A v4
+ * enqueue is its own frame and needs no free slot in advance, so a class may
+ * fill the queue completely — that retired constraint is what buys the
+ * one-transaction-per-DALI-frame steady state. */
+#define DQ_INFLIGHT_MAX  CMDQ_DEPTH
+
+/* Gateway-slot depth per class, bounded by DQ_INFLIGHT_MAX (2): one EXECUTING,
+ * one NEXT. The ladder still means something at that size — what matters is
+ * that BACKGROUND may only ever hold ONE slot, so a button press always finds
+ * the second one free and waits at most the DALI frame already in flight.
+ * Letting background fill both would put a user command behind two frames,
+ * which is the priority inversion the depth cap exists to bound. */
+#define DQ_DEPTH_USER    DQ_INFLIGHT_MAX   /* user work may fill the queue */
+#define DQ_DEPTH_CFG     DQ_INFLIGHT_MAX
+#define DQ_DEPTH_READ    DQ_INFLIGHT_MAX   /* verification reads: an outcome to HA */
+#define DQ_DEPTH_BG      1u                /* background never gets deeper than this */
+_Static_assert(DQ_DEPTH_USER <= DQ_INFLIGHT_MAX && DQ_DEPTH_CFG <= DQ_INFLIGHT_MAX &&
+               DQ_DEPTH_READ <= DQ_INFLIGHT_MAX && DQ_DEPTH_BG <= DQ_INFLIGHT_MAX,
+               "no class may exceed the gateway's command-queue depth");
 
 /* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
  * frames (user decision, 2026-07-28). A held button emits dim repeats faster
@@ -153,7 +167,7 @@ typedef struct {
     uint8_t  delta_cursor;   /* rotating start point, so one ballast being dimmed
                               * cannot starve another's steps */
 
-    dq_pending_t pend[MBQ_SLOTS];
+    dq_pending_t pend[DQ_INFLIGHT_MAX];
 
     /* Diagnostic counters (for the `dq` CLI command / bench fault drills). */
     uint32_t c_submitted;    /* commands shipped to the client */
@@ -178,7 +192,7 @@ static dq_slave_t *slave_for(uint8_t slave_id) {
 }
 
 static dq_pending_t *pend_alloc(dq_slave_t *s) {
-    for (uint8_t i = 0; i < MBQ_SLOTS; i++)
+    for (uint8_t i = 0; i < DQ_INFLIGHT_MAX; i++)
         if (!s->pend[i].in_use) return &s->pend[i];
     return NULL;
 }
@@ -219,7 +233,7 @@ bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
     }
     dq_class_t *c = &s->cl[class_of(prio)];
     dq_cmd_t entry = { .addr = addr, .data = data,
-                       .flags = (uint8_t)(flags & 0x07u), .dtr0 = dtr0,
+                       .flags = (uint8_t)(flags & MBQ_QF_MASK), .dtr0 = dtr0,
                        .prio = (uint8_t)prio, .idempotent = idempotent,
                        .cb = cb, .ctx = ctx };
 
@@ -306,7 +320,14 @@ static void dq_mbq_cb(uint8_t slave_id, mbq_result_t r, uint8_t response8, void 
             else { res = DQ_RES_ERR; answer = response8; if (s) s->c_err++; }
             break;
         case MBQ_R_LOST:
+        case MBQ_R_RESULT_LOST:
         default:
+            /* Both reach the producer as DROPPED — a DALI command's caller can
+             * do nothing different with "never ran" versus "ran, answer gone",
+             * since either way it has no measured value to publish and the
+             * verification read that follows every command is what recovers the
+             * truth. The distinction is kept in the client's counters, where it
+             * says whether a reboot ate work or ate answers. */
             res = DQ_RES_DROPPED;
             if (s) s->c_dropped++;
             break;
@@ -374,13 +395,44 @@ static bool ship_delta(dq_slave_t *s) {
     return false;
 }
 
+/* Walk the priority ladder for one slave and ship at most one command.
+ * Returns true if something went out. */
+static bool ship_ladder(dq_slave_t *s) {
+    /* Provisioning is bus-exclusive: while a slave is being commissioned the
+     * scheduler ships the commissioning frames AND NOTHING ELSE, so nothing
+     * can interleave with the binary search (a stray DTR0 write mid-bisect
+     * would corrupt it). Note this must still ship the PROV class — the
+     * sequence now runs on the controller and travels through this very
+     * queue, so gating it out entirely deadlocks the run. */
+    if (dali_provision_busy_slave(s->slave_id)) return ship_class(s, DQ_CL_PROV);
+
+    /* Each step applies its own class depth, so background work stops filling
+     * the gateway one slot before user work does and a button press waits at
+     * most the DALI frame already in flight. */
+    if (ship_class(s, DQ_CL_PROV)) return true;   /* commissioning steps */
+    if (ship_class(s, DQ_CL_USER)) return true;   /* discrete presses / HA commands */
+    if (ship_delta(s))             return true;   /* dim ramps, one step at a time */
+    if (ship_class(s, DQ_CL_CFG))  return true;   /* config writes */
+    if (ship_class(s, DQ_CL_READ)) return true;   /* verification reads */
+    return ship_class(s, DQ_CL_BG);               /* sweeps, rotation queries */
+}
+
+/* Rotating start point for the per-slave sweep below. Fairness across slaves is
+ * the scheduler's job (spec §5): with per-slave single-outstanding transactions
+ * and one shared RS-485 bus, always starting the sweep at slave index 0 lets
+ * the lowest-numbered gateway take every submit opportunity it can use before
+ * the next one is even looked at. Rotating the start bounds any slave's wait to
+ * one transaction time per competing slave. */
+static uint8_t s_rr_cursor;
+
 void dq_tick(void) {
     /* Drive the underlying client first: process completions (freeing slots and
      * trampolines) and pace polls, so a slot freed this tick is available to the
      * scheduler below. */
     mbq_client_tick();
 
-    for (int i = 0; i < MAX_DALI_SLAVES; i++) {
+    for (int n = 0; n < MAX_DALI_SLAVES; n++) {
+        int i = (s_rr_cursor + n) % MAX_DALI_SLAVES;
         dq_slave_t *s = &s_dq[i];
         if (!s->in_use) continue;
 
@@ -388,27 +440,9 @@ void dq_tick(void) {
          * command per tick per slave goes out regardless. */
         if (!mbq_client_can_submit(s->slave_id)) continue;
 
-        /* Provisioning is bus-exclusive: while a slave is being commissioned the
-         * scheduler ships the commissioning frames AND NOTHING ELSE, so nothing
-         * can interleave with the binary search (a stray DTR0 write mid-bisect
-         * would corrupt it). Note this must still ship the PROV class — the
-         * sequence now runs on the controller and travels through this very
-         * queue, so gating it out entirely deadlocks the run. */
-        if (dali_provision_busy_slave(s->slave_id)) {
-            ship_class(s, DQ_CL_PROV);
-            continue;
-        }
-
-        /* Priority ladder, consulted in order. Each step applies its own class
-         * depth, so background work stops filling the gateway two slots before
-         * user work does and a button press is never more than ~2 frame times
-         * behind background traffic. */
-        if (ship_class(s, DQ_CL_PROV)) continue;   /* commissioning steps */
-        if (ship_class(s, DQ_CL_USER)) continue;   /* discrete presses / HA commands */
-        if (ship_delta(s))             continue;   /* dim ramps, one step at a time */
-        if (ship_class(s, DQ_CL_CFG))  continue;   /* config writes */
-        if (ship_class(s, DQ_CL_READ)) continue;   /* verification reads */
-        ship_class(s, DQ_CL_BG);                   /* sweeps, rotation queries */
+        /* One command shipped means this slave used its turn: hand the next
+         * sweep's first look to the slave after it. */
+        if (ship_ladder(s)) s_rr_cursor = (uint8_t)((i + 1) % MAX_DALI_SLAVES);
     }
 }
 

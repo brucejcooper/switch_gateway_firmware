@@ -10,11 +10,17 @@
  *
  * Flow control: the probe submits straight into mbq_client (bypassing the
  * dali_queue priority backlog) and gates on mbq_client_inflight() — the
- * client's view of how many of the gateway's 8 slots are occupied — so it backs
- * off at half-full (4) and never leans on a DEVICE_BUSY rejection as flow
- * control. The gate counts commands from ALL producers, so background work
- * sharing the queue correctly narrows the probe's window instead of overfilling
- * the gateway.
+ * client's view of how many of the gateway's CMDQ_DEPTH command slots are
+ * occupied — so it never leans on a queue-full rejection as flow control. The
+ * gate counts commands from ALL producers, so background work sharing the
+ * queue correctly narrows the probe's window instead of overfilling the
+ * gateway.
+ *
+ * Under queue v4 the useful depth range is 1..CMDQ_DEPTH (2), and the number
+ * the run exists to produce is "txns per command" ≈ 1.0 — one Modbus
+ * transaction per DALI frame is the whole point of the protocol, and a
+ * correctness-only check would miss its loss (task-07 lesson: validate rate,
+ * not just correctness).
  */
 
 #include "dq_soak.h"
@@ -68,13 +74,14 @@ static struct {
     bool     next_is_query;
     uint32_t pairs_done;
 
-    soak_rec_t rec[MBQ_SLOTS];
+    soak_rec_t rec[CMDQ_DEPTH];
 
     absolute_time_t t_start, t_end;
 
     /* outcome counters */
     uint32_t n_submit, n_set_ok, n_set_fail;
     uint32_t n_query_ok, n_lag1, n_other, n_query_fail, n_lost;
+    uint32_t n_result_lost;  /* of n_lost: the command ran, its answer died */
     uint32_t n_reject;     /* mbq_client_submit refused (modbus action queue full) */
     uint32_t n_ooo;        /* results delivered out of submit order (informational) */
 
@@ -89,7 +96,7 @@ static struct {
     uint32_t t_queue_full; /* gate closed: gateway queue at `depth` — DALI-bound */
     uint32_t t_tx_busy;    /* room in the queue but the Modbus SM was mid-transaction */
     uint32_t t_ready;      /* room AND the bus was free — we submitted */
-    uint32_t inflight_hist[MBQ_SLOTS + 1];
+    uint32_t inflight_hist[CMDQ_DEPTH + 1];
 
     /* Modbus transactions attributable to this slave over the run */
     uint32_t tx0_submits, tx0_polls;
@@ -107,14 +114,14 @@ static struct {
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
 static soak_rec_t *rec_alloc(void) {
-    for (uint8_t i = 0; i < MBQ_SLOTS; i++)
+    for (uint8_t i = 0; i < CMDQ_DEPTH; i++)
         if (!S.rec[i].in_use) return &S.rec[i];
     return NULL;
 }
 
 static uint8_t inflight_recs(void) {
     uint8_t n = 0;
-    for (uint8_t i = 0; i < MBQ_SLOTS; i++) if (S.rec[i].in_use) n++;
+    for (uint8_t i = 0; i < CMDQ_DEPTH; i++) if (S.rec[i].in_use) n++;
     return n;
 }
 
@@ -155,10 +162,13 @@ static void soak_cb(uint8_t slave, mbq_result_t r, uint8_t response8, void *ctx)
     S.lat_sum += lat32;
     S.lat_n++;
 
-    /* Delivery order: the gateway executes in accept order, so results should come
-     * back in submit order. Two terminals collected by ONE status read are
-     * delivered in slot-index order, which can legitimately invert the pair — so
-     * this is reported, not failed. A value mismatch is the real defect signal. */
+    /* Delivery order: the gateway executes in accept order and its response
+     * queue is FIFO, and v4 delivers at most one result per reply — so under a
+     * correct implementation results arrive in submit order and this counter
+     * should read 0. (Under v2 it legitimately did not: two terminals collected
+     * by one status read were delivered in slot-index order, which inverted
+     * ~6 % of pairs.) Still reported rather than failed; a value mismatch is
+     * the real defect signal. */
     if (S.have_done && rec->seq != S.seq_last_done + 1u) S.n_ooo++;
     S.have_done = true;
     S.seq_last_done = rec->seq;
@@ -170,7 +180,11 @@ static void soak_cb(uint8_t slave, mbq_result_t r, uint8_t response8, void *ctx)
          * error (collision/bus fault) or LOST is a failure here. */
         if (r == MBQ_R_COMPLETE
             || (r == MBQ_R_FAILED && response8 == SOAK_DALI_NAK)) S.n_set_ok++;
-        else if (r == MBQ_R_LOST)   { S.n_lost++; miss_log(rec->seq, 0, 0, 3); }
+        else if (r == MBQ_R_LOST || r == MBQ_R_RESULT_LOST) {
+            S.n_lost++;
+            if (r == MBQ_R_RESULT_LOST) S.n_result_lost++;
+            miss_log(rec->seq, 0, 0, 3);
+        }
         else                        { S.n_set_fail++; miss_log(rec->seq, 0, response8, 1); }
     } else {
         S.lat_q_sum += lat32;
@@ -179,8 +193,10 @@ static void soak_cb(uint8_t slave, mbq_result_t r, uint8_t response8, void *ctx)
             if (response8 == rec->expect)    S.n_query_ok++;
             else if (response8 == rec->prev) { S.n_lag1++;  miss_log(rec->seq, rec->expect, response8, 0); }
             else                             { S.n_other++; miss_log(rec->seq, rec->expect, response8, 0); }
-        } else if (r == MBQ_R_LOST) {
-            S.n_lost++; miss_log(rec->seq, rec->expect, 0, 3);
+        } else if (r == MBQ_R_LOST || r == MBQ_R_RESULT_LOST) {
+            S.n_lost++;
+            if (r == MBQ_R_RESULT_LOST) S.n_result_lost++;
+            miss_log(rec->seq, rec->expect, 0, 3);
         } else {
             S.n_query_fail++; miss_log(rec->seq, rec->expect, response8, 2);
         }
@@ -279,7 +295,7 @@ void dq_soak_tick(void) {
 
     /* Pacing sample: why we are (or are not) submitting this instant. */
     uint8_t occupied = mbq_client_inflight(S.slave);
-    S.inflight_hist[occupied <= MBQ_SLOTS ? occupied : MBQ_SLOTS]++;
+    S.inflight_hist[occupied <= CMDQ_DEPTH ? occupied : CMDQ_DEPTH]++;
 
     if (S.path != SOAK_PATH_DIRECT) {
         /* Scheduler path: keep that class's storage fed and let its own depth
@@ -311,7 +327,7 @@ bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs,
                    soak_path_t path) {
     if (S.running || S.draining) return false;
     if (depth < 1u) depth = 1u;
-    if (depth > MBQ_SLOTS) depth = MBQ_SLOTS;
+    if (depth > CMDQ_DEPTH) depth = CMDQ_DEPTH;
 
     memset(&S, 0, sizeof S);
     S.slave = slave;
@@ -393,7 +409,8 @@ void dq_soak_report(void) {
     cdc_out_printf("  %-22s %lu\n", "query nak/err", (unsigned long)S.n_query_fail);
     cdc_out_printf("  %-22s %lu / %lu\n", "set ok / failed",
            (unsigned long)S.n_set_ok, (unsigned long)S.n_set_fail);
-    cdc_out_printf("  %-22s %lu\n", "lost (gw reboot)", (unsigned long)S.n_lost);
+    cdc_out_printf("  %-22s %lu (%lu ran, answer lost)\n", "lost (gw reboot)",
+           (unsigned long)S.n_lost, (unsigned long)S.n_result_lost);
     cdc_out_printf("  %-22s %lu\n", "submit rejected", (unsigned long)S.n_reject);
     cdc_out_printf("  %-22s %lu (informational)\n", "out-of-order delivery", (unsigned long)S.n_ooo);
     cdc_out_printf("  %-22s %s (%lu bad)\n", "VERDICT", bad ? "FAIL" : "clean",
@@ -472,7 +489,7 @@ void dq_soak_report(void) {
            (unsigned long)((uint64_t)S.t_tx_busy * 100u / tt));
     cdc_out_printf("  %-22s %lu%%\n", "submitted", (unsigned long)((uint64_t)S.t_ready * 100u / tt));
     cdc_out_printf("  inflight:");
-    for (uint8_t i = 0; i <= MBQ_SLOTS; i++) {
+    for (uint8_t i = 0; i <= CMDQ_DEPTH; i++) {
         uint64_t pct = (uint64_t)S.inflight_hist[i] * 100u / tt;
         if (S.inflight_hist[i]) cdc_out_printf(" %u:%lu%%", i, (unsigned long)pct);
     }

@@ -11,7 +11,6 @@
  */
 
 #include "modbus.h"
-#include "mbq_client.h"   /* MBQ_CMD_BYTES — FC65 payload size */
 #include "config.h"
 #include "log.h"
 #include "hardware/gpio.h"
@@ -72,13 +71,17 @@ typedef enum {
     ACTION_SET_HOLDING_REGISTER  = 0x06,
     ACTION_WRITE_MULTI_REG       = 0x10,   /* new: FC16 Write Multiple Registers */
     ACTION_READ_WRITE_MULTI_REG  = 0x17,   /* new: FC23 Read/Write Multiple Registers */
-    /* User-defined codes for the DALI command queue. MODBUS Application Protocol
-     * V1.1b reserves 65-72 and 100-110 for exactly this, so they are conformant
-     * rather than an extension of the standard set — ordinary RTU framing, CRC,
-     * t3.5 silence and exception replies; only the payload shape is ours.
-     * See TinyModbus/src/modbus.c FC_MBQ_ENQUEUE for the rationale. */
-    ACTION_MBQ_ENQUEUE           = 0x41,   /* FC65: enqueue 1 cmd anywhere + status */
-    ACTION_MBQ_STATUS            = 0x42,   /* FC66: status only */
+    /* The DALI command queue's one user-defined code. MODBUS Application
+     * Protocol V1.1b reserves 65-72 and 100-110 for exactly this, so it is
+     * conformant rather than an extension of the standard set — ordinary RTU
+     * framing, CRC, t3.5 silence; only the payload shape is ours.
+     *
+     * ONE action type covers the whole protocol because a v4 request IS one
+     * shape: an optional enqueue plus an optional ack (spec §1). The three wire
+     * lengths differ only in how many payload bytes follow the control byte, so
+     * splitting them into separate actions would buy nothing and give the reply
+     * parser two places to disagree about which shape it asked for. */
+    ACTION_MBQ_V4                = 0x41,
 } modbus_action_type_t;
 
 /* Largest register block any FC16/FC23 write carries here is the gateway's
@@ -96,6 +99,11 @@ typedef struct {
     uint16_t             wr_count;                /* write register count */
     uint8_t              wr_payload[MODBUS_WR_PAYLOAD_MAX]; /* big-endian register bytes */
     uint8_t              wr_len;                  /* bytes used in wr_payload */
+    /* Suppress BOTH the no-reply retry and the DEVICE_BUSY retry for this
+     * action. Set for queue-v4 enqueue frames, where a re-send of a request
+     * whose reply was merely lost would execute the command twice; the caller
+     * resolves the timeout itself (spec §4). */
+    bool                 no_retry;
     modbus_action_cb_t   callback;
     void                *ctx;
 } modbus_action_t;
@@ -136,6 +144,7 @@ static bool                  s_retry_pending;
 static absolute_time_t       s_op_deadline;   /* hard deadline for the whole in-flight op */
 static uint32_t              s_drop_count = 0;    /* actions dropped on a full queue */
 static uint32_t              s_recover_count = 0; /* forced SM recoveries (wedge watchdog) */
+static uint32_t              s_crc_errors = 0;    /* replies discarded on a bad CRC-16 */
 
 /* ── Bus-occupancy accounting (bench instrumentation) ─────────────────────────
  * Who is actually using the RS-485 bus, and for how long. A transaction's
@@ -236,8 +245,6 @@ static bool backoff_should_skip(uint8_t slave, bool *is_probe) {
     b->skipped++;
     return true;
 }
-
-static bool modbus_rx_valid(void) { return true; }
 
 static const char *modbus_de_mode_str[MODBUS_DE_MAX] = { "tx", "always" };
 
@@ -533,18 +540,16 @@ static void start_action_tx(void) {
         for (uint8_t i = 0; i < currentAction.wr_len; i++)
             buf[11 + i] = currentAction.wr_payload[i];
         sz = 11u + currentAction.wr_len;
-    } else if (currentAction.action == ACTION_MBQ_ENQUEUE) {
-        /* FC65: dev, fc, cmd[4]. No addresses or counts — the gateway picks the
-         * slot and the status block it returns is always the whole thing. */
+    } else if (currentAction.action == ACTION_MBQ_V4) {
+        /* Queue v4: dev, fc, [flags:3|ack:5], then 0/2/3 payload bytes — the
+         * 5/7/8-byte request shapes of spec §1. No addresses or counts: the
+         * gateway assigns the sequence and the reply carries the binding. */
         buf[0] = currentAction.device;
         buf[1] = currentAction.action;
-        for (uint8_t i = 0; i < MBQ_CMD_BYTES; i++)
-            buf[2 + i] = currentAction.wr_payload[i];
-        sz = 2u + MBQ_CMD_BYTES;
-    } else if (currentAction.action == ACTION_MBQ_STATUS) {
-        buf[0] = currentAction.device;   /* FC66: dev, fc — nothing else to say */
-        buf[1] = currentAction.action;
-        sz = 2;
+        buf[2] = (uint8_t)currentAction.arg;   /* control byte */
+        for (uint8_t i = 0; i < currentAction.wr_len; i++)
+            buf[3 + i] = currentAction.wr_payload[i];
+        sz = 3u + currentAction.wr_len;
     } else {
         buf[0] = currentAction.device;
         buf[1] = currentAction.action;
@@ -721,8 +726,9 @@ void modbus_poll(void) {
              * arriving behind it must wait out. Measured: this alone was the
              * whole remaining latency tail (247 ms worst case) once the backoff
              * had removed the frequent hits. */
-            s_attempts_left = is_probe ? 0u : MODBUS_MAX_RETRIES;
-            s_busy_left     = DALI_BUSY_RETRIES;
+            s_attempts_left = (is_probe || currentAction.no_retry)
+                                  ? 0u : MODBUS_MAX_RETRIES;
+            s_busy_left     = currentAction.no_retry ? 0u : DALI_BUSY_RETRIES;
             s_retry_pending = false;
             s_op_deadline   = make_timeout_time_ms(MODBUS_OP_MAX_MS);
             log_action_intent(&currentAction);
@@ -747,6 +753,26 @@ void modbus_poll(void) {
 
     case MODBUS_RECEIVED_RESPONSE: {
         uart_set_irqs_enabled(UART_ID, false, false);
+
+        /* CRC-16 gate. The ISR runs the CRC over every byte it stores, and
+         * CRC-16/MODBUS over a frame INCLUDING its own two CRC bytes is zero
+         * for a good frame — so a non-zero residue here means the frame is
+         * corrupt. Nothing else in this file validates it: closing a frame on
+         * t3.5 silence (as RTU actually defines it) replaced an earlier scheme
+         * that completed the frame at the first offset where the running CRC
+         * happened to reach zero, and that accident was the only thing checking
+         * integrity. A corrupt reply must be indistinguishable from no reply —
+         * queue v4 in particular reads a command's identity straight out of two
+         * dense reply bytes, with no redundancy to catch a flipped one. */
+        if (readbuf_sz > 0 && (readbuf_sz < 4u || readbuf_crc != 0u)) {
+            s_crc_errors++;
+            if ((s_crc_errors & 0x0Fu) == 1u)
+                LOG_WARN("modbus", "bad CRC slave=%u fc=0x%02x len=%u — discarding "
+                         "(total %lu)", currentAction.device,
+                         (unsigned)currentAction.action, (unsigned)readbuf_sz,
+                         (unsigned long)s_crc_errors);
+            readbuf_sz = 0;   /* fall into the no-valid-reply path below */
+        }
 
         /* Log the raw response bytes (mirrors the tx dump). Covers both normal
          * and exception replies; a timeout leaves readbuf_sz == 0 (nothing). */
@@ -857,6 +883,8 @@ static inline bool enqueue(modbus_action_t *act) {
 
 uint32_t modbus_drop_count(void) { return s_drop_count; }
 
+uint32_t modbus_crc_error_count(void) { return s_crc_errors; }
+
 bool modbus_get_coils(uint8_t dev, uint16_t addr, uint16_t count,
                       modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = { .action = ACTION_GET_COILS, .device = dev,
@@ -900,24 +928,24 @@ bool modbus_get_input_registers(uint8_t dev, uint16_t addr, uint16_t count,
     return enqueue(&a);
 }
 
+bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
+                   uint8_t payload_len, modbus_action_cb_t cb, void *ctx) {
+    /* 0 / 2 / 3 are the only payload lengths the protocol defines; anything
+     * else is a caller bug, and putting it on the wire would be discarded
+     * silently by the gateway and read back as a lost frame. */
+    if (payload_len != 0u && payload_len != 2u && payload_len != 3u) return false;
+    modbus_action_t a = { .action = ACTION_MBQ_V4, .device = dev,
+                          .arg = ctl, .wr_len = payload_len,
+                          .no_retry = (payload_len != 0u),
+                          .callback = cb, .ctx = ctx };
+    if (payload_len) memcpy(a.wr_payload, payload, payload_len);
+    return enqueue(&a);
+}
+
 /* New: FC23 Read/Write Multiple Registers.  The slave writes wr_count registers
  * at wr_addr (data = big-endian bytes), THEN reads rd_count registers at rd_addr;
  * the response carries the post-write read block.  wr_count may be 0 for a
  * read-only FC23 (some slaves reject that; the gateway accepts it). */
-bool modbus_mbq_enqueue(uint8_t dev, const uint8_t cmd[MBQ_CMD_BYTES],
-                        modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = { .action = ACTION_MBQ_ENQUEUE, .device = dev,
-                          .wr_len = MBQ_CMD_BYTES, .callback = cb, .ctx = ctx };
-    memcpy(a.wr_payload, cmd, MBQ_CMD_BYTES);
-    return enqueue(&a);
-}
-
-bool modbus_mbq_status(uint8_t dev, modbus_action_cb_t cb, void *ctx) {
-    modbus_action_t a = { .action = ACTION_MBQ_STATUS, .device = dev,
-                          .callback = cb, .ctx = ctx };
-    return enqueue(&a);
-}
-
 bool modbus_read_write_multiple_registers(uint8_t dev,
                                           uint16_t rd_addr, uint16_t rd_count,
                                           uint16_t wr_addr, uint16_t wr_count,
