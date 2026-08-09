@@ -24,7 +24,12 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#define MBQ_SLOTS      8u   /* gateway queue depth (matches the gateway MBQ_SLOTS) */
+/* MUST match the gateway's MBQ_SLOTS (TinyModbus/src/mbq_slots.h) — controller
+ * and gateway are a matched firmware set, deploy them together. Two slots is
+ * EXECUTING + NEXT, which is all a one-frame-at-a-time DALI bus can use; the
+ * status block is read in full on every submit and every poll, so each extra
+ * slot costs 2 bytes (~1 ms at 19200) on EVERY transaction forever. */
+#define MBQ_SLOTS      2u   /* gateway queue depth (matches the gateway MBQ_SLOTS) */
 #define MBQ_CMD_BYTES  4u   /* opaque command size (32-bit, 2 Modbus registers)   */
 
 /* Terminal outcome delivered to a submitted command's callback (exactly once). */

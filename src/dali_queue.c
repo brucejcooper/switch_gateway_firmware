@@ -49,10 +49,19 @@
  *
  * Dim steps are not stored as commands at all — see the delta counters below. */
 #define DQ_CLASS_MAX     8u   /* per-class ring capacity (max over the classes) */
-#define DQ_DEPTH_USER    4u   /* gateway slots a user command may fill to */
-#define DQ_DEPTH_CFG     3u
-#define DQ_DEPTH_READ    3u   /* verification reads: a command's outcome to HA */
-#define DQ_DEPTH_BG      2u   /* background never gets deeper than this */
+/* Gateway-slot depth per class. These are bounded by MBQ_SLOTS (2): one
+ * EXECUTING, one NEXT. The ladder still means something at that size — what
+ * matters is that BACKGROUND may only ever hold ONE slot, so a button press
+ * always finds the second one free and waits at most the DALI frame already in
+ * flight. Letting background fill both would put a user command behind two
+ * frames, which is the priority inversion the depth cap exists to bound. */
+#define DQ_DEPTH_USER    2u   /* gateway slots a user command may fill to */
+#define DQ_DEPTH_CFG     2u
+#define DQ_DEPTH_READ    2u   /* verification reads: a command's outcome to HA */
+#define DQ_DEPTH_BG      1u   /* background never gets deeper than this */
+_Static_assert(DQ_DEPTH_USER <= MBQ_SLOTS && DQ_DEPTH_CFG <= MBQ_SLOTS &&
+               DQ_DEPTH_READ <= MBQ_SLOTS && DQ_DEPTH_BG < MBQ_SLOTS,
+               "class depths must fit MBQ_SLOTS, and background must leave one free");
 
 /* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
  * frames (user decision, 2026-07-28). A held button emits dim repeats faster
