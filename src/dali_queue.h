@@ -6,8 +6,8 @@
  * This is the DALI-SPECIFIC layer. It owns the per-slave PRIORITY SCHEDULER and
  * the producer API; the transaction layer beneath it is mbq_client.c (opaque
  * 32-bit command in, terminal outcome + 8-bit response out — DALI-agnostic; see
- * mbq_client.h and docs/modbus-command-queue.md). Producers (the raw command
- * path, the any-on probe, the config-query SM) submit DALI commands into a
+ * mbq_client.h and, normatively, ../TinyModbus/QUEUE-PROTOCOL.md). Producers
+ * (the raw command path, the any-on probe, the config-query SM) submit into a
  * per-slave local backlog sorted by priority class. dq_tick() drains the
  * highest-priority pending command into a free gateway slot (via mbq_client),
  * keeping at most DQ_INFLIGHT_MAX in flight so a fresh high-priority command

@@ -251,11 +251,15 @@ end-to-end system it is fine to change and reflash that firmware too.
 
 ## Serial / test rig
 
-- The controller's USB-CDC CLI is at **`/dev/tty.usbmodem111201`** (baud
+- The controller's USB-CDC CLI is at **`/dev/cu.usbmodem112201`** (baud
   irrelevant — native USB). Commands are line-based text; `help` lists them.
+  The device number changes with the USB port — check `ls /dev/cu.usbmodem*`
+  before assuming it.
 - Useful CLI commands for bus debugging: `dali_raw <slave> <cmd16> [twice]`,
   `gw_reboot <slave>` (software-resets a wedged gateway), `get_input`/`get_holding`,
-  `log dbg` (raise verbosity to capture Modbus traffic).
+  `log dbg` (raise verbosity to capture Modbus traffic), `mbq [<slave>]` (queue
+  transport FSM + protocol counters) and `mbq gw <slave>` (the gateway's own
+  queue counters).
 - End-to-end test harness: `test/run_tests.py`. Run it with the venv:
   ```sh
   .venv/bin/python test/run_tests.py            # build + flash + test
@@ -282,9 +286,9 @@ internal faults**, across two soaks totalling 1300 DALI frames and 2305 Modbus
 transactions with zero failures. For contrast, the pre-swap counters stood at
 8868 frame errors and 5162 CRC errors against 29210 good frames.
 
-**Diagnostics block sizes are exact.** `get_input <slave> 0x0300 16` and
-`get_input <slave> 0x0310 4` — asking for a different count returns ILLEGAL DATA
-ADDRESS rather than a short read.
+**Diagnostics block sizes are exact.** `get_input <slave> 0x0300 16`,
+`get_input <slave> 0x0310 4` and `get_input <slave> 0x0320 8` — asking for a
+different count returns ILLEGAL DATA ADDRESS rather than a short read.
 
 ## Logic-analyzer line traces (Saleae)
 
@@ -408,6 +412,29 @@ and emits `IC_EVT_GW_DIAG`. `ha_bridge` publishes JSON to
 (watchdog/software/external/brownout/power-on/updi) via `reset_reason_str`,
 priority-ordered so a multi-flag cold boot reports the most diagnostic cause.
 
+### Gateway queue counters (FC04 `0x0320`, 8-register read) — task 08, queue v4
+
+Read with `get_input <slave> 0x0320 8`, or decoded by the CLI as
+`mbq gw <slave>`. All 16-bit wrapping counters, zeroed on gateway reset, read on
+demand and **never polled hot** (queue-protocol §6):
+`reg0 accepts` · `reg1 a_full` · `reg2 executes` · `reg3 results` ·
+`reg4 acks` · `reg5 stalls` · `reg6 q_discard` · `reg7 spare` (reads 0).
+
+Two of them read in **opposite directions**, and it matters:
+
+- **`a_full` non-zero is a canary**, not traffic. A_FULL should be unreachable
+  while the master honours its in-flight cap, so a non-zero value means the
+  master's accounting is wrong — investigate rather than tune.
+- **`stalls` non-zero is normal.** It counts backpressure *episodes* (rising
+  edge) — the gateway stalling its DALI arbiter rather than dropping a result
+  whenever the master stops acking. That is the rule working, and the
+  `mbq no-ack <slave> <n>` drill drives it deliberately.
+- `q_discard` counts malformed FC 0x41 frames discarded without a reply.
+
+`TinyModbus/src/registers.h` is authoritative for the map; this table, the
+gateway's own `CLAUDE.md`, and the controller's `mbq` parser mirror it and must
+all move together.
+
 ### Scans read status, level and groups
 
 An interrogation reads QUERY STATUS + QUERY ACTUAL LEVEL for every present
@@ -419,7 +446,9 @@ asynchronous; the main loop drives them and state converges over a few seconds.
 ## Gateway recovery
 
 `gw_reboot <slave>` (CLI) software-resets a gateway via its `MBREG_SYSTEM_RESET`
-register (`set_holding <slave> 0x1015 0xA5A5`). Handy if a gateway ever wedges.
+register (`set_holding <slave> 0x1F05 0xA5A5` — `TinyModbus/src/registers.h` is
+authoritative; an earlier note here said `0x1015`, which was never the register).
+Handy if a gateway ever wedges.
 After it reboots, read `get_input <slave> 0x0310 4` — `reset_reason` bit4 (SWRF)
 confirms the software reset, and `boot_count` increments.
 
