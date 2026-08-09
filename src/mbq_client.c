@@ -520,8 +520,15 @@ static bool apply_head(slave_t *s, const reply_t *r) {
      * impossible. Under the always-piggyback policy of §5 this is unreachable
      * (the ack for a head we consumed rides the very next request), which is
      * why it is counted rather than acted on — if it ever fires, the policy or
-     * the gateway has changed and that is the finding. */
-    if (s->last_head != 0 && r->hseq != s->last_head && s->tx_ack != s->last_head)
+     * the gateway has changed and that is the finding.
+     *
+     * Not during recovery: there the head moving is the WHOLE POINT. R1's poll
+     * deliberately carries no ack precisely so that a moved head can only mean
+     * the lost frame's own ack was applied — an ack of ours that we simply
+     * never saw acknowledged. Counting that as an anomaly would flag every
+     * successful R1. */
+    if (s->st != S_RECOVERY_POLL && s->last_head != 0 &&
+        r->hseq != s->last_head && s->tx_ack != s->last_head)
         s->stats.head_anomalies++;
 
     /* Ack confirmation: the head moving off the seq we were acking proves the
@@ -995,8 +1002,11 @@ static void drive(slave_t *s) {
     uint8_t pi = find_state(s, CMD_PENDING);
     if (pi != NO_CMD) {
         if (now < s->next_at_us) return;
-        issue_queue_txn(s, pi);
-        s->st = S_AWAIT_REPLY;
+        /* Only claim AWAIT_REPLY if something actually went out: a refusal from
+         * a full Modbus action queue leaves nothing on the wire, and a state
+         * that says otherwise would report a phantom transaction and block
+         * submits until the next tick noticed. */
+        if (issue_queue_txn(s, pi)) s->st = S_AWAIT_REPLY;
         return;
     }
 

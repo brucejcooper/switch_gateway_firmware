@@ -335,6 +335,8 @@ int main(void) {
         CHECK(submit(CMD_SET, true, &c));
         CHECK(GW.acks_piggybacked == piggy_before + 1);
         CHECK(GW.rq_n == 0);                     /* retention is not accumulating */
+        CHECK(stats().head_anomalies == 0);      /* the head only ever moved on our acks */
+        CHECK(stats().proto_errors == 0);
     }
 
     /* ── 3. R1 — a lost reply to an enqueue+ack. The recovery poll finds the
@@ -360,6 +362,10 @@ int main(void) {
         CHECK(stats().r1_never == 0);
         CHECK(GW.accepts == accepts_before + 1); /* nothing was resent */
         CHECK(stats().resends == 0);
+        /* The head moved because the LOST FRAME's ack was applied — an ack of
+         * ours, so it is not a structural anomaly and must not be counted as
+         * one. Flagging every successful R1 would make the counter useless. */
+        CHECK(stats().head_anomalies == 0);
 
         gw_complete(0u, 0x22u);
         run_ms(104);
