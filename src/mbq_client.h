@@ -192,11 +192,13 @@ typedef struct {
                                * use — a DETECTED mis-binding, never silent    */
     uint32_t orphans;         /* results discarded as a previous controller
                                * epoch's leftovers (no-baseline state)         */
-    uint8_t  respq_est;       /* commands believed finished but whose result
-                               * has not been read — the controller's estimate
-                               * of gateway response-queue occupancy, which is
-                               * what climbs during the `no-ack` backpressure
-                               * drill                                         */
+    uint8_t  inflight;        /* commands accepted whose result has not come
+                               * back — what the client is actually tracking   */
+    uint8_t  respq_est;       /* lower bound on gateway response-queue
+                               * occupancy. Since the estimator went, this is
+                               * only what we have consumed and not yet acked —
+                               * observed rather than inferred. Climbs during
+                               * the `no-ack` backpressure drill               */
     uint8_t  unacked;         /* results consumed but not yet proven popped    */
     uint32_t head_blocked;    /* replies seen with the head still holding a
                                * result we have consumed but not acked — the

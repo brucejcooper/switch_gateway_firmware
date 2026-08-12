@@ -66,32 +66,11 @@ enum { H_OK = 0u, H_FAILED = 1u };       /* head-entry status  */
 
 /* ── policy constants ─────────────────────────────────────────────────────── */
 
-/* Estimated DALI execution time per command class. This is NOT only a
- * poll-pacing hint: because gw_occupancy() holds a command's slot until its
- * estimate expires, these numbers directly set how fast new commands are
- * admitted, and therefore the throughput ceiling. An estimate that is N ms
- * long costs N ms of DALI idle on every command. Correctness never depends on
- * them — the result deadline decides lateness — but the bench does.
- *
- * Calibrated against the rig, not derived: the FC23 baseline ran a DTR0-SET +
- * QUERY pair in 68.1 ms wall, and IEC 62386 puts the frame pair at ~63 ms, so
- * ~28 ms and ~38 ms are the real per-command costs including the gateway's
- * arbiter turnaround. The first cut used 25/40 + a 4 ms margin = 73 ms/pair and
- * measured 74.0 — i.e. the estimator, not DALI, was the limiter. Re-measure
- * these if the DALI bit timing or the gateway's main loop ever changes. */
-#define EST_SET_MS       26u
-#define EST_QUERY_MS     38u
-#define EST_DTR0_MS      50u
-
-/* Deliberate bias, and the direction matters (spec §5): an estimate that runs
- * LATE costs latency and throughput, one that runs EARLY costs an A_FULL and a
- * wasted transaction. Both are recoverable, so the margin is small and A_FULL
- * pushes the estimate out further when it does fire — self-correcting beats
- * permanently pessimistic, which is what the 4 ms margin plus a late anchor
- * cost us (9.9 pairs/s against a 14.7 baseline). */
-#define EST_MARGIN_MS     3u
-#define EST_AFULL_PUSH_MS 12u
-
+/* A command's result must arrive within this long, or rule R4 classifies it
+ * as lost to a reboot or a gateway wedge. Worst queueing at depth 2 is one
+ * ~50 ms DTR0-pair ahead of a ~50 ms one of your own, times a 1.5 margin
+ * (spec §4). This is the ONLY DALI timing the client knows, and it is a
+ * failure deadline — never flow control. */
 #define PACE_MIN_MS       2u    /* floor, so an estimate that has already passed
                                  * still yields to the rest of the main loop   */
 #define PACE_FAIL_MS      5u    /* first backoff after a transaction that failed */
@@ -173,7 +152,6 @@ typedef struct {
                                     * accept byte — must be verified when its
                                     * result surfaces (spec §4) */
     uint64_t deadline_us;          /* result deadline, armed at accept */
-    uint64_t est_done_us;          /* estimated DALI completion, for pacing */
     uint64_t born_us;              /* first submit; bounds recovery in TIME */
 } cmd_t;
 
@@ -206,9 +184,10 @@ typedef enum { TX_QUEUE = 0, TX_SYSINFO, TX_VERSION } tx_kind_t;
  * BUILT, the master has not yet collected the oldest result — so if the local
  * array were only CMDQ_DEPTH deep there would be nowhere to put the new
  * command and the master would have to spend a whole separate transaction
- * collecting first. That is exactly the 2.04-transactions-per-command the
- * first bench run measured. The extra slot is not extra queue depth: gateway
- * occupancy is still capped at CMDQ_DEPTH by gw_occupancy() below. */
+ * collecting first.
+ *
+ * The extra slot is not extra queue depth — the GATEWAY bounds its own queue
+ * and says A_FULL when it is full. Nothing here predicts that. */
 #define MBQ_CMD_SLOTS  (CMDQ_DEPTH + 1u)
 
 #define NO_CMD 0xFFu
@@ -262,17 +241,13 @@ typedef struct {
     uint64_t epoch_drain_us;    /* suppress repeat R3 until this passes */
     uint8_t  gw_major, gw_minor;
 
-    /* Two pacing gates, deliberately separate. next_at_us holds back work the
-     * client OWES the gateway (a resend, a retry after a failure, an A_FULL
-     * re-offer); poll_at_us holds back the speculative POLL that collects a
-     * result. Merging them would make an R1' resend wait out a DALI frame it
-     * has no reason to wait for, and would let a freshly submitted command sit
-     * behind a poll timer — which is the throughput this design exists to
-     * gain. A fresh submit is gated by neither (spec §5 paces "on A_FULL, or
-     * when awaiting results with an empty backlog", and a submit is neither). */
+    /* The ONE pacing gate, and it exists only for TRANSPORT trouble: a retry
+     * after a transaction that got no answer, backing off a slave that has
+     * stopped responding. Nothing here paces against DALI — the gateway
+     * answers A_FULL when it is busy and that is the whole of the flow
+     * control. A fresh submit is not gated by it at all. */
     uint64_t next_at_us;
-    uint64_t poll_at_us;
-    uint64_t poll_yield_us;     /* grace given to the scheduler before polling */
+    uint64_t poll_yield_us;     /* one-tick grace for the producer before a poll */
 
     /* Modbus completion hand-off (resolved in tick, not in the callback). */
     volatile bool cb_fired;
@@ -307,15 +282,6 @@ static slave_t *slave_for(uint8_t slave_id) {
     return NULL;
 }
 
-/* Sequences run 1-31 and skip 0, which means "none". An off-by-one here makes
- * "no ack" and "ack command 32" the same frame. */
-static uint8_t seq_next(uint8_t s) { return (s >= SEQ_MASK) ? 1u : (uint8_t)(s + 1u); }
-
-static uint32_t est_ms(const uint8_t cmd[MBQ_CMD_BYTES]) {
-    if (cmd[2] & MBQ_QF_DTR0)   return EST_DTR0_MS;
-    if (cmd[2] & MBQ_QF_ANSWER) return EST_QUERY_MS;
-    return EST_SET_MS;
-}
 
 static cmd_t *cmd_by_seq(slave_t *s, uint8_t seq) {
     if (seq == 0) return NULL;
@@ -332,6 +298,11 @@ static bool seq_tracked(slave_t *s, uint8_t seq) {
     if (s->ack_pending == seq) return true;
     return cmd_by_seq(s, seq) != NULL;
 }
+
+/* The sequence the gateway will assign next, mirroring its 1..31 counter with
+ * 0 reserved. Used only to PREDICT a binding after a lost reply (rule R1); the
+ * prediction is verified when the result surfaces. */
+static uint8_t seq_next(uint8_t s) { return (s >= SEQ_MASK) ? 1u : (uint8_t)(s + 1u); }
 
 static uint8_t count_state(const slave_t *s, cmd_state_t st) {
     uint8_t n = 0;
@@ -392,22 +363,37 @@ static uint8_t inflight_count(const slave_t *s) {
  * anchored at the moment the ACCEPT REPLY was parsed, roughly half a
  * transaction after the gateway really began executing, so it runs late. Late
  * costs a little latency; early costs an A_FULL and a wasted transaction. */
-static uint8_t gw_occupancy(const slave_t *s) {
-    uint64_t now = MBQ_NOW_US();
-    uint8_t n = 0;
-    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
-        const cmd_t *c = &s->cmd[i];
-        if (c->st == CMD_PENDING || c->st == CMD_SENDING) n++;
-        else if (c->st == CMD_ACCEPTED && now < c->est_done_us) n++;
-    }
-    return n;
+/* A_FULL IS FLOW CONTROL (user decision, 2026-08-12). The client does NOT
+ * predict how full the gateway is — it offers a command and lets the gateway
+ * answer. A refusal costs one transaction and that transaction is not wasted:
+ * every reply carries the head of the response queue, so a bounced enqueue
+ * still collects a result.
+ *
+ * What this replaces, and why: the client used to estimate when each command
+ * would finish (by class, ~26 ms SET / ~38 ms query) and admit a new one only
+ * when the estimate said a gateway slot had freed. That bought one transaction
+ * per DALI frame instead of two — and cost an estimator that had to be
+ * calibrated against the rig, drifted, and put a command's admission at the
+ * mercy of a guess. It was the direct cause of the scheduler-path defect
+ * (1.79 txns/command): a command whose ESTIMATE had expired but whose RESULT
+ * had not arrived still held a local slot, so the client ran out of slots,
+ * could not enqueue, and polled instead.
+ *
+ * The trade, accepted deliberately: more Modbus transactions, in exchange for
+ * no guesswork, lower command latency (a retry lands within a transaction of a
+ * slot opening, where a deliberately-late estimate does not), and a much
+ * smaller client. With several gateways the round-robin supplies the spacing
+ * for free — by the time the master comes back to a slave, it is more likely
+ * to have room. */
+static bool have_free_slot(const slave_t *s) {
+    return find_state(s, CMD_FREE) != NO_CMD;
 }
 
 /* True if the client would accept a new command this instant, ignoring
  * whether one is on the wire. drive() consults this to decide whether to yield
  * a transaction slot to the scheduler instead of spending it on a poll. */
 static bool submit_room(const slave_t *s) {
-    return gw_occupancy(s) < CMDQ_DEPTH && find_state(s, CMD_FREE) != NO_CMD;
+    return have_free_slot(s);
 }
 
 static void pace(slave_t *s, uint32_t ms) {
@@ -431,22 +417,6 @@ static void pace_backoff(slave_t *s) {
     pace(s, ms);
 }
 
-/* When the OLDEST in-flight command is estimated to finish (spec §5) — the
- * moment at which a poll has something to collect. Capped at the result
- * deadline so a bad estimate can never delay the deadline machinery past the
- * point where it should fire, and floored so it always yields to the rest of
- * the main loop. */
-static uint64_t oldest_done_at(const slave_t *s) {
-    uint64_t now = MBQ_NOW_US(), target = 0;
-    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
-        if (s->cmd[i].st != CMD_ACCEPTED) continue;
-        if (target == 0 || s->cmd[i].est_done_us < target) target = s->cmd[i].est_done_us;
-    }
-    uint64_t floor_us = now + (uint64_t)PACE_MIN_MS * 1000u;
-    uint64_t cap      = now + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
-    if (target == 0 || target < floor_us) return floor_us;
-    return (target > cap) ? cap : target;
-}
 
 static void deliver(slave_t *s, cmd_t *c, mbq_result_t r, uint8_t resp8) {
     mbq_cb_t cb = c->cb;
@@ -674,7 +644,6 @@ static bool parse_reply(const slave_t *s, const uint8_t *b, uint8_t n, reply_t *
     return true;
 }
 
-static void completion_reanchor(slave_t *s);
 
 /* ── head processing ─────────────────────────────────────────────────────── */
 
@@ -738,7 +707,6 @@ static bool apply_head(slave_t *s, const reply_t *r) {
         if (r->hstatus == H_OK) deliver(s, c, MBQ_R_COMPLETE, r->resp8);
         else                    deliver(s, c, MBQ_R_FAILED,   r->resp8);
         s->ack_pending = r->hseq;
-        completion_reanchor(s);
         return false;
     }
 
@@ -795,68 +763,20 @@ static bool apply_head(slave_t *s, const reply_t *r) {
     return true;
 }
 
-/* Bind a command to the seq the gateway assigned it and start its clocks. */
+/* Bind a command to the seq the gateway assigned it and start its deadline.
+ *
+ * There is no completion ESTIMATE any more. The deadline below is a failure
+ * timer, not a schedule: it decides when a missing result becomes rule R4's
+ * problem, and nothing reads it to decide when to transmit. */
 static void bind_accepted(slave_t *s, cmd_t *c, uint8_t seq, bool predicted) {
-    uint64_t now = MBQ_NOW_US();
-    /* Pipeline model for the pacing estimate: this command starts when the one
-     * ahead of it finishes, since the gateway executes strictly FIFO. Chained
-     * estimates compound their errors, so completion_reanchor() below resets
-     * the chain against an OBSERVED completion whenever one arrives. */
-    uint64_t start = now;
-    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
-        cmd_t *o = &s->cmd[i];
-        if (o == c || o->st != CMD_ACCEPTED) continue;
-        if (o->est_done_us > start) start = o->est_done_us;
-    }
     c->seq         = seq;
     c->pred        = predicted;
     c->st          = CMD_ACCEPTED;
-    c->deadline_us = now + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
-    c->est_done_us = start + (uint64_t)(est_ms(c->cmd) + EST_MARGIN_MS) * 1000u;
+    c->deadline_us = MBQ_NOW_US() + (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
     s->last_seq    = seq;
     s->seq_known   = true;
 }
 
-/* A result just arrived, so the gateway has moved on to the next command in
- * accept order. Re-anchor the remaining estimates on that observed fact rather
- * than leaving them chained off a bind time that may be several frames stale —
- * chained estimates drift. Ordering is by seq, which is accept order by
- * construction.
- *
- * ANCHOR AT t_issue_us, NOT AT NOW. The result was already sitting in the
- * gateway's response queue when it built this reply, so the command finished
- * at the latest when our request arrived — a whole transaction before we
- * parsed the answer. Anchoring at `now` therefore books ~12 ms of pure fiction
- * onto every estimate, and because a fresh command is only admitted once the
- * oldest estimate expires (gw_occupancy), that fiction is paid straight out of
- * throughput: MEASURED 100.7 ms per soak pair against a 68 ms baseline and a
- * ~63 ms DALI floor, i.e. 9.9 pairs/s where the FC23 path it replaces managed
- * 14.7. One transaction per DALI frame is worthless if the frames are 50 %
- * further apart.
- *
- * t_issue_us is the moment we put the request on the wire, which is an
- * honest lower bound on when the gateway had the result, and still LATE
- * relative to the true completion (the gateway may have finished it long
- * before we asked). It keeps the conservative direction §5 asks for without
- * paying a transaction of latency per command for it. */
-static void completion_reanchor(slave_t *s) {
-    uint64_t at = s->t_issue_us ? s->t_issue_us : MBQ_NOW_US();
-    for (;;) {
-        cmd_t *next = NULL;
-        for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++) {
-            cmd_t *c = &s->cmd[i];
-            if (c->st != CMD_ACCEPTED) continue;
-            if (c->est_done_us <= at) continue;          /* already re-anchored */
-            if (!next || c->seq < next->seq) next = c;
-        }
-        if (!next) return;
-        at += (uint64_t)(est_ms(next->cmd) + EST_MARGIN_MS) * 1000u;
-        next->est_done_us = at;
-        /* Mark it done for this pass without another flag: the loop above skips
-         * anything whose estimate is no later than `at`, which now includes it. */
-        if (at <= MBQ_NOW_US()) return;
-    }
-}
 
 /* ── resolution: a queue reply arrived ───────────────────────────────────── */
 
@@ -868,45 +788,27 @@ static void resolve_queue_reply(slave_t *s, const reply_t *r) {
         if (!c) { latch_incompatible(s, "accept byte for a request that enqueued nothing"); return; }
 
         if (r->astatus == A_FULL) {
-            /* A_FULL IS A CANARY, NOT BACK-PRESSURE (spec §4). The client
-             * decrements in-flight only on SEEING a result, while the gateway
-             * frees a command slot the moment the command completes — so the
-             * client's count always over-estimates gateway occupancy, and
-             * "the client believes there is room" implies there is room.
-             * Observing one therefore means the in-flight accounting is wrong.
-             * Recovery is still to hold the command and re-offer it, but this
-             * must never pass silently as though it were routine. */
-            s->stats.afull++;
-            LOG_ERR("mbq", "slave %u: A_FULL — the in-flight cap should make this "
-                    "unreachable, so the client's accounting is wrong "
-                    "(inflight=%u of %u, total A_FULL=%lu)",
-                    s->slave_id, (unsigned)inflight_count(s), (unsigned)CMDQ_DEPTH,
-                    (unsigned long)s->stats.afull);
-            c->st = CMD_PENDING;
-            c->seq = 0;
-            /* The gateway really was full, so the estimate that released this
-             * enqueue ran early. Push the oldest command's estimate out before
-             * re-offering — otherwise the retry is released by the same
-             * already-expired estimate and A_FULL repeats at main-loop speed. */
-            uint64_t push = MBQ_NOW_US() + (uint64_t)EST_AFULL_PUSH_MS * 1000u;
-            for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
-                if (s->cmd[i].st == CMD_ACCEPTED && s->cmd[i].est_done_us < push)
-                    s->cmd[i].est_done_us = push;
-            /* Floor the gate at `push` INDEPENDENTLY of the loop above, because
-             * the case that matters most has nothing for it to push. After a
-             * gateway reboot the client has disposed its tracked commands, so
-             * no slot is CMD_ACCEPTED, oldest_done_at() falls through to its
-             * 2 ms floor, and the retry fires straight back into a gateway that
-             * is full of work we can no longer see — the very main-loop-speed
-             * repeat this push exists to prevent.
+            /* A_FULL IS FLOW CONTROL, not an anomaly (user decision,
+             * 2026-08-12). The gateway is the authority on its own queue: we
+             * offer, it answers. Hold the command and re-offer it on the next
+             * transaction to this slave.
              *
-             * Measured without the floor, on a reboot drill: 7755 A_FULL and
-             * 4263 resends in 35 s, which exhausted the per-command resend
-             * budget and disposed 225 of 240 idempotent commands as LOST —
-             * commands a reboot should have cost us nothing, since idempotent
-             * work is exactly what survives one. */
-            uint64_t gate = oldest_done_at(s);
-            s->next_at_us = (gate > push) ? gate : push;
+             * The refused transaction is NOT wasted — its reply carried the
+             * head of the response queue like any other, so it still collected
+             * a result. That is what makes offer-and-be-told affordable, and
+             * it is why there is no backoff here: retrying at bus rate lands
+             * the command within one transaction of a slot opening, which is
+             * better latency than any estimate would give. With several
+             * gateways the scheduler's round-robin supplies the spacing.
+             *
+             * (Kept deliberately quiet at LOG_DBG. It used to be LOG_ERR on
+             * the theory that A_FULL was unreachable — that claim was false
+             * twice over and is retracted in QUEUE-PROTOCOL.md §4.) */
+            s->stats.afull++;
+            LOG_DBG("mbq", "slave %u: A_FULL, re-offering (total %lu)",
+                    s->slave_id, (unsigned long)s->stats.afull);
+            c->st  = CMD_PENDING;
+            c->seq = 0;
         } else if (r->astatus == A_ACCEPTED && r->aseq != 0) {
             /* R2: the gateway pins a seq until its result is acked, and acks are
              * head-only and in order, so reaching the same value again needs 31
@@ -1463,7 +1365,6 @@ static void handle_reply(slave_t *s) {
      * only once the oldest in-flight command could plausibly have finished. A
      * submit arriving before then still goes out immediately — this gate is on
      * polls alone. */
-    s->poll_at_us = oldest_done_at(s);
 
     /* An R4 poll that did not bring back the result it was chasing escalates to
      * the cold-path arbiter. */
@@ -1580,16 +1481,40 @@ static void drive(slave_t *s) {
      * carries the ack and collects the result in the same frame, and only the
      * layer above knows whether a command is waiting. Polling here instead is
      * what costs the second transaction per DALI frame. */
+    /* Results outstanding, or an ack still owed: poll. There is nothing to
+     * predict and nothing to wait for — Modbus is master-slave, so a result
+     * only arrives when we ask, and asking sooner gets it sooner.
+     *
+     * This used to defer the poll to an ESTIMATE of when the oldest command
+     * would finish, and yield 2 ms first in case the scheduler had a command
+     * to send instead. That bought one transaction per DALI frame rather than
+     * two, and cost the estimator, the yield latch, and the slot-starvation
+     * defect they produced between them. The command path above already
+     * prefers an enqueue whenever one is waiting, which is the part that
+     * actually mattered: a poll only happens when there is genuinely nothing
+     * to send. */
     if (count_state(s, CMD_ACCEPTED) > 0 || s->ack_pending != 0) {
         s->st = S_DEADLINE_WAIT;
-        uint64_t at = (s->next_at_us > s->poll_at_us) ? s->next_at_us : s->poll_at_us;
-        if (now < at) { s->poll_yield_us = 0; return; }
-        if (submit_room(s)) {
+        if (now < s->next_at_us) return;      /* transport backoff only */
+
+        /* Before spending a transaction on a POLL, give the layer above first
+         * refusal — only it knows whether a command is waiting, and an enqueue
+         * does the poll's job for free by carrying the ack and returning the
+         * head. This is NOT pacing and involves no estimate: it is a
+         * yield-to-producer, and it lasts one scheduler tick, not a DALI frame.
+         *
+         * Removing it entirely was measured and is much worse than it looks:
+         * the client polls back-to-back, so `mbq_client_can_submit()` is false
+         * almost always (a transaction is on the wire), the producer cannot
+         * hand over a command, and the bus fills with polls that a single
+         * enqueue would have replaced — 5.5 transactions per command in the
+         * host model, with commands waiting behind polls. */
+        if (have_free_slot(s)) {
             if (s->poll_yield_us == 0) {
                 s->poll_yield_us = now + (uint64_t)PACE_YIELD_MS * 1000u;
                 return;
             }
-            if (now < s->poll_yield_us) return;   /* still the scheduler's turn */
+            if (now < s->poll_yield_us) return;
         }
         s->poll_yield_us = 0;
         if (issue_queue_txn(s, NO_CMD)) s->st = S_AWAIT_REPLY;
@@ -1650,8 +1575,9 @@ bool mbq_client_can_submit(uint8_t slave_id) {
     if (s->busy) return false;
     if (s->st != S_IDLE && s->st != S_DEADLINE_WAIT) return false;
     if (find_state(s, CMD_PENDING) != NO_CMD) return false;
-    /* Admission is against ESTIMATED GATEWAY OCCUPANCY, not against how many
-     * commands the client is holding — see gw_occupancy(). */
+    /* Admission is bounded ONLY by local bookkeeping — a slot to remember the
+     * command in. Whether the GATEWAY has room is the gateway's answer to give
+     * (A_FULL), not ours to predict. */
     return submit_room(s);
 }
 
@@ -1718,18 +1644,16 @@ void mbq_client_stats(uint8_t slave_id, mbq_stats_t *out) {
     slave_t *s = slave_for(slave_id);
     if (!s) return;
     *out = s->stats;
-    /* Live figures rather than counters. respq_est is the controller's view of
-     * how much of the gateway's response queue is occupied: a command past its
-     * estimated completion has produced a result, and until the master reads
-     * and acks it that result is sitting in the response queue. It reads ~1 in
-     * steady state and climbs under `mbq no-ack`, which is what makes the
-     * backpressure drill legible from this side. */
-    uint64_t now = MBQ_NOW_US();
-    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
-        if (s->cmd[i].st == CMD_ACCEPTED && now >= s->cmd[i].est_done_us)
-            out->respq_est++;
-    out->unacked = (s->ack_pending != 0) ? 1u : 0u;
-    if (s->ack_pending != 0) out->respq_est++;
+    /* Live figures rather than counters. Without a completion estimate the
+     * client can no longer guess how many results are SITTING in the gateway's
+     * response queue — it only knows about the one it has consumed and not yet
+     * acked. That is enough for the backpressure drill to be legible from this
+     * side (`unacked` climbs under `mbq no-ack`), and it has the merit of
+     * being observed rather than inferred. `inflight` is what the client is
+     * genuinely tracking: commands accepted whose results have not arrived. */
+    out->inflight = count_state(s, CMD_ACCEPTED);
+    out->unacked  = (s->ack_pending != 0) ? 1u : 0u;
+    out->respq_est = out->unacked;
 }
 
 uint16_t mbq_client_consec_fail(uint8_t slave_id) {
@@ -1796,7 +1720,7 @@ void mbq_client_debug_print(int slave_id) {
         cdc_out_printf("  ack_pending=%u head=%u last_seq=%u%s  respq~%u occupancy=%u/%u\n",
                        s->ack_pending, s->last_head, s->last_seq,
                        s->seq_known ? "" : " (no baseline)",
-                       live.respq_est, gw_occupancy(s), CMDQ_DEPTH);
+                       live.respq_est, count_state(s, CMD_ACCEPTED), CMDQ_DEPTH);
         cdc_out_printf("  commands:");
         for (uint8_t k = 0; k < MBQ_CMD_SLOTS; k++)
             cdc_out_printf(" %u:%s/seq%u", k, cmd_state_name(s->cmd[k].st), s->cmd[k].seq);
