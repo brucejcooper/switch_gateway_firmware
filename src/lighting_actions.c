@@ -274,10 +274,9 @@ static void toggle_cb(uint8_t slave, dq_result_t res, uint8_t answer, void *ctx)
     s_tog[ix].busy = false;
 
     bool any_on;
-    switch (res) {
-    case DQ_RES_OK:                  /* answered — something is on */
-    case DQ_RES_ERR:  any_on = true;  break;   /* garbled = collision — >=1 on */
-    case DQ_RES_NAK:  any_on = false; break;   /* nothing answered — none on */
+    switch (dq_yes_no(res, answer)) {
+    case DQ_YN_YES: any_on = true;  break;
+    case DQ_YN_NO:  any_on = false; break;
     default:
         LOG_WARN("light", "toggle %u.%s%u unresolved — not acting",
                  slave_id, is_group ? "G" : "", target);
@@ -336,13 +335,10 @@ bool lighting_any_on_probe_sync(uint8_t slave_id, uint8_t addr_byte, bool *any_o
     if (!dq_submit_sync(slave_id, addr_byte, PROBE_QUERY_OPCODE, DQ_ANSWER, 0,
                         true, PROBE_DEADLINE_MS, &res, &ans))
         return false;
-    switch (res) {
-    case DQ_RES_OK:              /* answered — it is on */
-    case DQ_RES_ERR:             /* garbled = collision of answers — >=1 on */
-        *any_on = true;  return true;
-    case DQ_RES_NAK:             /* nothing answered — none on */
-        *any_on = false; return true;
-    default:                     /* dropped/lost — no definitive answer */
+    switch (dq_yes_no(res, ans)) {
+    case DQ_YN_YES: *any_on = true;  return true;
+    case DQ_YN_NO:  *any_on = false; return true;
+    default:                     /* bus fault / dropped — no definitive answer */
         return false;
     }
 }
@@ -404,16 +400,15 @@ void lighting_any_on_probe_tick(void) {
         if (!s_probe.have) return;
         s_probe.have      = false;
         s_probe.in_flight = false;
-        switch (s_probe.res) {
-        case DQ_RES_OK:                       /* answered — something is on */
-        case DQ_RES_ERR:                      /* garbled = collision of answers — ≥1 on */
+        switch (dq_yes_no(s_probe.res, s_probe.answer)) {
+        case DQ_YN_YES:
             probe_finish(true, true, "answered");
             return;
-        case DQ_RES_NAK:                      /* none on this target — try the next */
+        case DQ_YN_NO:                        /* none on this target — try the next */
             if (++s_probe.tgt_ix >= s_probe.tgt_count)
                 probe_finish(true, false, "all nak");
             return;                           /* next target submitted below next tick */
-        default:                              /* DQ_RES_DROPPED etc. — unresolved */
+        default:                              /* bus fault / dropped — unresolved */
             probe_finish(false, false, "dropped");
             return;
         }

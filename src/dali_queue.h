@@ -65,7 +65,9 @@ typedef enum {
 /* Result codes delivered to a command's completion callback. */
 typedef enum {
     DQ_RES_OK  = 0,   /* backward frame received; `answer` is the response byte */
-    DQ_RES_NAK = 1,   /* no backward frame (normal for fire-and-forget sends) */
+    DQ_RES_NAK = 1,   /* EXPECTED a backward frame, got silence. A fact, not a
+                       * verdict — see dq_yes_no(). A command that expects no
+                       * reply now completes DQ_RES_OK instead of arriving here. */
     DQ_RES_ERR = 2,   /* bus/timing error or answer collision; `answer` = failure code */
     DQ_RES_DROPPED = 3, /* command lost (gateway reboot; non-idempotent → not resubmitted) */
     /* Synchronous-submit failure reasons (dq_submit_sync only; never delivered to
@@ -74,6 +76,37 @@ typedef enum {
     DQ_RES_BACKLOG = 4, /* submit rejected up front — controller backlog full */
     DQ_RES_TIMEOUT = 5, /* submitted, but no result within the sync deadline (bus congestion) */
 } dq_result_t;
+
+/* ---- yes/no queries -------------------------------------------------------
+ *
+ * A DALI query is one of two quite different things, and the difference is
+ * invisible in the result code:
+ *
+ *   a VALUE query (QUERY ACTUAL LEVEL, QUERY STATUS) wants a byte back, and
+ *   silence means the gear did not answer — evidence of absence; and
+ *
+ *   a YES/NO query (COMPARE, QUERY LAMP FAILURE, "is anything on?") answers
+ *   YES with a backward frame and NO by staying silent. Silence is the answer.
+ *
+ * For a yes/no query a GARBLED backward frame is also YES: it means two or more
+ * gear answered at once and their frames collided, which is the normal case in
+ * the commissioning bisect. Reading a collision as an error there would break
+ * the binary search.
+ *
+ * A bus fault is NOT yes. It is the absence of an answer for a transport
+ * reason, and callers must not fold it in with collision — the distinction is
+ * carried in `answer` (DALI_RESP_*) and is easy to lose, which is why this
+ * lives here once rather than at each call site. */
+typedef enum {
+    DQ_YN_NO = 0,          /* silence — the gear answered no                   */
+    DQ_YN_YES = 1,         /* a frame came back, clean or collided — >=1 said yes */
+    DQ_YN_UNRESOLVED = 2,  /* bus fault or lost command — no answer was obtained */
+} dq_yes_no_t;
+
+/* Interpret a completed yes/no query. `res`/`answer` are the callback's, and
+ * the caller is asserting it asked a yes/no question — this is meaningless for
+ * a value query, where DQ_RES_NAK means absent rather than no. */
+dq_yes_no_t dq_yes_no(dq_result_t res, uint8_t answer);
 
 /* Completion callback for one submitted command. Invoked exactly once (from
  * dq_tick context, i.e. the core-0 main loop) when the command's result is

@@ -54,7 +54,7 @@ uint64_t mbq_test_now_us(void);
 #define SEQ_MASK        0x1Fu   /* sequences are 1-31; 0 is reserved for "none" */
 
 enum { A_ACCEPTED = 0u, A_FULL = 1u };   /* accept-byte status */
-enum { H_OK = 0u, H_FAILED = 1u };       /* head-entry status  */
+enum { H_OK = 0u, H_FAILED = 1u, H_NAK = 2u };   /* head-entry status; cq.h is authoritative */
 
 /* Cold-path gateway registers (controller CLAUDE.md, "Gateway sysinfo"). Both
  * blocks are exact-count reads — a different count answers ILLEGAL DATA
@@ -622,7 +622,7 @@ static bool parse_reply(const slave_t *s, const uint8_t *b, uint8_t n, reply_t *
     /* An empty head must carry nothing; a non-empty one must carry a defined
      * status. Both are cheap structural checks on bytes we are about to act on. */
     if (r->hseq == 0 && (r->hstatus != 0 || r->resp8 != 0)) return false;
-    if (r->hstatus > H_FAILED) return false;
+    if (r->hstatus > H_NAK) return false;
     return true;
 }
 
@@ -686,8 +686,9 @@ static bool apply_head(slave_t *s, const reply_t *r) {
          * calculation is confirmed against the gateway. */
         c->pred = false;
         s->tx_deadline_seq = 0;
-        if (r->hstatus == H_OK) deliver(s, c, MBQ_R_COMPLETE, r->resp8);
-        else                    deliver(s, c, MBQ_R_FAILED,   r->resp8);
+        if      (r->hstatus == H_OK)  deliver(s, c, MBQ_R_COMPLETE, r->resp8);
+        else if (r->hstatus == H_NAK) deliver(s, c, MBQ_R_NAK,      0);
+        else                          deliver(s, c, MBQ_R_FAILED,   r->resp8);
         s->ack_pending = r->hseq;
         return false;
     }

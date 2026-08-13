@@ -122,6 +122,12 @@ typedef enum {
                              * gateway's response queue. Distinct from LOST
                              * because the bus state changed and a caller that
                              * would retry on LOST must not retry on this.       */
+    MBQ_R_NAK         = 4,  /* the command RAN and EXPECTED a reply; none came.
+                             * response8 = 0. This is a FACT, not a verdict:
+                             * silence means "no" to a yes/no query and "absent"
+                             * to a value query, and only the issuer knows which
+                             * it asked. Deliberately NOT MBQ_R_FAILED — nothing
+                             * broke, so failure counters must not count it.     */
 } mbq_result_t;
 
 /* Delivered once when a submitted command resolves. Runs from mbq_client_tick()

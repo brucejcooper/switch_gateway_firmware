@@ -184,8 +184,23 @@ static void advance(void) {
         case P_COMPARE: {
             /* COMPARE is anyone-pulls-low: ANY decoded response means at least
              * one gear's random address is <= the search value. Only a clean
-             * no-answer means none — a collided/garbled frame is a match. */
-            bool yes = (s.res != DQ_RES_NAK);
+             * no-answer means none — a collided/garbled frame is a match, which
+             * is why this goes through dq_yes_no() rather than testing the
+             * result code directly.
+             *
+             * UNRESOLVED must NOT be guessed. This used to read `s.res !=
+             * DQ_RES_NAK`, which folded a bus fault and a dropped command into
+             * "yes" and sent the bisect down the wrong branch — and a bisect
+             * that takes one wrong branch programs a short address onto the
+             * wrong gear. Abort the run instead; DCOM_ERR_TIMEOUT already means
+             * exactly "a step produced no result — bus or transport fault". */
+            dq_yes_no_t yn = dq_yes_no(s.res, s.answer);
+            if (yn == DQ_YN_UNRESOLVED) {
+                s.state = DCOM_ERR_TIMEOUT;
+                s.phase = P_TERMINATE;
+                break;
+            }
+            bool yes = (yn == DQ_YN_YES);
             uint8_t bb = s.bisect_bit;
 
             if (!yes) {

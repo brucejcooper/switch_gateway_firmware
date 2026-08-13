@@ -36,7 +36,6 @@
 /* DALI wire constants used by the probe (the gateway's dali.h equivalents). */
 #define DALI_ADDR_SET_DTR0        0xA3u   /* special command: addr byte = 0xA3, data = value */
 #define DALI_CMD_QUERY_DTR0       0x98u   /* QUERY CONTENT DTR0 (IEC 62386-102) */
-#define SOAK_DALI_NAK             0x01u   /* gateway DALI_RESP_NAK: no backward frame */
 
 /* Stride for the value walk: odd ⇒ coprime with 256 ⇒ all 256 values before a
  * repeat, and adjacent pairs never collide. */
@@ -192,12 +191,14 @@ static void soak_cb(uint8_t slave, mbq_result_t r, uint8_t response8, void *ctx)
     S.seq_last_done = rec->seq;
 
     if (!rec->is_query) {
-        /* A no-answer forward frame (KIND_CMD) is completed by the gateway as
-         * FAILED/DALI_RESP_NAK — "no backward frame" is the normal, successful
-         * outcome for a fire-and-forget send (dali_queue.h). Only a genuine bus
-         * error (collision/bus fault) or LOST is a failure here. */
-        if (r == MBQ_R_COMPLETE
-            || (r == MBQ_R_FAILED && response8 == SOAK_DALI_NAK)) S.n_set_ok++;
+        /* A no-answer forward frame (KIND_CMD) now completes as MBQ_R_COMPLETE:
+         * nothing was expected, so nothing was missing. Before 2026-08-13 the
+         * gateway reported it as FAILED/DALI_RESP_NAK and this test decoded that
+         * back into success — the convention that let a real failure and a
+         * normal send share one code. MBQ_R_NAK is not accepted here: an
+         * answerless command has no reply to miss, so seeing one would mean the
+         * gateway ran it with the wrong flags. */
+        if (r == MBQ_R_COMPLETE) S.n_set_ok++;
         else if (r == MBQ_R_LOST || r == MBQ_R_RESULT_LOST) {
             S.n_lost++;
             if (r == MBQ_R_RESULT_LOST) S.n_result_lost++;
@@ -230,7 +231,7 @@ static void soak_cb(uint8_t slave, mbq_result_t r, uint8_t response8, void *ctx)
 static void soak_dq_cb(uint8_t slave, dq_result_t r, uint8_t answer, void *ctx) {
     switch (r) {
         case DQ_RES_OK:  soak_cb(slave, MBQ_R_COMPLETE, answer, ctx); break;
-        case DQ_RES_NAK: soak_cb(slave, MBQ_R_FAILED, SOAK_DALI_NAK, ctx); break;
+        case DQ_RES_NAK: soak_cb(slave, MBQ_R_NAK, 0, ctx); break;
         case DQ_RES_ERR: soak_cb(slave, MBQ_R_FAILED, answer ? answer : 0x03u, ctx); break;
         default:         soak_cb(slave, MBQ_R_LOST, 0, ctx); break;
     }

@@ -384,10 +384,14 @@ int main(void) {
         CHECK(mbq_client_can_submit(SLAVE));
         CHECK(GW.afulls == 0);
 
-        gw_complete(1u, 0x01u);                  /* the SET: H_FAILED/NAK, normal */
+        /* The SET completes normally. Until 2026-08-13 the gateway reported an
+         * answerless command as H_FAILED carrying a DALI_RESP_NAK payload and
+         * this asserted exactly that; it now reports H_OK/0, because a command
+         * that expected no reply is not missing one. */
+        gw_complete(0u, 0x00u);
         run_ms(103);
         CHECK(a.n == 1);
-        CHECK(a.r == MBQ_R_FAILED && a.resp == 0x01u);
+        CHECK(a.r == MBQ_R_COMPLETE && a.resp == 0x00u);
 
         /* The ack for b's result must ride the NEXT ENQUEUE, not a poll of its
          * own — that is what makes steady state one transaction per DALI frame
@@ -1158,6 +1162,33 @@ int main(void) {
          * QUEUE-PROTOCOL.md §10. The print stays because a sudden change in it
          * is still worth a human look. */
         GW.dali_running = false;
+    }
+
+    /* ── The three-way head status. H_NAK exists so that "a query heard
+     *    silence" stops travelling as a failure code, and the client must relay
+     *    all three distinctly — it is the layer that decides NOTHING about what
+     *    silence means, so a status it collapses is information the producer can
+     *    never recover. The old encoding is also checked to still be rejected:
+     *    H_NAK took the value 2, so a reply carrying 3+ is a mismatched gateway
+     *    and must fail the structural check rather than decode as something. ── */
+    begin("head status: OK, NAK and FAILED stay distinct");
+    {
+        cap_t a = {0}, b = {0}, c = {0};
+
+        CHECK(submit(CMD_SET, true, &a));
+        gw_complete(0u, 0x00u);                          /* H_OK, answerless   */
+        CHECK(run_until_delivered(&a, 120));
+        CHECK(a.r == MBQ_R_COMPLETE && a.resp == 0x00u);
+
+        CHECK(submit(CMD_QUERY, true, &b));
+        gw_complete(2u, 0x00u);                          /* H_NAK, query silent */
+        CHECK(run_until_delivered(&b, 120));
+        CHECK(b.r == MBQ_R_NAK && b.resp == 0x00u);      /* NOT MBQ_R_FAILED   */
+
+        CHECK(submit(CMD_QUERY, true, &c));
+        gw_complete(1u, 0x02u);                          /* H_FAILED, collision */
+        CHECK(run_until_delivered(&c, 120));
+        CHECK(c.r == MBQ_R_FAILED && c.resp == 0x02u);   /* payload preserved  */
     }
 
     if (!fail) printf("PASS: all mbq_client checks passed\n");

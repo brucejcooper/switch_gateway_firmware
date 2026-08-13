@@ -118,7 +118,8 @@ _Static_assert(DQ_DEPTH_USER <= DQ_PIPELINE_MAX && DQ_DEPTH_CFG <= DQ_PIPELINE_M
 /* DALI response8 failure codes on a FAILED slot — the payload contract mirrored
  * from the gateway (TinyModbus dali_sync.h). A COMPLETE slot's response8 is the
  * backward-frame answer byte instead. */
-#define DALI_RESP_NAK        0x01u  /* no / short backward frame where one was expected */
+/* 0x01 was DALI_RESP_NAK, retired 2026-08-13 — "a query got silence" is the
+ * status MBQ_R_NAK now, not a failure payload. Reserved, not reused. */
 #define DALI_RESP_COLLISION  0x02u  /* garbled backward frame (≥1 gear answered) */
 #define DALI_RESP_BUSFAULT   0x03u  /* transport-level fault (short pulse etc.) */
 
@@ -218,6 +219,19 @@ static dq_pending_t *pend_alloc(dq_slave_t *s) {
 }
 
 /* ── public API ──────────────────────────────────────────────────────────── */
+
+/* See dali_queue.h for why a collision is YES and a bus fault is not. */
+dq_yes_no_t dq_yes_no(dq_result_t res, uint8_t answer) {
+    switch (res) {
+        case DQ_RES_OK:  return DQ_YN_YES;              /* a clean backward frame */
+        case DQ_RES_NAK: return DQ_YN_NO;               /* silence IS the answer  */
+        case DQ_RES_ERR:
+            /* Collision means two or more gear answered simultaneously, so at
+             * least one said yes. A bus fault means nothing was learned. */
+            return (answer == DALI_RESP_COLLISION) ? DQ_YN_YES : DQ_YN_UNRESOLVED;
+        default:         return DQ_YN_UNRESOLVED;       /* dropped / lost         */
+    }
+}
 
 void dq_init(void) {
     memset(s_dq, 0, sizeof s_dq);
@@ -335,9 +349,15 @@ static void dq_mbq_cb(uint8_t slave_id, mbq_result_t r, uint8_t response8, void 
             res = DQ_RES_OK; answer = response8;
             if (s) s->c_ok++;
             break;
+        case MBQ_R_NAK:
+            /* Expected a reply, heard silence. Passed straight through: what it
+             * MEANS is the producer's call (no / absent), so this layer must not
+             * decide. Previously this arrived as MBQ_R_FAILED carrying a
+             * DALI_RESP_NAK payload and was decoded back here by convention. */
+            res = DQ_RES_NAK; if (s) s->c_nak++;
+            break;
         case MBQ_R_FAILED:
-            if (response8 == DALI_RESP_NAK) { res = DQ_RES_NAK; if (s) s->c_nak++; }
-            else { res = DQ_RES_ERR; answer = response8; if (s) s->c_err++; }
+            res = DQ_RES_ERR; answer = response8; if (s) s->c_err++;
             break;
         case MBQ_R_LOST:
         case MBQ_R_RESULT_LOST:
