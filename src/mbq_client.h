@@ -83,6 +83,35 @@
  * slower gateway ever reports spurious R4 expiries. */
 #define MBQ_RESULT_DEADLINE_MS  150u
 
+/* TWO CAPACITIES, SEPARATE, BECAUSE THEY MEAN DIFFERENT THINGS.
+ *
+ *   MBQ_QUEUE_DEPTH   the QUEUE: commands accepted from a producer and not yet
+ *                     offered to the gateway (CMD_PENDING). This is OUR policy
+ *                     — how much backlog we are willing to hold so the
+ *                     transmission loop always has something to attach.
+ *
+ *   MBQ_INFLIGHT_MAX  IN FLIGHT: commands at the gateway or on the wire
+ *                     (CMD_ACCEPTED / CMD_SENDING). This is NOT policy and we
+ *                     do not enforce it — the GATEWAY bounds its own queue and
+ *                     says A_FULL. It is tracking capacity only: at most
+ *                     CMDQ_DEPTH sit at the gateway and one more can be on the
+ *                     wire, so CMDQ_DEPTH + 1 is what we must be able to
+ *                     remember.
+ *
+ * They were one number (MBQ_CMD_SLOTS = CMDQ_DEPTH + n) holding both, which is
+ * why "how much backlog?" and "how deep is the gateway?" could not be answered
+ * independently — and why in-flight work could fill the array and leave the
+ * loop with nothing to attach, so it sent a packet with no command in it.
+ *
+ * The array is their sum. Nothing else should derive from CMDQ_DEPTH here. */
+/* Four measured best on the bench: the loop only needs ONE queued command to
+ * keep every packet carrying work, and deeper only adds queueing latency
+ * (queue 8 measured 14.85 pairs/s against 15.12 at 4, with the gateway
+ * unchanged — which is also the check that these two really are independent). */
+#define MBQ_QUEUE_DEPTH   4u
+#define MBQ_INFLIGHT_MAX  (CMDQ_DEPTH + 1u)
+#define MBQ_CMD_SLOTS     (MBQ_QUEUE_DEPTH + MBQ_INFLIGHT_MAX)
+
 /* Terminal outcome delivered to a submitted command's callback, exactly once. */
 typedef enum {
     MBQ_R_COMPLETE    = 0,  /* the command succeeded; response8 = its answer byte  */

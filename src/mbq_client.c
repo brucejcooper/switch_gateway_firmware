@@ -176,19 +176,6 @@ typedef enum {
 
 typedef enum { TX_QUEUE = 0, TX_SYSINFO, TX_VERSION } tx_kind_t;
 
-/* The client holds ONE MORE command than the gateway's queue is deep, and that
- * extra slot is what buys the one-transaction-per-DALI-frame steady state.
- *
- * The transaction v4 exists to make possible acks the oldest result AND
- * enqueues the next command in one frame. At the instant that request is
- * BUILT, the master has not yet collected the oldest result — so if the local
- * array were only CMDQ_DEPTH deep there would be nowhere to put the new
- * command and the master would have to spend a whole separate transaction
- * collecting first.
- *
- * The extra slot is not extra queue depth — the GATEWAY bounds its own queue
- * and says A_FULL when it is full. Nothing here predicts that. */
-#define MBQ_CMD_SLOTS  (CMDQ_DEPTH + 4u)  /* in-flight + a real queue */
 
 #define NO_CMD 0xFFu
 
@@ -386,7 +373,8 @@ static uint8_t inflight_count(const slave_t *s) {
  * for free — by the time the master comes back to a slave, it is more likely
  * to have room. */
 static bool have_free_slot(const slave_t *s) {
-    return find_state(s, CMD_FREE) != NO_CMD;
+    return count_state(s, CMD_PENDING) < MBQ_QUEUE_DEPTH &&
+           find_state(s, CMD_FREE) != NO_CMD;
 }
 
 
