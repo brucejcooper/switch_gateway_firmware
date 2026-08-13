@@ -66,29 +66,28 @@
  * enqueue is its own frame and needs no free slot in advance, so a class may
  * fill the queue completely — that retired constraint is what buys the
  * one-transaction-per-DALI-frame steady state. */
-/* How much of the client's QUEUE the scheduler may fill.
+/* How much of the PIPELINE the scheduler keeps filled — client staging plus
+ * whatever the gateway holds, which is what s->outstanding counts.
  *
- * This is queue occupancy, NOT gateway depth — the gateway bounds itself with
- * A_FULL and the client tracks in-flight separately (MBQ_INFLIGHT_MAX). The
- * old name and value (DQ_INFLIGHT_MAX = CMDQ_DEPTH + n) said "gateway slots",
- * which is what made the two impossible to reason about independently.
- *
- * Filling the whole queue is fine and is what keeps a command available to
- * attach to every packet. */
-#define DQ_QUEUE_MAX  MBQ_QUEUE_DEPTH
+ * CMDQ_DEPTH at the gateway plus ONE staged is the whole of it. Going deeper
+ * does not buy throughput (the gateway is the bottleneck, and it says A_FULL)
+ * and it costs latency: work staged in the client has left the priority
+ * ladder behind, so anything queued past the gateway's depth is a DALI frame
+ * a button press may have to wait out. */
+#define DQ_PIPELINE_MAX  (CMDQ_DEPTH + 1u)
 
-/* QUEUE share per class. The ladder's job is priority, not flow control: what
- * matters is that BACKGROUND may never fill the queue, so a button press
- * always finds room and waits at most for the work already queued ahead of it.
- * Letting background fill it would put a user command behind the whole
- * backlog, which is the priority inversion this bound exists to prevent. */
-#define DQ_DEPTH_USER    DQ_QUEUE_MAX          /* user work may fill the queue */
-#define DQ_DEPTH_CFG     DQ_QUEUE_MAX
-#define DQ_DEPTH_READ    DQ_QUEUE_MAX          /* verification reads: an outcome to HA */
-#define DQ_DEPTH_BG      (DQ_QUEUE_MAX - 1u)   /* background never fills the queue */
-_Static_assert(DQ_DEPTH_USER <= DQ_QUEUE_MAX && DQ_DEPTH_CFG <= DQ_QUEUE_MAX &&
-               DQ_DEPTH_READ <= DQ_QUEUE_MAX && DQ_DEPTH_BG < DQ_QUEUE_MAX,
-               "no class may exceed the client's queue, and background must not fill it");
+/* Pipeline share per class. The ladder's job is priority, not flow control.
+ * What matters is that BACKGROUND may never take the staging slot: capped at
+ * CMDQ_DEPTH it can fill the gateway but never the slot in front of it, so a
+ * button press arriving now is staged next and waits only for the DALI frame
+ * already executing. That bound is the whole point of the ladder. */
+#define DQ_DEPTH_USER    DQ_PIPELINE_MAX          /* user work may fill the queue */
+#define DQ_DEPTH_CFG     DQ_PIPELINE_MAX
+#define DQ_DEPTH_READ    DQ_PIPELINE_MAX          /* verification reads: an outcome to HA */
+#define DQ_DEPTH_BG      CMDQ_DEPTH            /* never takes the staging slot */
+_Static_assert(DQ_DEPTH_USER <= DQ_PIPELINE_MAX && DQ_DEPTH_CFG <= DQ_PIPELINE_MAX &&
+               DQ_DEPTH_READ <= DQ_PIPELINE_MAX && DQ_DEPTH_BG < DQ_PIPELINE_MAX,
+               "no class may exceed the pipeline, and background must not take the staging slot");
 
 /* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
  * frames (user decision, 2026-07-28). A held button emits dim repeats faster
