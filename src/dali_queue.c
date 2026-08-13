@@ -84,7 +84,18 @@
 #define DQ_DEPTH_USER    DQ_PIPELINE_MAX          /* user work may fill the queue */
 #define DQ_DEPTH_CFG     DQ_PIPELINE_MAX
 #define DQ_DEPTH_READ    DQ_PIPELINE_MAX          /* verification reads: an outcome to HA */
-#define DQ_DEPTH_BG      CMDQ_DEPTH            /* never takes the staging slot */
+/* ONE, and the file's own design note above says why: the gateway executes
+ * strictly FIFO with no priority, so every background command already sitting
+ * there delays a button press by a whole DALI frame. At depth 2 background can
+ * hold BOTH gateway slots and a press waits ~76 ms behind them; at 1 the
+ * inversion is bounded to the single frame already executing.
+ *
+ * This was CMDQ_DEPTH, which contradicted that note — the comment said "only
+ * ONE of the gateway's command slots" while the constant allowed both.
+ * Background throughput drops to ~0.6x (one idle DALI frame per collect round
+ * trip), which is irrelevant to a 10 s-cadence backstop sweep and costs a few
+ * seconds on the boot scan. Buttons are latency-sensitive; sweeps are not. */
+#define DQ_DEPTH_BG      1u
 _Static_assert(DQ_DEPTH_USER <= DQ_PIPELINE_MAX && DQ_DEPTH_CFG <= DQ_PIPELINE_MAX &&
                DQ_DEPTH_READ <= DQ_PIPELINE_MAX && DQ_DEPTH_BG < DQ_PIPELINE_MAX,
                "no class may exceed the pipeline, and background must not take the staging slot");
