@@ -133,6 +133,8 @@ bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
  * result deadlines, and issue the next request (enqueue, ack/poll, recovery
  * poll or boot_count read) when its pacing timer allows. Call every main-loop
  * iteration. */
+void mbq_client_collect(void);
+void mbq_client_drive(void);
 void mbq_client_tick(void);
 
 /* Commands of `slave_id`'s CMDQ_DEPTH the client is holding — waiting to be

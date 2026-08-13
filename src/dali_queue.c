@@ -73,7 +73,7 @@
  * worse than the FC23 path it replaced. The client caps real gateway occupancy
  * at CMDQ_DEPTH itself (mbq_client's gw_occupancy), so this cannot overfill
  * the gateway; it only stops the scheduler starving the pipeline. */
-#define DQ_INFLIGHT_MAX  (CMDQ_DEPTH + 1u)
+#define DQ_INFLIGHT_MAX  (CMDQ_DEPTH + 3u)  /* keep the client queue fed */
 
 /* Gateway-slot depth per class, bounded by DQ_INFLIGHT_MAX (2): one EXECUTING,
  * one NEXT. The ladder still means something at that size — what matters is
@@ -436,7 +436,7 @@ void dq_tick(void) {
     /* Drive the underlying client first: process completions (freeing slots and
      * trampolines) and pace polls, so a slot freed this tick is available to the
      * scheduler below. */
-    mbq_client_tick();
+    mbq_client_collect();
 
     for (int n = 0; n < MAX_DALI_SLAVES; n++) {
         int i = (s_rr_cursor + n) % MAX_DALI_SLAVES;
@@ -451,6 +451,7 @@ void dq_tick(void) {
          * sweep's first look to the slave after it. */
         if (ship_ladder(s)) s_rr_cursor = (uint8_t)((i + 1) % MAX_DALI_SLAVES);
     }
+    mbq_client_drive();   /* now, with what we just queued available */
 }
 
 /* ── Blocking helper for the text CLI ────────────────────────────────────── */

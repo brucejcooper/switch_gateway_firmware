@@ -42,6 +42,24 @@
  * repeat, and adjacent pairs never collide. */
 #define SOAK_VAL_STRIDE           97u
 
+/* Outstanding records the probe may hold, and therefore the most work it can
+ * keep in the pipeline. THIS IS NOT THE GATEWAY'S DEPTH and must not be tied
+ * to it.
+ *
+ * It was `CMDQ_DEPTH + 1` (3), with `depth` clamped to CMDQ_DEPTH (2) — so the
+ * probe could never have more than two commands outstanding, the controller's
+ * queue was always empty, and every transaction after the first had nothing to
+ * attach and went out as a bare poll. That put a floor of ~2.7 Modbus
+ * transactions per DALI command into every measurement taken with this
+ * instrument, INCLUDING the "depth sweep {1,2,3}" of task 08's gate V1, which
+ * silently ran at depth 2 three times.
+ *
+ * The probe is the producer here: to measure how fast the queue can go it has
+ * to be able to keep it fed, which means holding more outstanding than the
+ * gateway can execute. */
+#define SOAK_MAX_RECS             16u
+
+
 #define SOAK_MISS_LOG             6u   /* mismatches kept in detail for the report */
 
 /* Scheduler-path backoff after a class-full refusal — roughly a fifth of a DALI
@@ -74,7 +92,7 @@ static struct {
     bool     next_is_query;
     uint32_t pairs_done;
 
-    soak_rec_t rec[CMDQ_DEPTH + 1u];
+    soak_rec_t rec[SOAK_MAX_RECS];
 
     absolute_time_t t_start, t_end;
 
@@ -114,14 +132,14 @@ static struct {
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
 static soak_rec_t *rec_alloc(void) {
-    for (uint8_t i = 0; i < CMDQ_DEPTH + 1u; i++)
+    for (uint8_t i = 0; i < SOAK_MAX_RECS; i++)
         if (!S.rec[i].in_use) return &S.rec[i];
     return NULL;
 }
 
 static uint8_t inflight_recs(void) {
     uint8_t n = 0;
-    for (uint8_t i = 0; i < CMDQ_DEPTH + 1u; i++) if (S.rec[i].in_use) n++;
+    for (uint8_t i = 0; i < SOAK_MAX_RECS; i++) if (S.rec[i].in_use) n++;
     return n;
 }
 
@@ -349,7 +367,7 @@ bool dq_soak_start(uint8_t slave, uint8_t addr, uint8_t depth, uint32_t pairs,
                    soak_path_t path) {
     if (S.running || S.draining) return false;
     if (depth < 1u) depth = 1u;
-    if (depth > CMDQ_DEPTH) depth = CMDQ_DEPTH;
+    if (depth > SOAK_MAX_RECS) depth = SOAK_MAX_RECS;
 
     memset(&S, 0, sizeof S);
     S.slave = slave;
