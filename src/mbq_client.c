@@ -389,12 +389,6 @@ static bool have_free_slot(const slave_t *s) {
     return find_state(s, CMD_FREE) != NO_CMD;
 }
 
-/* True if the client would accept a new command this instant, ignoring
- * whether one is on the wire. drive() consults this to decide whether to yield
- * a transaction slot to the scheduler instead of spending it on a poll. */
-static bool submit_room(const slave_t *s) {
-    return have_free_slot(s);
-}
 
 static void pace(slave_t *s, uint32_t ms) {
     if (ms < PACE_MIN_MS) ms = PACE_MIN_MS;
@@ -1593,13 +1587,22 @@ void mbq_client_add_slave(uint8_t slave_id) {
 bool mbq_client_can_submit(uint8_t slave_id) {
     slave_t *s = slave_for(slave_id);
     if (!s || s_resolving) return false;
-    if (s->busy) return false;
-    if (s->st != S_IDLE && s->st != S_DEADLINE_WAIT) return false;
-    if (find_state(s, CMD_PENDING) != NO_CMD) return false;
-    /* Admission is bounded ONLY by local bookkeeping — a slot to remember the
-     * command in. Whether the GATEWAY has room is the gateway's answer to give
-     * (A_FULL), not ours to predict. */
-    return submit_room(s);
+    if (s->st == S_INCOMPATIBLE) return false;
+    /* ROOM IN THE QUEUE. That is the whole test.
+     *
+     * NOT whether a transaction is on the wire, NOT what the recovery state
+     * machine is doing, NOT how full the gateway is — the gateway answers that
+     * itself with A_FULL. Accepting a command is bookkeeping; transmitting it
+     * is mbq_client_drive()'s job, and coupling the two starves every producer
+     * that is not interleaved into dq_tick's ship phase: a transaction lasts
+     * ~12 ms and the controller runs ~340 loop passes inside one, so a
+     * producer had to CATCH A WINDOW rather than simply hand work over.
+     *
+     * NOTE this is no longer a READINESS signal. It is true from the first
+     * instant, including during the startup drain — a producer may queue work
+     * then and the client transmits it once the drain finishes. Callers that
+     * want "is the client up" should look at mbq_client_stats().drained. */
+    return find_state(s, CMD_FREE) != NO_CMD;
 }
 
 bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
@@ -1620,12 +1623,9 @@ bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
     c->born_us    = MBQ_NOW_US();    /* bounds recovery in time, see CMD_MAX_LIFE_MS */
     c->st         = CMD_PENDING;
 
-    /* A fresh command is not subject to the pacing timer: pacing exists to stop
-     * POLLS spinning, and holding real work back behind it would trade the
-     * throughput this design exists to gain (spec §5 paces "on A_FULL, or when
-     * awaiting results with an empty backlog" — this is neither). */
-    if (!issue_queue_txn(s, k)) { c->st = CMD_FREE; c->cb = NULL; return false; }
-    s->st = S_AWAIT_REPLY;
+    /* QUEUED, NOT TRANSMITTED. mbq_client_drive() attaches it to the next
+     * packet. Accepting work and putting it on the wire are different jobs,
+     * and this one always succeeds once there is a slot. */
     return true;
 }
 
