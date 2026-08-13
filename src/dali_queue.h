@@ -9,9 +9,11 @@
  * mbq_client.h and, normatively, ../TinyModbus/QUEUE-PROTOCOL.md). Producers
  * (the raw command path, the any-on probe, the config-query SM) submit into a
  * per-slave local backlog sorted by priority class. dq_tick() drains the
- * highest-priority pending command into a free gateway slot (via mbq_client),
- * keeping at most DQ_INFLIGHT_MAX in flight so a fresh high-priority command
- * never waits behind a backlog of background work. Each command's terminal
+ * highest-priority pending command into the client's QUEUE (via mbq_client),
+ * filling at most DQ_QUEUE_MAX of it — and background at most DQ_QUEUE_MAX-1 —
+ * so a fresh high-priority command never waits behind a backlog of background
+ * work. Note this is queue occupancy, not gateway depth: the gateway bounds
+ * itself with A_FULL. Each command's terminal
  * outcome is mapped back to a dq_result_t and delivered to its callback exactly
  * once.
  *

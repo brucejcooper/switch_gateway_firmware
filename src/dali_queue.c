@@ -66,28 +66,29 @@
  * enqueue is its own frame and needs no free slot in advance, so a class may
  * fill the queue completely — that retired constraint is what buys the
  * one-transaction-per-DALI-frame steady state. */
-/* ONE MORE than the gateway's queue depth. The extra is not extra queue: it is
- * the command that rides the transaction which also collects the oldest
- * result, and without it that collection needs a transaction of its own —
- * measured 2.04 Modbus transactions per DALI frame on the first bench run,
- * worse than the FC23 path it replaced. The client caps real gateway occupancy
- * at CMDQ_DEPTH itself (mbq_client's gw_occupancy), so this cannot overfill
- * the gateway; it only stops the scheduler starving the pipeline. */
-#define DQ_INFLIGHT_MAX  (CMDQ_DEPTH + 1u)
+/* How much of the client's QUEUE the scheduler may fill.
+ *
+ * This is queue occupancy, NOT gateway depth — the gateway bounds itself with
+ * A_FULL and the client tracks in-flight separately (MBQ_INFLIGHT_MAX). The
+ * old name and value (DQ_INFLIGHT_MAX = CMDQ_DEPTH + n) said "gateway slots",
+ * which is what made the two impossible to reason about independently.
+ *
+ * Filling the whole queue is fine and is what keeps a command available to
+ * attach to every packet. */
+#define DQ_QUEUE_MAX  MBQ_QUEUE_DEPTH
 
-/* Gateway-slot depth per class, bounded by DQ_INFLIGHT_MAX (2): one EXECUTING,
- * one NEXT. The ladder still means something at that size — what matters is
- * that BACKGROUND may only ever hold ONE slot, so a button press always finds
- * the second one free and waits at most the DALI frame already in flight.
- * Letting background fill both would put a user command behind two frames,
- * which is the priority inversion the depth cap exists to bound. */
-#define DQ_DEPTH_USER    DQ_INFLIGHT_MAX   /* user work may fill the queue */
-#define DQ_DEPTH_CFG     DQ_INFLIGHT_MAX
-#define DQ_DEPTH_READ    DQ_INFLIGHT_MAX   /* verification reads: an outcome to HA */
-#define DQ_DEPTH_BG      CMDQ_DEPTH        /* background never gets the pipeline slot */
-_Static_assert(DQ_DEPTH_USER <= DQ_INFLIGHT_MAX && DQ_DEPTH_CFG <= DQ_INFLIGHT_MAX &&
-               DQ_DEPTH_READ <= DQ_INFLIGHT_MAX && DQ_DEPTH_BG <= DQ_INFLIGHT_MAX,
-               "no class may exceed the gateway's command-queue depth");
+/* QUEUE share per class. The ladder's job is priority, not flow control: what
+ * matters is that BACKGROUND may never fill the queue, so a button press
+ * always finds room and waits at most for the work already queued ahead of it.
+ * Letting background fill it would put a user command behind the whole
+ * backlog, which is the priority inversion this bound exists to prevent. */
+#define DQ_DEPTH_USER    DQ_QUEUE_MAX          /* user work may fill the queue */
+#define DQ_DEPTH_CFG     DQ_QUEUE_MAX
+#define DQ_DEPTH_READ    DQ_QUEUE_MAX          /* verification reads: an outcome to HA */
+#define DQ_DEPTH_BG      (DQ_QUEUE_MAX - 1u)   /* background never fills the queue */
+_Static_assert(DQ_DEPTH_USER <= DQ_QUEUE_MAX && DQ_DEPTH_CFG <= DQ_QUEUE_MAX &&
+               DQ_DEPTH_READ <= DQ_QUEUE_MAX && DQ_DEPTH_BG < DQ_QUEUE_MAX,
+               "no class may exceed the client's queue, and background must not fill it");
 
 /* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
  * frames (user decision, 2026-07-28). A held button emits dim repeats faster
@@ -174,7 +175,9 @@ typedef struct {
     uint8_t  delta_cursor;   /* rotating start point, so one ballast being dimmed
                               * cannot starve another's steps */
 
-    dq_pending_t pend[DQ_INFLIGHT_MAX];
+    /* One record per command handed to the client and not yet resolved — so
+     * it must cover the client's whole capacity, queue and in-flight alike. */
+    dq_pending_t pend[MBQ_CMD_SLOTS];
 
     /* Diagnostic counters (for the `dq` CLI command / bench fault drills). */
     uint32_t c_submitted;    /* commands shipped to the client */
@@ -199,7 +202,7 @@ static dq_slave_t *slave_for(uint8_t slave_id) {
 }
 
 static dq_pending_t *pend_alloc(dq_slave_t *s) {
-    for (uint8_t i = 0; i < DQ_INFLIGHT_MAX; i++)
+    for (uint8_t i = 0; i < MBQ_CMD_SLOTS; i++)
         if (!s->pend[i].in_use) return &s->pend[i];
     return NULL;
 }
@@ -436,7 +439,7 @@ void dq_tick(void) {
     /* Drive the underlying client first: process completions (freeing slots and
      * trampolines) and pace polls, so a slot freed this tick is available to the
      * scheduler below. */
-    mbq_client_tick();
+    mbq_client_collect();
 
     for (int n = 0; n < MAX_DALI_SLAVES; n++) {
         int i = (s_rr_cursor + n) % MAX_DALI_SLAVES;
@@ -451,6 +454,7 @@ void dq_tick(void) {
          * sweep's first look to the slave after it. */
         if (ship_ladder(s)) s_rr_cursor = (uint8_t)((i + 1) % MAX_DALI_SLAVES);
     }
+    mbq_client_drive();   /* now, with what we just queued available */
 }
 
 /* ── Blocking helper for the text CLI ────────────────────────────────────── */

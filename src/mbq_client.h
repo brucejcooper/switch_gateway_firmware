@@ -83,6 +83,35 @@
  * slower gateway ever reports spurious R4 expiries. */
 #define MBQ_RESULT_DEADLINE_MS  150u
 
+/* TWO CAPACITIES, SEPARATE, BECAUSE THEY MEAN DIFFERENT THINGS.
+ *
+ *   MBQ_QUEUE_DEPTH   the QUEUE: commands accepted from a producer and not yet
+ *                     offered to the gateway (CMD_PENDING). This is OUR policy
+ *                     — how much backlog we are willing to hold so the
+ *                     transmission loop always has something to attach.
+ *
+ *   MBQ_INFLIGHT_MAX  IN FLIGHT: commands at the gateway or on the wire
+ *                     (CMD_ACCEPTED / CMD_SENDING). This is NOT policy and we
+ *                     do not enforce it — the GATEWAY bounds its own queue and
+ *                     says A_FULL. It is tracking capacity only: at most
+ *                     CMDQ_DEPTH sit at the gateway and one more can be on the
+ *                     wire, so CMDQ_DEPTH + 1 is what we must be able to
+ *                     remember.
+ *
+ * They were one number (MBQ_CMD_SLOTS = CMDQ_DEPTH + n) holding both, which is
+ * why "how much backlog?" and "how deep is the gateway?" could not be answered
+ * independently — and why in-flight work could fill the array and leave the
+ * loop with nothing to attach, so it sent a packet with no command in it.
+ *
+ * The array is their sum. Nothing else should derive from CMDQ_DEPTH here. */
+/* Four measured best on the bench: the loop only needs ONE queued command to
+ * keep every packet carrying work, and deeper only adds queueing latency
+ * (queue 8 measured 14.85 pairs/s against 15.12 at 4, with the gateway
+ * unchanged — which is also the check that these two really are independent). */
+#define MBQ_QUEUE_DEPTH   4u
+#define MBQ_INFLIGHT_MAX  (CMDQ_DEPTH + 1u)
+#define MBQ_CMD_SLOTS     (MBQ_QUEUE_DEPTH + MBQ_INFLIGHT_MAX)
+
 /* Terminal outcome delivered to a submitted command's callback, exactly once. */
 typedef enum {
     MBQ_R_COMPLETE    = 0,  /* the command succeeded; response8 = its answer byte  */
@@ -133,6 +162,8 @@ bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
  * result deadlines, and issue the next request (enqueue, ack/poll, recovery
  * poll or boot_count read) when its pacing timer allows. Call every main-loop
  * iteration. */
+void mbq_client_collect(void);
+void mbq_client_drive(void);
 void mbq_client_tick(void);
 
 /* Commands of `slave_id`'s CMDQ_DEPTH the client is holding — waiting to be
@@ -192,11 +223,13 @@ typedef struct {
                                * use — a DETECTED mis-binding, never silent    */
     uint32_t orphans;         /* results discarded as a previous controller
                                * epoch's leftovers (no-baseline state)         */
-    uint8_t  respq_est;       /* commands believed finished but whose result
-                               * has not been read — the controller's estimate
-                               * of gateway response-queue occupancy, which is
-                               * what climbs during the `no-ack` backpressure
-                               * drill                                         */
+    uint8_t  inflight;        /* commands accepted whose result has not come
+                               * back — what the client is actually tracking   */
+    uint8_t  respq_est;       /* lower bound on gateway response-queue
+                               * occupancy. Since the estimator went, this is
+                               * only what we have consumed and not yet acked —
+                               * observed rather than inferred. Climbs during
+                               * the `no-ack` backpressure drill               */
     uint8_t  unacked;         /* results consumed but not yet proven popped    */
     uint32_t head_blocked;    /* replies seen with the head still holding a
                                * result we have consumed but not acked — the
