@@ -337,27 +337,34 @@ flowing for the whole window and fire the event of interest a couple seconds in.
 
 ## RS-485 baud
 
-**19200 is canonical** (controller default, gateway USERROW `BAUD_INDEX=1`, probe
-baud). The ATtiny's internal RC oscillator is marginal for 38400 RX sampling
-under load — it mis-frames bytes that are clean on the wire.
+**38400 is canonical** (controller default, gateway USERROW `BAUD_INDEX=2`,
+probe baud). 9600 remains the factory/safe speed a device falls back to with an
+unprogrammed USERROW, and boot discovery walks 38400 → 19200 → 9600 so a device
+left on the old canonical speed is found and promoted rather than reported
+unreachable.
 
-**Re-measured 2026-08-08** with the proper transceiver and `rs485 tx`, gateway
-counters zeroed by `gw_reboot 3` before each run, identical soaks at both rates:
+**This reverses the previous verdict, and the reason matters.** 38400 used to be
+recorded here as "works but is not clean, ~0.7 % bad frames, not worth trading a
+zero error rate for", blamed on the ATtiny's internal RC oscillator mis-framing
+bytes that were clean on the wire. The observation was right and the diagnosis
+wrong. That is the signature of a documented tinyAVR silicon erratum — the USART
+start-of-frame detector re-triggering mid-frame when RXDATA is read while the
+next byte is arriving — not the oscillator. Scoped on the Saleae, both ends
+transmit within 0.8 % of nominal at both bauds, and the OSC20ERR trim's sign is
+correct. See the erratum block above `modbus_init()` in
+`TinyModbus/src/modbus.c`.
 
-| | 19200 | 38400 |
+**Measured 2026-08-14**, gateway counters zeroed *after* the baud settled, 40–60 s
+of saturated traffic per cell:
+
+| | SFDEN in Active (before) | SFDEN only around sleep (after) |
 |---|---|---|
-| frames OK | 3048 | 3755 |
-| frame_error | **0** | 13 |
-| crc_error | **0** | 14 |
-| txn failures | 0 of 2305 | 0 of 3535 |
-| bg-path soak (250 pairs) | 24.8 s | **17.2 s** |
-| user-path soak (400 pairs) | 26.7 s | 26.6 s |
+| 19200 | 0.13 % bad | **0.00 %** — 0 of 3046 frames |
+| 38400 | 0.85 % bad | **0.00 %** — 0 of 6582 frames |
 
-So 38400 *works* — Modbus retries absorb the ~0.7 % bad frames and nothing fails
-— but it is not clean, and the win is narrow: the DALI-bound path is unchanged
-(26.7 vs 26.6 s) because pacing is 99 % "queue full, DALI-bound". Only the
-Modbus-bound background path gains. Not worth trading a zero error rate for, so
-19200 stays canonical.
+19200 was never actually clean either. With the erratum fixed, 38400 takes the
+average transaction from 12.65 ms to **8.96 ms (−29 %)**, and a 600-pair soak
+runs VERDICT clean with 0 transaction failures of 5791.
 
 Note the old 8868 frame / 5162 CRC errors against 29210 frames were the **bad
 transceiver**, not the baud — the driver was the dominant fault by far. Watch
@@ -420,11 +427,15 @@ demand and **never polled hot** (queue-protocol §6):
 `reg0 accepts` · `reg1 a_full` · `reg2 executes` · `reg3 results` ·
 `reg4 acks` · `reg5 stalls` · `reg6 q_discard` · `reg7 spare` (reads 0).
 
-Two of them read in **opposite directions**, and it matters:
+Two of them look alarming and are not — both are the system working:
 
-- **`a_full` non-zero is a canary**, not traffic. A_FULL should be unreachable
-  while the master honours its in-flight cap, so a non-zero value means the
-  master's accounting is wrong — investigate rather than tune.
+- **`a_full` non-zero is NORMAL and is the saturation signal.** It means the
+  gateway's queue is full, i.e. the DALI engine is fully fed — the goal state.
+  The master re-offers immediately. Under one saturated gateway ~72 % of
+  transactions are refusals, and that share is the HEADROOM gauge: those probes
+  convert into useful enqueues as more gateways are added. (It was described
+  here as a canary when the master paced itself against an estimate and A_FULL
+  was meant to be unreachable; A_FULL is the flow control now.)
 - **`stalls` non-zero is normal.** It counts backpressure *episodes* (rising
   edge) — the gateway stalling its DALI arbiter rather than dropping a result
   whenever the master stops acking. That is the rule working, and the

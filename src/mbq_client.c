@@ -1531,26 +1531,17 @@ void mbq_client_collect(void) {
     }
 }
 
-/* Round-robin cursor. have_free_slot()'s comment says the spacing between
- * re-offers to one gateway comes "for free" from the round-robin across
- * gateways — but a scan that always restarts at index 0 is not a round-robin,
- * and with more than one gateway it STARVES the higher indices.
+/* Drive every eligible slave. The FIRMWARE does not call this — the transport
+ * asks each slave for work in rotation (mbq_offer / modbus_register_offer), so
+ * this exists for the host test, which has no transport to be asked by.
  *
- * The mechanism: transactions serialise on one wire, so when slave 0's reply
- * lands both slaves are free at the same instant; a fixed scan then hands the
- * wire straight back to slave 0. Under saturation slave 0 always has an offer
- * to make (A_FULL is re-offered immediately), so it never yields and slave 1
- * never transmits.
- *
- * Invisible with a single gateway, which is why it survived. The cursor only
- * advances when a transaction actually went out, so a slave that had nothing
- * to say does not consume its turn. */
-static uint8_t s_rr_next;
-
+ * A round-robin cursor lived here briefly, on the theory that a fixed scan
+ * would let slave 0 starve slave 1. It could not: drive() ENQUEUES rather than
+ * seizing the wire, so every eligible slave got a turn in the same pass and the
+ * shared FIFO served them in order. The rotation that does matter is the
+ * transport's, one level down. */
 void mbq_client_drive(void) {
-    uint8_t start = s_rr_next;
-    for (int n = 0; n < MAX_DALI_SLAVES; n++) {
-        uint8_t i = (uint8_t)((start + n) % MAX_DALI_SLAVES);
+    for (int i = 0; i < MAX_DALI_SLAVES; i++) {
         slave_t *s = &s_sl[i];
         /* Never drive a slave with a transaction already on the wire: a
          * producer may have queued between the phases and mbq_client_submit()
@@ -1559,12 +1550,6 @@ void mbq_client_drive(void) {
         if (!s->in_use || s->busy) continue;
         drive(s);
     }
-    /* Only the STARTING POINT rotates. Every eligible slave is still offered a
-     * turn on every pass, exactly as before — returning after the first one to
-     * take the wire was measured to be much worse (1.8 vs 14.7 pairs/s),
-     * because an absent slave then consumed alternate passes and each of its
-     * turns cost a full response timeout. */
-    s_rr_next = (uint8_t)((start + 1u) % MAX_DALI_SLAVES);
 }
 
 void mbq_client_tick(void) {

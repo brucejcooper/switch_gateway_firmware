@@ -53,7 +53,7 @@
 #define UART_RX_PIN  5
 #define UART_DE_PIN  1
 
-#define DEFAULT_BAUD_RATE 19200u
+#define DEFAULT_BAUD_RATE 38400u
 
 typedef enum {
     MODBUS_IDLE,

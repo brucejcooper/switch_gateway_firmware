@@ -17,7 +17,7 @@ MQTT **directly over its on-board Ethernet** — no external bridge host.
 ## System Architecture
 
 ```
-RS-485 bus @ 19200 baud (canonical; firmware auto-recovers slaves stuck at 9600)
+RS-485 bus @ 38400 baud (canonical; firmware auto-recovers slaves left at 19200 or 9600)
 
 W5100S-EVB-Pico (RP2040) — Modbus master, single source of truth
  ├── core 0: Modbus master · button matrix (PIO) · button FSM · DALI world
@@ -97,12 +97,16 @@ owned by core 0. The button matrix tops out at GP15, leaving the SPI block clear
 
 ### Baud rate setup
 
-The canonical bus speed is **19200** — the reliable rate for the TinyModbus
-slaves' internal-RC oscillator (38400 is marginal and drops occasional frames).
-The firmware auto-recovers slaves stuck at the factory-default 9600 baud:
-on boot it pings each slave at 19200 first, falls back to 9600 on timeout,
-sends the per-device "set baud to 19200" command, and verifies the slave
-came back at 19200 — all logged under the `disc` module tag.
+The canonical bus speed is **38400**. It was previously 19200, on the belief
+that 38400 was marginal for the TinyModbus slaves' internal-RC oscillator; the
+real cause was a tinyAVR silicon erratum in the USART start-of-frame detector,
+and with that fixed both bauds measure a 0.00 % frame-error rate. 38400 cuts the
+average transaction from 12.65 ms to 8.96 ms.
+
+The firmware auto-recovers slaves left on another speed. On boot it pings each
+slave at 38400, then walks 19200 (the old canonical speed) and 9600 (the factory
+default) on timeout, sends the per-device set-baud command, and verifies the
+slave came back at 38400 — all logged under the `disc` module tag.
 
 | Slave kind | Set-baud register | Value |
 |---|---|---|
@@ -113,7 +117,7 @@ The set-baud writes are persisted on the slaves, so the fallback path only
 fires once per device. After the first successful boot, subsequent boots
 take <100 ms total for all three slaves.
 
-If a slave is unreachable at *both* 19200 and 9600, the discovery logs
+If a slave is unreachable at 38400, 19200 and 9600 alike, the discovery logs
 `E disc: slave N (...) unreachable at both bauds` and boot continues
 without that slave — the relay sync / DALI scan will see it as missing.
 Most commonly this means the slave is unplugged, has a different baud
@@ -166,8 +170,8 @@ Each boot, before the main loop starts, the firmware runs:
 4. **Config + mapping load** — `/config.json` and `/mappings.json` (defaults if
    absent; legacy files auto-migrated, see [Persistent Storage](#persistent-storage)).
 5. **State cache init** — zeros the in-memory entity state.
-6. **Modbus init** — UART at the persisted baud rate (19200 default).
-7. **Bus discovery** — for each configured slave, ping at 19200, fall back to
+6. **Modbus init** — UART at the persisted baud rate (38400 default).
+7. **Bus discovery** — for each configured slave, ping at 38400, fall back to
    9600, auto-reconfigure if needed (see "Baud rate setup" above).
 8. **DALI interrogation ARMED** — for each gateway, arm a full DALI
    interrogation and carry on. It is *not* waited on: the main loop drives it,
@@ -628,9 +632,11 @@ finding), the fault counters (`predicted-seq`, `orphans`, `protocol` — all thr
 should read 0 forever), the four result classes, and round-trip timing.
 **`mbq gw <slave>`** reads the gateway's own queue counters (FC04 `0x0320`,
 exactly 8 registers): `accepts, a_full, executes, results, acks, stalls,
-q_discard, spare`. Two of those read in opposite directions — **`a_full`
-non-zero is a canary** that the master's in-flight accounting is wrong, while
-**`stalls` non-zero is normal**, the backpressure rule doing its job. Bare `dq` /
+q_discard, spare`. Two of those look alarming and are not — **`a_full` non-zero is
+the saturation signal**, meaning the gateway's queue is full and its DALI engine
+fully fed (the client re-offers immediately; ~72 % of transactions are refusals
+under load, and that share is the headroom gauge), while **`stalls` non-zero is
+normal**, the backpressure rule doing its job. Bare `dq` /
 `mbq` = all DALI slaves. For throughput and correctness under load, see
 [`busload` and `soak`](#measuring-the-command-path-busload-and-soak).
 
@@ -647,7 +653,8 @@ deadline.
 
 #### What v4 measured against the FC23 design it replaces
 
-Bench figures, saturated, slave 3 at 19200:
+Bench figures, saturated, slave 3 at 19200 — historical, taken before 38400
+became canonical and before the SFDEN erratum fix:
 
 | | FC23 | v4 |
 |---|---|---|
@@ -1340,7 +1347,8 @@ that paid for it, the bus split, and a pacing breakdown that names the actual
 constraint: **queue-full % = DALI-bound** (good — the gateway queue is kept fed
 and the DALI bus is the limit) vs **tx-busy % = Modbus-bound**.
 
-Reference numbers on the bench (slave 3 addr 0, 19200), queue v4 at depth 2:
+Reference numbers on the bench (slave 3 addr 0, 19200 — historical, pre-38400),
+queue v4 at depth 2:
 ~13.9–14.1 pairs/s = ~28 DALI frames/s, **1.03 Modbus transactions per DALI
 command**, and the RS-485 bus **37 %** occupied at saturation. The endurance run
 was 5000 pairs / 10 000 frames with 0 bad results and 0 failures across 20 748

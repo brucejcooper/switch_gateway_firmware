@@ -37,7 +37,7 @@ void config_defaults(void) {
     g_config.dali_slave_ids[0]   = 2;
     g_config.dali_slave_ids[1]   = 3;
     g_config.dali_slave_count    = 2;
-    g_config.baud                = 19200;
+    g_config.baud                = 38400;
     g_config.de_mode             = 0;
     g_config.relay_byteswap      = false;
     g_config.mqtt_port           = 1883;

@@ -2,15 +2,23 @@
  * bus_discovery.c — boot-time bus probe + auto baud recovery.
  *
  * Slaves shipped from the factory default to 9600 baud; the controller's
- * canonical bus speed is 19200.  (38400 was tried, but the TinyModbus ATtiny's
- * internal-RC-oscillator RX sampling is marginal at 38400 — confirmed on the
- * Saleae: clean frames on the wire, but the gateway mis-frames bytes and fails
- * CRC under load.  19200 doubles the bit-time and the errors vanish, so 19200
- * is canonical.  Separately, a TinyModbus RX interrupt-starvation bug — now
- * fixed.)
- * At boot, for each configured slave, try 19200 first; on timeout, drop to 9600
- * and re-ping; if it responds, send the per-device set-baud command, snap back
- * to 19200, and verify.
+ * canonical bus speed is 38400.
+ *
+ * 38400 was previously believed unusable — "the ATtiny's internal-RC-oscillator
+ * RX sampling is marginal at 38400: clean frames on the wire, but the gateway
+ * mis-frames bytes and fails CRC under load". The OBSERVATION was right and the
+ * diagnosis wrong. That is the signature of a documented tinyAVR silicon
+ * erratum (USART start-of-frame detection re-triggering mid-frame), not the
+ * oscillator: scoped on the Saleae, both ends transmit within 0.8% of nominal
+ * at both bauds. With SFDEN cleared in Active mode the measured error rate is
+ * 0.00% at 38400 over 6609 frames — and 19200 was never clean either (0.13%).
+ * See the erratum block above modbus_init() in TinyModbus/src/modbus.c.
+ *
+ * At boot, for each configured slave, try 38400 first; on timeout, walk the
+ * fallbacks in turn and re-ping. The list carries 19200 as well as 9600 so a
+ * device left on the OLD canonical speed is found and promoted rather than
+ * reported unreachable. If one answers, send the per-device set-baud command,
+ * snap back to 38400, and verify.
  *
  * Blocking by design — must be called from main() before the watchdog is
  * enabled and before the main poll loop starts. Worst case ~10 s per slave.
@@ -24,8 +32,13 @@
 #include <string.h>
 
 #define DISC_TIMEOUT_MS 1000
-#define BAUD_FAST  19200u
-#define BAUD_FALLBACK 9600u
+#define BAUD_FAST  38400u
+/* Tried in order when the canonical speed gets no answer. 19200 is here for
+ * devices commissioned before 38400 became canonical; 9600 is the factory
+ * default and the safe speed a device falls back to with an unprogrammed
+ * USERROW. */
+static const uint32_t BAUD_FALLBACKS[] = { 19200u, 9600u };
+#define BAUD_FALLBACK_N (sizeof BAUD_FALLBACKS / sizeof BAUD_FALLBACKS[0])
 #define POST_RECONFIG_SETTLE_MS 100
 
 typedef struct {
@@ -124,19 +137,24 @@ bool bus_discover_slave(uint8_t slave_id, slave_kind_t kind) {
         return true;
     }
 
-    LOG_WARN("disc", "slave %u (%s) no response at %u, trying %u",
-             slave_id, kind_s, BAUD_FAST, BAUD_FALLBACK);
-    modbus_uart_set_baud_runtime(BAUD_FALLBACK);
+    uint32_t found_at = 0;
+    for (unsigned i = 0; i < BAUD_FALLBACK_N; i++) {
+        LOG_WARN("disc", "slave %u (%s) no response at %u, trying %u",
+                 slave_id, kind_s, (i == 0) ? BAUD_FAST : BAUD_FALLBACKS[i - 1],
+                 BAUD_FALLBACKS[i]);
+        modbus_uart_set_baud_runtime(BAUD_FALLBACKS[i]);
+        if (ping(slave_id, kind)) { found_at = BAUD_FALLBACKS[i]; break; }
+    }
 
-    if (!ping(slave_id, kind)) {
-        LOG_ERR("disc", "slave %u (%s) unreachable at both bauds",
+    if (!found_at) {
+        LOG_ERR("disc", "slave %u (%s) unreachable at any known baud",
                 slave_id, kind_s);
         modbus_uart_set_baud_runtime(BAUD_FAST);
         return false;
     }
 
     LOG_INFO("disc", "slave %u (%s) found at %u, reconfiguring to %u",
-             slave_id, kind_s, BAUD_FALLBACK, BAUD_FAST);
+             slave_id, kind_s, found_at, BAUD_FAST);
     if (!bus_set_slave_baud(slave_id, kind, BAUD_FAST)) {
         LOG_ERR("disc", "slave %u (%s) set-baud command failed",
                 slave_id, kind_s);
