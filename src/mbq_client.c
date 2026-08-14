@@ -1579,6 +1579,18 @@ void mbq_client_init(void) {
     s_resolving = false;
 }
 
+#ifndef MBQ_CLIENT_HOST_TEST
+/* Offered to the bus when it falls idle and it is this slave's turn. drive()
+ * is unchanged — it already was "if this slave has something to do, do it";
+ * the only difference is that it is now ASKED rather than free to push. */
+static bool mbq_offer(void *ctx) {
+    slave_t *s = (slave_t *)ctx;
+    if (!s->in_use || s->busy) return false;
+    drive(s);
+    return s->busy;          /* true only if it actually took the wire */
+}
+#endif
+
 void mbq_client_add_slave(uint8_t slave_id) {
     if (slave_for(slave_id)) return;
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
@@ -1592,6 +1604,11 @@ void mbq_client_add_slave(uint8_t slave_id) {
         s->rec_cmd    = NO_CMD;
         s->drain_pass = 1u;
         s->next_at_us = 0;
+#ifndef MBQ_CLIENT_HOST_TEST
+        /* Join the bus rotation. The host test drives the client directly via
+         * mbq_client_tick(), so it does not register. */
+        modbus_register_offer(mbq_offer, s);
+#endif
         return;
     }
     LOG_WARN("mbq", "no room to register slave %u", slave_id);

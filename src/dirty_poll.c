@@ -70,6 +70,29 @@ typedef struct { uint32_t last_poll_ms; bool awaiting; } gwdiag_t;
 static gwdiag_t s_gd[MAX_DALI_SLAVES];
 static uint8_t  s_gd_idx[MAX_DALI_SLAVES];   /* callback ctx → dali-slave index */
 
+static void relay_health_cb(int res, uint8_t *buf, void *ctx);   /* defined below */
+
+/* Offered to the bus when it falls idle and it is this relay board's turn.
+ * A cheap 32-coil read every RELAY_POLL_INTERVAL_MS; relay_health_cb flips
+ * state_gateway when the board appears or disappears. */
+static bool relay_offer(void *ctx) {
+    int i = (int)(intptr_t)ctx;
+    if (i >= g_config.relay_slave_count) return false;
+    rpoll_t *rp = &s_rp[i];
+    if (rp->awaiting) return false;
+    uint32_t now_ms = to_ms_since_boot(get_absolute_time());
+    if (now_ms - rp->last_poll_ms < RELAY_POLL_INTERVAL_MS) return false;
+    rp->last_poll_ms = now_ms;
+    /* Only mark awaiting if the read actually queued — otherwise a dropped
+     * action would leave awaiting stuck and we'd never poll this relay again.
+     * On a drop we just retry next interval. */
+    if (!modbus_get_coils(g_config.relay_slave_ids[i], 0, 32,
+                          relay_health_cb, &s_rp_idx[i]))
+        return false;
+    rp->awaiting = true;
+    return true;
+}
+
 void dirty_poll_init(void) {
     memset(s_dp, 0, sizeof(s_dp));
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
@@ -88,6 +111,11 @@ void dirty_poll_init(void) {
         }
     }
     memset(s_rp, 0, sizeof(s_rp));
+    /* Join the bus rotation, one turn per relay board. Registered here, before
+     * the DALI gateways register in mbq_client_add_slave, so the rotation runs
+     * relay -> gateway -> gateway. */
+    for (int i = 0; i < g_config.relay_slave_count; i++)
+        modbus_register_offer(relay_offer, (void *)(intptr_t)i);
     for (int i = 0; i < MAX_RELAY_SLAVES; i++) {
         s_rp[i].reachable = false;   /* same rule as DALI gateways above */
         s_rp_idx[i]       = (uint8_t)i;
@@ -221,21 +249,10 @@ void dirty_poll_arm_scan(uint8_t slave_id) {
 void dirty_poll_tick(void) {
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
 
-    /* Relay-board reachability: a cheap coil read every RELAY_POLL_INTERVAL_MS.
-     * relay_health_cb flips state_gateway when the board appears/disappears. */
-    for (int i = 0; i < g_config.relay_slave_count; i++) {
-        rpoll_t *rp = &s_rp[i];
-        if (rp->awaiting) continue;
-        if (now_ms - rp->last_poll_ms >= RELAY_POLL_INTERVAL_MS) {
-            rp->last_poll_ms = now_ms;
-            /* Only mark awaiting if the read actually queued — otherwise a dropped
-             * action (full queue) would leave awaiting stuck and we'd never poll
-             * this relay again. On a drop we just retry next interval. */
-            if (modbus_get_coils(g_config.relay_slave_ids[i], 0, 32,
-                                 relay_health_cb, &s_rp_idx[i]))
-                rp->awaiting = true;
-        }
-    }
+    /* Relay reachability polls are no longer issued from here — they are offered
+     * to the bus in rotation (relay_offer, registered in dirty_poll_init), so a
+     * relay board takes its turn alongside the DALI gateways instead of pushing
+     * whenever this tick happens to run. */
 
     for (int i = 0; i < g_config.dali_slave_count; i++) {
         uint8_t  slave_id = g_config.dali_slave_ids[i];

@@ -35,7 +35,17 @@ void modbus_init(void);
 void modbus_poll(void);
 
 /* Total actions dropped because the action queue was full (diagnostics). */
+/* Bus arbitration. An offerer is asked, in rotation, whenever the bus falls
+ * idle with nothing committed; it returns true if it issued a transaction.
+ * Registration order is the rotation order. */
+typedef bool (*modbus_offer_fn)(void *ctx);
+void modbus_register_offer(modbus_offer_fn fn, void *ctx);
+
 uint32_t modbus_drop_count(void);
+/* High-water mark of the action queue since boot. Should sit at roughly the
+ * number of concurrent producers (~3-5); a larger value means something has
+ * stopped being single-outstanding and priority is being lost to FIFO order. */
+uint32_t modbus_action_peak(void);
 
 /* ── Bus-occupancy accounting (bench instrumentation) ─────────────────────────
  * Answers "who is using the RS-485 bus, and how much of it is left?". Each

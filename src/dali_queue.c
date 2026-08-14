@@ -484,7 +484,11 @@ void dq_tick(void) {
          * sweep's first look to the slave after it. */
         if (ship_ladder(s)) s_rr_cursor = (uint8_t)((i + 1) % MAX_DALI_SLAVES);
     }
-    mbq_client_drive();   /* now, with what we just queued available */
+    /* No drive() here any more. The transport asks each slave for work when the
+     * bus falls idle (modbus_register_offer), so pushing from here would both
+     * bypass the rotation and race the offer. Staging above is unchanged — this
+     * tick still decides WHICH command is next for each slave; the bus decides
+     * WHEN it goes out. */
 }
 
 /* ── Blocking helper for the text CLI ────────────────────────────────────── */

@@ -141,6 +141,47 @@ static uint8_t               s_attempts_left;
 static uint8_t               s_busy_left;     /* DEVICE_BUSY retries remaining */
 static bool                  s_retry_pending;
 static absolute_time_t       s_op_deadline;   /* hard deadline for the whole in-flight op */
+/* ── Bus arbitration ──────────────────────────────────────────────────────
+ *
+ * The bus is either idle or busy. When it goes idle we ask each participant,
+ * in strict rotation, whether it has work — and the first that does gets the
+ * wire. That is the ONE arbitration point in the system.
+ *
+ * Why pull rather than push: producers used to enqueue whenever they liked, so
+ * ordering was fixed at enqueue time and a button press could sit behind a
+ * background read that was committed microseconds earlier. Asking at dispatch
+ * time instead means the decision uses the freshest state, and each offerer
+ * consults its OWN state machine — including its backoff, so an absent board
+ * declines instantly instead of costing a turn.
+ *
+ * The cursor advances only when a participant actually issues, so one that had
+ * nothing to say does not consume its turn. The action queue is still drained
+ * every pass: it now carries only what an offer just produced, plus one-shots
+ * (CLI, boot discovery) which are too rare to be worth converting. */
+#define MODBUS_MAX_OFFERERS 8
+static struct { modbus_offer_fn fn; void *ctx; } s_off[MODBUS_MAX_OFFERERS];
+static uint8_t               s_off_n;
+static uint8_t               s_off_cursor;
+
+void modbus_register_offer(modbus_offer_fn fn, void *ctx) {
+    if (s_off_n < MODBUS_MAX_OFFERERS) {
+        s_off[s_off_n].fn  = fn;
+        s_off[s_off_n].ctx = ctx;
+        s_off_n++;
+    }
+}
+
+static void offer_next(void) {
+    for (uint8_t n = 0; n < s_off_n; n++) {
+        uint8_t i = (uint8_t)((s_off_cursor + n) % s_off_n);
+        if (s_off[i].fn(s_off[i].ctx)) {
+            s_off_cursor = (uint8_t)((i + 1u) % s_off_n);
+            return;
+        }
+    }
+}
+
+static uint32_t              s_aq_peak;       /* action-queue high-water mark */
 static uint32_t              s_drop_count = 0;    /* actions dropped on a full queue */
 static uint32_t              s_recover_count = 0; /* forced SM recoveries (wedge watchdog) */
 static uint32_t              s_crc_errors = 0;    /* replies discarded on a bad CRC-16 */
@@ -437,7 +478,19 @@ void modbus_uart_set_baud_runtime(uint32_t baud) {
 
 /* ── Init ────────────────────────────────────────────────────────────────── */
 void modbus_init(void) {
-    queue_init(&action_queue,   sizeof(modbus_action_t), 256);
+    /* 16, not 256. Every producer is single-outstanding — mbq_client skips a
+     * slave with a transaction in flight, dirty_poll skips a board it is already
+     * awaiting, and boot discovery is synchronous (it spins on modbus_poll()
+     * until its callback fires) — so occupancy is bounded by the number of
+     * producers, about 3-5. A 256-deep FIFO was sized for a cross-core problem
+     * this queue does not have: every caller is on core 0, because core 1 talks
+     * to core 0 through ic_cmd_t rather than reaching the transport directly.
+     *
+     * Depth here is not free headroom: this queue is FIFO, so anything sitting
+     * in it has already had its priority decided and cannot be overtaken by a
+     * button press. Keeping it shallow keeps that inversion window small.
+     * s_aq_peak records the true high-water mark — see `busload`. */
+    queue_init(&action_queue,   sizeof(modbus_action_t), 16);
     queue_init(&response_queue, sizeof(modbus_action_t),  20);
 
     /* Baud + DE mode now come from the unified config (loaded by config_load()
@@ -684,6 +737,8 @@ void modbus_poll(void) {
     switch (bus_state) {
 
     case MODBUS_IDLE:
+        /* Nothing already committed? Then it is someone's turn. */
+        if (queue_get_level(&action_queue) == 0) offer_next();
         if (queue_try_remove(&action_queue, &currentAction)) {
             /* Slave is in backoff: complete as a timeout without transmitting.
              * Identical outcome for the caller, zero bus cost. */
@@ -846,7 +901,11 @@ void modbus_poll(void) {
 
 /* ── Action enqueuers ────────────────────────────────────────────────────── */
 static inline bool enqueue(modbus_action_t *act) {
-    if (queue_try_add(&action_queue, act)) return true;
+    if (queue_try_add(&action_queue, act)) {
+        uint32_t lvl = (uint32_t)queue_get_level(&action_queue);
+        if (lvl > s_aq_peak) s_aq_peak = lvl;
+        return true;
+    }
     s_drop_count++;
     /* Rate-limited so a sustained overflow can't itself flood the log / stall the
      * CDC. The count is the real signal; surfaced via modbus_drop_count(). */
@@ -858,6 +917,7 @@ static inline bool enqueue(modbus_action_t *act) {
 }
 
 uint32_t modbus_drop_count(void) { return s_drop_count; }
+uint32_t modbus_action_peak(void) { return s_aq_peak; }
 
 uint32_t modbus_crc_error_count(void) { return s_crc_errors; }
 

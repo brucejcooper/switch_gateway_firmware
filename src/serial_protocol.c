@@ -1608,6 +1608,9 @@ static void cmd_busload(char **saveptr) {
      * only place they become visible — until now they were counted and never
      * read by anything, which made a real loss of presses or HA commands
      * completely silent. Non-zero here is always worth investigating. */
+    cdc_out_printf("action queue: peak %lu of 16, dropped %lu\n",
+                   (unsigned long)modbus_action_peak(),
+                   (unsigned long)modbus_drop_count());
     cdc_out_printf("busload: window %lu.%02lu s, bus busy %lu%% (%lu txns, %lu.%02lu ms avg)\n",
            (unsigned long)(win / 1000000u), (unsigned long)((win % 1000000u) / 10000u),
            (unsigned long)(busy * 100u / win), (unsigned long)txns,
