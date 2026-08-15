@@ -76,10 +76,11 @@
  * "never". */
 #define ABSENT_PROBE_EVERY  6u
 
-/* Consecutive no-reply transactions after which a gateway is treated as down,
- * and how often to re-attempt while it is. Matches the transport's own backoff
- * trip point so the two agree about what "dead" means. */
-#define LINK_DOWN_FAILS   3u
+/* How often to re-attempt a gateway the client has declared down
+ * (LINK_DOWN_FAILS consecutive no-replies, mbq_client.h — the threshold used to
+ * be a second `#define 3u` here, with nothing keeping the two in agreement).
+ * The client fails these probes fast once the link has been down longer than a
+ * restart could explain, so one every 5 s costs a single transaction. */
 #define LINK_RETRY_MS     5000u
 
 /* QUERY STATUS bit 4 = fade running (IEC 62386-102). */

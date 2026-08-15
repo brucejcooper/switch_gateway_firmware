@@ -898,6 +898,107 @@ int main(void) {
         GW.present = true;
     }
 
+    /* ── 12c-i. A link that has been down long enough to be WRITTEN OFF stops
+     *      paying for the §4 ladder. The evidence the ladder would go and
+     *      collect — "the transport says nothing" — is already in hand, so a
+     *      fresh submission gets its verdict on its own transaction instead of
+     *      after 8 s of recovery polls, held slots and five WARN lines. On the
+     *      bench this is dali_state's 5 s liveness probe against a
+     *      configured-but-absent gateway: it repeated forever. */
+    begin("a written-off link fails submissions fast, with no recovery ladder");
+    {
+        establish_baseline();
+        GW.present = false;
+
+        /* The FIRST probe after the link drops still pays in full — at that
+         * point a gateway mid-restart and a gateway that is not there look
+         * identical, and only one of them may have its work dropped. */
+        cap_t warm = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, true, cap_cb, &warm));
+        run_ms(9000);
+        CHECK(warm.n == 1);
+
+        /* Now the link is written off, and the probe rhythm (5 s on the bench)
+         * means nothing is paced when the next one arrives. */
+        uint32_t recpolls = stats().recovery_polls;
+        uint32_t lost     = stats().lost;
+        uint32_t drops    = stats().link_down_drops;
+        uint32_t txns     = stats().enqueues + stats().polls;
+
+        cap_t a = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, true, cap_cb, &a));
+        uint32_t ms = 0;
+        for (; ms < 9000 && !a.n; ms++) pump();
+        printf("  [fastfail] resolved in %u ms, %u txns\n",
+               ms, stats().enqueues + stats().polls - txns);
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_LOST);                     /* the caller's verdict... */
+        CHECK(ms <= 5u);                              /* ...on its own transaction */
+        CHECK(stats().recovery_polls == recpolls);    /* no ladder was run     */
+        CHECK(stats().lost == lost);                  /* `lost` still means lost */
+        CHECK(stats().link_down_drops == drops + 1u);
+        CHECK(mbq_client_inflight(SLAVE) == 0);
+        GW.present = true;
+    }
+
+    /* ── 12c-ii. THE PROPERTY THE FAST-FAIL MUST NOT BREAK. A gateway that is
+     *      merely RESTARTING is down on the same evidence, and its idempotent
+     *      work must still ride the outage out — dropping it is the gate-V2
+     *      defect (the soak's SET goes missing, DTR0 keeps the previous pair's
+     *      value, the paired query reads stale). Only TIME separates the two
+     *      cases, so this drives the same code with a shorter outage. */
+    begin("a gateway restart still carries idempotent work across the outage");
+    {
+        establish_baseline();
+        uint32_t accepts = GW.accepts;
+        GW.present = false;
+        cap_t a = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_SET, true, cap_cb, &a));
+        run_ms(1500);                                 /* a restart, not an absence */
+        CHECK(a.n == 0);                              /* held, not dropped     */
+        CHECK(stats().link_down_drops == 0u);
+
+        GW.present = true;
+        for (int i = 0; i < 4000 && !a.n; i++) {
+            pump();
+            if (GW.cq_n) gw_complete(0u, 0x11u);
+        }
+        CHECK(a.n == 1);
+        CHECK(a.r == MBQ_R_COMPLETE);                 /* it executed, once     */
+        CHECK(GW.accepts == accepts + 1u);
+        CHECK(stats().link_down_drops == 0u);
+    }
+
+    /* ── 12c-iii. ...and the link comes back. A written-off slave must still be
+     *      driven — the transport's backoff probe only happens if the client
+     *      keeps offering it a transaction — so the queue has to resume the
+     *      moment the gateway answers again, with no re-registration. */
+    begin("a written-off link resumes when the gateway answers again");
+    {
+        establish_baseline();
+        GW.present = false;
+        cap_t a = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, true, cap_cb, &a));
+        run_ms(20000);                                /* an absence, not a restart */
+        CHECK(a.n == 1 && a.r == MBQ_R_LOST);
+        CHECK(stats().link_down_drops >= 1u);
+        CHECK(mbq_client_consec_fail(SLAVE) >= LINK_DOWN_FAILS);
+        uint32_t lost = stats().lost;
+
+        GW.present = true;
+        cap_t b = {0};
+        CHECK(mbq_client_submit(SLAVE, CMD_QUERY, true, cap_cb, &b));
+        for (int i = 0; i < 4000 && !GW.cq_n; i++) pump();
+        CHECK(GW.cq_n == 1u);                         /* the enqueue landed    */
+        pump();                                       /* ...and its accept came back */
+        CHECK(mbq_client_consec_fail(SLAVE) == 0u);   /* link declared up again */
+        gw_complete(0u, 0x77u);
+        CHECK(run_until_delivered(&b, 2000));
+        CHECK(b.r == MBQ_R_COMPLETE && b.resp == 0x77u);
+        CHECK(stats().lost == lost);
+        CHECK(stats().proto_errors == 0u);
+    }
+
     /* ── 12d. A_FULL's reply is SEVEN bytes — the shape follows the REQUEST,
      *      not the outcome. A parser that sized the reply off the accept
      *      status would break only on the A_FULL path, which is the canary

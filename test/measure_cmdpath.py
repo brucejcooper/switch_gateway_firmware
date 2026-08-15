@@ -87,7 +87,7 @@ class Rig:
     # left off this line stops being counted as a DALI command and inflates
     # txns/cmd. `nak` split out of `lost` in task 11 for exactly that reason.
     RES_RE = re.compile(r"results: complete=(\d+) failed=(\d+) lost=(\d+) "
-                        r"result_lost=(\d+) nak=(\d+)")
+                        r"result_lost=(\d+) nak=(\d+) link_down=(\d+)")
 
     def counters(self):
         """(enqueues, polls, a_full, commands) — commands = terminal outcomes."""
