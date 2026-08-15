@@ -125,7 +125,9 @@ def main():
 
     rig.drain(1.0)
     rig.cmd("echo off")
-    rig.rec("hello", rig.cmd("version") + rig.cmd("log warn"))
+    # `cfg` bare is a get, and reports the read-only fw_version — which is what
+    # a run's log has to record about the firmware it measured.
+    rig.rec("hello", rig.cmd("cfg") + rig.cmd("log warn"))
 
     verdicts = []
 
