@@ -10,9 +10,10 @@
  * (the raw command path, the any-on probe, the config-query SM) submit into a
  * per-slave local backlog sorted by priority class. dq_tick() drains the
  * highest-priority pending command into the client's QUEUE (via mbq_client),
- * filling at most DQ_QUEUE_MAX of it — and background at most DQ_QUEUE_MAX-1 —
- * so a fresh high-priority command never waits behind a backlog of background
- * work. Note this is queue occupancy, not gateway depth: the gateway bounds
+ * filling at most DQ_PIPELINE_MAX of it — and background strictly less, one
+ * slot normally and two while a scan is armed (dq_set_bg_burst) — so a fresh
+ * high-priority command never waits behind a backlog of background work. Note
+ * this is queue occupancy, not gateway depth: the gateway bounds
  * itself with A_FULL. Each command's terminal
  * outcome is mapped back to a dq_result_t and delivered to its callback exactly
  * once.
@@ -129,6 +130,18 @@ void dq_init(void);
 bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
                uint8_t flags, uint8_t dtr0, bool idempotent,
                dq_result_cb_t cb, void *ctx);
+
+/* Raise (or drop) `slave_id`'s BACKGROUND gateway depth for the duration of a
+ * scan. Background normally fills at most ONE of the gateway's command slots,
+ * so a button press waits at most the DALI frame already executing; that also
+ * means background runs one command per round trip, with the DALI engine idle
+ * between them, which is most of the cost of a full interrogation scan. While a
+ * scan is armed the sweep may hold both slots, then drops back.
+ *
+ * Called by dali_state from the one place that knows a scan's lifetime. Burst
+ * depth still cannot take the client's staging slot (static-asserted), so a
+ * fresh user command is always staged next whatever the sweep is doing. */
+void dq_set_bg_burst(uint8_t slave_id, bool on);
 
 /* Accumulate `steps` dim steps (signed; + = UP, − = DOWN) for a ballast short
  * address (`is_group` false) or a group number (`is_group` true).

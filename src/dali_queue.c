@@ -96,8 +96,26 @@
  * trip), which is irrelevant to a 10 s-cadence backstop sweep and costs a few
  * seconds on the boot scan. Buttons are latency-sensitive; sweeps are not. */
 #define DQ_DEPTH_BG      1u
+
+/* ...EXCEPT while a scan is armed for that slave (dq_set_bg_burst, task 10).
+ *
+ * Depth 1 also serialises background work to one command per round trip: the
+ * gateway's DALI engine finishes a frame and then sits idle while the result is
+ * collected and the next command enqueued. That idle is most of what made a
+ * full scan hold 66 % of the RS-485 bus for 3.4 s — the producer windows above
+ * cannot ship their second query while a background command is outstanding.
+ *
+ * A scan is armed at boot, by `scan`, and after provisioning: seconds at a
+ * time, not the steady state. For that window background may hold BOTH gateway
+ * slots, so a button press can again wait ~76 ms behind two frames (dd83279
+ * measured the depth-1 bound as a 241->189 ms median improvement under
+ * SATURATING load). Bruce's call, 2026-08-15: a few seconds of scan is worth
+ * it; the steady-state sweep stays at 1, where dd83279's bound is what
+ * matters. */
+#define DQ_DEPTH_BG_BURST 2u
 _Static_assert(DQ_DEPTH_USER <= DQ_PIPELINE_MAX && DQ_DEPTH_CFG <= DQ_PIPELINE_MAX &&
-               DQ_DEPTH_READ <= DQ_PIPELINE_MAX && DQ_DEPTH_BG < DQ_PIPELINE_MAX,
+               DQ_DEPTH_READ <= DQ_PIPELINE_MAX && DQ_DEPTH_BG < DQ_PIPELINE_MAX &&
+               DQ_DEPTH_BG_BURST < DQ_PIPELINE_MAX,
                "no class may exceed the pipeline, and background must not take the staging slot");
 
 /* Pending dim steps, per ballast and per group, instead of queued UP/DOWN
@@ -252,7 +270,13 @@ void dq_init(void) {
          * fan-out can mark several at once — hence a wider ring than the sweep,
          * which only ever has one rotation entry outstanding. */
         s_dq[i].cl[DQ_CL_READ] = (dq_class_t){ .cap = 4u,           .depth = DQ_DEPTH_READ };
-        s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 2u,           .depth = DQ_DEPTH_BG   };
+        /* Two background producers each submit a rolling window of two (the
+         * dali_state sweep's STATUS+LEVEL, the config rotation's next two
+         * fields), so a ring of 2 let whichever arrived first lock the other
+         * out for a whole round trip. This is STORAGE, not gateway depth: the
+         * inversion a button press can suffer is bounded by .depth below, which
+         * is unchanged. */
+        s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 4u,           .depth = DQ_DEPTH_BG   };
         mbq_client_add_slave(s_dq[i].slave_id);
     }
 }
@@ -302,6 +326,12 @@ bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
     }
     c->e[c->n++] = entry;   /* FIFO within the class */
     return true;
+}
+
+void dq_set_bg_burst(uint8_t slave_id, bool on) {
+    dq_slave_t *s = slave_for(slave_id);
+    if (!s) return;
+    s->cl[DQ_CL_BG].depth = on ? DQ_DEPTH_BG_BURST : DQ_DEPTH_BG;
 }
 
 bool dq_add_delta(uint8_t slave_id, bool is_group, uint8_t addr, int8_t steps) {
@@ -535,14 +565,19 @@ void dq_debug_print(int slave_id) {
         for (uint8_t j = 0; j < 64; j++) if (s->delta[j])  { dsum += s->delta[j]; dn++; }
         for (uint8_t j = 0; j < 16; j++) if (s->gdelta[j]) { dsum += s->gdelta[j]; dn++; }
         cdc_out_printf("dq slave %u: inflight=%u\n", s->slave_id, s->outstanding);
+        /* The background depth is the live one: it is raised while a scan is
+         * armed, and "why is a press slow right now" is exactly what this dump
+         * is read for. */
         cdc_out_printf("  pending/class: prov=%u/%u user=%u/%u cfg=%u/%u read=%u/%u bg=%u/%u"
-                       "  (depth %u/%u/%u/%u)\n",
+                       "  (depth %u/%u/%u/%u%s)\n",
                        s->cl[DQ_CL_PROV].n, s->cl[DQ_CL_PROV].cap,
                        s->cl[DQ_CL_USER].n, s->cl[DQ_CL_USER].cap,
                        s->cl[DQ_CL_CFG].n,  s->cl[DQ_CL_CFG].cap,
                        s->cl[DQ_CL_READ].n, s->cl[DQ_CL_READ].cap,
                        s->cl[DQ_CL_BG].n,   s->cl[DQ_CL_BG].cap,
-                       DQ_DEPTH_USER, DQ_DEPTH_CFG, DQ_DEPTH_READ, DQ_DEPTH_BG);
+                       DQ_DEPTH_USER, DQ_DEPTH_CFG, DQ_DEPTH_READ,
+                       s->cl[DQ_CL_BG].depth,
+                       s->cl[DQ_CL_BG].depth == DQ_DEPTH_BG_BURST ? " burst" : "");
         cdc_out_printf("  dim delta: %d target(s), net %d steps, cursor=%u\n",
                        dn, dsum, s->delta_cursor);
         cdc_out_printf("  counters: submitted=%lu ok=%lu nak=%lu err=%lu dropped=%lu "

@@ -1,12 +1,25 @@
 /*
  * dali_state.c — the controller's DALI world model. See dali_state.h.
  *
- * One sweep state machine per DALI slave. Each holds at most ONE query in flight
- * (like the config-query rotation it sits beside), so it paces itself against
- * the bus without ever needing to queue a burst: the work to do is held as
- * BITMAPS of what needs asking, not as a queue of commands. A ballast marked
- * twice before its query runs is asked once — which is the whole point of
- * keeping wants as state.
+ * One sweep state machine per DALI slave. The work to do is held as BITMAPS of
+ * what needs asking, not as a queue of commands: a ballast marked twice before
+ * its query runs is asked once, which is the whole point of keeping wants as
+ * state.
+ *
+ * Each slave runs ONE ballast's pass at a time, but a pass submits its queries
+ * in WINDOWS of up to two. STATUS and LEVEL do not depend on each other's
+ * answers, nor do the two group reads, so holding one query in flight and only
+ * asking the next after the previous landed left the queue empty at every
+ * collect moment — and an empty queue is exactly when the transport must spend
+ * a bare poll instead of an enqueue that carries the ack (task 10). Submitting
+ * the pair means the collect of the first rides the enqueue of the second, and
+ * the gateway's DALI engine has the next frame ready the instant it finishes
+ * one. The decision about what to ask NEXT still happens at the last possible
+ * moment — when the window's results land — so nothing is committed early.
+ *
+ * A believed-ABSENT address is the exception and stays a single STATUS probe:
+ * pairing would double the DALI cost of the common empty-address case for a
+ * LEVEL answer that is discarded the moment STATUS reports nobody home.
  *
  * Selection order per slave:
  *   1. verification marks (a command just touched these) at DQ_PRIO_LEVEL_READ
@@ -81,6 +94,16 @@ typedef enum {
     STEP_DONE,
 } step_t;
 
+/* One step's submission and its answer. Each carries its OWN token: two
+ * queries are live at once and either may be superseded or abandoned alone, so
+ * a single expected-token guard could no longer say which answer it admitted. */
+typedef struct {
+    uint16_t gen;         /* stale-callback guard; 0 = no live query for this step */
+    bool     have;        /* a result landed */
+    dq_result_t res;
+    uint8_t  answer;
+} ds_step_state_t;
+
 typedef struct {
     bool     in_use;
     uint8_t  slave_id;
@@ -91,16 +114,15 @@ typedef struct {
     uint64_t present;     /* our current belief */
     uint8_t  strikes[64]; /* consecutive clean no-answers, per address */
 
-    /* the query currently in flight */
+    /* the window currently in flight: steps [step, step + win_n) */
     bool     busy;
     uint8_t  addr;
     step_t   step;
+    uint8_t  win_n;       /* queries submitted together, 1 or 2 */
     bool     is_scan;     /* this pass includes the group reads */
-    bool     have;        /* a result landed */
-    dq_result_t res;
-    uint8_t  answer;
-    uint16_t gen;         /* stale-callback guard */
-    uint16_t exp_gen;
+    bool     burst;       /* this slave's background burst depth is raised */
+    uint16_t gen;         /* token source */
+    ds_step_state_t st[STEP_DONE];
     absolute_time_t deadline;
 
     /* partial results for the ballast being read */
@@ -191,21 +213,32 @@ void dali_state_mark_scan(uint8_t slave_id, uint8_t addr) {
     d->scan |= (uint64_t)1 << addr;
 }
 
+static bool scan_busy(const ds_slave_t *d) {
+    return d->scan != 0 || (d->busy && d->is_scan);
+}
+
 bool dali_state_scan_busy(uint8_t slave_id) {
     ds_slave_t *d = slave_for(slave_id);
-    return d && (d->scan != 0 || (d->busy && d->is_scan));
+    return d && scan_busy(d);
 }
 
 /* ── result handling ─────────────────────────────────────────────────────── */
 
+/* The token names the STEP as well as the query: whichever step still expects
+ * this token owns the answer. A token no step holds belongs to a query that was
+ * superseded or abandoned, and is dropped. */
 static void ds_cb(uint8_t slave_id, dq_result_t res, uint8_t answer, void *ctx) {
     ds_slave_t *d = slave_for(slave_id);
     if (!d) return;
     uint16_t g = (uint16_t)(uintptr_t)ctx;
-    if (g == 0 || g != d->exp_gen) return;   /* superseded / abandoned */
-    d->res    = res;
-    d->answer = answer;
-    d->have   = true;
+    if (g == 0) return;
+    for (int s = 0; s < STEP_DONE; s++) {
+        if (d->st[s].gen != g) continue;
+        d->st[s].res    = res;
+        d->st[s].answer = answer;
+        d->st[s].have   = true;
+        return;
+    }
 }
 
 /* Apply the presence evidence rules to one query outcome. Returns true if the
@@ -332,6 +365,27 @@ static bool pick_next(ds_slave_t *d, uint8_t *addr_out, bool *is_scan) {
     return false;
 }
 
+/* How many queries to submit together, starting at the pass's current step.
+ * Only the fixed sequences pair: neither step of a pair needs the other's
+ * answer, so both can be decided now. */
+static uint8_t window_at(const ds_slave_t *d) {
+    switch (d->step) {
+        case STEP_STATUS:
+            /* Pair STATUS+LEVEL only where we already believe someone is home.
+             * On an address we believe empty, STATUS is a probe we expect to go
+             * unanswered and LEVEL would be a second DALI frame thrown at
+             * nobody — and 62 of a 64-address scan's frames are that case. */
+            return (d->present & ((uint64_t)1 << d->addr)) ? 2u : 1u;
+        case STEP_GROUPS_LO:
+            return 2u;   /* GROUPS_LO + GROUPS_HI */
+        default:
+            return 1u;
+    }
+}
+
+/* Submit the window starting at d->step. Returns false only if NOTHING went
+ * out (the class is full); a second query refused after the first went out
+ * simply narrows the window to one and is picked up by the next step. */
 static bool issue(ds_slave_t *d) {
     static const uint8_t OPCODE[] = {
         [STEP_STATUS]     = Q_STATUS,
@@ -340,53 +394,77 @@ static bool issue(ds_slave_t *d) {
         [STEP_GROUPS_HI]  = Q_GROUPS_8_15,
     };
     uint8_t addr_byte = (uint8_t)(((d->addr & 0x3Fu) << 1) | 0x01u);
-    uint16_t g = next_gen(d);
     /* Verification reads outrank the sweep: a command's real outcome must reach
      * HA promptly, while a background refresh can wait behind anything. This now
      * holds: DQ_PRIO_LEVEL_READ has its own scheduler class. */
     dq_prio_t prio = d->is_scan ? DQ_PRIO_BACKGROUND : DQ_PRIO_LEVEL_READ;
-    if (!dq_submit(d->slave_id, prio, addr_byte, OPCODE[d->step],
-                   DQ_ANSWER, 0, true, ds_cb, (void *)(uintptr_t)g))
-        return false;   /* class full — retry next tick */
-    d->exp_gen  = g;
-    d->have     = false;
+    uint8_t want = window_at(d);
+    uint8_t n = 0;
+
+    for (uint8_t i = 0; i < want; i++) {
+        step_t s = (step_t)(d->step + i);
+        uint16_t g = next_gen(d);
+        if (!dq_submit(d->slave_id, prio, addr_byte, OPCODE[s],
+                       DQ_ANSWER, 0, true, ds_cb, (void *)(uintptr_t)g))
+            break;      /* class full — whatever is left goes next tick */
+        d->st[s].gen  = g;
+        d->st[s].have = false;
+        n++;
+    }
+    if (n == 0) return false;
+
+    d->win_n    = n;
     d->busy     = true;
+    /* One deadline for the window: both queries were handed over at the same
+     * instant, so it bounds each of them exactly as the per-query deadline it
+     * replaced did. */
     d->deadline = make_timeout_time_ms(QUERY_DEADLINE_MS);
     return true;
 }
 
-static void advance(ds_slave_t *d) {
-    uint64_t bit = (uint64_t)1 << d->addr;
-
-    /* Record this step's answer. */
-    bool ok = (d->res == DQ_RES_OK);
-    switch (d->step) {
+/* Record one step's answer into the pass's accumulators and retire its token. */
+static void record(ds_slave_t *d, step_t s) {
+    bool ok = (d->st[s].res == DQ_RES_OK);
+    uint8_t answer = d->st[s].answer;
+    switch (s) {
         case STEP_STATUS:
             d->got_status_ok = ok;
-            d->got_status    = ok ? d->answer : 0u;
+            d->got_status    = ok ? answer : 0u;
             break;
         case STEP_LEVEL:
             /* A query that did not answer cleanly must not publish a fabricated
              * 0 — keep whatever the cache already holds. */
             d->got_level_ok = ok;
-            d->got_level    = ok ? d->answer : cached_arc(d, d->addr);
+            d->got_level    = ok ? answer : cached_arc(d, d->addr);
             break;
         case STEP_GROUPS_LO:
-            if (ok) d->got_groups = (uint16_t)((d->got_groups & 0xFF00u) | d->answer);
+            if (ok) d->got_groups = (uint16_t)((d->got_groups & 0xFF00u) | answer);
             break;
         case STEP_GROUPS_HI:
-            if (ok) d->got_groups = (uint16_t)((d->got_groups & 0x00FFu) | ((uint16_t)d->answer << 8));
+            if (ok) d->got_groups = (uint16_t)((d->got_groups & 0x00FFu) | ((uint16_t)answer << 8));
             break;
         default: break;
     }
+    d->st[s].gen = 0;   /* answered: this token is no longer live */
+}
+
+/* Fold the completed window into the pass and decide what to ask next. */
+static void advance(ds_slave_t *d) {
+    uint64_t bit = (uint64_t)1 << d->addr;
+    step_t last = (step_t)(d->step + d->win_n - 1u);
+
+    for (step_t s = d->step; s <= last; s = (step_t)(s + 1)) record(d, s);
 
     /* Presence is judged on the FIRST directed query of the pass (QUERY STATUS):
      * one clean no-answer there is the absence evidence; the remaining steps are
      * pointless if nobody is home. */
     if (d->step == STEP_STATUS) {
-        bool present = presence_from(d, d->addr, d->res, d->is_scan);
+        bool present = presence_from(d, d->addr, d->st[STEP_STATUS].res, d->is_scan);
         if (!present) {
-            /* Abandon the rest of this ballast's pass. */
+            /* Abandon the rest of this ballast's pass. A LEVEL answer that
+             * arrived in the same window is discarded with it: presence keys off
+             * STATUS alone, and there is nothing to publish about a ballast that
+             * is not there. */
             d->verify &= ~bit;
             d->scan   &= ~bit;
             d->busy    = false;
@@ -395,7 +473,7 @@ static void advance(ds_slave_t *d) {
         }
     }
 
-    if (d->step == STEP_LEVEL) {
+    if (last == STEP_LEVEL) {
         if (!d->is_scan) {
             /* Verification pass ends here: status + level are what a command
              * changes. Group membership is only re-read on a full scan. */
@@ -425,7 +503,7 @@ static void advance(ds_slave_t *d) {
         d->got_groups = 0;   /* about to read them */
     }
 
-    if (d->step == STEP_GROUPS_HI) {
+    if (last == STEP_GROUPS_HI) {
         commit_ballast(d, d->addr, d->got_level, d->got_status, true, d->got_groups);
         d->scan  &= ~bit;
         d->busy   = false;
@@ -433,14 +511,28 @@ static void advance(ds_slave_t *d) {
         return;
     }
 
-    d->step = (step_t)(d->step + 1);
-    d->busy = false;   /* issue the next step on the following tick */
+    d->step = (step_t)(last + 1);
+    d->busy = false;   /* issue the next window on the following tick */
 }
 
 void dali_state_tick(void) {
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
         ds_slave_t *d = &s_ds[i];
         if (!d->in_use) continue;
+
+        /* A scan is the one background burst worth paying for: seconds of work
+         * whose whole point is to converge, where depth 1 leaves the gateway's
+         * DALI engine idle between every frame. Armed here and dropped the
+         * moment the last marked address is committed, from the single place
+         * that knows both ends of a scan's life. */
+        /* ARMED, not "a scan-style pass is running": the idle sweep's periodic
+         * absent probe is also a scan-style pass, and one probe every six sweep
+         * steps is the steady state dd83279 bounds at depth 1. */
+        bool scanning = (d->scan != 0);
+        if (scanning != d->burst) {
+            dq_set_bg_burst(d->slave_id, scanning);
+            d->burst = scanning;
+        }
 
         /* A slave mid-provisioning owns its bus. */
         if (dali_provision_busy_slave(d->slave_id)) continue;
@@ -461,16 +553,24 @@ void dali_state_tick(void) {
         }
 
         if (d->busy) {
-            if (d->have) {
-                d->have = false;
+            step_t last = (step_t)(d->step + d->win_n - 1u);
+            bool all = true;
+            for (step_t s = d->step; s <= last; s = (step_t)(s + 1))
+                if (!d->st[s].have) all = false;
+
+            if (all) {
                 advance(d);
             } else if (time_reached(d->deadline)) {
-                /* Abandon: bump the token so a late answer is ignored, and treat
-                 * it as bus evidence (not absence evidence) — the counters stay
-                 * frozen, the belief stands. */
-                d->exp_gen = 0;
-                d->res     = DQ_RES_ERR;
-                d->answer  = 0;
+                /* Abandon whatever is still missing: record() drops its token so
+                 * a late answer is ignored, and the outcome is bus evidence (not
+                 * absence evidence) — the counters stay frozen, the belief
+                 * stands. A step of the window that DID answer keeps its answer. */
+                for (step_t s = d->step; s <= last; s = (step_t)(s + 1)) {
+                    if (d->st[s].have) continue;
+                    d->st[s].res    = DQ_RES_ERR;
+                    d->st[s].answer = 0;
+                    d->st[s].have   = true;
+                }
                 advance(d);
             }
             continue;

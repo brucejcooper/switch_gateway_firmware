@@ -439,8 +439,21 @@ void lighting_any_on_probe_tick(void) {
  * interlocks, post-drain settle-gate and first-field discard are all gone. A
  * per-field deadline bounds a query that never resolves (wedged gateway); the
  * query token (s_query_gen) makes a late callback from an abandoned field
- * harmless. */
+ * harmless.
+ *
+ * The five fields are INDEPENDENT — no field's opcode depends on another's
+ * answer — so they run as a ROLLING WINDOW of two rather than strictly
+ * serially: as one field's result lands the next is submitted, and the collect
+ * of the first rides the enqueue of the second instead of costing the transport
+ * a bare poll (task 10). Two, not five: the backlog belongs to the priority
+ * ladder in dali_queue, and a third field staged here would only sit in front
+ * of a button press. Each field carries its own token and its own deadline, and
+ * a field that fails or times out is still just one field — field_ok[] already
+ * says which answered, and cfgq_commit_ballast keeps the cached value for the
+ * rest. Fields complete out of order without consequence: each result is stored
+ * under its own index and the ballast is committed when the last one is in. */
 #define CFGQ_FIELD_DEADLINE_MS 300  /* bound one field through the queue (round-trips + recovery) */
+#define CFGQ_WINDOW            2u   /* fields in flight at once */
 
 /* DALI-16 query opcodes (low byte of the forward frame). Verified against
  * IEC 62386-102 and the gateway's TinyModbus/src/dali.h: 0xA1 QUERY MAX LEVEL,
@@ -459,29 +472,43 @@ static const uint8_t CFGQ_OPCODE[CFGQ_NFIELDS] = {
 
 static uint64_t s_cfgq_pending[MAX_DALI_SLAVES];  /* ballasts awaiting read, by slave index */
 
+/* One field's query while it is outstanding. Per-field rather than one shared
+ * slot: two are live at once, and either may be answered or abandoned alone. */
+typedef struct {
+    uint16_t gen;                     /* token of this field's query; 0 = not live */
+    bool     have;                    /* a result landed via the callback */
+    dq_result_t res;
+    uint8_t  answer;
+    absolute_time_t deadline;
+} cfgq_field_t;
+
 static struct {
     bool     active;                  /* a per-ballast sequence is running */
     uint8_t  slave_idx;               /* index into g_config.dali_slave_ids */
     uint8_t  slave_id;
     uint8_t  addr;
-    uint8_t  field;                   /* CFGQ_MIN..CFGQ_NFIELDS-1 */
+    uint8_t  next;                    /* next field to submit (CFGQ_NFIELDS = all out) */
+    uint8_t  settled;                 /* fields whose outcome is recorded */
+    uint8_t  live;                    /* fields submitted and not yet settled */
     uint8_t  vals[CFGQ_NFIELDS];      /* accumulated response bytes */
     bool     field_ok[CFGQ_NFIELDS];  /* which fields answered cleanly */
-    bool     in_flight;               /* the current field's query is submitted */
-    bool     have;                    /* its result landed via the callback */
-    dq_result_t res;
-    uint8_t  answer;
-    uint16_t exp_gen;                 /* token of the in-flight field query */
-    absolute_time_t deadline;         /* per-field */
+    cfgq_field_t q[CFGQ_NFIELDS];
 } s_cfgq;
 
 /* Completion callback for a queued config query. Runs from dq_tick (main-loop)
- * context; stash for the cfgq tick, guarded by the query token. */
+ * context; stash for the cfgq tick, guarded by the query token — which names
+ * the FIELD as well as the query, so whichever field still expects this token
+ * owns the answer. A token no field holds belongs to an abandoned or superseded
+ * query and is dropped. */
 static void cfgq_result_cb(uint8_t slave, dq_result_t res, uint8_t answer, void *ctx) {
     (void)slave;
-    if (!s_cfgq.active) return;
-    if ((uint16_t)(uintptr_t)ctx != s_cfgq.exp_gen) return;   /* stale */
-    s_cfgq.res = res; s_cfgq.answer = answer; s_cfgq.have = true;
+    uint16_t g = (uint16_t)(uintptr_t)ctx;
+    if (!s_cfgq.active || g == 0) return;
+    for (uint8_t f = 0; f < CFGQ_NFIELDS; f++) {
+        if (s_cfgq.q[f].gen != g) continue;
+        s_cfgq.q[f].res = res; s_cfgq.q[f].answer = answer; s_cfgq.q[f].have = true;
+        return;
+    }
 }
 
 void lighting_cfg_query_mark(uint8_t slave_id, uint8_t addr) {
@@ -552,54 +579,57 @@ static bool cfgq_start_next(void) {
     return false;
 }
 
-/* Record the current field's outcome and advance; commit the ballast when the
- * last field is done. */
-static void cfgq_field_done(bool ok, uint8_t value) {
-    s_cfgq.field_ok[s_cfgq.field] = ok;
-    if (ok) s_cfgq.vals[s_cfgq.field] = value;
-    /* Advance; the tick submits the next field's query (or commits the ballast
-     * once all CFGQ_NFIELDS have been attempted). */
-    if (++s_cfgq.field >= CFGQ_NFIELDS)
-        cfgq_commit_ballast();
+/* Record one field's outcome and retire its query. */
+static void cfgq_settle(uint8_t f, bool ok, uint8_t value) {
+    s_cfgq.field_ok[f] = ok;
+    if (ok) s_cfgq.vals[f] = value;
+    s_cfgq.q[f].gen = 0;   /* answered or abandoned: the token is no longer live */
+    s_cfgq.live--;
+    s_cfgq.settled++;
 }
 
 void lighting_cfg_query_tick(void) {
 
     if (!s_cfgq.active && !cfgq_start_next()) return;
 
-    /* A slave mid-provisioning owns its bus — defer this ballast and retry. */
+    /* A slave mid-provisioning owns its bus — defer this ballast and retry.
+     * Queries still out are abandoned: the callback ignores everything while
+     * the sequence is inactive, and cfgq_start_next clears every token before
+     * the next ballast begins, so no late answer can reach a live field. */
     if (dali_provision_busy_slave(s_cfgq.slave_id)) {
         lighting_cfg_query_mark(s_cfgq.slave_id, s_cfgq.addr);
         s_cfgq.active = false;
         return;
     }
 
-    /* A field query is in flight: act on its result, or abandon it on the field
-     * deadline (bumping the token so the eventual late callback is ignored). */
-    if (s_cfgq.in_flight) {
-        if (s_cfgq.have) {
-            s_cfgq.have = false; s_cfgq.in_flight = false;
-            cfgq_field_done(s_cfgq.res == DQ_RES_OK, s_cfgq.answer);
-        } else if (time_reached(s_cfgq.deadline)) {
-            s_cfgq.in_flight = false;
-            s_cfgq.exp_gen   = 0;             /* invalidate a late callback */
-            cfgq_field_done(false, 0);        /* keep the cached value for this field */
-        }
-        return;
+    /* Collect whatever has landed, and abandon anything past its own deadline
+     * (keeping that field's cached value). */
+    for (uint8_t f = 0; f < CFGQ_NFIELDS; f++) {
+        if (s_cfgq.q[f].gen == 0) continue;
+        if (s_cfgq.q[f].have)
+            cfgq_settle(f, s_cfgq.q[f].res == DQ_RES_OK, s_cfgq.q[f].answer);
+        else if (time_reached(s_cfgq.q[f].deadline))
+            cfgq_settle(f, false, 0);
     }
 
-    /* Submit the current field's query. A NAK/ERR (or a backlog-full retry that
-     * eventually times out) leaves the field un-answered, and cfgq_field_done
-     * keeps its cached value. */
-    uint8_t  addr_byte = (uint8_t)((s_cfgq.addr & 0x3Fu) << 1) | 0x01u;
-    uint16_t g         = next_query_gen();
-    if (dq_submit(s_cfgq.slave_id, DQ_PRIO_BACKGROUND, addr_byte, CFGQ_OPCODE[s_cfgq.field],
-                  DQ_ANSWER, 0, true, cfgq_result_cb, (void *)(uintptr_t)g)) {
-        s_cfgq.exp_gen   = g;
-        s_cfgq.have      = false;
-        s_cfgq.in_flight = true;
-        s_cfgq.deadline  = make_timeout_time_ms(CFGQ_FIELD_DEADLINE_MS);
-    }   /* else backlog full — retry next tick */
+    if (s_cfgq.settled >= CFGQ_NFIELDS) { cfgq_commit_ballast(); return; }
+
+    /* Refill the window. A NAK/ERR (or a backlog-full retry that eventually
+     * times out) leaves that field un-answered and cfgq_commit_ballast keeps
+     * its cached value. */
+    uint8_t addr_byte = (uint8_t)((s_cfgq.addr & 0x3Fu) << 1) | 0x01u;
+    while (s_cfgq.live < CFGQ_WINDOW && s_cfgq.next < CFGQ_NFIELDS) {
+        uint8_t  f = s_cfgq.next;
+        uint16_t g = next_query_gen();
+        if (!dq_submit(s_cfgq.slave_id, DQ_PRIO_BACKGROUND, addr_byte, CFGQ_OPCODE[f],
+                       DQ_ANSWER, 0, true, cfgq_result_cb, (void *)(uintptr_t)g))
+            break;   /* backlog full — retry next tick */
+        s_cfgq.q[f].gen      = g;
+        s_cfgq.q[f].have     = false;
+        s_cfgq.q[f].deadline = make_timeout_time_ms(CFGQ_FIELD_DEADLINE_MS);
+        s_cfgq.live++;
+        s_cfgq.next++;
+    }
 }
 
 /* ── Config write via a DTR0-load + SET queue entry ──────────────────────────
