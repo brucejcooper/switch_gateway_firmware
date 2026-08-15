@@ -148,10 +148,20 @@ bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
                    uint8_t payload_len, modbus_action_cb_t cb, void *ctx);
 
 
-/* ── Baud rate (new — replaces hardcoded 9600) ───────────────────────────── */
-/* Call before modbus_init() if a non-default baud rate is desired.
- * Persisted to /modbus_baud.txt. Default 19200 — the reliable bus speed for the
- * TinyModbus slaves (38400 is marginal against the internal-RC oscillator). */
+/* ── Baud rate ───────────────────────────────────────────────────────────── */
+/* Call before modbus_init() if a non-default baud rate is desired. Persisted as
+ * the `baud` key in /config.json (migrated from the old /modbus_baud.txt).
+ *
+ * Default 38400, canonical since 2026-08-14 and measured at 0.00 % bad frames
+ * (0 of 6582). This REVERSED an earlier verdict recorded right here, that 19200
+ * was the reliable speed and 38400 marginal against the ATtiny's internal RC
+ * oscillator. The dirty-at-38400 observation was real; the oscillator diagnosis
+ * was wrong. It was the tinyAVR start-of-frame-detector erratum, and 19200 was
+ * never clean either (0.13 % bad). Both ends scope within 0.8 % of nominal at
+ * both bauds. The full quote, mechanism and workaround are in the erratum block
+ * above modbus_init() in TinyModbus/src/modbus.c — read that before proposing a
+ * baud change. 9600 remains the factory/safe fallback for a device with an
+ * unprogrammed USERROW, which is why boot discovery walks 38400 → 19200 → 9600. */
 void modbus_set_baud(uint32_t baud);
 uint32_t modbus_get_baud(void);
 

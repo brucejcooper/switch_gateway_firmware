@@ -11,15 +11,18 @@
 #include "pico/time.h"
 #include <string.h>
 
-/* TinyModbus register addresses:
- *   0x0000 + addr  per-ballast brightness bank (FC06 low byte = DAPC level,
- *                  0 = off, 1–254 proportional, 255 = no change)
- *   0x1000-0x1007  command-queue submit window (FC10/FC23; see dali_queue.c)
+/* EVERY DALI frame this file emits leaves by the same door: dq_submit() into
+ * the per-slave priority ladder (dali_queue.c), which hands it to the queue-v4
+ * client and out as FC 0x41 (QUEUE-PROTOCOL.md §1). DAPC levels, OFF,
+ * GOTO_LAST_ACTIVE, UP/DOWN steps, group commands, config DTR0+SET pairs and
+ * raw queries are all the same kind of thing here — a (addr, data, flags,
+ * dtr0) tuple with a priority and an idempotency flag.
  *
- * DAPC and OFF go through the per-ballast brightness bank. Everything else
- * (GOTO_LAST_ACTIVE / UP / DOWN, group commands, config DTR0+SET, raw queries)
- * is submitted through the id-tagged command queue (dali_queue.c). The legacy
- * queue carries every raw command. */
+ * There is no register-window path left. Earlier revisions wrote DAPC to a
+ * per-ballast brightness bank at FC06 0x0000+addr and pushed everything else
+ * through a submit window at 0x1000-0x1007; both are gone, along with the
+ * FC10/FC23 frames that carried them. Comments below that mention them are
+ * describing what was replaced. */
 
 /* ── State event queue — written here, drained by serial_poll() ──────────── */
 /* We use a simple ring buffer rather than the pico queue_t here because all
@@ -141,19 +144,19 @@ static void dali_write_cb(int res, uint8_t *buf, void *ctx) {
 }
 
 /* ── Raw DALI commands via the gateway command queue ──────────────────────────
- * Broadcast/group/specialty DALI sends (GOTO_LAST_ACTIVE, UP/DOWN, group
- * on/off/level/step, config DTR0+SET) go through the id-tagged gateway command
- * queue (dali_queue.c) instead of the old single-slot 0x1000/0x0108 FIFO. Each
- * command carries an idempotency flag: idempotent commands (GOTO_LAST_ACTIVE,
- * group on/off/level, config re-store, all queries) may be resubmitted after a
- * transport fault or gateway reboot; UP/DOWN step frames are NOT (replaying
- * would double-step), so the driver drops them on a fault rather than resubmit.
+ * The one send primitive in this file. DAPC levels and OFF come through here
+ * too — everything is a queued frame now.
  *
- * Per-ballast OFF and DAPC level do NOT come here — they use the per-ballast
- * brightness bank (0x0000+addr) directly. Raw sends are fire-and-forget (no
- * completion callback: a NAK is the normal outcome of a no-answer send); the
- * driver logs backlog-full drops. Self-describing slots remove the shared-result-register
- * interlocks and settle-gate the single-slot path needed. */
+ * Each command carries an idempotency flag, which is what the client needs to
+ * recover a gateway reboot or a never-landed frame (QUEUE-PROTOCOL.md §4):
+ * idempotent commands (DAPC, OFF, GOTO_LAST_ACTIVE, group on/off/level, config
+ * re-store, all queries) are resubmitted, while UP/DOWN step frames are NOT
+ * (replaying would double-step) and are reported DQ_RES_DROPPED instead.
+ *
+ * Raw sends are fire-and-forget: no completion callback, because a NAK is the
+ * normal outcome of a no-answer send, and dirty_poll/dali_state read back what
+ * the ballast actually did. A refusal here means the priority class is full,
+ * and the caller logs the drop. */
 static bool raw_submit(uint8_t slave, dq_prio_t prio, uint8_t addr, uint8_t data,
                        uint8_t flags, uint8_t dtr0, bool idempotent) {
     return dq_submit(slave, prio, addr, data, flags, dtr0, idempotent, NULL, NULL);
@@ -166,11 +169,12 @@ static bool raw_submit(uint8_t slave, dq_prio_t prio, uint8_t addr, uint8_t data
  * NAK means "none on" — the ballasts themselves are the ground truth, immune
  * to the group-mask cache going stale across gateway reboots.
  *
- * Targets are queried sequentially through the modbus action queue,
- * short-circuiting on the first "on". Known benign race: another RAW_CMD user
- * (HA / CLI) firing between our write and our result read can garble the
- * result; bounded by the deadline, worst case the toggle assumes off, which
- * the next press self-corrects. */
+ * Targets are queried sequentially through dq_submit, short-circuiting on the
+ * first "on". There is no interleaving hazard from another producer any more:
+ * the answer byte is delivered to THIS command's callback, bound to the
+ * gateway-assigned seq, so a concurrent HA or CLI send cannot be mistaken for
+ * our result. The deadline still bounds the probe; worst case the toggle
+ * assumes off, which the next press self-corrects. */
 
 #define PROBE_QUERY_OPCODE      0x93u    /* QUERY LAMP POWER ON */
 #define PROBE_DEADLINE_MS       600      /* whole probe, all targets */
@@ -691,16 +695,15 @@ bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
     }
     bool ok;
     if (on) {
-        /* GOTO_LAST_ACTIVE (0x0A) — no per-ballast bank shortcut, use the queue.
-         * Address byte: short address, command form (A0=1). Idempotent. */
+        /* GOTO_LAST_ACTIVE (0x0A). Address byte: short address, command form
+         * (A0=1). Idempotent. */
         uint8_t addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
         ok = raw_submit(slave_id, DQ_PRIO_USER, addr_byte, 0x0Au, 0, 0, true);
     } else {
-        /* OFF — DAPC level 0 as a queued frame, rather than writing 0 to the
-         * gateway's per-ballast brightness bank (FC06 0x0000+addr) and let the
-         * gateway and having it synthesise the DAPC: the
-         * controller emits the frame itself. Address byte is DAPC form (bit 0
-         * clear); idempotent — re-sending level 0 has no cumulative effect. */
+        /* OFF — DAPC level 0 as a queued frame. The controller emits the frame
+         * itself rather than writing 0 to a gateway register and having the
+         * gateway synthesise it. Address byte is DAPC form (bit 0 clear);
+         * idempotent — re-sending level 0 has no cumulative effect. */
         uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
         ok = raw_submit(slave_id, DQ_PRIO_USER, dapc_addr, 0x00u, 0, 0, true);
     }
@@ -754,9 +757,8 @@ bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
         return false;
     }
     /* DAPC as a queued frame (address byte in DAPC form — bit 0 clear — and the
-     * arc level as the data byte). Replaces the gateway's per-ballast brightness
-     * bank; the ballast clamps to its own min/max,
-     * so the read-back remains the authority on what actually happened.
+     * arc level as the data byte). The ballast clamps to its own min/max, so the
+     * read-back remains the authority on what actually happened.
      * Idempotent: re-sending the same level has no cumulative effect. */
     uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
     if (!raw_submit(slave_id, DQ_PRIO_USER, dapc_addr, arc, 0, 0, true)) {
@@ -772,8 +774,8 @@ bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
 
 /* ── DALI group helpers ──────────────────────────────────────────────────── */
 /* Group address byte: bit 7 = 1 (group), bits 5..1 = group# (0-15) << 1,
- * bit 0 = 0 → DAPC form, bit 0 = 1 → command form. All sends use RAW_CMD
- * (FC06 0x1000); per-ballast brightness bank shortcut isn't applicable. */
+ * bit 0 = 0 → DAPC form, bit 0 = 1 → command form. Like every other send in
+ * this file these go out through raw_submit() → dq_submit() → FC 0x41. */
 
 bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
     if (dali_provision_busy_slave(slave_id)) {

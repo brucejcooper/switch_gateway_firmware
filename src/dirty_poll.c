@@ -1,11 +1,18 @@
 /*
- * dirty_poll.c — dirty-bit polling for TinyModbus DALI slaves.
+ * dirty_poll.c — reachability and cold-path polling for the Modbus slaves.
  *
- * Fixes applied:
- *   #1  Removed dead blocking_read_input_regs() with C++ lambda syntax
- *   #5  Correct Modbus response frame size checks (include CRC bytes)
- *   #7  dirty_poll_tick() skips slaves being provisioned
- *   #8  Deadtime is baud-rate-correct (was hardcoded for 9600)
+ * Despite the name, the DALI dirty-mask sweep this file was built around is
+ * gone: dali_state.c owns the world model and its verification reads, and
+ * reachability is inferred from consecutive no-reply transactions on the
+ * queue-v4 client (see gateway_report's caller at the end of the tick). Four
+ * jobs remain, none of which has another home:
+ *
+ *   - the gateway/relay reachability debounce and its state_gateway events;
+ *   - relay-board coil polls, offered to the bus in rotation;
+ *   - the per-gateway sysinfo read (FC04 0x0310) behind HA's uptime / reboots /
+ *     reset-reason diagnostic sensors;
+ *   - noticing that an armed scan has finished, and the slow config rotation
+ *     that follows it.
  */
 
 #include "dirty_poll.h"
@@ -228,9 +235,12 @@ static void gwdiag_cb(int res, uint8_t *buf, void *ctx) {
     int idx = state_cache_slave_idx(slave);
     if (idx >= 0) gateway_report(slave, idx, true);
     lighting_emit_gw_diag(slave, uptime, boot, reason);
-    /* boot_count / uptime / reset_reason are a pure HA diagnostic here (queue v2
-     * detects a gateway reboot from the slot statuses in mbq_client, not from
-     * boot_count) — nothing to feed to the command queue. */
+    /* boot_count / uptime / reset_reason are a pure HA diagnostic on this path —
+     * nothing to feed to the command queue. The client detects a gateway reboot
+     * for itself, from result deadlines plus the two structural rules
+     * (QUEUE-PROTOCOL.md §4), and reads boot_count on its own account as the
+     * cold-path arbiter for the one ambiguous corner. It does not consume the
+     * value published here. */
 }
 
 
@@ -258,7 +268,8 @@ void dirty_poll_tick(void) {
         uint8_t  slave_id = g_config.dali_slave_ids[i];
         dpoll_t *dp       = &s_dp[i];
 
-        /* fix #7: do not poll slaves being provisioned */
+        /* Commissioning is bus-exclusive: nothing may interleave with the
+         * binary search, so a slave being provisioned is skipped entirely. */
         if (dali_provision_busy_slave(slave_id)) continue;
 
         /* Scan completion. Every scan is asynchronous now — boot, the CLI and
@@ -312,14 +323,11 @@ void dirty_poll_tick(void) {
             }
         }
 
-        /* The dirty-mask / block0 / background-check reads that would
-         * live here are GONE. They read gateway registers (0x0104 dirty, 0x0000
-         * block0, 0x0100 present, 0x0110 group masks) that the gateway strip
-         * removes. Level, status, presence and groups are now learned by
-         * querying the ballasts through the command queue — see dali_state.c,
-         * driven from the main loop. What remains in this file is the relay
-         * board (a different device entirely) and the gateway sysinfo poll,
-         * neither of which the strip touches. */
+        /* No dirty-mask / block0 / background-check read here: those gateway
+         * registers (0x0104 dirty, 0x0000 block0, 0x0100 present, 0x0110 group
+         * masks) no longer exist. Level, status, presence and groups are
+         * learned by querying the ballasts themselves — dali_state.c, driven
+         * from the main loop. */
         /* Gateway reachability now rides the COMMAND QUEUE rather than a
          * dedicated register poll. The queue talks to each gateway continuously
          * (the world-model sweep alone keeps it busy), so consecutive no-reply
@@ -331,22 +339,6 @@ void dirty_poll_tick(void) {
                        mbq_client_consec_fail(slave_id) < GATEWAY_FAIL_THRESHOLD);
     }
 }
-
-/* ── sync_read helper ────────────────────────────────────────────────────── */
-
-typedef struct {
-    volatile bool done;
-    volatile bool ok;
-    uint16_t     *out;
-    uint16_t      count;
-} sync_ctx_t;
-
-
-
-
-/* ── Group-mask read (used by full_scan and background_check) ────────────── */
-
-/* ── Blocking startup full scan ──────────────────────────────────────────── */
 
 
 

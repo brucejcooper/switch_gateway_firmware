@@ -149,13 +149,18 @@ void mbq_client_init(void);
  * that does not match the head is a no-op. */
 void mbq_client_add_slave(uint8_t slave_id);
 
-/* True if `slave_id` can accept a new command this instant: it is registered
- * and compatible, has finished draining, holds fewer than CMDQ_DEPTH commands,
- * has no transaction in flight and no command already waiting to be (re)sent.
- * The adapter's scheduler gates a submit on this. */
+/* True if `slave_id` can accept a new command this instant: it is registered,
+ * compatible, and has a FREE SLOT in its command table. That is the whole test
+ * — NOT whether a transaction is on the wire, NOT how full the gateway is
+ * (A_FULL answers that), and NOT whether the startup drain has finished. It is
+ * true from the first instant; work queued during the drain goes out when the
+ * drain completes. Callers wanting "is the client up" want
+ * mbq_client_stats().drained. The long-form rationale is on the definition in
+ * mbq_client.c. The adapter's scheduler gates a submit on this. */
 bool mbq_client_can_submit(uint8_t slave_id);
 
-/* Submit one command to `slave_id`'s gateway queue and issue the transaction.
+/* Stage one command for `slave_id`'s gateway queue. QUEUED, NOT TRANSMITTED:
+ * mbq_client_drive() attaches it to the next packet.
  * `cmd` is [addr, data, flags (MBQ_QF_*), dtr0]. `idempotent` = safe to run
  * twice, so a reboot or a never-landed frame resubmits it rather than
  * reporting MBQ_R_LOST; queries and absolute SETs are, UP/DOWN steps are not.

@@ -31,7 +31,6 @@
 #include "pico/time.h"
 #include <string.h>
 #include "cdc_out.h"
-#include <stdio.h>
 
 /* DALI wire constants used by the probe (the gateway's dali.h equivalents). */
 #define DALI_ADDR_SET_DTR0        0xA3u   /* special command: addr byte = 0xA3, data = value */
@@ -350,12 +349,12 @@ void dq_soak_tick(void) {
         return;
     }
 
-    /* Gate on the client's OWN admission policy, not on a raw count. The
-     * client admits one command beyond the gateway's depth once the oldest is
-     * estimated complete — that is what makes a single transaction collect a
-     * result and submit the next command — and a probe that second-guesses it
-     * with its own counter would throttle exactly the behaviour gate V1
-     * measures. `depth` still caps the run for the sweep. */
+    /* Gate on the client's OWN admission policy, not on a raw count. There is
+     * no estimator any more: can_submit is simply "is there a free slot", so
+     * the probe hands work over the instant one opens and the client decides
+     * when it goes on the wire. A probe that second-guessed that with its own
+     * counter would throttle exactly the behaviour gate V1 measures. `depth`
+     * still caps the run for the sweep. */
     if (occupied > S.depth) { S.t_queue_full++; return; }
     if (!mbq_client_can_submit(S.slave)) { S.t_tx_busy++; return; }
     S.t_ready++;
