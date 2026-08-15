@@ -10,7 +10,7 @@ import json, subprocess, sys, time, threading, queue
 BROKER = "192.168.1.113"
 CMD_T   = "lighting/dali/3/45/set"
 STATE_T = "lighting/dali/3/45/state"
-AVAIL   = ["lighting/bridge/status", "lighting/gateway/3/availability",
+AVAIL   = ["lighting/availability", "lighting/gateway/3/availability",
            "lighting/dali/3/45/availability"]
 
 def sub_lines(topics, q):
