@@ -127,7 +127,9 @@ typedef enum {
                              * silence means "no" to a yes/no query and "absent"
                              * to a value query, and only the issuer knows which
                              * it asked. Deliberately NOT MBQ_R_FAILED — nothing
-                             * broke, so failure counters must not count it.     */
+                             * broke, so failure counters must not count it, and
+                             * for the same reason it has its own `naks` stat
+                             * rather than falling into `lost`.                  */
 } mbq_result_t;
 
 /* Delivered once when a submitted command resolves. Runs from mbq_client_tick()
@@ -244,6 +246,12 @@ typedef struct {
     uint32_t afull;           /* A_FULL accept bytes (gateway queue full)    */
     uint32_t completed, failed;
     uint32_t lost, result_lost;
+    uint32_t naks;            /* MBQ_R_NAK terminals — the gear did not answer,
+                               * which is an ANSWER. These used to land in
+                               * `lost` (the default: arm), and on a sparse bus
+                               * that is ~62 phantom losses per scan: the
+                               * counter that should say "a reboot ate work"
+                               * instead reported the empty addresses.        */
     uint32_t resends;         /* commands put back on the wire (R1', A_FULL, reboot) */
     uint32_t boot_reads;      /* cold-path sysinfo boot_count arbitrations   */
     uint32_t proto_errors;    /* wrong reply length / shape / bad accept status */

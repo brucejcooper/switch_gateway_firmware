@@ -410,6 +410,10 @@ static void deliver(slave_t *s, cmd_t *c, mbq_result_t r, uint8_t resp8) {
         case MBQ_R_COMPLETE:    s->stats.completed++;   break;
         case MBQ_R_FAILED:      s->stats.failed++;      break;
         case MBQ_R_RESULT_LOST: s->stats.result_lost++; break;
+        /* A clean "the gear did not answer" is a normal outcome on a sparse
+         * bus, not a loss. It used to fall into the default: arm below and was
+         * most of the bench's lost=1106 — 62 empty addresses per scan. */
+        case MBQ_R_NAK:         s->stats.naks++;        break;
         default:                s->stats.lost++;        break;
     }
     if (cb) cb(s->slave_id, r, resp8, ctx);
@@ -1780,9 +1784,11 @@ void mbq_client_debug_print(int slave_id) {
         cdc_out_printf("  faults: predicted-seq=%lu orphans=%lu protocol=%lu\n",
                        (unsigned long)t->pred_faults, (unsigned long)t->orphans,
                        (unsigned long)t->proto_errors);
-        cdc_out_printf("  results: complete=%lu failed=%lu lost=%lu result_lost=%lu\n",
+        cdc_out_printf("  results: complete=%lu failed=%lu lost=%lu result_lost=%lu "
+                       "nak=%lu\n",
                        (unsigned long)t->completed, (unsigned long)t->failed,
-                       (unsigned long)t->lost, (unsigned long)t->result_lost);
+                       (unsigned long)t->lost, (unsigned long)t->result_lost,
+                       (unsigned long)t->naks);
 
         mbq_txn_stats_t ts;
         mbq_client_txn_stats(s->slave_id, &ts);

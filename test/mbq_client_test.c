@@ -1180,10 +1180,18 @@ int main(void) {
         CHECK(run_until_delivered(&a, 120));
         CHECK(a.r == MBQ_R_COMPLETE && a.resp == 0x00u);
 
+        uint32_t lost_before = stats().lost;
         CHECK(submit(CMD_QUERY, true, &b));
         gw_complete(2u, 0x00u);                          /* H_NAK, query silent */
         CHECK(run_until_delivered(&b, 120));
         CHECK(b.r == MBQ_R_NAK && b.resp == 0x00u);      /* NOT MBQ_R_FAILED   */
+        /* ...and NOT counted as a loss either. A NAK used to fall into the
+         * default: arm of deliver()'s switch, so on a bus that is mostly empty
+         * addresses `lost` reported the empty addresses rather than losses —
+         * 62 phantom losses per scan on the bench, most of lost=1106. */
+        CHECK(stats().lost == lost_before);
+        CHECK(stats().naks == 1u);
+        CHECK(stats().failed == 0u);
 
         CHECK(submit(CMD_QUERY, true, &c));
         gw_complete(1u, 0x02u);                          /* H_FAILED, collision */
