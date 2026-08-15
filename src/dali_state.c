@@ -213,9 +213,13 @@ void dali_state_mark_scan(uint8_t slave_id, uint8_t addr) {
     d->scan |= (uint64_t)1 << addr;
 }
 
+static bool scan_busy(const ds_slave_t *d) {
+    return d->scan != 0 || (d->busy && d->is_scan);
+}
+
 bool dali_state_scan_busy(uint8_t slave_id) {
     ds_slave_t *d = slave_for(slave_id);
-    return d && (d->scan != 0 || (d->busy && d->is_scan));
+    return d && scan_busy(d);
 }
 
 /* ── result handling ─────────────────────────────────────────────────────── */
@@ -515,6 +519,20 @@ void dali_state_tick(void) {
     for (int i = 0; i < MAX_DALI_SLAVES; i++) {
         ds_slave_t *d = &s_ds[i];
         if (!d->in_use) continue;
+
+        /* A scan is the one background burst worth paying for: seconds of work
+         * whose whole point is to converge, where depth 1 leaves the gateway's
+         * DALI engine idle between every frame. Armed here and dropped the
+         * moment the last marked address is committed, from the single place
+         * that knows both ends of a scan's life. */
+        /* ARMED, not "a scan-style pass is running": the idle sweep's periodic
+         * absent probe is also a scan-style pass, and one probe every six sweep
+         * steps is the steady state dd83279 bounds at depth 1. */
+        bool scanning = (d->scan != 0);
+        if (scanning != d->burst) {
+            dq_set_bg_burst(d->slave_id, scanning);
+            d->burst = scanning;
+        }
 
         /* A slave mid-provisioning owns its bus. */
         if (dali_provision_busy_slave(d->slave_id)) continue;
