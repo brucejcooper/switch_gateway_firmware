@@ -18,7 +18,6 @@
 #include "hardware/uart.h"
 #include "pico/util/queue.h"
 #include "stdio.h"
-#include <ctype.h>
 #include <pico/time.h>
 #include <pico/types.h>
 #include <stdbool.h>

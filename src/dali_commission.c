@@ -12,7 +12,6 @@
 #include "dali_queue.h"
 #include "dali_state.h"
 #include "state_cache.h"
-#include "config.h"
 #include "log.h"
 #include "pico/time.h"
 #include <string.h>

@@ -33,7 +33,6 @@
 #include "pico/time.h"
 #include <string.h>
 #include "cdc_out.h"
-#include <stdio.h>
 
 /* ── Scheduler shape ────────────────────────────────────────────────────────
  * There is no single FIFO backlog any more. Two reasons, both measured:

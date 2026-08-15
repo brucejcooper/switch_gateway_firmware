@@ -31,7 +31,6 @@
 #include "pico/time.h"
 #include <string.h>
 #include "cdc_out.h"
-#include <stdio.h>
 
 /* DALI wire constants used by the probe (the gateway's dali.h equivalents). */
 #define DALI_ADDR_SET_DTR0        0xA3u   /* special command: addr byte = 0xA3, data = value */
