@@ -252,7 +252,13 @@ void dq_init(void) {
          * fan-out can mark several at once — hence a wider ring than the sweep,
          * which only ever has one rotation entry outstanding. */
         s_dq[i].cl[DQ_CL_READ] = (dq_class_t){ .cap = 4u,           .depth = DQ_DEPTH_READ };
-        s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 2u,           .depth = DQ_DEPTH_BG   };
+        /* Two background producers each submit a rolling window of two (the
+         * dali_state sweep's STATUS+LEVEL, the config rotation's next two
+         * fields), so a ring of 2 let whichever arrived first lock the other
+         * out for a whole round trip. This is STORAGE, not gateway depth: the
+         * inversion a button press can suffer is bounded by .depth below, which
+         * is unchanged. */
+        s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 4u,           .depth = DQ_DEPTH_BG   };
         mbq_client_add_slave(s_dq[i].slave_id);
     }
 }
