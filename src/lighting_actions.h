@@ -30,10 +30,11 @@ bool lighting_set_relay(uint8_t channel, bool on);
  * Returns false for channels beyond byte_count*8. */
 bool lighting_relay_coil_on(const uint8_t *coil_bytes, uint8_t byte_count, uint8_t ch);
 
-/* Raw DALI commands (broadcast/group/specialty sends) go through the id-tagged
- * gateway command queue (dali_queue.h / dq_submit), driven by dq_tick() from the
- * main loop. The producers below (on/off, step, group *, config write) submit
- * into it directly; there is no separate raw-command tick to call. */
+/* Every DALI command this module emits — levels, on/off, steps, group sends,
+ * config writes, queries — goes through the gateway command queue
+ * (dali_queue.h / dq_submit), driven by dq_tick() from the main loop. The
+ * producers below submit into it directly; there is no separate raw-command
+ * tick to call. */
 
 /* ── Any-on probe ────────────────────────────────────────────────────────────
  * Ground-truth "is any light in this binding on?" for button toggles. Started
@@ -75,12 +76,12 @@ void               lighting_any_on_probe_tick(void);
 
 /* ── Config-over-raw queries ──────────────────────────────────────────────────
  * Fill the controller's per-ballast config cache (min/max/power-on/sys-fail/
- * fade) from raw DALI queries — the only config path now that the gateway's
- * Config is read over raw DALI. Ballasts are marked via a per-slave
- * pending bitmap; the tick walks it, runs the 5-query sequence per ballast,
- * writes state_cache_set_dali_config, and re-emits state_dali so HA sees the
- * refreshed config. (Stage 3 routes these queries through the id-tagged gateway
- * command queue; see lighting_actions.c.) */
+ * fade) by querying the gear directly — the only config path there is, now that
+ * the gateway's own config block is gone. Ballasts are marked via a per-slave
+ * pending bitmap; the tick walks it, runs the 5-query sequence per ballast (as
+ * rolling windows of two, see lighting_actions.c), writes
+ * state_cache_set_dali_config, and re-emits state_dali so HA sees the refreshed
+ * config. */
 /* Arm a raw config read for every ballast in `mask` (the boot sweep). Called
  * when a scan establishes presence, so HA's config numbers are populated from
  * the gear in seconds rather than over the ~15 min rotation. */

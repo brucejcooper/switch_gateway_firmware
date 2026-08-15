@@ -506,8 +506,12 @@ void dq_tick(void) {
         dq_slave_t *s = &s_dq[i];
         if (!s->in_use) continue;
 
-        /* can_submit is false once a transaction is in flight, so at most one
-         * command per tick per slave goes out regardless. */
+        /* can_submit means ROOM IN THE CLIENT'S SLOT TABLE, nothing more — it
+         * is true with a transaction already on the wire (see the note on
+         * mbq_client_can_submit). What bounds this to one command per tick per
+         * slave is ship_ladder(), which returns after a single ship; what
+         * bounds how much may be in flight at once is the per-class depth each
+         * ship_class() applies against s->outstanding. */
         if (!mbq_client_can_submit(s->slave_id)) continue;
 
         /* One command shipped means this slave used its turn: hand the next

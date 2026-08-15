@@ -1,13 +1,14 @@
 /*
  * modbus.c — Modbus RTU master for the switch gateway.
  *
- * Architecture is unchanged from the original: ISR-driven RX with an alarm
- * for DE release timing, non-blocking poll loop.  Changes from original:
- *   - ACTION_DALI (0x44) removed; TinyModbus uses standard FC04/FC06
- *   - FC04 Read Input Registers added (ACTION_GET_INPUT_REGISTERS)
- *   - Baud rate is configurable, defaulting to 19200 (38400 is marginal
- *     against the TinyModbus ATtiny's internal-RC-oscillator RX sampling)
- *   - Baud rate and DE mode are both persisted to flash filesystem
+ * ISR-driven RX with an alarm for DE release timing, non-blocking poll loop.
+ * Standard FC03/04/05/06/16 plus the queue's one user-defined code, FC 0x41
+ * (ACTION_MBQ_V4 below; QUEUE-PROTOCOL.md is authoritative for its shape).
+ *
+ * Baud rate and DE mode are configurable and persisted in /config.json. The
+ * default is 38400 — see the long note on modbus_set_baud() in modbus.h for why
+ * that reversed the earlier 19200 verdict, and TinyModbus/src/modbus.c's
+ * erratum block for the silicon behaviour behind it.
  */
 
 #include "modbus.h"
@@ -83,17 +84,24 @@ typedef enum {
     ACTION_MBQ_V4                = 0x41,
 } modbus_action_type_t;
 
-/* Largest register block any FC16/FC23 write carries here is the gateway's
- * 4-command submit window (0x1000-0x1007) = 8 registers = 16 bytes.  Sized to
- * that; a longer write is rejected at enqueue time. */
+/* Staging for the bytes that follow the header on a write frame. The only live
+ * user is FC 0x41, whose enqueue payload is at most 3 bytes (addr, data, dtr0);
+ * FC16 shares the buffer and is capped by it at 8 registers, which is the
+ * largest multi-register write the encoder below can emit. 16 is therefore
+ * generous headroom rather than a tight fit — it was sized to a 4-command
+ * submit window at 0x1000-0x1007 that no longer exists. Anything longer is
+ * rejected at enqueue time, so the slack costs 13 bytes of an action record and
+ * nothing else. */
 #define MODBUS_WR_PAYLOAD_MAX 16u
 
 typedef struct {
     modbus_action_type_t action;
     uint8_t              device;
-    uint16_t             address;   /* FC03/04/06: start addr.  FC23: READ start addr. */
-    uint16_t             arg;       /* read count / single-write value.  FC23: READ reg count. */
-    /* FC16/FC23 write side. */
+    uint16_t             address;   /* FC03/04/06: start addr */
+    uint16_t             arg;       /* read count / single-write value.
+                                     * FC 0x41: the control byte. */
+    /* Write side: FC16 uses all four; FC 0x41 uses only wr_payload/wr_len, for
+     * the 0-, 2- or 3-byte enqueue payload that follows its control byte. */
     uint16_t             wr_address;              /* write start addr */
     uint16_t             wr_count;                /* write register count */
     uint8_t              wr_payload[MODBUS_WR_PAYLOAD_MAX]; /* big-endian register bytes */

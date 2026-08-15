@@ -71,8 +71,9 @@ enum { H_OK = 0u, H_FAILED = 1u, H_NAK = 2u };   /* head-entry status; cq.h is a
  * ~50 ms DTR0-pair ahead of a ~50 ms one of your own, times a 1.5 margin
  * (spec §4). This is the ONLY DALI timing the client knows, and it is a
  * failure deadline — never flow control. */
-#define PACE_MIN_MS       2u    /* floor, so an estimate that has already passed
-                                 * still yields to the rest of the main loop   */
+#define PACE_MIN_MS       2u    /* floor on any pace() delay, so a zero-length
+                                 * backoff still yields to the rest of the
+                                 * main loop instead of spinning the bus       */
 #define PACE_FAIL_MS      5u    /* first backoff after a transaction that failed */
 #define PACE_DOWN_MS   1000u    /* backoff ceiling once the link looks dead      */
 /* LINK_DOWN_FAILS is in mbq_client.h — dali_state gates on it too. */
@@ -370,21 +371,11 @@ static uint8_t inflight_count(const slave_t *s) {
     return n;
 }
 
-/* Commands the client believes are still OCCUPYING A GATEWAY COMMAND SLOT.
+/* Room to accept one more command: a free slot, and fewer than
+ * MBQ_QUEUE_DEPTH already staged waiting to go out. Note this asks nothing
+ * about the GATEWAY's occupancy — that is the gateway's to answer.
  *
- * This, not "accepts minus results", is what the in-flight cap has to be
- * measured against. The gateway frees a command slot the moment the command
- * COMPLETES; the result then sits in the response queue, which is a different
- * resource with its own depth. So a command whose estimated completion has
- * passed no longer occupies a command slot even though the master has not read
- * its result yet — and admitting one more command at that point is precisely
- * what lets a single transaction ack the old result and enqueue the new one.
- *
- * The estimate is deliberately conservative in the safe direction: it is
- * anchored at the moment the ACCEPT REPLY was parsed, roughly half a
- * transaction after the gateway really began executing, so it runs late. Late
- * costs a little latency; early costs an A_FULL and a wasted transaction. */
-/* A_FULL IS FLOW CONTROL (user decision, 2026-08-12). The client does NOT
+ * A_FULL IS FLOW CONTROL (user decision, 2026-08-12). The client does NOT
  * predict how full the gateway is — it offers a command and lets the gateway
  * answer. A refusal costs one transaction and that transaction is not wasted:
  * every reply carries the head of the response queue, so a bounced enqueue
