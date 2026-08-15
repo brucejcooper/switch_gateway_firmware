@@ -16,9 +16,11 @@ an enqueue refused with A_FULL costs a transaction and carries no command, so
 counting it as one flatters any change that converts polls into re-offers —
 which is exactly what raising a queue depth does. The honest denominator is the
 number of commands that REACHED A TERMINAL OUTCOME in the window, i.e. the sum
-of the client's result counters (complete + failed + lost + result_lost; a NAK
-lands in `lost`, so absent-address probes are counted, as they must be — they
-each cost a DALI frame). Both ratios are printed: `txns/cmd` is the real one,
+of the client's result counters (complete + failed + lost + result_lost + nak +
+link_down). Every class on that line must be summed or the denominator quietly
+shrinks: `nak` in particular is where the absent-address probes land since task
+11 split it out of `lost`, and they must be counted — each one costs a real DALI
+frame. Both ratios are printed: `txns/cmd` is the real one,
 `txns/enq` is the one the 2026-08-15 baseline log quotes, kept so the two runs
 can be compared line for line. They agree exactly when A_FULL is 0.
 
@@ -83,7 +85,11 @@ class Rig:
     # ── counters ─────────────────────────────────────────────────────────────
     TXN_RE = re.compile(r"txns: (\d+) enqueue \+ (\d+) poll \((\d+) recovery\), "
                         r"(\d+) timeout,\s*(\d+) A_FULL, (\d+) resend")
-    RES_RE = re.compile(r"results: complete=(\d+) failed=(\d+) lost=(\d+) result_lost=(\d+)")
+    # Every terminal outcome, because `cmds` below is the denominator: a class
+    # left off this line stops being counted as a DALI command and inflates
+    # txns/cmd. `nak` split out of `lost` in task 11 for exactly that reason.
+    RES_RE = re.compile(r"results: complete=(\d+) failed=(\d+) lost=(\d+) "
+                        r"result_lost=(\d+) nak=(\d+) link_down=(\d+)")
 
     def counters(self):
         """(enqueues, polls, a_full, commands) — commands = terminal outcomes."""

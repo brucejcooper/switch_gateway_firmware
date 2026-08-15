@@ -75,7 +75,38 @@ enum { H_OK = 0u, H_FAILED = 1u, H_NAK = 2u };   /* head-entry status; cq.h is a
                                  * still yields to the rest of the main loop   */
 #define PACE_FAIL_MS      5u    /* first backoff after a transaction that failed */
 #define PACE_DOWN_MS   1000u    /* backoff ceiling once the link looks dead      */
-#define LINK_DOWN_FAILS   3u
+/* LINK_DOWN_FAILS is in mbq_client.h — dali_state gates on it too. */
+
+/* How long a DECLARED-DOWN link must stay down before the client stops paying
+ * for the §4 recovery ladder and fails new work immediately.
+ *
+ * The threshold alone cannot separate the two cases that both read
+ * "c_consec_fail >= LINK_DOWN_FAILS", and they want opposite treatment:
+ *
+ *   a gateway REBOOTING — down for ~1 s and coming back. Its in-flight
+ *     idempotent work must ride the outage out, because dropping it is the
+ *     gate-V2 defect: the soak's SET goes missing, DTR0 keeps the previous
+ *     pair's value, and the paired query reads stale (see recovery_give_up).
+ *
+ *   a gateway that is NOT THERE — configured but absent, down since boot. Every
+ *     submission is doomed before it is made, and the ladder spends 8 s of held
+ *     slots and ~5 WARN lines per attempt proving it. dali_state probes such a
+ *     slave every LINK_RETRY_MS (5 s) forever, so that is a permanent saga.
+ *
+ * TIME is what tells them apart, so time is what this gates on. Below it,
+ * NOTHING changes — R1/R1' and the whole ladder run exactly as before, which is
+ * what a single lost frame on a healthy link needs.
+ *
+ * The value is set by how long REDISCOVERY takes, not by how long a restart
+ * takes, and rediscovery is the transport's to do: modbus.c stops putting a
+ * dead slave on the wire and lets exactly one probe through per backoff window,
+ * the first of which is 1 s (MODBUS_BACKOFF_MIN_MS). So a gateway that restarts
+ * in ~1 s is not seen answering again until ~2-2.5 s after the link went down,
+ * and anything shorter than that would drop the very work the ride-out exists
+ * to carry. Four seconds leaves a comfortable margin and is still half of
+ * CMD_MAX_LIFE_MS, the absolute bound this short-circuits: a permanently absent
+ * slave pays for one 4 s ladder at boot and nothing after it. */
+#define LINK_QUIET_MS  4000u
 
 /* Grace given to the SCHEDULER before the client spends a transaction on a
  * poll. When the oldest command comes due, the right next transaction is
@@ -249,6 +280,9 @@ typedef struct {
     uint32_t w_n, w_min, w_max, w_fail, w_busy;
     uint64_t w_sum;
     uint16_t c_consec_fail;
+    uint64_t link_down_us;      /* when c_consec_fail crossed LINK_DOWN_FAILS;
+                                 * 0 = the link is up. Any valid reply clears
+                                 * it, exactly as it clears c_consec_fail.    */
 
     mbq_stats_t stats;
 } slave_t;
@@ -400,19 +434,54 @@ static void pace_backoff(slave_t *s) {
 }
 
 
-static void deliver(slave_t *s, cmd_t *c, mbq_result_t r, uint8_t resp8) {
+/* The link has been DECLARED down (LINK_DOWN_FAILS consecutive no-replies).
+ * Used only to pick a log LEVEL: while a slave is not answering, the ladder's
+ * per-command narration is noise, and the one line worth printing has already
+ * been printed one layer down (modbus.c's "slave %u unresponsive — backing off"
+ * / "answering again — backoff cleared"). Mirror it, do not duplicate it. */
+static bool link_down(const slave_t *s) { return s->link_down_us != 0; }
+
+/* ...and it has stayed down past the point where a gateway restart could
+ * explain it (LINK_QUIET_MS). This, not link_down(), gates BEHAVIOUR. */
+static bool link_written_off(const slave_t *s) {
+    return s->link_down_us != 0 &&
+           (MBQ_NOW_US() - s->link_down_us) >= (uint64_t)LINK_QUIET_MS * 1000u;
+}
+
+/* WARN on a healthy link, DBG on a link already known to be down. Same text
+ * either way — the difference is whether it is news. */
+#define LOG_LINK(s, ...) \
+    log_emit(link_down(s) ? LOG_LEVEL_DBG : LOG_LEVEL_WARN, \
+             link_down(s) ? "D" : "W", "mbq", __VA_ARGS__)
+
+/* Deliver a terminal outcome and charge it to `stat`. Split out so the two
+ * outcomes that are NOT protocol losses — a NAK, and a command failed fast
+ * against a link that is down — can be delivered as MBQ_R_NAK/MBQ_R_LOST to the
+ * caller (which is what they are) while being counted somewhere honest. */
+static void deliver_as(slave_t *s, cmd_t *c, mbq_result_t r, uint8_t resp8,
+                       uint32_t *stat) {
     mbq_cb_t cb = c->cb;
     void *ctx = c->ctx;
     c->st = CMD_FREE;      /* free before the callback: it may submit again */
     c->cb = NULL;
     c->seq = 0;
-    switch (r) {
-        case MBQ_R_COMPLETE:    s->stats.completed++;   break;
-        case MBQ_R_FAILED:      s->stats.failed++;      break;
-        case MBQ_R_RESULT_LOST: s->stats.result_lost++; break;
-        default:                s->stats.lost++;        break;
-    }
+    (*stat)++;
     if (cb) cb(s->slave_id, r, resp8, ctx);
+}
+
+static void deliver(slave_t *s, cmd_t *c, mbq_result_t r, uint8_t resp8) {
+    uint32_t *stat;
+    switch (r) {
+        case MBQ_R_COMPLETE:    stat = &s->stats.completed;   break;
+        case MBQ_R_FAILED:      stat = &s->stats.failed;      break;
+        case MBQ_R_RESULT_LOST: stat = &s->stats.result_lost; break;
+        /* A clean "the gear did not answer" is a normal outcome on a sparse
+         * bus, not a loss. It used to fall into the default: arm below and was
+         * most of the bench's lost=1106 — 62 empty addresses per scan. */
+        case MBQ_R_NAK:         stat = &s->stats.naks;        break;
+        default:                stat = &s->stats.lost;        break;
+    }
+    deliver_as(s, c, r, resp8, stat);
 }
 
 /* Put a command back on the wire, or give up on it. Shared by R1', A_FULL and
@@ -420,7 +489,7 @@ static void deliver(slave_t *s, cmd_t *c, mbq_result_t r, uint8_t resp8) {
  * place. */
 static void resend_or_lose(slave_t *s, cmd_t *c, mbq_result_t give_up_as) {
     if (c->resends >= MAX_RESENDS) {
-        LOG_WARN("mbq", "slave %u: command %02X%02X resent %u times without a "
+        LOG_LINK(s, "slave %u: command %02X%02X resent %u times without a "
                  "result — giving up", s->slave_id, c->cmd[0], c->cmd[1],
                  (unsigned)c->resends);
         deliver(s, c, give_up_as, 0);
@@ -517,8 +586,14 @@ static void mbq_modbus_cb(int res, uint8_t *buf, void *ctx) {
         /* Link liveness: a Modbus exception is still an ANSWER — the gateway is
          * alive and disagreeing — so only a genuine no-reply counts against it. */
         if (res == 0 && s->c_consec_fail < 0xFFFFu) s->c_consec_fail++;
+        /* Stamp the DOWN transition once. What the fast-fail needs to know is
+         * not how many failures there have been but how long they have been
+         * going on — a gateway restart is short, an absent gateway is not. */
+        if (s->c_consec_fail >= LINK_DOWN_FAILS && s->link_down_us == 0)
+            s->link_down_us = MBQ_NOW_US();
     } else {
         s->c_consec_fail = 0;
+        s->link_down_us  = 0;
     }
     s->cb_res = res;
     s->cb_len = 0;
@@ -1113,7 +1188,7 @@ static void resolve_sysinfo(slave_t *s, const uint8_t *b, uint8_t n) {
  * we were reading it wanted to know "did this command run?", and the answer is
  * now unknowable — so take the disposition that assumes it might have. */
 static void bootchk_give_up(slave_t *s) {
-    LOG_WARN("mbq", "slave %u: boot_count unreadable — disposing conservatively",
+    LOG_LINK(s, "slave %u: boot_count unreadable — disposing conservatively",
              s->slave_id);
     s->bc_valid = false;
     if ((s->bc_reason == BC_ACKLESS || s->bc_reason == BC_R1_EMPTY)
@@ -1163,16 +1238,26 @@ static void recovery_give_up(slave_t *s) {
      * already stops this costing bus, and CMD_MAX_LIFE_MS guarantees a
      * terminal disposition for a gateway that never comes back — which is the
      * property the recovery path must not lose. */
-    bool link_down = (s->c_consec_fail > 0);
-    bool too_old   = (MBQ_NOW_US() - c->born_us) >= (uint64_t)CMD_MAX_LIFE_MS * 1000u;
+    bool failing  = (s->c_consec_fail > 0);
+    bool too_old  = (MBQ_NOW_US() - c->born_us) >= (uint64_t)CMD_MAX_LIFE_MS * 1000u;
 
-    if (c->idempotent && link_down && !too_old) {
+    /* A link that has been down long enough to be written off (LINK_QUIET_MS)
+     * is not a gateway mid-restart, and re-queueing into it just repeats this
+     * whole procedure until CMD_MAX_LIFE_MS. Fail it here instead — same
+     * terminal verdict, 8 s sooner, and charged to link_down_drops because the
+     * protocol lost nothing. Above the ride-out window this is unchanged. */
+    if (link_written_off(s)) {
+        deliver_as(s, c, MBQ_R_LOST, 0, &s->stats.link_down_drops);
+        return;
+    }
+
+    if (c->idempotent && failing && !too_old) {
         c->seq = 0;
         c->st  = CMD_PENDING;
         return;                       /* deliberately NOT counted as a resend */
     }
 
-    LOG_WARN("mbq", "slave %u: recovery for %02X%02X timed out unresolved — "
+    LOG_LINK(s, "slave %u: recovery for %02X%02X timed out unresolved — "
              "disposing", s->slave_id, c->cmd[0], c->cmd[1]);
     if (c->idempotent) resend_or_lose(s, c, MBQ_R_LOST);
     else               deliver(s, c, MBQ_R_LOST, 0);
@@ -1230,7 +1315,7 @@ static void resolve_failure(slave_t *s) {
         return;
     }
 
-    bool link_down = (s->c_consec_fail >= LINK_DOWN_FAILS);
+    bool down = link_down(s);
     pace_backoff(s);
 
     if (s->tx_kind == TX_VERSION) {
@@ -1243,7 +1328,7 @@ static void resolve_failure(slave_t *s) {
          * but a command cannot be left unresolved forever waiting for a gateway
          * that is gone — so once the link is declared down, classify the way an
          * unreadable boot_count demands: conservatively, as if it had changed. */
-        if (link_down) bootchk_give_up(s);
+        if (down) bootchk_give_up(s);
         return;
     }
 
@@ -1260,6 +1345,28 @@ static void resolve_failure(slave_t *s) {
             s->epoch_clean = false;
             s->st = S_IDLE;
         }
+        return;
+    }
+
+    /* THE FAST-FAIL. A link written off (declared down, and down for longer
+     * than a gateway restart takes) has already answered the only question the
+     * recovery ladder would ask: the transport says NOTHING, so no frame
+     * reached the gateway, so no DALI frame happened and there is no result to
+     * reconcile. Running the ladder anyway costs ~8 s of held slots and five
+     * WARN lines per attempt to reach the verdict it starts with — and against
+     * a configured-but-absent slave, which dali_state probes every 5 s forever,
+     * that is a permanent saga. Deliver the verdict now.
+     *
+     * NOT a shortcut around §4. Everything below LINK_QUIET_MS still runs the
+     * full ladder, which is where R1/R1' live and where a single lost frame on
+     * an otherwise healthy link is resolved — that case is scar tissue and this
+     * does not touch it. Counted as link_down_drops, not `lost`: the protocol
+     * lost nothing, there was no wire for it to lose anything on. */
+    if (link_written_off(s)) {
+        cmd_t *c = &s->cmd[s->tx_cmd];
+        LOG_DBG("mbq", "slave %u: link down, failing %02X%02X without recovery",
+                s->slave_id, c->cmd[0], c->cmd[1]);
+        deliver_as(s, c, MBQ_R_LOST, 0, &s->stats.link_down_drops);
         return;
     }
 
@@ -1751,6 +1858,11 @@ void mbq_client_debug_print(int slave_id) {
                        s->slave_id, state_name(s->st), s->busy ? " (on wire)" : "",
                        s->gw_major, s->gw_minor, s->stats.boot_count,
                        s->epoch_clean ? "" : " EPOCH-UNCLEAN");
+        if (link_down(s))
+            cdc_out_printf("  LINK DOWN for %lu ms (%u consecutive no-reply)%s\n",
+                           (unsigned long)((MBQ_NOW_US() - s->link_down_us) / 1000u),
+                           (unsigned)s->c_consec_fail,
+                           link_written_off(s) ? " — failing submissions fast" : "");
         mbq_stats_t live;
         mbq_client_stats(s->slave_id, &live);
         cdc_out_printf("  ack_pending=%u head=%u last_seq=%u%s  respq~%u occupancy=%u/%u\n",
@@ -1780,9 +1892,11 @@ void mbq_client_debug_print(int slave_id) {
         cdc_out_printf("  faults: predicted-seq=%lu orphans=%lu protocol=%lu\n",
                        (unsigned long)t->pred_faults, (unsigned long)t->orphans,
                        (unsigned long)t->proto_errors);
-        cdc_out_printf("  results: complete=%lu failed=%lu lost=%lu result_lost=%lu\n",
+        cdc_out_printf("  results: complete=%lu failed=%lu lost=%lu result_lost=%lu "
+                       "nak=%lu link_down=%lu\n",
                        (unsigned long)t->completed, (unsigned long)t->failed,
-                       (unsigned long)t->lost, (unsigned long)t->result_lost);
+                       (unsigned long)t->lost, (unsigned long)t->result_lost,
+                       (unsigned long)t->naks, (unsigned long)t->link_down_drops);
 
         mbq_txn_stats_t ts;
         mbq_client_txn_stats(s->slave_id, &ts);

@@ -261,11 +261,26 @@ static void backoff_note(uint8_t slave, bool answered) {
     }
     if (b->fails < 0xFFu) b->fails++;
     if (b->fails < MODBUS_BACKOFF_TRIP) return;
+    bool transition = (b->backoff_ms == 0);
     b->backoff_ms = b->backoff_ms ? (b->backoff_ms * 2u) : MODBUS_BACKOFF_MIN_MS;
     if (b->backoff_ms > MODBUS_BACKOFF_MAX_MS) b->backoff_ms = MODBUS_BACKOFF_MAX_MS;
     b->retry_at = make_timeout_time_ms(b->backoff_ms);
-    LOG_WARN("modbus", "slave %u unresponsive — backing off %lu ms",
-             slave, (unsigned long)b->backoff_ms);
+    /* ONE line per DOWN transition, to pair with the one INFO on recovery
+     * above. Every re-trip after that is a probe finding the slave still
+     * absent, which is the backoff working and not news — and at the 60 s
+     * ceiling it is a WARN a minute, forever, per absent slave. */
+    if (transition)
+        LOG_WARN("modbus", "slave %u unresponsive — backing off %lu ms",
+                 slave, (unsigned long)b->backoff_ms);
+    else
+        LOG_DBG("modbus", "slave %u still unresponsive — backing off %lu ms",
+                slave, (unsigned long)b->backoff_ms);
+}
+
+/* True if this slave is currently being kept off the wire. */
+static bool backoff_active(uint8_t slave) {
+    mb_backoff_t *b = backoff_for(slave);
+    return b && b->backoff_ms;
 }
 
 /* True if this request should be failed without touching the bus. Lets exactly
@@ -835,9 +850,17 @@ void modbus_poll(void) {
                          currentAction.device, (unsigned)currentAction.action,
                          (unsigned)s_attempts_left);
             } else {
-                LOG_WARN("modbus", "rx timeout slave=%u fc=0x%02x (gave up)",
-                         currentAction.device, (unsigned)currentAction.action);
                 backoff_note(currentAction.device, false);
+                /* Only news while the slave is still expected to answer. Once
+                 * the backoff owns it, this line is the periodic probe failing
+                 * — which the transition WARN above has already reported and
+                 * the `backoff:` busload counters track. */
+                if (backoff_active(currentAction.device))
+                    LOG_DBG("modbus", "rx timeout slave=%u fc=0x%02x (gave up)",
+                            currentAction.device, (unsigned)currentAction.action);
+                else
+                    LOG_WARN("modbus", "rx timeout slave=%u fc=0x%02x (gave up)",
+                             currentAction.device, (unsigned)currentAction.action);
                 if (currentAction.callback)
                     currentAction.callback(0, buf, currentAction.ctx);
             }
