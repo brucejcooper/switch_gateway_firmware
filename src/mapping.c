@@ -1,4 +1,5 @@
 #include "mapping.h"
+#include "log.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -11,6 +12,7 @@ mapping_record_t g_mappings[MAX_FIXTURES][MAX_BUTTONS];
  * fwrite() of mapping_record_t, a layout change can no longer silently corrupt
  * the file, missing/extra fields are tolerated, and it's human-inspectable. */
 #define MAPPINGS_PATH        "/mappings.json"
+#define MAPPINGS_PATH_TMP    "/mappings.json.tmp"
 #define MAPPINGS_PATH_LEGACY "/mappings.bin"
 #define MAPPINGS_VERSION     1
 
@@ -105,6 +107,11 @@ static bool mapping_load_legacy(void) {
 
 bool mapping_load(void) {
     memset(g_mappings, 0, sizeof(g_mappings));
+    /* A power cut between mapping_save()'s fclose() and rename() leaves the
+     * new table sitting in the .tmp file with the old MAPPINGS_PATH still
+     * intact and authoritative — discard the orphaned .tmp so a later save
+     * doesn't confuse it for anything meaningful. */
+    remove(MAPPINGS_PATH_TMP);
     FILE *fp = fopen(MAPPINGS_PATH, "r");
     if (!fp) {
         mapping_load_legacy();
@@ -127,7 +134,14 @@ bool mapping_load(void) {
 }
 
 bool mapping_save(void) {
-    FILE *fp = fopen(MAPPINGS_PATH, "w");
+    /* Write the full table to a .tmp file first, then rename() it over the
+     * live path — littlefs rename is a single atomic metadata commit, so a
+     * power cut anywhere in this function leaves either the old table or
+     * the new one intact, never a truncated one. The old fopen(path, "w")
+     * destroyed the old table before the new one was durable, which is the
+     * exact silent-binding-loss failure the JSON format was meant to fix
+     * (see CLAUDE.md "Persistence (2026-06-07)"). */
+    FILE *fp = fopen(MAPPINGS_PATH_TMP, "w");
     if (!fp) return false;
     fprintf(fp, "{\"format\":\"mappings\",\"version\":%d}\n", MAPPINGS_VERSION);
     char tbuf[256];
@@ -140,8 +154,17 @@ bool mapping_save(void) {
             if (fprintf(fp, "{\"fixture\":%u,\"button\":%u,\"targets\":%s}\n",
                         r->fixture, r->button, tbuf) < 0) ok = false;
         }
-    fclose(fp);
-    return ok;
+    /* pico-vfs's littlefs backend exposes no separate fsync(); fclose()
+     * reaches lfs_file_close(), which syncs the file's data to flash before
+     * returning, so this is the actual durability boundary. */
+    if (fflush(fp) != 0) ok = false;
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) return false;
+    if (rename(MAPPINGS_PATH_TMP, MAPPINGS_PATH) != 0) {
+        LOG_ERR("mapping", "save failed: rename %s -> %s", MAPPINGS_PATH_TMP, MAPPINGS_PATH);
+        return false;
+    }
+    return true;
 }
 
 const mapping_record_t *mapping_lookup(uint8_t fixture, uint8_t button) {
