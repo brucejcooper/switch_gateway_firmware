@@ -183,10 +183,19 @@ int main(void) {
     erase_bc();
 
     /* Stage + confirm A (mirrors a normal OTA that booted and was proven
-     * good) — this is the "outgoing active image" B's finish() will see. */
+     * good) — this is the "outgoing active image" B's finish() will see.
+     * ota_stage_confirm() is now a no-op on a PENDING record (see (e)
+     * below), so simulate the bootloader's commit step in between — it
+     * clears BC_F_PENDING and persists that before the app (and its
+     * eventual confirm) ever runs — exactly like the real boot sequence:
+     * ota_stage_finish() (PENDING) -> bootloader commit (PENDING cleared)
+     * -> app boots -> ota_stage_confirm(). */
     ota_stage_begin();
     stream_in_chunks(g_image, total_len);
     CHECK(ota_stage_finish(total_len) == true);
+    CHECK(bc_read(&bc) == true);
+    bc.flags &= ~BC_F_PENDING;
+    CHECK(bc_write(&bc) == true);
     ota_stage_confirm();
     CHECK(bc_read(&bc) == true);
     CHECK((bc.flags & BC_F_CONFIRMED) != 0);
@@ -228,6 +237,32 @@ int main(void) {
     CHECK(bc.staged_len == total_len_b);
     CHECK((bc.flags & BC_F_BACKUP_VALID) == 0);   /* nothing safe to roll back to */
     CHECK(bc.backup_len == 0);
+
+    /* ── (e) confirm on a PENDING record is a no-op ──────────────────────
+     * Reachable race (see ota_stage.c's ota_stage_confirm() comment): the
+     * healthy-boot confirm one-shot in src/net/ota.c can fire against a
+     * record ota_stage_finish() just wrote for a brand-new candidate,
+     * before the post-install reboot actually happens. That record
+     * describes STAGING, not whatever is running right now — confirming it
+     * must be a no-op, not a write that sets BC_F_CONFIRMED on a PENDING
+     * record (which would silently disarm crash-loop rollback for whatever
+     * eventually gets committed — see bootloader/main.c). */
+    erase_staging();
+    erase_bc();
+
+    ota_stage_begin();
+    stream_in_chunks(g_image, total_len);
+    CHECK(ota_stage_finish(total_len) == true);
+    CHECK(bc_read(&bc) == true);
+    CHECK((bc.flags & BC_F_PENDING) != 0);   /* sanity: freshly staged, still pending */
+    uint32_t seq_before = bc.seq;
+
+    ota_stage_confirm();
+
+    CHECK(bc_read(&bc) == true);
+    CHECK((bc.flags & BC_F_PENDING) != 0);      /* still pending */
+    CHECK((bc.flags & BC_F_CONFIRMED) == 0);    /* NOT confirmed */
+    CHECK(bc.seq == seq_before);                /* no flash write happened at all */
 
     if (fail) {
         printf("FAILED\n");

@@ -225,6 +225,27 @@ void ota_stage_abort(void) {
 void ota_stage_confirm(void) {
     struct boot_control bc;
     if (!bc_read(&bc)) return;   /* nothing valid to confirm */
+    /* Reachable race (src/net/ota.c): ota_poll()'s 30 s healthy-boot confirm
+     * one-shot (OTA_CONFIRM_UPTIME_MS) runs unconditionally at the top of
+     * every tick, "independent of the download state machine" — including
+     * the tick where ota_succeed() has just pushed IC_CMD_REBOOT after a
+     * brand-new install finished staging. controller_reboot() takes on the
+     * order of ~350 ms to actually take effect from there (intercore queue
+     * drain + the reboot path itself), and IC_CMD_OTA_CONFIRM is checked
+     * (and so can be queued) before that tick's REBOOT is even pushed, so
+     * both commands can land on core 0 before the reboot happens. If they
+     * do, bc_read() above returns the record ota_stage_finish() JUST wrote
+     * for the newly-staged candidate — BC_F_PENDING set, describing
+     * STAGING, not whatever is actually running right now. Confirming that
+     * record marks the CANDIDATE confirmed before it has ever booted, and
+     * pairs with a bootloader-side gap (bootloader/main.c): a
+     * PENDING|CONFIRMED record commits silently on every boot without ever
+     * bumping boot_attempts, permanently disarming crash-loop rollback for
+     * whatever gets committed. A PENDING record is never the currently-
+     * running image's own record, so there is nothing here to legitimately
+     * confirm — bail out and let the eventual real boot of that candidate
+     * re-arm its own 30 s timer instead. */
+    if (bc.flags & BC_F_PENDING) return;
     /* Idempotent: already confirmed with a clean attempt count -> no needless
      * flash erase/program. This is called once per healthy boot, so without
      * this guard every boot would wear a boot-control sector for nothing. */

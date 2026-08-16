@@ -537,8 +537,28 @@ int main(void) {
 
     boot_action_t action = boot_decide(&bc, bc_valid, MAX_BOOT_ATTEMPTS);
 
+    /* Set only when try_commit_staging() below clears BC_F_PENDING in `bc`
+     * without itself writing it to flash (see that function's doc comment —
+     * the write is deliberately deferred to the shared step at the bottom
+     * of this function). Tracked as its own bool, rather than diffing
+     * bc.flags before/after, so try_rollback()'s own already-persisted
+     * record (see below) can never accidentally trigger a second, redundant
+     * write here — only a REAL unwritten commit does. main() must fold this
+     * into whichever write ends up happening below, or a PENDING flag
+     * cleared only in RAM here can silently never reach flash: if the
+     * active image the commit just produced happens to already be
+     * BC_F_CONFIRMED (the crash-loop-restore case can't reach this, but a
+     * hand-crafted/corrupted PENDING|CONFIRMED record could), the old code
+     * below only ever wrote on the `!(bc.flags & BC_F_CONFIRMED)` branch —
+     * so that record would commit successfully and silently EVERY boot,
+     * never actually persisting the clear and never bumping boot_attempts,
+     * permanently disarming crash-loop rollback for whatever gets
+     * committed. */
+    bool pending_clear_unwritten = false;
+
     if (action == BOOT_COMMIT_STAGING) {
         action = try_commit_staging(&bc);
+        if (action == BOOT_ACTIVE) pending_clear_unwritten = true;
     }
 
     if (action == BOOT_ROLLBACK) {
@@ -550,7 +570,9 @@ int main(void) {
          * On success it also updates `bc` in place to the freshly-
          * persisted, CONFIRMED record naming the restored image, so the
          * BOOT_ACTIVE handling just below verifies and jumps to THAT
-         * image. */
+         * image. try_rollback() already wrote that record itself, so
+         * pending_clear_unwritten stays false here — nothing left for the
+         * write below to do for this path. */
         action = try_rollback(&bc);
     }
 
@@ -565,17 +587,32 @@ int main(void) {
          * signed length here, however many boots later. */
         if (!fw_verify((const uint8_t *)PART_XIP(APP_OFF), bc.staged_len, FW_PUBKEY)) {
             action = BOOT_STUCK;
-        } else if (!(bc.flags & BC_F_CONFIRMED)) {
-            /* About to boot an unconfirmed image — either freshly
-             * committed just above, or a plain retry still within budget.
-             * Bump+persist boot_attempts now, BEFORE jumping, so a crash
-             * during *this* attempt is visible to the crash-loop check on
-             * the next boot (this is also the single bc_write that
-             * persists try_commit_staging()'s in-RAM BC_F_PENDING clear,
-             * if this boot came through that path — one write, one seq
-             * bump, for the whole commit-and-boot sequence). */
-            bc.boot_attempts += 1;
-            bc_write(&bc);
+        } else {
+            /* Whatever RAM-only change try_commit_staging() made above
+             * (pending_clear_unwritten) must reach flash on this boot no
+             * matter which of the two conditions below actually holds —
+             * see pending_clear_unwritten's own doc comment for why. */
+            bool need_write = pending_clear_unwritten;
+            if (!(bc.flags & BC_F_CONFIRMED)) {
+                /* About to boot an unconfirmed image — either freshly
+                 * committed just above, or a plain retry still within
+                 * budget. Bump boot_attempts now, BEFORE jumping, so a
+                 * crash during *this* attempt is visible to the crash-loop
+                 * check on the next boot. */
+                bc.boot_attempts += 1;
+                need_write = true;
+            }
+            /* Common case (freshly committed and unconfirmed, or a plain
+             * unconfirmed retry): both conditions land on the same single
+             * bc_write() below — one write, one seq bump, for the whole
+             * commit-and-boot sequence, exactly as before this fix. The
+             * only new case is an already-CONFIRMED record whose PENDING
+             * clear from try_commit_staging() would otherwise be lost: that
+             * now still gets its own write here, just without a
+             * boot_attempts bump (a confirmed image doesn't own a retry
+             * budget). Already-confirmed with nothing pending
+             * (need_write == false) still costs no write, same as before. */
+            if (need_write) bc_write(&bc);
         }
     }
     /* action == BOOT_ACTIVE && !bc_valid: no boot_control record has ever
