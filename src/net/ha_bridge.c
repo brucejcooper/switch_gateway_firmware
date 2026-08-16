@@ -1058,11 +1058,12 @@ static bool jtok_eq(const char *js, const jsmntok_t *t, const char *s) {
     return t->type == JSMN_STRING && (int)strlen(s) == len && strncmp(js + t->start, s, len) == 0;
 }
 static int jfind(const char *js, const jsmntok_t *t, int n, const char *key) {
-    for (int i = 1; i < n; i++) if (jtok_eq(js, &t[i], key)) return i + 1;
+    for (int i = 1; i < n; i++) if (jtok_eq(js, &t[i], key)) return (i + 1 < n) ? i + 1 : -1;
     return -1;
 }
 static long jint(const char *js, const jsmntok_t *t) {
-    char b[16]; int len = t->end - t->start; if (len >= (int)sizeof b) len = (int)sizeof b - 1;
+    char b[16]; int len = t->end - t->start; if (len < 0) return 0;
+    if (len >= (int)sizeof b) len = (int)sizeof b - 1;
     memcpy(b, js + t->start, len); b[len] = '\0'; return strtol(b, NULL, 10);
 }
 

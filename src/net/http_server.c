@@ -290,11 +290,12 @@ static bool jeq(const char *js, const jsmntok_t *t, const char *s) {
            strncmp(js + t->start, s, len) == 0;
 }
 static int jfind(const char *js, const jsmntok_t *t, int n, const char *key) {
-    for (int i = 1; i < n; i++) if (jeq(js, &t[i], key)) return i + 1;
+    for (int i = 1; i < n; i++) if (jeq(js, &t[i], key)) return (i + 1 < n) ? i + 1 : -1;
     return -1;
 }
 static long jint(const char *js, const jsmntok_t *t) {
-    char b[16]; int len = t->end - t->start; if (len >= (int)sizeof b) len = (int)sizeof b - 1;
+    char b[16]; int len = t->end - t->start; if (len < 0) return 0;
+    if (len >= (int)sizeof b) len = (int)sizeof b - 1;
     memcpy(b, js + t->start, len); b[len] = '\0'; return strtol(b, NULL, 10);
 }
 static bool jhas(const char *js, const jsmntok_t *t, int n, const char *key) {
@@ -308,7 +309,8 @@ static void jstr_key(const char *js, const jsmntok_t *t, int n, const char *key,
     out[0] = '\0';
     int i = jfind(js, t, n, key);
     if (i < 0) return;
-    int len = t[i].end - t[i].start; if (len >= (int)cap) len = (int)cap - 1;
+    int len = t[i].end - t[i].start; if (len < 0) { out[0] = '\0'; return; }
+    if (len >= (int)cap) len = (int)cap - 1;
     memcpy(out, js + t[i].start, len); out[len] = '\0';
 }
 static bool jbool_key(const char *js, const jsmntok_t *t, int n, const char *key, bool def) {
