@@ -33,6 +33,7 @@
 #include "pico/time.h"
 #include <string.h>
 #include "cdc_out.h"
+#include "core1.h"   /* wd_feed */
 
 /* ── Scheduler shape ────────────────────────────────────────────────────────
  * There is no single FIFO backlog any more. Two reasons, both measured:
@@ -548,6 +549,10 @@ bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
     while (!s_sync_have && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         modbus_poll();
         dq_tick();
+        /* Long CLI-driven chains (dali_read_mem, cmd_blink) call this up to
+         * ~193 times; feed here or the 5 s watchdog fires mid-command
+         * (core-1-gated, so a real core-1 wedge still reboots). */
+        wd_feed();
     }
     if (!s_sync_have) { if (result) *result = DQ_RES_TIMEOUT; return false; }
     if (result) *result = s_sync_res;
