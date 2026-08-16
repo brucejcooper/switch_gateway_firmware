@@ -28,6 +28,26 @@ typedef struct {
     uint8_t  dali_slave_ids[MAX_DALI_SLAVES];
     uint8_t  dali_slave_count;
 
+    /* Pending relay_slaves/dali_slaves rewrite, staged by `cfg relay_slaves=`/
+     * `dali_slaves=` (CLI). These lists are persist-only, reboot-to-apply: every
+     * consumer above binds slave_id -> array index once at boot (dali_state.c,
+     * dirty_poll.c, dali_queue.c keep their own frozen slave_id/idx tables) while
+     * state_cache_slave_idx() recomputes the index live from
+     * relay_slave_ids/dali_slave_ids on every call. Writing a rewrite straight
+     * into the live arrays made the frozen tables and the live lookup disagree
+     * mid-session, so e.g. removing slave 2 from a {2,3} list re-numbered slave
+     * 3 to index 0 and caused emit_state_dali to publish slave 2's stale cached
+     * state under slave 3's name while dirty_poll kept polling the removed
+     * slave. config_save() persists these pending values in place of the live
+     * ones when a rewrite is pending; the live arrays only pick it up on the
+     * next config_load() at boot. */
+    bool     relay_slaves_pending;
+    uint8_t  pending_relay_slave_ids[MAX_RELAY_SLAVES];
+    uint8_t  pending_relay_slave_count;
+    bool     dali_slaves_pending;
+    uint8_t  pending_dali_slave_ids[MAX_DALI_SLAVES];
+    uint8_t  pending_dali_slave_count;
+
     /* Modbus bus settings (migrated from /modbus_baud.txt + /modbus_config.txt). */
     uint32_t baud;                 /* default 19200 */
     uint8_t  de_mode;              /* modbus_de_mode_t, default 0 (when-tx) */

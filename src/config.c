@@ -201,11 +201,19 @@ bool config_save(void) {
         (unsigned long)g_config.gw_diag_interval_ms,
         (unsigned long)g_config.dali_sweep_interval_ms,
         (unsigned long)g_config.baud, g_config.de_mode, g_config.relay_byteswap ? 1u : 0u);
-    for (int i = 0; i < g_config.relay_slave_count; i++)
-        fprintf(fp, "%s%u", i ? "," : "", g_config.relay_slave_ids[i]);
+    /* A pending rewrite (see config.h) is persisted here, NOT applied to the
+     * live relay_slave_ids/dali_slave_ids arrays (or their counts) — those stay
+     * whatever they were at boot until the next config_load() re-reads this
+     * file. */
+    const uint8_t *rs = g_config.relay_slaves_pending ? g_config.pending_relay_slave_ids : g_config.relay_slave_ids;
+    uint8_t rc = g_config.relay_slaves_pending ? g_config.pending_relay_slave_count : g_config.relay_slave_count;
+    for (int i = 0; i < rc; i++)
+        fprintf(fp, "%s%u", i ? "," : "", rs[i]);
     fprintf(fp, "],\"dali_slaves\":[");
-    for (int i = 0; i < g_config.dali_slave_count; i++)
-        fprintf(fp, "%s%u", i ? "," : "", g_config.dali_slave_ids[i]);
+    const uint8_t *ds = g_config.dali_slaves_pending ? g_config.pending_dali_slave_ids : g_config.dali_slave_ids;
+    uint8_t dc = g_config.dali_slaves_pending ? g_config.pending_dali_slave_count : g_config.dali_slave_count;
+    for (int i = 0; i < dc; i++)
+        fprintf(fp, "%s%u", i ? "," : "", ds[i]);
     fprintf(fp,
         "],\"mqtt_host\":\"%s\",\"mqtt_port\":%u,\"mqtt_user\":\"%s\","
         "\"mqtt_pass\":\"%s\",\"mqtt_prefix\":\"%s\","

@@ -655,7 +655,7 @@ static void cmd_help(void) {
     printf("                                           group (gN) also: members=0,1  add=2  remove=1\n");
     printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms\n");
     printf("                                           fw_url (reboot to apply)\n");
-    printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3\n");
+    printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3 (reboot to apply)\n");
     printf("tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n");
     printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
     printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result (dropped-not-resubmitted on gw reboot)\n");
@@ -1083,7 +1083,8 @@ static void cmd_tombstone(char **saveptr) {
 
 /* cfg [key=value ...] — controller device config; bare = get (emit state_cfg).
  * keys: long_press_ms dim_repeat_ms reversal_window_ms baud fw_url (reboot to apply)
- *       relay_slaves=1,2  dali_slaves=2,3  (comma lists). fw_version is read-only. */
+ *       relay_slaves=1,2  dali_slaves=2,3  (comma lists, reboot to apply — see
+ *       config.h's pending_relay/dali_slave_* fields). fw_version is read-only. */
 static void cmd_cfg(char **saveptr) {
     char *kv = strtok_r(NULL, " \t", saveptr);
     if (!kv) { emit_state_cfg(); txt_ok(); return; }
@@ -1101,10 +1102,20 @@ static void cmd_cfg(char **saveptr) {
         else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
         else if (strcasecmp(key, "relay_byteswap") == 0)
             g_config.relay_byteswap = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
-        else if (strcasecmp(key, "relay_slaves") == 0)
-            g_config.relay_slave_count = (uint8_t)parse_csv_u8(val, g_config.relay_slave_ids, MAX_RELAY_SLAVES);
-        else if (strcasecmp(key, "dali_slaves") == 0)
-            g_config.dali_slave_count  = (uint8_t)parse_csv_u8(val, g_config.dali_slave_ids, MAX_DALI_SLAVES);
+        else if (strcasecmp(key, "relay_slaves") == 0) {
+            /* Persist-only, reboot-to-apply — see the field comment in config.h.
+             * Consumers bind slave_id -> array index at boot, so rewriting the
+             * live list here would desync them from state_cache_slave_idx()'s
+             * live lookup mid-session and misattribute cached state. */
+            g_config.pending_relay_slave_count = (uint8_t)parse_csv_u8(val, g_config.pending_relay_slave_ids, MAX_RELAY_SLAVES);
+            g_config.relay_slaves_pending = true;
+            deferred = true;
+        }
+        else if (strcasecmp(key, "dali_slaves") == 0) {
+            g_config.pending_dali_slave_count = (uint8_t)parse_csv_u8(val, g_config.pending_dali_slave_ids, MAX_DALI_SLAVES);
+            g_config.dali_slaves_pending = true;
+            deferred = true;
+        }
         else if (strcasecmp(key, "fw_url") == 0) {
             /* empty value clears the override (compiled-in default applies) */
             strncpy(g_config.fw_url, val, sizeof g_config.fw_url - 1);
