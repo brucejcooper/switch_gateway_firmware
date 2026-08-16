@@ -193,47 +193,172 @@ static boot_action_t try_commit_staging(struct boot_control *bc) {
         return BOOT_STUCK;
     }
 
-    /* ── commit-time backup (true-rollback phase) ─────────────────────────
-     * Staging verified but the active slot is STILL UNTOUCHED at this
-     * point — this is the only safe window to back it up: back it up now,
-     * before the active-slot erase below makes that image unrecoverable.
-     * bc_has_valid_backup() (boot_decide.c, pure/host-tested) checks
-     * exactly the BC_F_BACKUP_VALID + backup_len-in-range contract
-     * ota_stage.c promises; bc->backup_len is that outgoing image's own
-     * byte length (NOT bc->staged_len, which by now names the *candidate*
-     * — see the big comment above). */
-    if (bc_has_valid_backup(bc)) {
-        flash_copy_region(APP_OFF, BACKUP_OFF, bc->backup_len);
-
-        /* Re-verify the backup we just made — the only way this bootloader
-         * can detect a bad flash copy, since flash_range_erase/program
-         * report failure only via hard_assert on malformed *arguments*, not
-         * on a genuine write fault. Fails -> BOOT_STUCK immediately,
-         * WITHOUT having touched active at all (matches the acceptance
-         * rule: a backup-copy failure must never proceed to overwrite the
-         * still-good active image). The device is no worse off than before
-         * this boot attempt — active is untouched, staging is untouched,
-         * bc is untouched below (BC_F_PENDING still set) — just stuck
-         * rather than silently committing over an active image whose
-         * rollback safety net didn't actually get made. */
-        if (!fw_verify((const uint8_t *)PART_XIP(BACKUP_OFF), bc->backup_len, FW_PUBKEY)) {
-            return BOOT_STUCK;
-        }
-    }
-    /* else: no valid backup record — nothing to back up (first-ever OTA, or
-     * the outgoing image was never itself confirmed); proceed straight to
-     * the commit below exactly as before this phase. */
-
-    /* Staging verified (and, if applicable, the outgoing active image is
-     * now safely backed up) — copy staging into the active slot. From this
-     * point on the OLD active image is being overwritten; a failure past
-     * here can no longer be undone by re-reading the (about to be
-     * clobbered) active slot — only the just-made BACKUP (if any) can help,
-     * and only on a LATER boot via the BOOT_ROLLBACK path, once this
-     * candidate has been given its fair chance and crash-looped. */
-    flash_copy_region(STAGING_OFF, APP_OFF, bc->staged_len);
-
     const uint8_t *active = (const uint8_t *)PART_XIP(APP_OFF);
+
+    /* ── interrupted-commit gate: has THIS commit already completed on a
+     * previous, interrupted boot? ─────────────────────────────────────────
+     *
+     * A commit can be cut short after the staging->active copy below has
+     * finished (and even after it re-verified) but before main()'s bc_write
+     * persists BC_F_PENDING's clear — that write is deliberately deferred to
+     * the shared "about to boot an unconfirmed active image" step in main(),
+     * see this function's own doc comment. On the retry boot, bc_read()
+     * comes back with BC_F_PENDING still set (the clear never reached
+     * flash), boot_decide() returns BOOT_COMMIT_STAGING again, and this
+     * function runs again from the top against a STAGING region and a
+     * staged_len that are both completely unchanged — but ACTIVE now
+     * already holds the candidate, not the old outgoing image the naive
+     * (pre-this-fix) code below assumed.
+     *
+     * The naive code backed up unconditionally whenever bc_has_valid_backup()
+     * was true, sizing that backup copy from bc->backup_len (the OLD
+     * outgoing image's length). If backup_len happened to equal staged_len,
+     * fw_verify(ACTIVE, backup_len) — checking whether ACTIVE holds a validly
+     * signed image of that length — PASSED, because ACTIVE now holds the
+     * candidate, which genuinely is a validly signed image of that length.
+     * So the "verify the outgoing image before backing it up" check does NOT
+     * close this hole: it happily overwrites the last-good BACKUP with a
+     * second copy of the CANDIDATE, silently destroying the actual rollback
+     * safety net. If the lengths differ, the backup copy instead reproduces
+     * a torn image of the wrong length, permanently corrupting the same
+     * safety net and landing in a stable BOOT_STUCK. Either way, the retry
+     * boot must never blindly redo the backup step.
+     *
+     * The robust gate compares TRAILERS, not lengths: STAGING's trailer
+     * (already proven-signed by the fw_verify() just above) and ACTIVE's
+     * trailer at the same, candidate-sized offset. RFC 8032 Ed25519 signing
+     * is deterministic, so two byte-identical trailers (magic, img_len,
+     * sha512 AND sig) can only mean ACTIVE already holds this exact signed
+     * candidate — forging a match without the private key is exactly as
+     * hard as forging fw_verify() itself. A match therefore proves the
+     * staging->active copy already ran to completion on a prior boot; a
+     * mismatch proves it did not (or the active slot holds something else
+     * entirely, torn or old).
+     *
+     * staged_len >= sizeof(struct fw_trailer) is already guaranteed by the
+     * fw_verify() above (it fails closed on any total_len shorter than the
+     * trailer — see fw_image.c — so this function would already have
+     * returned BOOT_STUCK otherwise), and staged_len <= APP_SIZE is
+     * guaranteed by the bounds check at the top of this function, so
+     * trailer_off can't underflow and the read below can't walk off either
+     * slot. Restated explicitly below anyway, belt-and-braces, matching this
+     * file's "never trust shouldn't happen" rule (see the bounds check at
+     * the top of this function). */
+    if (bc->staged_len < sizeof(struct fw_trailer)) return BOOT_STUCK;
+    uint32_t trailer_off = bc->staged_len - sizeof(struct fw_trailer);
+    bool commit_already_done =
+        memcmp(active + trailer_off, staging + trailer_off, sizeof(struct fw_trailer)) == 0;
+
+    if (!commit_already_done) {
+        /* ── commit-time backup (true-rollback phase) ─────────────────────
+         * Staging verified and this is NOT a retry of an already-completed
+         * commit — proceed as before, with one added gate. bc_has_valid_backup()
+         * (boot_decide.c, pure/host-tested) checks exactly the
+         * BC_F_BACKUP_VALID + backup_len-in-range contract ota_stage.c
+         * promises; bc->backup_len is the OUTGOING image's own byte length
+         * (NOT bc->staged_len, which by now names the *candidate* — see the
+         * big comment above the function). */
+        if (bc_has_valid_backup(bc)) {
+            /* Extra gate this phase adds: only back up if ACTIVE itself
+             * still verifies AS THE OUTGOING IMAGE (backup_len). Walk the
+             * interruption points to see why this is exactly the right
+             * condition, and why it's safe:
+             *
+             * (a) Cut during THIS backup copy (flash_copy_region(APP_OFF,
+             *     BACKUP_OFF, ...) below, mid-loop): active has not been
+             *     touched by this function at all yet (the backup copy
+             *     strictly precedes the active-slot erase later in this
+             *     function, on every code path) — so ACTIVE still holds the
+             *     old outgoing image intact, fw_verify(ACTIVE, backup_len)
+             *     passes, commit_already_done is false (ACTIVE's trailer is
+             *     still the OLD one), and the backup copy correctly re-runs
+             *     from scratch. BACKUP itself may be left part-old/part-new
+             *     from the interrupted copy, but that's fine: it hasn't been
+             *     trusted yet (BC_F_BACKUP_VALID / bc are untouched by this
+             *     boot) and this re-run overwrites it sector-by-sector
+             *     again before it's ever re-verified below.
+             * (b) Cut during the staging->active copy further down (mid-
+             *     loop): ACTIVE is now a TORN mix of old and new bytes —
+             *     genuinely neither the outgoing image nor the candidate.
+             *     Because the backup copy in (a) strictly precedes this
+             *     point on every path through this function, if execution
+             *     ever reached here on a PRIOR boot, the backup was either
+             *     already made and verified then, or there was nothing to
+             *     back up in the first place (bc_has_valid_backup() false) —
+             *     either way there is nothing this boot needs to (re)do for
+             *     BACKUP. commit_already_done is false here too (the torn
+             *     ACTIVE's trailer, if the copy hasn't yet reached the tail
+             *     sector, is still the OLD trailer, not the candidate's) —
+             *     so without this extra fw_verify(ACTIVE, backup_len) gate,
+             *     the naive backup-whenever-trailers-differ rule would copy
+             *     this GARBAGE torn image over the good backup made in (a).
+             *     fw_verify(ACTIVE, backup_len) correctly fails here (a torn
+             *     mix of two different images is never a validly-signed
+             *     image of either length), so the gate skips the backup —
+             *     exactly right, since it was already made (or never
+             *     needed) before this point was ever reachable.
+             * (c) Cut after the staging->active copy completes AND its own
+             *     post-copy fw_verify() (below) succeeds, but before
+             *     main()'s deferred bc_write() persists BC_F_PENDING's
+             *     clear: this is the commit_already_done == true case
+             *     handled by the outer `if` above — this whole backup
+             *     branch is skipped entirely, correctly, without even
+             *     reaching this fw_verify(ACTIVE, backup_len) check.
+             *
+             * So: skip backup if trailers already match (case c, handled
+             * above); else do the backup ONLY if ACTIVE still verifies as
+             * the outgoing image (cases "never started this boot" and (a));
+             * else (case (b), ACTIVE is a torn copy) skip it — it was
+             * necessarily already made, or never needed, before the active
+             * slot was first touched. */
+            if (fw_verify(active, bc->backup_len, FW_PUBKEY)) {
+                flash_copy_region(APP_OFF, BACKUP_OFF, bc->backup_len);
+
+                /* Re-verify the backup we just made — the only way this
+                 * bootloader can detect a bad flash copy, since
+                 * flash_range_erase/program report failure only via
+                 * hard_assert on malformed *arguments*, not on a genuine
+                 * write fault. Fails -> BOOT_STUCK immediately, WITHOUT
+                 * having touched active at all (matches the acceptance
+                 * rule: a backup-copy failure must never proceed to
+                 * overwrite the still-good active image). The device is no
+                 * worse off than before this boot attempt — active is
+                 * untouched, staging is untouched, bc is untouched below
+                 * (BC_F_PENDING still set) — just stuck rather than
+                 * silently committing over an active image whose rollback
+                 * safety net didn't actually get made. */
+                if (!fw_verify((const uint8_t *)PART_XIP(BACKUP_OFF), bc->backup_len, FW_PUBKEY)) {
+                    return BOOT_STUCK;
+                }
+            }
+            /* else: ACTIVE is a torn copy from an interrupted staging->active
+             * copy on a previous boot (interruption point (b) above) — skip
+             * the backup; it was already made (or never applicable) before
+             * active was first touched, so redoing it here would only
+             * clobber the real backup with garbage. */
+        }
+        /* else: no valid backup record — nothing to back up (first-ever OTA,
+         * or the outgoing image was never itself confirmed); proceed
+         * straight to the commit below exactly as before this phase. */
+
+        /* Staging verified (and, if applicable, the outgoing active image is
+         * now safely backed up, or correctly left alone) — copy staging
+         * into the active slot. From this point on the OLD active image is
+         * being overwritten; a failure past here can no longer be undone by
+         * re-reading the (about to be clobbered) active slot — only the
+         * just-made BACKUP (if any) can help, and only on a LATER boot via
+         * the BOOT_ROLLBACK path, once this candidate has been given its
+         * fair chance and crash-looped. */
+        flash_copy_region(STAGING_OFF, APP_OFF, bc->staged_len);
+    }
+    /* else: commit_already_done — this exact candidate was already copied
+     * into ACTIVE (and, on the boot that did it, already re-verified below)
+     * on a previous, interrupted boot; see interruption point (c) above.
+     * Skip both the backup copy and the redundant staging->active copy
+     * entirely and fall straight through to the re-verify immediately
+     * below, which re-checks the (already-correct) active slot one more
+     * time before clearing BC_F_PENDING. */
+
     if (!fw_verify(active, bc->staged_len, FW_PUBKEY)) {
         /* The copy did not reproduce a verifiable image (flash write
          * error, power loss mid-copy, ...). Leave bc exactly as read
