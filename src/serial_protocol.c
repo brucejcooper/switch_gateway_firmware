@@ -2015,21 +2015,8 @@ static void cmd_mqtt(char **sp) {
     printf("ok (reboot to apply)\n");
 }
 
-/* A DHCP/DNS hostname is one label: 1..31 chars, letters/digits/hyphen, and not
- * leading/trailing a hyphen (RFC 1123). Reject anything else so we never put an
- * illegal label on the wire (which some DHCP servers drop silently). */
-static bool hostname_ok(const char *s) {
-    size_t n = strlen(s);
-    if (n < 1 || n > 31) return false;
-    if (s[0] == '-' || s[n - 1] == '-') return false;
-    for (size_t i = 0; i < n; i++) {
-        char ch = s[i];
-        bool good = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-                    (ch >= '0' && ch <= '9') || ch == '-';
-        if (!good) return false;
-    }
-    return true;
-}
+/* hostname_ok()/hostname_set() moved to config.{c,h} — config_load() and the
+ * core-1 web/API handler need the same rule this file used to keep private. */
 
 static void cmd_net(char **sp) {
     char *sub = strtok_r(NULL, " \t", sp);
@@ -2075,9 +2062,9 @@ static void cmd_net(char **sp) {
         else if (!strcasecmp(k, "gw"))   { if (!parse_ip4(v, g_config.net_gw))   { txt_err("bad_ip"); return; } any = true; }
         else if (!strcasecmp(k, "dns"))  { if (!parse_ip4(v, g_config.net_dns))  { txt_err("bad_ip"); return; } any = true; }
         else if (!strcasecmp(k, "hostname")) {
-            if (!hostname_ok(v)) { txt_err("bad_hostname"); return; }
-            strncpy(g_config.net_hostname, v, sizeof g_config.net_hostname - 1);
-            g_config.net_hostname[sizeof g_config.net_hostname - 1] = '\0';
+            if (!config_hostname_set(g_config.net_hostname, sizeof g_config.net_hostname, v)) {
+                txt_err("bad_hostname"); return;
+            }
             any = true;
         }
         else { txt_err("bad_key"); return; }
@@ -2460,9 +2447,16 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (f & IC_NET_F_MASK) memcpy(g_config.net_mask, c->set_netcfg.mask, 4);
         if (f & IC_NET_F_GW)   memcpy(g_config.net_gw,   c->set_netcfg.gw,   4);
         if (f & IC_NET_F_DNS)  memcpy(g_config.net_dns,  c->set_netcfg.dns,  4);
-        if ((f & IC_NET_F_HOSTNAME) && hostname_ok(c->set_netcfg.hostname)) {
-            strncpy(g_config.net_hostname, c->set_netcfg.hostname, sizeof g_config.net_hostname - 1);
-            g_config.net_hostname[sizeof g_config.net_hostname - 1] = '\0';
+        /* Backstop: /api/net rejects a bad label up front with a 400 so the
+         * user sees it, but this is the single writer to g_config, and the
+         * command can also arrive from a future core-1 producer that hasn't
+         * checked. Keep the gate, and say so when it fires — silently dropping
+         * the field while config_save() below still reported success is what
+         * made a rejected hostname look like it had been applied. */
+        if (f & IC_NET_F_HOSTNAME) {
+            if (!config_hostname_set(g_config.net_hostname, sizeof g_config.net_hostname,
+                                     c->set_netcfg.hostname))
+                LOG_WARN("cli", "ignored invalid hostname from web/API");
         }
         if (f && !config_save()) LOG_ERR("cli", "config_save failed — netcfg not persisted");
         break;

@@ -19,6 +19,45 @@ global_config_t g_config;
 #define CONFIG_PATH     "/config.json"
 #define CONFIG_PATH_TMP "/config.json.tmp"
 
+/* See config.h for the rule and why this lives here rather than in
+ * serial_protocol.c. Whitelist, not a blacklist: every byte must be one of the
+ * permitted characters, so anything else — dots, underscores, spaces, control
+ * characters, high-bit/UTF-8 bytes — is rejected without having to enumerate
+ * it. */
+bool config_hostname_ok(const char *s) {
+    if (!s) return false;
+    size_t n = strlen(s);
+    if (n < 1 || n > 31) return false;
+    if (s[0] == '-' || s[n - 1] == '-') return false;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        bool good = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+                    (ch >= '0' && ch <= '9') || ch == '-';
+        if (!good) return false;
+    }
+    return true;
+}
+
+bool config_hostname_set(char *dst, size_t cap, const char *src) {
+    if (!dst || cap == 0 || !config_hostname_ok(src)) return false;
+    /* Refuse rather than truncate. config_hostname_ok() has already bounded
+     * the length at 31, so this cannot fire for any caller in this firmware
+     * (they all pass a net_hostname-sized 32-byte buffer) — but silently
+     * storing a SHORTER, different hostname than the one that was accepted is
+     * the wrong way to fail if that ever stops being true. */
+    size_t n = strlen(src);
+    if (n >= cap) return false;
+    /* dst == src is supported and used (http_server.c normalises /api/net's
+     * command buffer in place): the copy runs strictly forward, writing index
+     * i only after reading it, and never re-reads an index it has written. */
+    for (size_t i = 0; i < n; i++) {
+        char ch = src[i];
+        dst[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+    }
+    dst[n] = '\0';
+    return true;
+}
+
 slave_kind_t slave_kind(uint8_t slave_id) {
     if (slave_id == 0) return SLAVE_KIND_UNKNOWN;  /* broadcast */
     for (int i = 0; i < g_config.relay_slave_count; i++)
@@ -182,7 +221,18 @@ bool config_load(void) {
             get_ip(buf, tk, nt, "net_mask", g_config.net_mask);
             get_ip(buf, tk, nt, "net_gw",   g_config.net_gw);
             get_ip(buf, tk, nt, "net_dns",  g_config.net_dns);
-            get_str(buf, tk, nt, "net_hostname", g_config.net_hostname, sizeof g_config.net_hostname);
+            /* Validate on the way IN, not just at the CLI/API. get_str() only
+             * length-clamps, so before this a hand-edited or damaged
+             * /config.json put arbitrary bytes straight into net_hostname, and
+             * netif_init() copies that into HOST_NAME[] and onto the wire as
+             * DHCP option 12. An invalid stored value keeps the default set by
+             * config_defaults() above rather than failing the whole load —
+             * consistent with how every other field here degrades. */
+            { char hn[sizeof g_config.net_hostname];
+              if (get_str(buf, tk, nt, "net_hostname", hn, sizeof hn) &&
+                  !config_hostname_set(g_config.net_hostname, sizeof g_config.net_hostname, hn))
+                  LOG_WARN("cfg", "net_hostname in config is not a valid label — using \"%s\"",
+                           g_config.net_hostname); }
 
             get_str(buf, tk, nt, "web_user", g_config.web_user, sizeof g_config.web_user);
             get_str(buf, tk, nt, "web_pass", g_config.web_pass, sizeof g_config.web_pass);

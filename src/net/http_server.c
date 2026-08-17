@@ -26,6 +26,7 @@
 #include "wizchip_conf.h"   /* getSn_SR / getSn_RX_RSR / getSn_TX_FSR / Sn_* */
 #include "jsmn.h"
 #include "mapping.h"        /* mapping_target_t, TARGET_*, MAX_TARGETS_PER_BTN */
+#include "config.h"         /* config_hostname_set() — /api/net validation */
 
 #include "pico/time.h"
 #include <string.h>
@@ -476,7 +477,23 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
         if (jip(body, tk, nt, "mask", cmd.set_netcfg.mask)) f |= IC_NET_F_MASK;
         if (jip(body, tk, nt, "gw",   cmd.set_netcfg.gw))   f |= IC_NET_F_GW;
         if (jip(body, tk, nt, "dns",  cmd.set_netcfg.dns))  f |= IC_NET_F_DNS;
-        if (jhas(body, tk, nt, "hostname")) { jstr_key(body, tk, nt, "hostname", cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname); f |= IC_NET_F_HOSTNAME; }
+        if (jhas(body, tk, nt, "hostname")) {
+            jstr_key(body, tk, nt, "hostname", cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname);
+            /* Reject here rather than leaving it to core 0. This request is
+             * answered as soon as the command is pushed, so core 0's own gate
+             * can only drop the field silently — the caller saw {"ok":true}
+             * and the web UI toasted "Saved" for a hostname that never
+             * changed. Same rule and same normalisation as the CLI, which has
+             * always reported bad_hostname. */
+            if (!config_hostname_set(cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname,
+                                     cmd.set_netcfg.hostname)) {
+                resp_text(c, "400 Bad Request", "application/json",
+                          "{\"error\":\"hostname must be 1-31 chars of a-z 0-9 -, "
+                          "not starting or ending with -\"}");
+                return;
+            }
+            f |= IC_NET_F_HOSTNAME;
+        }
         cmd.set_netcfg.fields = f;
         push_cmd_resp(c, &cmd); return;
     }

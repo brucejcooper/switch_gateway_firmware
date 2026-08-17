@@ -1,6 +1,7 @@
 #pragma once
 #include <stdint.h>
 #include <stdbool.h>
+#include <stddef.h>   /* size_t, for config_hostname_set() */
 
 /* Slaves are addressed by their real Modbus address. The relay (Waveshare) and
  * DALI (TinyModbus) gateways are kept in separate config lists so the firmware
@@ -72,7 +73,8 @@ typedef struct {
     uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
     /* DHCP option-12 hostname (default "lights"). Sent in DISCOVER/REQUEST so the
      * router registers it in local DNS — e.g. reach the board as "lights". DNS
-     * label charset (letters/digits/hyphen); reboot to apply. */
+     * label charset (letters/digits/hyphen); reboot to apply. Always stored
+     * lowercased — see config_hostname_set(). */
     char     net_hostname[32];     /* default "lights" */
 
     /* Embedded config web UI (core 1). Basic-auth credentials; default
@@ -88,6 +90,26 @@ typedef struct {
 } global_config_t;
 
 extern global_config_t g_config;
+
+/* ── DHCP/DNS hostname validation ─────────────────────────────────────────
+ * One RFC-1123 label: 1..31 chars, letters/digits/hyphen, not leading or
+ * trailing a hyphen. Rejecting anything else keeps an illegal label off the
+ * wire (some DHCP servers drop those silently).
+ *
+ * Lives here rather than in serial_protocol.c (where it started, private and
+ * core-0-only) because all three write paths need the same rule: the CLI, the
+ * web/API command handler on core 1, and config_load() itself — which used to
+ * skip validation entirely and let anything in /config.json reach
+ * netif_init(), and so HOST_NAME[] and the wire. Pure functions, no shared
+ * state, safe to call from either core. */
+bool config_hostname_ok(const char *s);
+
+/* Validate `src` and write its LOWERCASED form into dst[cap]; returns false
+ * and leaves dst untouched if `src` is not a valid label. Uppercase is legal
+ * in a label (labels are case-insensitive, RFC 4343) but is normalised on the
+ * way in so the stored value, the DHCP option-12 bytes and whatever the router
+ * shows in local DNS are all the same string. */
+bool config_hostname_set(char *dst, size_t cap, const char *src);
 
 typedef enum {
     SLAVE_KIND_UNKNOWN = 0,
