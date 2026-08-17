@@ -19,9 +19,9 @@ It will:
   6. run the tests, dumping the captured controller logs (with a heuristic
      diagnosis) whenever a test fails.
 
-Test rig wiring note: two devices share Modbus slave id 2 on the RS-485 bus —
-a relay board and a TinyModbus DALI gateway driving an LED ballast.  The DALI
-tests target slave 2.
+Test rig wiring note: only the DALI gateway at Modbus slave id 3 is on the bus
+(ballasts 3.0, a binary relay ballast, and 3.45, dimmable).  Slaves 1 and 2 are
+configured but absent.  The DALI tests target slave 3.
 
 Requires pyserial (already in controller/.venv).
 """
@@ -47,7 +47,7 @@ CONTROLLER_DIR = Path(__file__).resolve().parent.parent
 BUILD_DIR = CONTROLLER_DIR / "build"
 UF2_NAME = "light_switch.uf2"
 DEFAULT_PORT = "/dev/tty.usbmodem111201"
-DEFAULT_SLAVE = 2
+DEFAULT_SLAVE = 3
 
 # ── DALI command opcodes (IEC 62386-102) ────────────────────────────────────
 DALI_QUERY_CONTROL_GEAR_PRESENT = 0x91  # gear answers 0xFF (YES) if present
@@ -474,7 +474,7 @@ def main():
     ap.add_argument("--capture", action="store_true",
                     help="capture the DALI/RS-485 lines with Saleae Logic during the DALI test")
     ap.add_argument("--saleae-port", type=int, default=10430, help="Saleae automation server port")
-    ap.add_argument("--capture-baud", type=int, default=19200,
+    ap.add_argument("--capture-baud", type=int, default=38400,
                     help="RS-485 baud for Modbus decode in the trace")
     ap.add_argument("--capture-test", default="dali_presence_addr0",
                     help="which test to wrap with a Saleae line capture")
