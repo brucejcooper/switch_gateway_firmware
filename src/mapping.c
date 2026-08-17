@@ -20,6 +20,7 @@ mapping_record_t g_mappings[MAX_FIXTURES][MAX_BUTTONS];
  * group → {slave,group}).  Used by mapping_save. */
 static int serialise_targets(char *buf, int size, const mapping_record_t *r) {
     int p = snprintf(buf, size, "[");
+    if (p > size) p = size;
     for (int t = 0; t < r->target_count; t++) {
         if (TARGET_IS_GROUP(r->targets[t]))
             p += snprintf(buf + p, size - p, "%s{\"slave\":%u,\"group\":%u}",
@@ -28,6 +29,13 @@ static int serialise_targets(char *buf, int size, const mapping_record_t *r) {
         else
             p += snprintf(buf + p, size - p, "%s{\"slave\":%u,\"addr\":%u}",
                           t ? "," : "", r->targets[t].slave, r->targets[t].addr);
+        /* snprintf returns the length it WOULD have written, not what actually
+         * fit, so p can exceed size once the buffer fills — clamp it or the
+         * next call's `size - p` underflows to a huge size_t. Unreachable at
+         * today's MAX_TARGETS_PER_BTN/tbuf[256] sizing (worst case ~202 of 256
+         * bytes), but that headroom is accidental, not guaranteed: raising
+         * MAX_TARGETS_PER_BTN past ~10 turns this into a stack smash. */
+        if (p > size) p = size;
     }
     p += snprintf(buf + p, size - p, "]");
     return p;
