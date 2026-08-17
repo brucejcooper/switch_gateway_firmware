@@ -2427,14 +2427,13 @@ static void handle_text_line(const char *original_line) {
 /* ── State event serialisation ───────────────────────────────────────────── */
 /* lighting_actions.c defines levt_t internally; we replicate the minimal
  * struct here for serialisation.  In a real project these would share a header. */
-typedef enum { LEVT_RELAY, LEVT_DALI, LEVT_PRESENCE, LEVT_FAULT,
+typedef enum { LEVT_RELAY, LEVT_DALI, LEVT_FAULT,
                LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY, LEVT_GW_DIAG } levt_type_t;
 typedef struct {
     levt_type_t type;
     union {
         struct { uint8_t ch; bool on; } relay;
         struct { uint8_t slave_id; uint8_t addr; uint8_t arc; uint8_t status; } dali;
-        struct { uint8_t slave_id; uint64_t appeared; uint64_t disappeared; } presence;
         struct { uint8_t slave_id; uint8_t addr; bool lamp_fail; bool power_cycle; } fault;
         struct { uint8_t slave_id; uint64_t present_mask; } scan_complete;
         struct { uint8_t slave_id; uint8_t group; uint8_t bri; bool on; } group;
@@ -2476,12 +2475,6 @@ static bool levt_to_ic(const levt_t *e, ic_event_t *ic) {
         ic->dali.cfg_known = b ? b->cfg_known : false;
         return true;
     }
-    case LEVT_PRESENCE:
-        ic->type = IC_EVT_PRESENCE;
-        ic->presence.slave       = e->presence.slave_id;
-        ic->presence.appeared    = e->presence.appeared;
-        ic->presence.disappeared = e->presence.disappeared;
-        return true;
     case LEVT_FAULT:
         ic->type = IC_EVT_FAULT;
         ic->fault.slave       = e->fault.slave_id;

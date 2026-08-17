@@ -937,18 +937,6 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         snprintf(top, sizeof top, "%s/gateway/%u/availability", P, e->gateway.slave);
         pub_str(top, e->gateway.online ? "online" : "offline", true);
         break;
-    case IC_EVT_PRESENCE:
-        for (int a = 0; a < 64; a++) {
-            if (e->presence.appeared & ((uint64_t)1 << a)) {
-                snprintf(top, sizeof top, "%s/dali/%u/%u/availability", P, e->presence.slave, a);
-                pub_str(top, "online", true);
-            }
-            if (e->presence.disappeared & ((uint64_t)1 << a)) {
-                snprintf(top, sizeof top, "%s/dali/%u/%u/availability", P, e->presence.slave, a);
-                pub_str(top, "offline", true);
-            }
-        }
-        break;
     case IC_EVT_BUTTON: {
         static const char *const act[] = { "press", "release", "click", "long_press",
                                            "long_press_repeat", "stuck", "unstuck" };

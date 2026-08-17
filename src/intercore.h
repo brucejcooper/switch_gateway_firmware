@@ -38,13 +38,18 @@ typedef enum {
     IC_BTN_UNSTUCK,           /* stuck button finally released */
 } ic_btn_action_t;
 
-/* ── core0 -> core1 : events ─────────────────────────────────────────────── */
+/* ── core0 -> core1 : events ───────────────────────────────────────────────
+ * NOT a wire/ABI format: both cores run the same firmware image compiled
+ * together (no independent versioning across the SPSC queue, unlike the MQTT
+ * JSON at core 1's edge or the DALI/Modbus register maps), so these values
+ * are free to renumber on any rebuild. (IC_EVT_PRESENCE was removed as dead
+ * code rather than left as a tombstoned gap for exactly this reason — see the
+ * removal commit.) */
 typedef enum {
     IC_EVT_RELAY = 0,
     IC_EVT_DALI,
     IC_EVT_GROUP,
     IC_EVT_GATEWAY,
-    IC_EVT_PRESENCE,
     IC_EVT_FAULT,
     IC_EVT_SCAN_COMPLETE,
     IC_EVT_BUTTON,
@@ -89,7 +94,6 @@ typedef struct {
          * the consumer if needed). */
         struct { uint8_t slave, group, bri; bool on; uint64_t members; } group;
         struct { uint8_t slave; bool online; } gateway;
-        struct { uint8_t slave; uint64_t appeared, disappeared; } presence;
         struct { uint8_t slave, addr; bool lamp_fail, power_cycle; } fault;
         struct { uint8_t slave; uint64_t present_mask; } scan_complete;
         struct { uint8_t fixture, button; ic_btn_action_t action; } button;
@@ -232,8 +236,8 @@ typedef struct {
         struct { uint32_t total_len; } ota_end;
         /* IC_CMD_OTA_BEGIN/OTA_ABORT/OTA_CONFIRM carry no payload. */
         /* IC_CMD_SCAN: which DALI gateway to re-interrogate. Asynchronous on
-         * core 0 — the reply is the eventual scan_complete/presence events, not
-         * an ack, so a newly powered ballast appears without waiting for the
+         * core 0 — the reply is the eventual IC_EVT_SCAN_COMPLETE, not an ack,
+         * so a newly powered ballast appears without waiting for the
          * background sweep to reach it. */
         struct { uint8_t slave; } scan;
     };

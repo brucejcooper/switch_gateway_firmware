@@ -128,17 +128,6 @@ void web_state_on_event(const ic_event_t *e) {
         if (r >= 0) { S.relay_gw_seen[r] = true; S.relay_gw_online[r] = e->gateway.online; }
         break;
     }
-    case IC_EVT_PRESENCE: {
-        int s = dali_idx(e->presence.slave);
-        if (s < 0) break;
-        for (uint8_t a = 0; a < DALI_ADDR_COUNT; a++) {
-            if (e->presence.appeared & (1ull << a)) {
-                S.ball[s][a].seen = true; S.ball[s][a].present = true;
-            }
-            if (e->presence.disappeared & (1ull << a)) S.ball[s][a].present = false;
-        }
-        break;
-    }
     case IC_EVT_SCAN_COMPLETE: {
         int s = dali_idx(e->scan_complete.slave);
         if (s < 0) break;

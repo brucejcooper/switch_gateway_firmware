@@ -34,7 +34,7 @@
 #define EVT_QUEUE_SIZE 256
 
 typedef enum {
-    LEVT_RELAY, LEVT_DALI, LEVT_PRESENCE, LEVT_FAULT,
+    LEVT_RELAY, LEVT_DALI, LEVT_FAULT,
     LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY, LEVT_GW_DIAG
 } levt_type_t;
 
@@ -44,8 +44,6 @@ typedef struct {
         struct { uint8_t ch; bool on; }                       relay;
         struct { uint8_t slave_id; uint8_t addr;
                  uint8_t arc; uint8_t status; }               dali;
-        struct { uint8_t slave_id;
-                 uint64_t appeared; uint64_t disappeared; }   presence;
         struct { uint8_t slave_id; uint8_t addr;
                  bool lamp_fail; bool power_cycle; }          fault;
         struct { uint8_t slave_id; uint64_t present_mask; }  scan_complete;
