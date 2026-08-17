@@ -51,6 +51,7 @@
 #define TX_GATE     1100        /* min free TX before a discovery/sweep step */
 #define PUMP_GATE    900        /* min free TX before draining a state event */
 #define SWEEP_BATCH    8        /* availability topics per sweep tick */
+#define DISC_EVT_DRAIN 16       /* web_state-only events drained per tick during discovery */
 
 static char s_pl[PL_CAP];
 static char s_top[112];
@@ -1355,10 +1356,39 @@ void ha_bridge_tick(void) {
                 disc_fw_update();
                 disc_fw_check();
                 pub_fw_state();
+                /* The full resync below is what makes it safe to have skipped
+                 * MQTT publication for every event drained during the burst
+                 * (below): IC_CMD_RESYNC makes core 0 replay its complete
+                 * state as a fresh burst of ordinary events, which the normal
+                 * post-discovery pump at the bottom of this function DOES
+                 * publish. Nothing drained here is lost, only deferred. */
                 ic_cmd_t rc; memset(&rc, 0, sizeof rc); rc.type = IC_CMD_RESYNC;
                 ic_push_cmd(&rc);
                 break;
             }
+        }
+        /* The discovery burst is ~1380 steps (DISC_BATCH=6/tick => ~230 ticks)
+         * and re-runs on every reconnect and homeassistant/status=online.
+         * Until now this function returned above without ever reaching
+         * intercore_pop_event() for the whole burst, so core-0 events piled
+         * into the 512-deep queue (dropped past that — intercore_event_drops)
+         * and web_state_on_event never ran, freezing the config web UI for
+         * the duration — contradicting the documented contract that web_state
+         * is fed in both the connected and disconnected paths (see the
+         * disconnected branch above). Drain a bounded number of events into
+         * web_state only, same triage as that disconnected branch: ping/ota
+         * events still get routed to their handlers (they are not MQTT
+         * traffic), everything else updates the local web read model without
+         * an MQTT publish — safe because DISC_DONE above always ends the
+         * burst with the IC_CMD_RESYNC that republishes full state once
+         * discovery completes. No TX gate: web_state_on_event is local-memory
+         * only, no socket I/O. */
+        ic_event_t ev;
+        for (int budget = DISC_EVT_DRAIN; budget > 0; budget--) {
+            if (!intercore_pop_event(&ev)) break;
+            if (ev.type == IC_EVT_PING_REQ) { ping_submit(ev.ping_req.ip, ev.ping_req.count); continue; }
+            if (ev.type == IC_EVT_OTA_ACK || ev.type == IC_EVT_OTA_STATUS) { ota_on_event(&ev); continue; }
+            web_state_on_event(&ev);
         }
         return;
     }
