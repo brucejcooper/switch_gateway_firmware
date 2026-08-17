@@ -41,9 +41,6 @@
 
 #include "version.h"   /* FW_VERSION — generated from git at build time */
 
-/* Consume levt_t events from lighting_actions */
-extern bool lighting_evt_try_pop(void *out);  /* defined in lighting_actions.c */
-
 /* When true, serial_poll() echoes received characters back to the terminal
  * and honours backspace for line editing.  On by default: the CLI is now a
  * human-only interface (machine clients went away when the on-board core-1
@@ -52,27 +49,6 @@ extern bool lighting_evt_try_pop(void *out);  /* defined in lighting_actions.c *
  * locally or wants a clean byte stream. */
 static bool echo_on = true;
 
-/* ── Minimal JSON key extraction (identical to pico_lighting design) ─────── */
-static bool json_str(const char *json, const char *key, char *out, int out_len) {
-    char needle[64];
-    snprintf(needle, sizeof(needle), "\"%s\"", key);
-    const char *kp = strstr(json, needle);
-    if (!kp) return false;
-    kp += strlen(needle);
-    while (*kp == ' ' || *kp == ':') kp++;
-    if (*kp == '"') {
-        kp++;
-        int i = 0;
-        while (*kp && *kp != '"' && i < out_len - 1) out[i++] = *kp++;
-        out[i] = '\0';
-        return true;
-    }
-    int i = 0;
-    while (*kp && *kp != ',' && *kp != '}' && *kp != ']' && i < out_len - 1)
-        out[i++] = *kp++;
-    out[i] = '\0';
-    return i > 0;
-}
 /* Forward decls — defined alongside the other DALI helpers further down. */
 static int  dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t value);
 static int  dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const char *val);
@@ -81,40 +57,6 @@ static void emit_state_relay(uint8_t ch);
 static void emit_state_group(uint8_t slave, uint8_t group);
 static void emit_state_cfg(void);
 static void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_mask);
-
-static bool json_int(const char *j, const char *k, int *out) {
-    char buf[16];
-    if (!json_str(j, k, buf, sizeof(buf))) return false;
-    *out = atoi(buf);
-    return true;
-}
-static bool json_bool(const char *j, const char *k, bool *out) {
-    char buf[8];
-    if (!json_str(j, k, buf, sizeof(buf))) return false;
-    *out = strcmp(buf, "true") == 0 || strcmp(buf, "1") == 0;
-    return true;
-}
-
-/* Parse a JSON int array `"key":[a,b,c]` into out[]. Returns the count, or -1
- * if the key is absent (so an omitted array is left unchanged by the caller). */
-static int json_uint8_array(const char *line, const char *key, uint8_t *out, int max) {
-    char needle[32];
-    snprintf(needle, sizeof needle, "\"%s\"", key);
-    const char *p = strstr(line, needle);
-    if (!p) return -1;
-    p += strlen(needle);
-    while (*p == ' ' || *p == ':') p++;
-    if (*p != '[') return -1;
-    p++;
-    int n = 0;
-    while (*p && *p != ']') {
-        while (*p == ' ' || *p == ',') p++;
-        if (*p < '0' || *p > '9') break;
-        if (n < max) out[n++] = (uint8_t)atoi(p);
-        while (*p && *p != ',' && *p != ']') p++;
-    }
-    return n;
-}
 
 /* Parse a CLI comma list "1,2,3" into out[]. Returns the count. */
 static int parse_csv_u8(const char *s, uint8_t *out, int max) {
@@ -126,46 +68,6 @@ static int parse_csv_u8(const char *s, uint8_t *out, int max) {
         while (*s && *s != ',') s++;
     }
     return n;
-}
-
-/* Parse `"targets":[{...},{...}]` out of `line`, populating `out` with up
- * to `max` valid entries. Invalid target objects are skipped (matching the
- * legacy set_mapping behaviour). Returns the count of accepted targets. */
-static uint8_t parse_targets(const char *line, mapping_target_t *out, uint8_t max) {
-    uint8_t count = 0;
-    const char *tp = strstr(line, "\"targets\"");
-    if (!tp) return 0;
-    const char *p = tp;
-    while (count < max && (p = strchr(p, '{')) != NULL) {
-        const char *end = strchr(p, '}');
-        if (!end) break;
-        char obj[64];
-        size_t len = (size_t)(end - p + 1);
-        if (len < sizeof(obj)) {
-            memcpy(obj, p, len);
-            obj[len] = '\0';
-            int slave = 0, addr = 0, group = 0;
-            bool has_slave = json_int(obj, "slave", &slave);
-            bool has_addr  = json_int(obj, "addr",  &addr);
-            bool has_group = json_int(obj, "group", &group);
-            if (has_slave && slave > 0 && slave <= 247 &&
-                (has_addr || has_group)) {
-                out[count].slave = (uint8_t)slave;
-                bool is_relay = slave_kind((uint8_t)slave) == SLAVE_KIND_RELAY;
-                if (has_group && !is_relay) {
-                    if (group >= 0 && group <= 15) {
-                        out[count].addr = TARGET_MAKE_GROUP((uint8_t)group);
-                        count++;
-                    }
-                } else if (has_addr) {
-                    out[count].addr = (uint8_t)addr;
-                    count++;
-                }
-            }
-        }
-        p = end + 1;
-    }
-    return count;
 }
 
 /* Emit a config_mapping line for one (fixture, button). Empty `targets`
@@ -1199,9 +1101,6 @@ static int dali_cfg_set(uint8_t slave, uint8_t addr, const char *field, uint8_t 
 
 /* ── Unified {t,d,v} state reports — used by get_* and as set_* confirmation ─
  * Same shape the client sends to set: {"t":"state_X","d":{addr},"v":{values}}. */
-static unsigned long now_ms_u(void) {
-    return (unsigned long)to_ms_since_boot(get_absolute_time());
-}
 
 /* Push the cached state of one entity to core 1 (the network bridge). These are
  * the get/predictive paths; the unsolicited dirty-poll path goes through the
@@ -1358,13 +1257,13 @@ static int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const cha
          * that says 0 while the lamp is still ramping down is an inferred value
          * on a topic that must only carry measured ones. The verification read
          * marked by lighting_set_on_off reports the real level, including each
-         * step of the ramp. */
-        return 2;   /* applied — nothing measured yet to report */
-        /* On: GOTO_LAST_ACTIVE restores a level the controller does NOT know.
+         * step of the ramp.
+         *
+         * On: GOTO_LAST_ACTIVE restores a level the controller does NOT know.
          * Don't assume it (the old code guessed max_level/254) — commanded_on is
          * already set by lighting_set_on_off, and the dirty-poll reports the real
-         * brightness shortly.  Return 2 = "applied, no level to report yet". */
-        return 2;
+         * brightness shortly. */
+        return 2;   /* applied — nothing measured yet to report */
     }
     return dali_cfg_set(slave, addr, key, (uint8_t)atoi(val));
 }
@@ -2425,23 +2324,8 @@ static void handle_text_line(const char *original_line) {
 }
 
 /* ── State event serialisation ───────────────────────────────────────────── */
-/* lighting_actions.c defines levt_t internally; we replicate the minimal
- * struct here for serialisation.  In a real project these would share a header. */
-typedef enum { LEVT_RELAY, LEVT_DALI, LEVT_FAULT,
-               LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY, LEVT_GW_DIAG } levt_type_t;
-typedef struct {
-    levt_type_t type;
-    union {
-        struct { uint8_t ch; bool on; } relay;
-        struct { uint8_t slave_id; uint8_t addr; uint8_t arc; uint8_t status; } dali;
-        struct { uint8_t slave_id; uint8_t addr; bool lamp_fail; bool power_cycle; } fault;
-        struct { uint8_t slave_id; uint64_t present_mask; } scan_complete;
-        struct { uint8_t slave_id; uint8_t group; uint8_t bri; bool on; } group;
-        struct { uint8_t slave_id; bool online; } gateway;
-        struct { uint8_t slave_id; uint32_t uptime_s;
-                 uint16_t boot_count; uint8_t reset_reason; } gw_diag;
-    };
-} levt_t;
+/* levt_type_t / levt_t come from lighting_actions.h (included above) — no
+ * local copy; lighting_evt_try_pop()'s prototype there carries the real type. */
 
 /* ── Inter-core seam (core0 -> core1 events, core1 -> core0 commands) ─────────
  * Convert a drained levt_t (the core-0 staging-ring event) to the typed

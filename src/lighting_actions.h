@@ -18,6 +18,38 @@
  * never claims a state the hardware was never told. Callers may ignore the result
  * (the drop is already logged) or react to it. */
 
+/* ── State event queue — written here, drained by serial_poll() ────────────
+ * The single definition: serial_poll() (serial_protocol.c) used to hand-copy
+ * this struct for its own levt_to_ic() translation, with
+ * lighting_evt_try_pop()'s prototype re-declared there as `void *out` to paper
+ * over the duplication. One copy, shared. */
+typedef enum {
+    LEVT_RELAY, LEVT_DALI, LEVT_FAULT,
+    LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY, LEVT_GW_DIAG
+} levt_type_t;
+
+typedef struct {
+    levt_type_t type;
+    union {
+        struct { uint8_t ch; bool on; }                       relay;
+        struct { uint8_t slave_id; uint8_t addr;
+                 uint8_t arc; uint8_t status; }               dali;
+        struct { uint8_t slave_id; uint8_t addr;
+                 bool lamp_fail; bool power_cycle; }          fault;
+        struct { uint8_t slave_id; uint64_t present_mask; }  scan_complete;
+        struct { uint8_t slave_id; uint8_t group;
+                 uint8_t bri; bool on; }                      group;
+        struct { uint8_t slave_id; bool online; }            gateway;
+        struct { uint8_t slave_id; uint32_t uptime_s;
+                 uint16_t boot_count; uint8_t reset_reason; } gw_diag;
+    };
+} levt_t;
+
+/* Drain one queued state event (FIFO). Returns false when the queue is empty.
+ * Called from serial_poll() once per main-loop iteration to forward each event
+ * to core 1 as a typed ic_event_t (see levt_to_ic in serial_protocol.c). */
+bool lighting_evt_try_pop(levt_t *out);
+
 /* Relay: on/off */
 bool lighting_set_relay(uint8_t channel, bool on);
 

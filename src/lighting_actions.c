@@ -33,27 +33,8 @@
  * iteration, so this only needs to absorb a single synchronous burst. */
 #define EVT_QUEUE_SIZE 256
 
-typedef enum {
-    LEVT_RELAY, LEVT_DALI, LEVT_FAULT,
-    LEVT_SCAN_COMPLETE, LEVT_GROUP, LEVT_GATEWAY, LEVT_GW_DIAG
-} levt_type_t;
-
-typedef struct {
-    levt_type_t type;
-    union {
-        struct { uint8_t ch; bool on; }                       relay;
-        struct { uint8_t slave_id; uint8_t addr;
-                 uint8_t arc; uint8_t status; }               dali;
-        struct { uint8_t slave_id; uint8_t addr;
-                 bool lamp_fail; bool power_cycle; }          fault;
-        struct { uint8_t slave_id; uint64_t present_mask; }  scan_complete;
-        struct { uint8_t slave_id; uint8_t group;
-                 uint8_t bri; bool on; }                      group;
-        struct { uint8_t slave_id; bool online; }            gateway;
-        struct { uint8_t slave_id; uint32_t uptime_s;
-                 uint16_t boot_count; uint8_t reset_reason; } gw_diag;
-    };
-} levt_t;
+/* levt_type_t / levt_t now live in lighting_actions.h — serial_protocol.c
+ * needs the real type too (levt_to_ic()), not a hand-copy. */
 
 /* Per-slave/group debounce cache — last emitted (on, bri, members) per group.
  * Zero-init: all groups start as { on=false, bri=0, members=0 }.
@@ -79,9 +60,7 @@ static void push_evt(const levt_t *e) {
     s_evt_head = next;
 }
 
-/* Called by serial_poll() to drain events */
-bool lighting_evt_try_pop(levt_t *out);
-
+/* Called by serial_poll() to drain events — prototype in lighting_actions.h */
 bool lighting_evt_try_pop(levt_t *out) {
     if (s_evt_head == s_evt_tail) return false;
     *out = s_evts[s_evt_tail];
@@ -246,11 +225,17 @@ static void probe_finish(bool valid, bool any_on, const char *why) {
  * So HA toggle correctness rests on the accuracy of our state topic — i.e. on
  * the verification reads — not on this code.
  *
- * Safe to submit the follow-up command from inside the completion callback:
- * dq_tick() drives mbq_client_tick() (which fires callbacks) BEFORE its ship
- * loop reads the class rings, and dq_mbq_cb releases the trampoline before
- * invoking the user callback — so the new command lands in a ring the loop has
- * not visited yet, using a trampoline that is already free.
+ * Safe to submit the follow-up command from inside the completion callback, on
+ * EITHER of the two contexts a callback can fire from (mbq_cb_t, in
+ * mbq_client.h). Normal path: dq_tick() calls mbq_client_collect() (which
+ * fires callbacks) BEFORE its ship loop reads the class rings, and dq_mbq_cb
+ * releases the trampoline before invoking the user callback — so the new
+ * command lands in a ring the loop has not visited yet, using a trampoline
+ * that is already free. Rarer path: a stalled §4 recovery poll giving up
+ * inside drive() (outside dq_tick's collect/ship ordering) — still safe
+ * because mbq_client_submit() is pure bookkeeping (it stages a command, it
+ * does not transmit), so it cannot interleave with the reply that triggered
+ * it.
  *
  * A slot is held only for the flight of one query. An unresolved probe does
  * NOTHING rather than guessing, and says so — the same rule as the CLI. */
