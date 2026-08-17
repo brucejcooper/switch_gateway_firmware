@@ -1173,8 +1173,10 @@ address is not stable. CLI tools:
 - `identify <slave> <addr>` — GTIN + serial; a garbled serial = a collision.
 - `blink <slave> <addr>` — flash one ballast (DAPC) to locate it physically.
 
-`test/dali_inventory.py <slave>` scans and flags collisions; the spreadsheet sync
-tooling records serial→address and can remap after a re-provision.
+`test/dali_inventory.py <slave>` scans and flags collisions. After a
+re-provision, re-run it to confirm the split, then `blink`/`identify` each new
+address to locate it physically — device identity (naming, floorplan position)
+lives in Home Assistant via the `lightswitch_mapper` panel, not a spreadsheet.
 
 ---
 
@@ -1265,20 +1267,21 @@ time rather than N per-ballast commands, so it is faster and atomic on the bus.
 The JSON `mapping/...` topics remain subscribed for back-compat (targets as
 `[{"slave":2,"addr":5},{"slave":2,"group":3}]`).
 
-### Bulk load from the spreadsheet
+### Bulk load — retired
 
-`tools/xlsx_to_ha.py` migrates `Switch wiring.xlsx` into Home Assistant **via the
-`lightswitch_mapper` integration** — it renames the DALI light and fixture
-devices, sets each fixture's physical button order, places devices on the
-floorplan, and writes each button's binding text entity (so the bindings flow to
-the controller over the `binding/...` topics). It runs against HA's REST +
-websocket API (`--token <long-lived>` or `--dev`), dry-run by default; pass
-`--apply` to write, or `--offline` to just print the plan from the xlsx.
+Bulk-loading bindings from a spreadsheet (`tools/xlsx_to_ha.py`, which pushed
+`Switch wiring.xlsx` into Home Assistant via the `lightswitch_mapper`
+integration) is retired. **HA is now the single source of truth** for the
+lighting layout: light/fixture names live in the device registry, floorplan
+positions and button orders live in the `lightswitch_mapper` integration's own
+storage, and bindings are edited live through the `text.*_binding_*` MQTT
+entities — via the mapper panel, HA services, or the CLI `map` command above.
 
-```bash
-python3 tools/xlsx_to_ha.py --offline                 # parse + print, no HA
-python3 tools/xlsx_to_ha.py --token <tok> --apply      # write to HA
-```
+`Switch wiring.xlsx` remains in this repo only as **frozen** documentation of
+the physical wiring (matrix wiring, button wiring order). A read-only
+spreadsheet *snapshot* of the current HA layout can be generated at any time
+with `mapper/tools/export_mappings.py` (see `../mapper/README.md`) — it reads
+straight from HA and never writes to it.
 
 ---
 

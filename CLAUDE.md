@@ -505,17 +505,18 @@ device) · `0x13-0x14` hw ver. Verified on the rig's ballasts.
 ### Scripts (`test/`)
 - `dali_inventory.py <slave> [--all]` — scan, print each device's GTIN/serial,
   flag collisions.
-- `dali_xlsx_sync.py {populate|remap} [--dry-run]` — sync the `Lights` sheet of
-  `Switch wiring.xlsx`. **populate**: record each device's GTIN+serial into its
-  (Device,Address) row. **remap**: after a re-provision changed addresses, scan
-  serial→address and rewrite each row's Address by matching its recorded serial.
-  Writes a timestamped `.bak` first (openpyxl may drop charts/images).
 
 ### Workflow for a collision
 1. `dali_inventory.py <slave>` → find collided addresses.
 2. `provision <slave> <addr>` per collided address → split onto free addresses.
-3. `blink`/`identify` the new addresses, update the spreadsheet — or run
-   `dali_xlsx_sync.py remap` if serials were `populate`d beforehand.
+3. `dali_inventory.py <slave>` again to confirm the split, then `blink`/`identify`
+   each new address to physically locate it. **HA is the single source of
+   truth** for device identity now — rename/reposition the light in Home
+   Assistant (the `lightswitch_mapper` sidebar panel, or the device registry
+   directly). There is no spreadsheet step: `Switch wiring.xlsx` is retired as
+   a workflow input and kept in the repo only as frozen wiring documentation;
+   a read-only spreadsheet snapshot of the live HA layout can be regenerated
+   any time with `mapper/tools/export_mappings.py` (see `mapper/README.md`).
 
 ## DALI per-ballast config — min/max/power-on/sys-fail/fade (2026-06-06)
 
