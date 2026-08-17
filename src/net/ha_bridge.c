@@ -119,9 +119,49 @@ static int slave_idx(uint8_t id) {
  * than two that could disagree. */
 static const char *idp(void) { return mqtt_app_prefix(); }
 
+/* ── shared "device" blocks ──────────────────────────────────────────────
+ * Several builders below are grouped under the same HA device and so build
+ * an identical {ids,name,via/gw} triple before calling dev() — only the
+ * builder's own payload and objid differ. One helper per device shape keeps
+ * that triple in one place instead of copy-pasted per builder; a builder
+ * that is the only member of its device (disc_relay) is left direct, per
+ * the DALI ballast/group/plate groupings below matching the file's existing
+ * PROV_TAIL/GWD_TAIL precedent for the gateway device. */
+static int dev_plate(int n, uint8_t fix) {
+    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF];
+    snprintf(ids, sizeof ids, "%s_switch_plate_%02u", idp(), fix);
+    snprintf(name, sizeof name, "Fixture %02u", fix + 1);
+    snprintf(via, sizeof via, "%s_controller", idp());
+    return dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", via);
+}
+static int dev_ballast(int n, uint8_t slave, uint8_t addr) {
+    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF];
+    snprintf(ids, sizeof ids, "%s_dali_%u_%u", idp(), slave, addr);
+    snprintf(name, sizeof name, "DALI %u.%02u", slave, addr);
+    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
+    return dev(n, ids, name, MFR_MECH, "DALI Ballast", gw);
+}
+static int dev_group(int n, uint8_t slave, uint8_t grp) {
+    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF];
+    snprintf(ids, sizeof ids, "%s_group_%u_%u", idp(), slave, grp);
+    snprintf(name, sizeof name, "DALI Group %u.%u", slave, grp);
+    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
+    return dev(n, ids, name, MFR_MECH, "DALI Group", gw);
+}
+/* The controller-device JSON literal — copy-pasted identically in
+ * disc_controller (all 3 branches), disc_system_reboot, disc_fw_update and
+ * disc_fw_check before this. Unlike dev(), it's a fixed leaf object (no
+ * via_device, sw_version instead), so it doesn't route through dev(). */
+static int dev_controller(int n) {
+    return pcat(n,
+        ",\"device\":{\"identifiers\":[\"%s_controller\"],"
+        "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
+        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+}
+
 static void disc_plate_event(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF], objid[DISC_BUF];
+    char objid[DISC_BUF];
     /* No value_template: HA's MQTT *event* platform parses the raw payload as
      * JSON and takes event_type from it (and any extra keys as attributes). A
      * value_template would be applied first and its *result* must itself be a
@@ -135,27 +175,21 @@ static void disc_plate_event(uint8_t fix, uint8_t btn) {
         "\"event_types\":[\"press\",\"release\",\"click\",\"long_press\",\"long_press_repeat\",\"stuck\",\"unstuck\"],"
         "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-button\"", idp(),
         fix, btn, btn + 1, P, fix, btn, P);
-    snprintf(ids, sizeof ids, "%s_switch_plate_%02u", idp(), fix);
-    snprintf(name, sizeof name, "Fixture %02u", fix + 1);
-    snprintf(via, sizeof via, "%s_controller", idp());
-    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", via);
+    dev_plate(n, fix);
     snprintf(objid, sizeof objid, "%s_switch_%02u_btn_%u", idp(), fix, btn);
     pub_cfg("event", objid);
 }
 
 static void disc_plate_binding(uint8_t fix, uint8_t btn) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF], objid[DISC_BUF];
+    char objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"%s_binding_%02u_btn_%u\",\"name\":\"Button %u Binding\","
         "\"command_topic\":\"%s/binding/%u/%u/set\",\"state_topic\":\"%s/binding/%u/%u/state\","
         "\"pattern\":\"%s\",\"availability_topic\":\"%s/availability\","
         "\"entity_category\":\"config\",\"icon\":\"mdi:link-variant\"", idp(),
         fix, btn, btn + 1, P, fix, btn, P, fix, btn, BINDING_PATTERN, P);
-    snprintf(ids, sizeof ids, "%s_switch_plate_%02u", idp(), fix);
-    snprintf(name, sizeof name, "Fixture %02u", fix + 1);
-    snprintf(via, sizeof via, "%s_controller", idp());
-    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", via);
+    dev_plate(n, fix);
     snprintf(objid, sizeof objid, "%s_binding_%02u_btn_%u", idp(), fix, btn);
     pub_cfg("text", objid);
     snprintf(s_top, sizeof s_top, "%s/binding/%u/%u/state", P, fix, btn);
@@ -170,17 +204,14 @@ static uint8_t s_stuck_mask[MAX_FIX];
 
 static void disc_plate_stuck(uint8_t fix) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], via[DISC_BUF], objid[DISC_BUF];
+    char objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"%s_switch_%02u_stuck\",\"name\":\"Button Stuck\","
         "\"state_topic\":\"%s/plate/%u/stuck\","
         "\"device_class\":\"problem\",\"entity_category\":\"diagnostic\","
         "\"availability_topic\":\"%s/availability\",\"icon\":\"mdi:gesture-tap-hold\"", idp(),
         fix, P, fix, P);
-    snprintf(ids, sizeof ids, "%s_switch_plate_%02u", idp(), fix);
-    snprintf(name, sizeof name, "Fixture %02u", fix + 1);
-    snprintf(via, sizeof via, "%s_controller", idp());
-    dev(n, ids, name, MFR_MECH, "Switch Gateway Button Matrix", via);
+    dev_plate(n, fix);
     snprintf(objid, sizeof objid, "%s_switch_%02u_stuck", idp(), fix);
     pub_cfg("binary_sensor", objid);
     snprintf(s_top, sizeof s_top, "%s/plate/%u/stuck", P, fix);
@@ -209,7 +240,7 @@ static void disc_relay(uint8_t slave, uint8_t ch) {
 
 static void disc_ballast(uint8_t slave, uint8_t addr) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
+    char objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"%s_dali_%u_%u\",\"name\":null,\"schema\":\"json\","
         "\"state_topic\":\"%s/dali/%u/%u/state\",\"command_topic\":\"%s/dali/%u/%u/set\","
@@ -218,10 +249,7 @@ static void disc_ballast(uint8_t slave, uint8_t addr) {
         "{\"topic\":\"%s/gateway/%u/availability\"},"
         "{\"topic\":\"%s/dali/%u/%u/availability\"}],\"availability_mode\":\"all\"", idp(),
         slave, addr, P, slave, addr, P, slave, addr, P, P, slave, P, slave, addr);
-    snprintf(ids, sizeof ids, "%s_dali_%u_%u", idp(), slave, addr);
-    snprintf(name, sizeof name, "DALI %u.%02u", slave, addr);
-    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
-    dev(n, ids, name, MFR_MECH, "DALI Ballast", gw);
+    dev_ballast(n, slave, addr);
     snprintf(objid, sizeof objid, "%s_dali_%u_%u", idp(), slave, addr);
     pub_cfg("light", objid);
     snprintf(s_top, sizeof s_top, "%s/dali/%u/%u/availability", P, slave, addr);
@@ -242,7 +270,7 @@ static void disc_ballast_cfg(uint8_t slave, uint8_t addr, uint8_t k) {
         { "fade_rate", "Fade Rate", 0, 15 }, { "fade_time", "Fade Time", 0, 15 },
     };
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
+    char objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"%s_dali_%u_%u_%s\",\"name\":\"%s\","
         "\"command_topic\":\"%s/dali/%u/%u/config/%s/set\","
@@ -254,17 +282,14 @@ static void disc_ballast_cfg(uint8_t slave, uint8_t addr, uint8_t k) {
         "\"entity_category\":\"config\"", idp(),
         slave, addr, F[k].key, F[k].name, P, slave, addr, F[k].key,
         P, slave, addr, F[k].key, F[k].lo, F[k].hi, P, P, slave, P, slave, addr);
-    snprintf(ids, sizeof ids, "%s_dali_%u_%u", idp(), slave, addr);
-    snprintf(name, sizeof name, "DALI %u.%02u", slave, addr);
-    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
-    dev(n, ids, name, MFR_MECH, "DALI Ballast", gw);
+    dev_ballast(n, slave, addr);
     snprintf(objid, sizeof objid, "%s_dali_%u_%u_%s", idp(), slave, addr, F[k].key);
     pub_cfg("number", objid);
 }
 
 static void disc_group_light(uint8_t slave, uint8_t grp) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
+    char objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"%s_group_%u_%u\",\"name\":null,\"schema\":\"json\","
         "\"state_topic\":\"%s/group/%u/%u/state\",\"command_topic\":\"%s/group/%u/%u/set\","
@@ -272,10 +297,7 @@ static void disc_group_light(uint8_t slave, uint8_t grp) {
         "\"availability\":[{\"topic\":\"%s/availability\"},"
         "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\"", idp(),
         slave, grp, P, slave, grp, P, slave, grp, P, P, slave);
-    snprintf(ids, sizeof ids, "%s_group_%u_%u", idp(), slave, grp);
-    snprintf(name, sizeof name, "DALI Group %u.%u", slave, grp);
-    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
-    dev(n, ids, name, MFR_MECH, "DALI Group", gw);
+    dev_group(n, slave, grp);
     snprintf(objid, sizeof objid, "%s_group_%u_%u", idp(), slave, grp);
     pub_cfg("light", objid);
     snprintf(s_top, sizeof s_top, "%s/group/%u/%u/state", P, slave, grp);
@@ -284,7 +306,7 @@ static void disc_group_light(uint8_t slave, uint8_t grp) {
 
 static void disc_group_members(uint8_t slave, uint8_t grp) {
     const char *P = mqtt_app_prefix();
-    char ids[DISC_BUF], name[DISC_BUF], gw[DISC_BUF], objid[DISC_BUF];
+    char objid[DISC_BUF];
     int n = snprintf(s_pl, PL_CAP,
         "{\"unique_id\":\"%s_group_%u_%u_members\",\"name\":\"Members\","
         "\"command_topic\":\"%s/group/%u/%u/members/set\","
@@ -293,10 +315,7 @@ static void disc_group_members(uint8_t slave, uint8_t grp) {
         "{\"topic\":\"%s/gateway/%u/availability\"}],\"availability_mode\":\"all\","
         "\"entity_category\":\"config\",\"icon\":\"mdi:format-list-bulleted\"", idp(),
         slave, grp, P, slave, grp, P, slave, grp, MEMBERS_PATTERN, P, P, slave);
-    snprintf(ids, sizeof ids, "%s_group_%u_%u", idp(), slave, grp);
-    snprintf(name, sizeof name, "DALI Group %u.%u", slave, grp);
-    snprintf(gw, sizeof gw, "%s_dali_gw_%u", idp(), slave);
-    dev(n, ids, name, MFR_MECH, "DALI Group", gw);
+    dev_group(n, slave, grp);
     snprintf(objid, sizeof objid, "%s_group_%u_%u_members", idp(), slave, grp);
     pub_cfg("text", objid);
     snprintf(s_top, sizeof s_top, "%s/group/%u/%u/members/state", P, slave, grp);
@@ -466,10 +485,7 @@ static void disc_controller(uint8_t k) {
             "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
             "\"icon\":\"mdi:swap-horizontal\"", idp(),
             P, P, P);
-        pcat(n,
-            ",\"device\":{\"identifiers\":[\"%s_controller\"],"
-            "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+        dev_controller(n);
         { char oid[DISC_BUF];
           snprintf(oid, sizeof oid, "%s_cfg_relay_byteswap", idp());
           pub_cfg("switch", oid); }
@@ -483,10 +499,7 @@ static void disc_controller(uint8_t k) {
             "\"mode\":\"box\",\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\"", idp(),
             CFG_NUM[k].key, CFG_NUM[k].name, P, CFG_NUM[k].key, P, CFG_NUM[k].key,
             CFG_NUM[k].lo, CFG_NUM[k].hi, CFG_NUM[k].step, P);
-        pcat(n,
-            ",\"device\":{\"identifiers\":[\"%s_controller\"],"
-            "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+        dev_controller(n);
         snprintf(objid, sizeof objid, "%s_cfg_%s", idp(), CFG_NUM[k].key); pub_cfg("number", objid);
     } else {
         int b = k - (int)CFG_NUM_N;
@@ -495,10 +508,7 @@ static void disc_controller(uint8_t k) {
             "\"value_template\":\"{{ value_json.%s }}\",\"availability_topic\":\"%s/availability\","
             "\"entity_category\":\"diagnostic\",\"icon\":\"%s\"", idp(),
             CFG_SENS[b].key, CFG_SENS[b].name, P, CFG_SENS[b].key, P, CFG_SENS[b].icon);
-        pcat(n,
-            ",\"device\":{\"identifiers\":[\"%s_controller\"],"
-            "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-            "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+        dev_controller(n);
         snprintf(objid, sizeof objid, "%s_cfg_%s", idp(), CFG_SENS[b].key); pub_cfg("sensor", objid);
     }
 }
@@ -627,10 +637,7 @@ static void disc_system_reboot(void) {
         "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
         "\"device_class\":\"restart\",\"icon\":\"mdi:restart\"", idp(),
         P, P);
-    pcat(n,
-        ",\"device\":{\"identifiers\":[\"%s_controller\"],"
-        "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+    dev_controller(n);
     { char oid[DISC_BUF];
           snprintf(oid, sizeof oid, "%s_reboot", idp());
           pub_cfg("button", oid); }
@@ -652,10 +659,7 @@ static void disc_fw_update(void) {
         "\"payload_install\":\"INSTALL\",\"device_class\":\"firmware\","
         "\"entity_category\":\"config\",\"value_template\":\"{{ value_json | tojson }}\"", idp(),
         P, P);
-    pcat(n,
-        ",\"device\":{\"identifiers\":[\"%s_controller\"],"
-        "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+    dev_controller(n);
     { char oid[DISC_BUF];
           snprintf(oid, sizeof oid, "%s_fw_update", idp());
           pub_cfg("update", oid); }
@@ -672,10 +676,7 @@ static void disc_fw_check(void) {
         "\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\","
         "\"icon\":\"mdi:cloud-refresh\"", idp(),
         P, P);
-    pcat(n,
-        ",\"device\":{\"identifiers\":[\"%s_controller\"],"
-        "\"name\":\"Switch Gateway Controller\",\"manufacturer\":\"" MFR_MECH "\","
-        "\"model\":\"" CTRL_MODEL "\",\"sw_version\":\"" FW_VERSION "\"}}", idp());
+    dev_controller(n);
     { char oid[DISC_BUF];
           snprintf(oid, sizeof oid, "%s_fw_check", idp());
           pub_cfg("button", oid); }
