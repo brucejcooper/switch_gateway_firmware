@@ -128,6 +128,18 @@ enum { H_OK = 0u, H_FAILED = 1u, H_NAK = 2u };   /* head-entry status; cq.h is a
  * is needed. */
 #define MAX_DEADLINE_CHASES 3u
 
+/* A Modbus EXCEPTION is still an ANSWER (mbq_modbus_cb below counts only
+ * res == 0 — a genuine no-reply — toward c_consec_fail/link_down), so a
+ * gateway that persistently EXCEPTIONS the sysinfo read (FC04 0x0310) rather
+ * than going silent never trips link_down, and S_BOOT_CHECK's `if (down)
+ * bootchk_give_up(s)` never fires. Without a bound of its own, that parks the
+ * slave in S_BOOT_CHECK forever, re-issuing the read every PACE_FAIL_MS with
+ * the whole command path stalled behind it (drive() returns from the
+ * S_BOOT_CHECK case before any command work runs). Give up after this many
+ * CONSECUTIVE exceptions, matching how TX_VERSION already treats its own
+ * unreadability as advisory rather than fatal. */
+#define MAX_SYSINFO_EXCEPTIONS 3u
+
 /* A command may go back on the wire this many times (A_FULL retries excluded,
  * they are not resends of a landed command) before the client gives up and
  * reports it LOST. Without a cap, an idempotent command against a gateway that
@@ -243,6 +255,9 @@ typedef struct {
     uint8_t  bc_reason;         /* bc_reason_t for the read in flight */
     bool     bc_valid;
     uint16_t bc_last;
+    uint8_t  sysinfo_exc;       /* consecutive Modbus EXCEPTIONS to the sysinfo
+                                 * read — see MAX_SYSINFO_EXCEPTIONS; reset on
+                                 * any non-exception outcome */
 
     uint32_t next_ord;          /* monotonic submit counter, source of cmd_t.ord */
     uint8_t  drain_polls;
@@ -1063,6 +1078,7 @@ static void resolve_recovery_reply(slave_t *s, const reply_t *r) {
 static void resolve_sysinfo(slave_t *s, const uint8_t *b, uint8_t n) {
     /* FC04 4-register frame: addr + fc + bytecount + 8 data + 2 CRC = 13. */
     if (n < 13u) { pace(s, PACE_FAIL_MS); s->st = S_IDLE; return; }
+    s->sysinfo_exc = 0;   /* a real reply — the exception streak, if any, is over */
     uint16_t bc = (uint16_t)(((uint16_t)b[7] << 8) | b[8]);   /* reg2 = boot_count */
     bool changed = s->bc_valid && (bc != s->bc_last);
     bool first   = !s->bc_valid;
@@ -1175,13 +1191,18 @@ static void resolve_sysinfo(slave_t *s, const uint8_t *b, uint8_t n) {
     }
 }
 
-/* The boot_count arbiter could not be read and the link is down. Every reason
- * we were reading it wanted to know "did this command run?", and the answer is
- * now unknowable — so take the disposition that assumes it might have. */
+/* The boot_count arbiter could not be read — either the link is down
+ * (LINK_DOWN_FAILS consecutive no-replies) or the gateway keeps answering the
+ * sysinfo read with a Modbus exception (MAX_SYSINFO_EXCEPTIONS in a row; an
+ * exception is an ANSWER, so it never trips the link-down path on its own).
+ * Every reason we were reading it wanted to know "did this command run?", and
+ * the answer is now unknowable either way — so take the disposition that
+ * assumes it might have. */
 static void bootchk_give_up(slave_t *s) {
     LOG_LINK(s, "slave %u: boot_count unreadable — disposing conservatively",
              s->slave_id);
     s->bc_valid = false;
+    s->sysinfo_exc = 0;   /* fresh budget the next time S_BOOT_CHECK is entered */
     if ((s->bc_reason == BC_ACKLESS || s->bc_reason == BC_R1_EMPTY)
         && s->rec_cmd != NO_CMD) {
         /* Both of these are "did this command run?" questions, and the arbiter
@@ -1319,6 +1340,24 @@ static void resolve_failure(slave_t *s) {
          * but a command cannot be left unresolved forever waiting for a gateway
          * that is gone — so once the link is declared down, classify the way an
          * unreadable boot_count demands: conservatively, as if it had changed. */
+        if (s->cb_res < 0) {
+            /* An EXCEPTION reply — e.g. a register-map skew that still reports
+             * a queue-v4-compatible version at 0x0200 — does not move
+             * c_consec_fail (see mbq_modbus_cb), so `down` alone cannot bound
+             * this case: a gateway that always exceptions this read would
+             * otherwise never satisfy `down` and would sit in S_BOOT_CHECK
+             * forever. Count consecutive exceptions here instead, and once
+             * they exhaust the same small budget TX_VERSION already tolerates,
+             * give up through the SAME path an unreadable boot_count uses —
+             * so any command mid-arbitration (including one stranded there by
+             * a BC_ACKLESS/BC_R1_EMPTY poll) resolves exactly per the §4
+             * contract, conservatively, as-if-changed, regardless of which way
+             * the arbiter became unreachable. */
+            if (s->sysinfo_exc < 0xFFu) s->sysinfo_exc++;
+            if (s->sysinfo_exc >= MAX_SYSINFO_EXCEPTIONS) { bootchk_give_up(s); return; }
+        } else {
+            s->sysinfo_exc = 0;
+        }
         if (down) bootchk_give_up(s);
         return;
     }
