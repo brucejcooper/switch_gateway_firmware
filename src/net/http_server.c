@@ -113,16 +113,37 @@ static uint32_t s_last_listen_ms = 0;
 static char    s_logbuf[LOG_SNAP_CAP];
 static conn_t *s_logbuf_owner = NULL;
 
-static void arm_listen(conn_t *c) {
-    if (s_logbuf_owner == c) s_logbuf_owner = NULL;   /* release the log snapshot */
-    close(c->sn);
-    int8_t s = socket(c->sn, Sn_MR_TCP, HTTP_PORT, SF_IO_NONBLOCK);
-    int8_t l = (s == c->sn) ? listen(c->sn) : (int8_t)-1;
-    if (s != c->sn || l != SOCK_OK) s_arm_fails++;
+/* Common to arm_listen and release_sock0_conn: drop whatever this connection
+ * was mid-doing and blank its request/response scratch state. Always releases
+ * the shared /api/log snapshot owner — a connection that's being torn down
+ * (listener re-armed, or socket 0 yanked back by netif) can never finish
+ * reading it, so holding the owner slot past this point only starves every
+ * later GET /api/log with a permanent 503. */
+static void reset_conn_state(conn_t *c) {
+    if (s_logbuf_owner == c) s_logbuf_owner = NULL;
     c->st = CONN_LISTEN;
     c->rx_len = 0; c->hdr_complete = false; c->content_len = 0; c->body_start = 0;
     c->out_len = c->out_sent = 0; c->mem = NULL; c->mem_len = c->mem_sent = 0;
     c->state_done = false;
+}
+
+static void arm_listen(conn_t *c) {
+    reset_conn_state(c);
+    close(c->sn);
+    int8_t s = socket(c->sn, Sn_MR_TCP, HTTP_PORT, SF_IO_NONBLOCK);
+    int8_t l = (s == c->sn) ? listen(c->sn) : (int8_t)-1;
+    if (s != c->sn || l != SOCK_OK) s_arm_fails++;
+}
+
+/* Socket 0 was just yanked back by the netif arbiter (DHCP renewal due, or
+ * ping/ota/fwupdate acquired it) — see http_server_tick(). We no longer own
+ * the physical socket, so unlike arm_listen() we must NOT re-open/listen on
+ * it (that would fight whoever the arbiter handed it to next); we only close
+ * our end and blank the connection slot so it starts clean if/when the loan
+ * returns and arm_listen() re-arms it for real. */
+static void release_sock0_conn(conn_t *c) {
+    reset_conn_state(c);
+    close(c->sn);
 }
 
 void http_server_init(void) {
@@ -709,6 +730,16 @@ void http_server_tick(void) {
         arm_listen(&s_conn[N_BASE]);     /* socket 0 */
         s_sock0_active = true;
     } else if (!en && s_sock0_active) {
+        /* Revoked mid-flight: whatever s_conn[N_BASE] was doing (RECV, SEND,
+         * DRAIN — even just LISTEN) is abandoned right now, not when the loan
+         * eventually returns. Previously this only flipped the flag and left
+         * pump() un-called on the slot, so a connection that owned the
+         * /api/log snapshot (s_logbuf_owner) never released it — every later
+         * GET /api/log answered 503 until the NEXT loan window happened to
+         * land on this same connection, which could be minutes/hours away, or
+         * (if netif's ping/ota/fwupdate arbiter held sock0 instead of a DHCP
+         * renewal) never during that boot. */
+        release_sock0_conn(&s_conn[N_BASE]);
         s_sock0_active = false;
     }
 

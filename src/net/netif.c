@@ -27,6 +27,23 @@ static uint8_t s_dhcp_buf[DHCP_BUF_SIZE];
  * drops the MAC-hex suffix, so the wire hostname is exactly what we copy here). */
 extern uint8_t HOST_NAME[];
 
+/* ioLibrary's own seconds-since-last-successful-lease-event counter (dhcp.c,
+ * not static, but not exposed via dhcp.h either). We read it — never write —
+ * to know how close the NEXT DHCP renewal is, instead of maintaining our own
+ * shadow copy (a prior version of this file kept a local s_lease_elapsed_s,
+ * incremented in step with this same counter but zeroed only from the
+ * ip_assign/ip_update callback below — see why that was wrong). It is
+ * reset by reset_DHCP_timeout() at every point that matters to us: the
+ * initial DISCOVER/REQUEST, and BOTH the send and the ACK of a T1 renewal
+ * REREQUEST — critically, on the ACK regardless of whether the leased IP
+ * changed. ioLibrary's ip_assign/ip_update callbacks are NOT an equivalent
+ * signal: dhcp_ip_update() (dhcp.c ~:883) fires ONLY when a renewal changes
+ * the IP, which is the unusual case — a same-IP renewal (the normal case)
+ * calls neither callback. Driving our guard band off the callback instead of
+ * this counter is exactly what caused the 2026-08-17 stuck-socket-0 incident;
+ * see that commit for the trace. */
+extern volatile uint32_t dhcp_tick_1s;
+
 /* Socket-0 lending: the W5100S has only 4 sockets (0=DHCP, 1=MQTT), leaving 2
  * for the web server. Between DHCP renewals the DHCP socket sits idle, so we
  * lend it to the web LISTEN pool as an opportunistic 3rd socket and reclaim it a
@@ -36,7 +53,6 @@ extern uint8_t HOST_NAME[];
  * socket 0 as revocable bonus capacity and never depends on it. */
 #define DHCP_RENEW_GUARD_S  15u
 static volatile bool s_web_sock0 = false;   /* may the web server use socket 0 now? */
-static uint32_t      s_lease_elapsed_s = 0; /* seconds since the current lease/renew */
 /* The CLI network-ping borrows socket 0 too (IPRAW/ICMP). While it holds it,
  * netif must not touch socket 0 (no DHCP_run, no web lend) — same invariant as
  * the web loan, with ping taking priority for the ~1 s it runs. */
@@ -118,7 +134,10 @@ static void dhcp_assigned(void) {
     getDNSfromDHCP(s_netinfo.dns);
     s_netinfo.dhcp = NETINFO_DHCP;
     wizchip_setnetinfo(&s_netinfo);
-    s_lease_elapsed_s = 0;              /* fresh lease/renew: restart the T1 clock */
+    /* No need to reset a T1 clock here: dhcp_tick_1s already did, inside
+     * dhcp.c's own ACK handling, before this callback ever runs (and unlike
+     * this callback, it does so on every successful lease/renewal, not just
+     * an IP-changing one — see the dhcp_tick_1s comment up top). */
     log_ip("DHCP lease");
 }
 static void dhcp_conflict(void) { LOG_WARN("net", "DHCP IP conflict"); }
@@ -215,7 +234,6 @@ void netif_tick(void) {
             if (s_cfg.dhcp && now - s_last_1s_ms >= 1000) {
                 s_last_1s_ms += 1000;
                 DHCP_time_handler();
-                s_lease_elapsed_s++;
             }
             break;
         }
@@ -223,12 +241,11 @@ void netif_tick(void) {
             if (now - s_last_1s_ms >= 1000) {
                 s_last_1s_ms += 1000;
                 DHCP_time_handler();        /* must keep ticking even while lending */
-                s_lease_elapsed_s++;
             }
             uint32_t lease = getDHCPLeasetime();        /* seconds */
             bool finite = lease != 0 && lease != 0xFFFFFFFFu;
             bool renewal_due = finite &&
-                (s_lease_elapsed_s + DHCP_RENEW_GUARD_S >= lease / 2);
+                (dhcp_tick_1s + DHCP_RENEW_GUARD_S >= lease / 2);
             if (renewal_due) {
                 /* Reclaim socket 0 for the renewal. DHCP_run()'s self-heal
                  * reopens it as UDP (stomping any web TCP use); since netif_tick
@@ -266,7 +283,7 @@ bool netif_ping_acquire_sock0(void) {
     if (s_cfg.dhcp) {
         uint32_t lease = getDHCPLeasetime();
         bool finite = lease != 0 && lease != 0xFFFFFFFFu;
-        if (finite && s_lease_elapsed_s + DHCP_RENEW_GUARD_S >= lease / 2)
+        if (finite && dhcp_tick_1s + DHCP_RENEW_GUARD_S >= lease / 2)
             return false;
     }
     s_web_sock0  = false;   /* web server backs off socket 0 next tick */
