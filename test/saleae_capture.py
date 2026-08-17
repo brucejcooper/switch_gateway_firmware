@@ -232,7 +232,10 @@ def _parse_serial_csv(path):
             if not val:
                 continue
             try:
-                b = int(val, 16) if val.lower().startswith("0x") else int(val, 16)
+                # export_data_table above is always configured with
+                # RadixType.HEXADECIMAL, so Data is always hex; int(val, 16)
+                # already tolerates an optional "0x"/"0X" prefix on its own.
+                b = int(val, 16)
             except ValueError:
                 continue
             try:
