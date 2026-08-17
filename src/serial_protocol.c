@@ -2792,17 +2792,32 @@ void serial_tx_config_full(void) {
 void serial_poll(void) {
     static char line_buf[SERIAL_LINE_MAX];
     static int  line_pos = 0;
+    /* Set the instant a line overflows the buffer; while poisoned, every byte
+     * up to the next newline is swallowed unbuffered instead of refilling
+     * line_buf from offset 0. Without this, the discard on overflow reset only
+     * line_pos, so bytes kept landing at line_buf[0] — the tail of an
+     * over-length paste (everything after the point it overflowed) filled the
+     * buffer again and got dispatched as its own command at the next newline —
+     * an attacker- or paste-controlled command executing from the middle of a
+     * line nothing meant to run standalone. */
+    static bool poisoned = false;
 
     /* Drain inbound characters (non-blocking, as in original lua_poll) */
     int ch;
     while ((ch = stdio_getchar_timeout_us(0)) != PICO_ERROR_TIMEOUT) {
         if (ch == '\n' || ch == '\r') {
             if (echo_on) { putchar('\r'); putchar('\n'); }
-            if (line_pos > 0) {
+            if (poisoned) {
+                poisoned = false;
+                line_pos = 0;
+                txt_err("line_too_long");
+            } else if (line_pos > 0) {
                 line_buf[line_pos] = '\0';
                 handle_line(line_buf);
                 line_pos = 0;
             }
+        } else if (poisoned) {
+            /* mid-overflow: discard silently, wait for the line to end */
         } else if (echo_on && (ch == 0x08 || ch == 0x7f)) {
             /* backspace / delete: erase the last buffered character and rub it
              * out on the terminal (cursor back, overwrite with space, back
@@ -2815,7 +2830,8 @@ void serial_poll(void) {
             line_buf[line_pos++] = (char)ch;
             if (echo_on) putchar((char)ch);
         } else {
-            line_pos = 0; /* overflow — discard */
+            line_pos  = 0;
+            poisoned  = true;   /* overflow — poison until the newline */
         }
         /* Push echoed characters (incl. the "\b \b" erase) out immediately so
          * the terminal updates on each keypress rather than at line end. */
