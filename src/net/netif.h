@@ -43,12 +43,18 @@ void netif_get_dns(uint8_t dns[4]);
  * The web server must relinquish socket 0 promptly when this returns false. */
 bool netif_web_sock0_enabled(void);
 
-/* Borrow socket 0 for a one-off CLI network ping (IPRAW/ICMP). Returns false if
- * socket 0 isn't free right now (not ready, DHCP about to renew, or already
- * lent to a ping). While held, netif leaves socket 0 alone and the web server
- * backs off; the caller MUST netif_ping_release_sock0() when done. */
-bool netif_ping_acquire_sock0(void);
-void netif_ping_release_sock0(void);
+/* Borrow socket 0 for exclusive use outside the web server's opportunistic
+ * TCP lend: the CLI network ping (ping.c, IPRAW/ICMP, held ~1 s), the OTA
+ * image downloader (ota.c, held for the whole signed-image HTTP GET — minutes,
+ * not seconds), and the firmware manifest checker (fwupdate.c, held for a
+ * single small HTTP GET, bounded a few seconds). Returns false if socket 0
+ * isn't free right now (not ready, DHCP about to renew, or already claimed by
+ * one of the above). While held, netif leaves socket 0 alone and the web
+ * server backs off; the caller MUST netif_sock0_release() when done — and
+ * should do so promptly, since netif does not reclaim a long-held claim the
+ * way it reclaims the web loan (see the s_sock0_claimed comment in netif.c). */
+bool netif_sock0_acquire(void);
+void netif_sock0_release(void);
 
 /* Force a full W5100S recovery (chip reset + re-init + re-DHCP). Used when a
  * higher layer detects the socket subsystem is wedged in a way it can't clear

@@ -90,7 +90,7 @@ bool fw_json_get(const char *buf, const char *key, char *out, int cap) {
 
 typedef enum {
     FS_IDLE = 0,        /* waiting for the interval or an announce() */
-    FS_ACQUIRE_SOCK,    /* waiting for netif_ready() + netif_ping_acquire_sock0() */
+    FS_ACQUIRE_SOCK,    /* waiting for netif_ready() + netif_sock0_acquire() */
     FS_RESOLVE,         /* dnsr_start/dnsr_poll in flight (skipped for a dotted-quad host) */
     FS_HTTP_START,      /* httpc_get_start() about to fire */
     FS_FETCHING,        /* pumping httpc_poll(); body cb fills s_body */
@@ -149,7 +149,7 @@ static bool parse_dotted_quad(const char *s, uint8_t ip[4]) {
 
 static void fw_release_sock(void) {
     if (F.have_sock) {
-        netif_ping_release_sock0();
+        netif_sock0_release();
         F.have_sock = false;
     }
 }
@@ -320,7 +320,7 @@ void fwupdate_poll(void) {
     }
 
     case FS_ACQUIRE_SOCK:
-        if (!netif_ready() || !netif_ping_acquire_sock0()) {
+        if (!netif_ready() || !netif_sock0_acquire()) {
             if (now_ms() - F.t_ms > FW_ACQUIRE_TIMEOUT_MS)
                 fw_abort(netif_ready() ? "socket 0 unavailable" : "network not ready");
             return;

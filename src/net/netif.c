@@ -53,10 +53,30 @@ extern volatile uint32_t dhcp_tick_1s;
  * socket 0 as revocable bonus capacity and never depends on it. */
 #define DHCP_RENEW_GUARD_S  15u
 static volatile bool s_web_sock0 = false;   /* may the web server use socket 0 now? */
-/* The CLI network-ping borrows socket 0 too (IPRAW/ICMP). While it holds it,
- * netif must not touch socket 0 (no DHCP_run, no web lend) — same invariant as
- * the web loan, with ping taking priority for the ~1 s it runs. */
-static volatile bool s_ping_sock0 = false;  /* does the ping own socket 0 now? */
+/* The general socket-0 arbiter: netif_sock0_acquire()/_release() below hand
+ * socket 0 to whichever of the CLI network-ping (ping.c, IPRAW/ICMP, ~1 s),
+ * the OTA image downloader (ota.c, http_client GET of the signed image —
+ * minutes, not seconds, for a ~576 KB image over plain HTTP), or the firmware
+ * manifest checker (fwupdate.c, a <1 KB http_client GET, bounded by
+ * FW_FETCH_TIMEOUT_MS ~10 s) currently holds it. This used to be named
+ * s_ping_sock0/netif_ping_acquire_sock0 from when only the CLI ping used it;
+ * ota.c and fwupdate.c grew onto the same arbiter later without a rename,
+ * which left the naming (and the old comment here, "the ~1 s it runs")
+ * describing only the shortest of the three holders. While ANY of them holds
+ * it, netif must not touch socket 0 (no DHCP_run, no web lend) — same
+ * invariant as the web loan. netif_sock0_acquire() only GRANTS the loan
+ * outside the DHCP_RENEW_GUARD_S (15 s) band before a renewal is due (mirrors
+ * the web-lend decision), but nothing re-checks that once granted: the
+ * NS_READY case below skips DHCP_run() entirely for as long as
+ * s_sock0_claimed stays true, however long that turns out to be, so an OTA
+ * download that outlasts the remaining lease time would ride past a T1
+ * renewal point without netif renewing (DHCP_time_handler() still ticks
+ * ioLibrary's own lease clock throughout, so it isn't lied to — netif just
+ * doesn't act on it while socket 0 is claimed). Not exercised by the current
+ * OTA image size / typical lease lengths; a real fix would need netif to
+ * reclaim socket 0 out from under a long-held claim the way it already does
+ * to the web loan, which is out of scope here (rename + doc only). */
+static volatile bool s_sock0_claimed = false;  /* does ping/ota/fwupdate own socket 0 now? */
 
 typedef enum { NS_RESET, NS_LINK_WAIT, NS_DHCP, NS_READY, NS_FAULT } netif_state_t;
 
@@ -227,10 +247,12 @@ void netif_tick(void) {
 
     case NS_READY:
         if (!link_up()) { LOG_WARN("net", "PHY link down"); s_state = NS_LINK_WAIT; break; }
-        if (s_ping_sock0) {
-            /* Ping owns socket 0 for the moment: keep the DHCP lease clock
-             * ticking but do NOT call DHCP_run() or re-lend to the web server
-             * (the ping has an IPRAW socket open on 0). Released within ~1 s. */
+        if (s_sock0_claimed) {
+            /* ping/ota/fwupdate owns socket 0 for the moment: keep the DHCP
+             * lease clock ticking but do NOT call DHCP_run() or re-lend to
+             * the web server. Released whenever the current holder finishes —
+             * anywhere from ~1 s (ping) to several minutes (an OTA image
+             * download); see the s_sock0_claimed comment above. */
             if (s_cfg.dhcp && now - s_last_1s_ms >= 1000) {
                 s_last_1s_ms += 1000;
                 DHCP_time_handler();
@@ -276,8 +298,8 @@ bool netif_ready(void)   { return s_state == NS_READY; }
 bool netif_link_up(void) { return link_up(); }
 bool netif_web_sock0_enabled(void) { return s_web_sock0; }
 
-bool netif_ping_acquire_sock0(void) {
-    if (s_state != NS_READY || s_ping_sock0) return false;
+bool netif_sock0_acquire(void) {
+    if (s_state != NS_READY || s_sock0_claimed) return false;
     /* Only grant when socket 0 is genuinely free: static IP always, or DHCP not
      * inside the pre-renewal guard band (mirrors the web-lend decision). */
     if (s_cfg.dhcp) {
@@ -286,11 +308,11 @@ bool netif_ping_acquire_sock0(void) {
         if (finite && dhcp_tick_1s + DHCP_RENEW_GUARD_S >= lease / 2)
             return false;
     }
-    s_web_sock0  = false;   /* web server backs off socket 0 next tick */
-    s_ping_sock0 = true;
+    s_web_sock0    = false;   /* web server backs off socket 0 next tick */
+    s_sock0_claimed = true;
     return true;
 }
 
-void netif_ping_release_sock0(void) { s_ping_sock0 = false; }
+void netif_sock0_release(void) { s_sock0_claimed = false; }
 void netif_get_ip(uint8_t ip[4])   { memcpy(ip, s_netinfo.ip, 4); }
 void netif_get_dns(uint8_t dns[4]) { memcpy(dns, s_netinfo.dns, 4); }

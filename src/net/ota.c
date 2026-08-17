@@ -92,7 +92,7 @@ bool ota_parse_url(const char *url, char *host, int host_cap, uint16_t *port, ch
 
 typedef enum {
     OS_IDLE = 0,
-    OS_ACQUIRE_SOCK,   /* waiting for netif_ready() + netif_ping_acquire_sock0() */
+    OS_ACQUIRE_SOCK,   /* waiting for netif_ready() + netif_sock0_acquire() */
     OS_RESOLVE,        /* dnsr_start/dnsr_poll in flight (skipped for a dotted-quad host) */
     OS_HTTP_START,      /* push IC_CMD_OTA_BEGIN, then httpc_get_start() */
     OS_DOWNLOADING,    /* pumping httpc_poll(); body cb fills g_ota_buf */
@@ -144,7 +144,7 @@ static bool parse_dotted_quad(const char *s, uint8_t ip[4]) {
 
 static void ota_release_sock(void) {
     if (O.have_sock) {
-        netif_ping_release_sock0();
+        netif_sock0_release();
         O.have_sock = false;
     }
 }
@@ -255,7 +255,7 @@ void ota_poll(void) {
         return;
 
     case OS_ACQUIRE_SOCK:
-        if (!netif_ready() || !netif_ping_acquire_sock0()) {
+        if (!netif_ready() || !netif_sock0_acquire()) {
             if (now_ms() - O.t_ms > OTA_ACQUIRE_TIMEOUT_MS) ota_fail();
             return;
         }

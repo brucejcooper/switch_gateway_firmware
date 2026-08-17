@@ -75,7 +75,7 @@ static void emit(uint8_t seq, ic_ping_status_t status, uint16_t rtt_ms) {
 
 static void finish(void) {
     close(PING_SOCK);
-    if (P.have_sock) { netif_ping_release_sock0(); P.have_sock = false; }
+    if (P.have_sock) { netif_sock0_release(); P.have_sock = false; }
     P.active = false;
     P.phase  = PH_IDLE;
 }
@@ -140,7 +140,7 @@ void ping_tick(void) {
 
     switch (P.phase) {
     case PH_OPEN:
-        if (!netif_ping_acquire_sock0()) { emit(0, IC_PING_BUSY, 0); finish(); return; }
+        if (!netif_sock0_acquire()) { emit(0, IC_PING_BUSY, 0); finish(); return; }
         P.have_sock = true;
         close(PING_SOCK);
         setSn_PROTO(PING_SOCK, IPPROTO_ICMP);
