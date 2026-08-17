@@ -59,6 +59,7 @@ pico_sdk_init()
 add_executable(bootloader
     main.c
     boot_decide.c
+    commit.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/boot_control.c
     ${CMAKE_CURRENT_LIST_DIR}/../src/fw_image.c
     ${CMAKE_CURRENT_LIST_DIR}/../lib/monocypher/monocypher.c
