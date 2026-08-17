@@ -484,7 +484,7 @@ const char *modbus_de_mode_to_str(modbus_de_mode_t mode) {
 }
 
 void modbus_set_baud(uint32_t baud) {
-    s_baud = baud;
+    modbus_uart_set_baud_runtime(baud); /* live first: s_baud + the UART divisor */
     g_config.baud = baud;               /* persisted via the unified config.json */
     if (!config_save())
         LOG_ERR("modbus", "config_save failed — baud not persisted");

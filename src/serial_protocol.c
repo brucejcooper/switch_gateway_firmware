@@ -1911,8 +1911,10 @@ static void cmd_baud(char **saveptr) {
     bool persist = sv && strcasecmp(sv, "save") == 0;
 
     LOG_INFO("cli", "baud %ld%s", baud, persist ? " save" : "");
-    modbus_uart_set_baud_runtime((uint32_t)baud);
+    /* modbus_set_baud() now applies the UART divisor itself before persisting,
+     * so the persist path no longer needs a separate runtime call first. */
     if (persist) modbus_set_baud((uint32_t)baud);
+    else         modbus_uart_set_baud_runtime((uint32_t)baud);
     printf("baud: %lu%s\n", (unsigned long)modbus_get_baud(),
            persist ? " (saved)" : " (live only)");
 }

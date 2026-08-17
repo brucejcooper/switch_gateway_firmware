@@ -149,8 +149,14 @@ bool modbus_mbq_v4(uint8_t dev, uint8_t ctl, const uint8_t *payload,
 
 
 /* ── Baud rate ───────────────────────────────────────────────────────────── */
-/* Call before modbus_init() if a non-default baud rate is desired. Persisted as
- * the `baud` key in /config.json (migrated from the old /modbus_baud.txt).
+/* Persists the `baud` key in /config.json (migrated from the old
+ * /modbus_baud.txt) AND applies it to the live UART immediately (via
+ * modbus_uart_set_baud_runtime() below — same caveat: only safe when no
+ * Modbus action is in flight). Every runtime caller (`cfg baud=`, the `baud
+ * ... save` CLI verb, the JSON/HA set_cfg baud key) goes through this one
+ * function so persisted config and the wire always agree; g_config.baud set
+ * ahead of modbus_init() (e.g. by config_load() at boot) is a separate path
+ * that does not call this function.
  *
  * Default 38400, canonical since 2026-08-14 and measured at 0.00 % bad frames
  * (0 of 6582). This REVERSED an earlier verdict recorded right here, that 19200
