@@ -54,7 +54,14 @@
  *
  * The probe is the producer here: to measure how fast the queue can go it has
  * to be able to keep it fed, which means holding more outstanding than the
- * gateway can execute. */
+ * gateway can execute.
+ *
+ * A second, unrelated miscalibration of the same shape lived in the
+ * direct-path depth GATE below (dq_soak_tick): it compared `depth` against
+ * mbq_client_inflight() — staged + wire + accepted, not what the gateway
+ * holds — so it let one extra command past the target the same way this
+ * constant used to. Every depth sweep run before that fix, including any
+ * archived {1,2} results, actually held depth+1 commands at the gateway. */
 #define SOAK_MAX_RECS             16u
 
 
@@ -327,17 +334,30 @@ void dq_soak_tick(void) {
         return;
     }
 
-    /* Pacing sample: why we are (or are not) submitting this instant. */
+    /* Pacing sample: why we are (or are not) submitting this instant. This is
+     * every non-FREE client slot — staged (MBQ_QUEUE_DEPTH), on the wire, AND
+     * accepted — a client-side occupancy diagnostic, and deliberately a
+     * DIFFERENT quantity from the gate below. Do not reuse it there; see why. */
     uint8_t occupied = mbq_client_inflight(S.slave);
     S.inflight_hist[occupied <= CMDQ_DEPTH + 1u ? occupied : CMDQ_DEPTH + 1u]++;
 
     if (S.path != SOAK_PATH_DIRECT) {
-        /* Scheduler path: keep that class's storage fed and let its own depth
-         * policy decide when to ship. A refused submit means the class is full,
-         * which is the scheduler doing its job, not an error — but the main loop
-         * spins far faster than DALI drains, so back off before re-offering
-         * instead of retrying thousands of times per second. Any polling producer
-         * against a deliberately shallow class needs this. */
+        /* Scheduler path: `depth` here is NOT the gateway's — dq_soak.h says so
+         * ("used only on the direct path — on a scheduler path the class's own
+         * depth policy governs"), and inflight_recs() is a THIRD quantity
+         * again: how many of the probe's OWN records (dq_soak.c's rec[]) are
+         * outstanding through the scheduler, submit to completion. That is the
+         * right thing to bound here — it caps how far the probe gets ahead of
+         * dali_queue, and the class's own depth policy is what actually paces
+         * the gateway. Checked against the direct-path bug below and it is not
+         * the same defect: this count already only advances on a real
+         * dq_submit() success and is not conflated with client-transport
+         * staging the way mbq_client_inflight() was. A refused submit means
+         * the class is full, which is the scheduler doing its job, not an
+         * error — but the main loop spins far faster than DALI drains, so back
+         * off before re-offering instead of retrying thousands of times per
+         * second. Any polling producer against a deliberately shallow class
+         * needs this. */
         if (inflight_recs() >= S.depth) { S.t_queue_full++; return; }
         if (!time_reached(S.retry_at)) { S.t_tx_busy++; return; }
         if (!submit_next()) {
@@ -349,13 +369,25 @@ void dq_soak_tick(void) {
         return;
     }
 
-    /* Gate on the client's OWN admission policy, not on a raw count. There is
-     * no estimator any more: can_submit is simply "is there a free slot", so
-     * the probe hands work over the instant one opens and the client decides
-     * when it goes on the wire. A probe that second-guessed that with its own
-     * counter would throttle exactly the behaviour gate V1 measures. `depth`
-     * still caps the run for the sweep. */
-    if (occupied > S.depth) { S.t_queue_full++; return; }
+    /* Gate on GATEWAY-HELD commands — mbq_stats_t.inflight, i.e.
+     * count_state(s, CMD_ACCEPTED) — NOT on `occupied` above.
+     * mbq_client_inflight() counts every non-FREE client slot: staged (not
+     * yet sent), on the wire (sent, accept byte not yet known), AND accepted.
+     * Gating on THAT with `>` let one extra command past the target: the
+     * MBQ_QUEUE_DEPTH staging slot stays topped up between transactions, so
+     * `occupied` only exceeded `depth` once a command was ALSO staged behind
+     * the `depth` already-accepted ones — a depth-N sweep actually ran the
+     * gateway at N+1 outstanding the whole time (same silent-miscalibration
+     * shape as the SOAK_MAX_RECS incident above, a different quantity this
+     * time). dq_soak.h's promise — "stops submitting once the gateway holds
+     * `depth` commands" — is about what the GATEWAY holds, i.e. accepted, so
+     * gate on that with `>=` to match the scheduler path's own `>=` above.
+     * There is otherwise no estimator: can_submit is simply "is there a free
+     * slot", so the probe hands work over the instant one opens and the
+     * client decides when it goes on the wire. */
+    mbq_stats_t st;
+    mbq_client_stats(S.slave, &st);
+    if (st.inflight >= S.depth) { S.t_queue_full++; return; }
     if (!mbq_client_can_submit(S.slave)) { S.t_tx_busy++; return; }
     S.t_ready++;
     submit_next();

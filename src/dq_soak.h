@@ -26,6 +26,18 @@
  * sides and both halves reflashed — the wire format is depth-agnostic but the
  * two constants must agree.
  *
+ * "The gateway holds `depth` commands" means mbq_stats_t.inflight
+ * (count_state(s, CMD_ACCEPTED) — accepted, result not yet in) specifically,
+ * not mbq_client_inflight() (which also counts a command staged but not yet
+ * sent, and one sent but not yet accepted) — the two "inflight"s are
+ * different counts of different things, and gating the depth sweep on the
+ * wrong one is a bug that shipped once (dq_soak.c, the direct-path gate).
+ *
+ * On a SOAK_PATH_BG/USER run `depth` instead bounds how many of the probe's
+ * own records are outstanding through the scheduler (dq_soak.c's
+ * inflight_recs()) — a third, deliberately different quantity again, because
+ * the class's own depth policy is what paces the gateway there.
+ *
  * Everything it measures is reported by `soak` (see dq_soak_report): pair rate,
  * DALI frame rate, per-command latency, the Modbus transaction count that paid
  * for it, and the in-flight histogram that says whether the gateway queue was
