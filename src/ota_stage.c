@@ -117,6 +117,95 @@ static bool flush_page(uint32_t off, const uint8_t *buf, uint32_t len) {
 }
 
 void ota_stage_begin(void) {
+    /* ── invalidate a stale PENDING record BEFORE touching STAGING ─────────
+     *
+     * ota_trigger() (src/net/ota.c) refuses a new job only while one is
+     * OTA_RUNNING, or — since this fix — while a just-succeeded install is
+     * still waiting for its IC_CMD_REBOOT to land. That closes the common
+     * path into this hazard, but does not by itself change what this
+     * function must do: a PREVIOUS ota_stage_finish() may have already
+     * written a BC_F_PENDING record naming a fully-verified candidate
+     * sitting in STAGING, and the reboot that's supposed to consume it
+     * hasn't happened yet (dropped push before the retry fix, a slow
+     * controller_reboot() sleep_ms(150), or any other reason a boot hasn't
+     * intervened). If THIS session goes on to erase/overwrite STAGING (the
+     * very next ota_stage_write() call lazily erases the first sector it
+     * touches) and then itself fails before ota_stage_finish() ever
+     * succeeds, boot-control is left pointing BC_F_PENDING at a STAGING
+     * region that no longer holds the image it claims to: the bootloader's
+     * try_commit_staging() would fw_verify() garbage against the OLD
+     * candidate's staged_len and land in BOOT_STUCK — even though the real
+     * ACTIVE image sitting untouched at APP_OFF is perfectly fine and was
+     * never at risk. See bootloader/README.md's "no fallback on a rejected
+     * candidate" for why the bootloader can't safely guess its way out of
+     * that once BC_F_PENDING is observed.
+     *
+     * So: invalidate the record HERE, before this session's s_offset even
+     * resets — before any flash in STAGING is touched — so a boot landing
+     * anywhere during this new download sees no dangling PENDING candidate
+     * at all, only whatever ACTIVE already legitimately holds.
+     *
+     * "Invalidate" must do more than clear BC_F_PENDING, though: once that
+     * flag clears, boot_decide() falls through to rules 3/4/5, and main()'s
+     * shared "about to boot ACTIVE" step re-verifies
+     * fw_verify(APP_OFF, bc.staged_len, ...) — but staged_len right now
+     * still names the ABANDONED candidate (ota_stage_finish() always
+     * overwrites the whole record with the candidate's own fields; the real
+     * ACTIVE image's length is gone from the "latest" record the instant
+     * that record was written). Left as-is, clearing PENDING alone would
+     * just move the same "verify against the wrong length" failure from the
+     * STAGING side to the ACTIVE side.
+     *
+     * The record being invalidated does carry one thing that can recover
+     * the real answer: backup_len. ota_stage_finish() sets
+     * backup_len/BC_F_BACKUP_VALID from the OUTGOING active image's own
+     * (previously confirmed) length at the moment the now-abandoned
+     * candidate was staged — and that outgoing image is exactly what is
+     * still sitting at APP_OFF right now, untouched, because the candidate
+     * was never committed. So when BC_F_BACKUP_VALID is set, backup_len IS
+     * ACTIVE's real length, and it was CONFIRMED to get there (only a
+     * CONFIRMED outgoing image is ever backed up — ota_stage.h) — so the
+     * invalidated record can correctly claim BC_F_CONFIRMED too, exactly
+     * mirroring what the bootloader's own try_rollback() does when it
+     * restores BACKUP and writes a fresh CONFIRMED record for it (same
+     * reasoning, same trust level, just done from the app side here instead
+     * of the bootloader side).
+     *
+     * When BC_F_BACKUP_VALID is NOT set (first-ever OTA over the
+     * trailer-less factory image, or the outgoing image at staging time was
+     * itself never confirmed), there is no recorded length to fall back on
+     * at all — a residual gap of the same shape bootloader/README.md already
+     * documents for the first-ever-OTA and "rollback of the rollback" cases.
+     * staged_len is set to 0 rather than left holding the stale candidate's
+     * value: fw_verify() fails closed on any length shorter than a trailer,
+     * so the eventual outcome is a deterministic BOOT_STUCK (which lands in
+     * BOOTSEL — remotely reflashable, see the bootloader's HARDENING #2)
+     * rather than a wrong-but-plausible-looking length that might pass or
+     * fail unpredictably depending on what ACTIVE happens to contain. */
+    struct boot_control bc;
+    if (bc_read(&bc) && (bc.flags & BC_F_PENDING)) {
+        bool have_real_active_len = (bc.flags & BC_F_BACKUP_VALID) != 0 &&
+                                     bc.backup_len > 0;
+        if (have_real_active_len) {
+            bc.staged_len = bc.backup_len;
+            bc.flags = BC_F_CONFIRMED | BC_F_BACKUP_VALID;
+        } else {
+            bc.staged_len = 0;
+            bc.flags &= ~(BC_F_PENDING | BC_F_CONFIRMED);
+        }
+        bc.boot_attempts = 0;
+        /* staged_sha512 is left as-is: nothing verifies boot_control's copy
+         * against anything (fw_verify() recomputes its own hash from the
+         * image's own trailer) — it's informational only, so a stale value
+         * here is harmless, unlike staged_len/flags above. */
+        bc_write(&bc);   /* best-effort: see ota_stage.c's no-LOG_* file
+                           * header — a failed write here leaves the OLD
+                           * (still-PENDING) record in place, which is no
+                           * worse than not having attempted this fix at all,
+                           * and this session's own flash writes below are
+                           * about to exercise the same flash regardless. */
+    }
+
     s_offset = 0;
     s_buf_len = 0;
     s_erased_upto = 0;

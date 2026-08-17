@@ -27,7 +27,17 @@
 extern uint8_t g_ota_buf[OTA_BUF_SZ];
 
 /* Reset the staging write offset to 0 — call once at the start of a new OTA
- * download, before any ota_stage_write(). */
+ * download, before any ota_stage_write(). If the current boot_control record
+ * is still BC_F_PENDING (a previous ota_stage_finish() staged a verified
+ * candidate that hasn't been committed by the bootloader yet — e.g. a
+ * re-trigger during the post-success pre-reboot window), that record is
+ * invalidated FIRST, before this session ever erases a byte of STAGING: a
+ * dangling PENDING record naming a region this session is about to overwrite
+ * would otherwise be verified as garbage on the next boot if this new
+ * session itself fails partway. See ota_stage.c's ota_stage_begin() for the
+ * full reasoning, including how it recovers the real ACTIVE-image length
+ * from backup_len so the bootloader's own "about to boot ACTIVE" re-verify
+ * step keeps working after the invalidation. */
 void ota_stage_begin(void);
 
 /* Append `len` bytes (from g_ota_buf, per the IC_CMD_OTA_DATA contract) at
