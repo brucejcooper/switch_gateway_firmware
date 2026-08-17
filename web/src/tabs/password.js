@@ -6,9 +6,12 @@ import { toastOk, toastErr } from '../toast.js';
 export function renderPassword(state) {
   const cur = (state.cfg && state.cfg.web_user) || '';
 
-  const user = h('input', { type: 'text', value: cur, placeholder: 'admin' });
-  const p1 = h('input', { type: 'password', placeholder: 'New password' });
-  const p2 = h('input', { type: 'password', placeholder: 'Confirm password' });
+  // maxlength mirrors web_user[32]/web_pass[48] in config.h. Worth stopping
+  // here rather than at the device: a credential that did not fit used to be
+  // truncated, saved, reported success — and then would not let you back in.
+  const user = h('input', { type: 'text', value: cur, placeholder: 'admin', maxlength: 31 });
+  const p1 = h('input', { type: 'password', placeholder: 'New password', maxlength: 47 });
+  const p2 = h('input', { type: 'password', placeholder: 'Confirm password', maxlength: 47 });
   const msg = h('div', { class: 'note', style: { color: 'var(--ok)', display: 'none' } });
 
   const save = h('button', { class: 'btn primary' }, 'Change credentials');

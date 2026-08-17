@@ -18,6 +18,7 @@
  *       && /tmp/config_hostname_test
  */
 #include "../src/config.h"
+#include "../src/strfit.h"
 #include "../src/log.h"
 
 #include <stdio.h>
@@ -145,6 +146,53 @@ int main(void) {
         char four2[5] = "keep";
         CHECK(!config_hostname_set(four2, sizeof four2, "ABCDE"));
         CHECK(strcmp(four2, "keep") == 0);
+    }
+
+    /* str_set() (strfit.h) is the shared fits-or-fails rule every config
+     * string now goes through — CLI, the HTTP API, intercore and config_load. Its
+     * whole point is that a value which does not fit is an ERROR, never a
+     * shorter value substituted behind the caller's back. */
+    g_case = "str_set: exact-fit boundary";
+    {
+        char d[6];
+        memset(d, 'x', sizeof d); d[5] = '\0';
+        CHECK(str_set(d, sizeof d, "abcde"));      /* 5 chars + NUL == cap */
+        CHECK(strcmp(d, "abcde") == 0);
+        CHECK(!str_set(d, sizeof d, "abcdef"));    /* one over */
+        CHECK(strcmp(d, "abcde") == 0);            /* untouched on refusal */
+        CHECK(str_set(d, sizeof d, ""));           /* empty always fits */
+        CHECK(d[0] == '\0');
+    }
+
+    g_case = "str_set: guards";
+    {
+        char d[8] = "keep";
+        CHECK(!str_set(NULL, 8, "x"));
+        CHECK(!str_set(d, 0, "x"));
+        CHECK(!str_set(d, sizeof d, NULL));
+        CHECK(strcmp(d, "keep") == 0);
+    }
+
+    /* The regression this whole family came from: a value one over the field
+     * must not become a valid shorter one. Sized like the real fields so the
+     * test moves with them if they are ever resized. */
+    g_case = "str_set: over-long is refused, not shortened (real field sizes)";
+    {
+        struct { size_t cap; const char *name; } F[] = {
+            { 32, "web_user" }, { 48, "web_pass" }, { 24, "mqtt_prefix" },
+            { 64, "mqtt_pass" }, { 48, "mqtt_user" }, { 128, "fw_url" },
+        };
+        for (size_t k = 0; k < sizeof F / sizeof F[0]; k++) {
+            char dst[192], src[192];
+            memcpy(dst, "sentinel", 9);
+            memset(src, 'a', F[k].cap); src[F[k].cap] = '\0';   /* exactly cap: one too many */
+            CHECK(!str_set(dst, F[k].cap, src));
+            CHECK(strcmp(dst, "sentinel") == 0);
+            src[F[k].cap - 1] = '\0';                            /* cap-1: the true maximum */
+            CHECK(str_set(dst, F[k].cap, src));
+            CHECK(strlen(dst) == F[k].cap - 1);
+            CHECK(STR_MAX_LEN(F[k].cap) == (unsigned)(F[k].cap - 1));
+        }
     }
 
     if (g_fails == 0) printf("PASS: all config hostname checks passed\n");

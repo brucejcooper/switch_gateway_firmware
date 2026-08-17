@@ -8,6 +8,7 @@
  */
 
 #include "config.h"
+#include "strfit.h"
 #include "log.h"
 #include "jsmn.h"
 #include <stdio.h>
@@ -39,23 +40,17 @@ bool config_hostname_ok(const char *s) {
 }
 
 bool config_hostname_set(char *dst, size_t cap, const char *src) {
-    if (!dst || cap == 0 || !config_hostname_ok(src)) return false;
-    /* Refuse rather than truncate. config_hostname_ok() has already bounded
-     * the length at 31, so this cannot fire for any caller in this firmware
-     * (they all pass a net_hostname-sized 32-byte buffer) — but silently
-     * storing a SHORTER, different hostname than the one that was accepted is
-     * the wrong way to fail if that ever stops being true. */
-    size_t n = strlen(src);
-    if (n >= cap) return false;
-    /* dst == src is supported (though no caller relies on it today — /api/net
-     * reads into its own buffer so an over-long value stays detectable): the
-     * copy runs strictly forward, writing index i only after reading it, and
-     * never re-reads an index it has written. */
-    for (size_t i = 0; i < n; i++) {
-        char ch = src[i];
-        dst[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
+    /* str_set() carries the refuse-rather-than-truncate rule (strfit.h) and
+     * the "leave dst untouched on failure" guarantee; the lowercasing is the
+     * only thing specific to a hostname. config_hostname_ok() has already
+     * bounded the length at 31, so str_set() cannot fail for any caller in
+     * this firmware (they all pass a net_hostname-sized 32-byte buffer) — it
+     * stays as the backstop if that ever stops being true. */
+    if (!config_hostname_ok(src) || !str_set(dst, cap, src)) return false;
+    for (size_t i = 0; dst[i]; i++) {
+        char ch = dst[i];
+        if (ch >= 'A' && ch <= 'Z') dst[i] = (char)(ch - 'A' + 'a');
     }
-    dst[n] = '\0';
     return true;
 }
 
@@ -84,11 +79,14 @@ void config_defaults(void) {
     g_config.de_mode             = 0;
     g_config.relay_byteswap      = false;
     g_config.mqtt_port           = 1883;
-    strncpy(g_config.mqtt_prefix, "lighting", sizeof g_config.mqtt_prefix - 1);
+    /* str_set() for the compiled defaults too — not because a literal could
+     * ever fail to fit, but so no strncpy(dst, src, sizeof dst - 1) is left in
+     * the file for the next person to copy as the house pattern. */
+    str_set(g_config.mqtt_prefix, sizeof g_config.mqtt_prefix, "lighting");
     g_config.net_dhcp            = 1;
-    strncpy(g_config.net_hostname, "lights", sizeof g_config.net_hostname - 1);
-    strncpy(g_config.web_user, "admin", sizeof g_config.web_user - 1);
-    strncpy(g_config.web_pass, "admin", sizeof g_config.web_pass - 1);
+    str_set(g_config.net_hostname, sizeof g_config.net_hostname, "lights");
+    str_set(g_config.web_user, sizeof g_config.web_user, "admin");
+    str_set(g_config.web_pass, sizeof g_config.web_pass, "admin");
 }
 
 /* ── jsmn helpers ────────────────────────────────────────────────────────── */
@@ -172,6 +170,45 @@ static bool migrate_legacy_modbus(void) {
     return changed;
 }
 
+/* Load one string field STRICTLY. get_str() clamps to the destination's cap,
+ * which destroys the evidence that a value was ever too long, so read into a
+ * buffer larger than any config string and let str_set() judge whether it
+ * fits. Values written by config_save() always fit by construction, so
+ * LS_TOO_LONG only ever means a hand-edited or damaged file — but silently
+ * substituting a shorter value there is exactly the failure this whole rule
+ * exists to prevent. */
+typedef enum { LS_ABSENT, LS_OK, LS_TOO_LONG } load_str_t;
+
+static load_str_t load_str(const char *js, const jsmntok_t *t, int n,
+                           const char *key, char *dst, size_t cap) {
+    /* Comfortably larger than the biggest config string (fw_url[128]); a
+     * value too long for THIS buffer is far too long for any field and is
+     * still correctly refused below. */
+    char tmp[192];
+    if (!get_str(js, t, n, key, tmp, sizeof tmp)) return LS_ABSENT;
+    return str_set(dst, cap, tmp) ? LS_OK : LS_TOO_LONG;
+}
+
+/* Ordinary field: too long -> keep the compiled default and say so. */
+#define LOAD_STR(k, field)                                                      \
+    do { if (load_str(buf, tk, nt, k, g_config.field,                           \
+                      sizeof g_config.field) == LS_TOO_LONG)                    \
+             LOG_WARN("cfg", k " in config exceeds %u chars — keeping default",  \
+                      STR_MAX_LEN(sizeof g_config.field)); } while (0)
+
+/* Credential: too long -> do NOT fall back to the compiled default. That
+ * would silently re-open the web UI on admin/admin because a config file was
+ * damaged, turning a corrupt file into an auth downgrade. Clear it instead:
+ * check_auth() (http_server.c) refuses an empty credential, so the device
+ * fails CLOSED and stays locked until the config is repaired. */
+#define LOAD_CRED(k, field)                                                     \
+    do { if (load_str(buf, tk, nt, k, g_config.field,                           \
+                      sizeof g_config.field) == LS_TOO_LONG) {                  \
+             g_config.field[0] = '\0';                                          \
+             LOG_ERR("cfg", k " in config exceeds %u chars — cleared; web UI "  \
+                     "stays locked until /config.json is repaired",             \
+                     STR_MAX_LEN(sizeof g_config.field)); } } while (0)
+
 bool config_load(void) {
     config_defaults();
 
@@ -211,10 +248,10 @@ bool config_load(void) {
             int dc = get_u8_array(buf, tk, nt, "dali_slaves", ds, MAX_DALI_SLAVES);
             if (dc >= 0) { memcpy(g_config.dali_slave_ids, ds, (size_t)dc); g_config.dali_slave_count = (uint8_t)dc; }
 
-            get_str(buf, tk, nt, "mqtt_host",   g_config.mqtt_host,   sizeof g_config.mqtt_host);
-            get_str(buf, tk, nt, "mqtt_user",   g_config.mqtt_user,   sizeof g_config.mqtt_user);
-            get_str(buf, tk, nt, "mqtt_pass",   g_config.mqtt_pass,   sizeof g_config.mqtt_pass);
-            get_str(buf, tk, nt, "mqtt_prefix", g_config.mqtt_prefix, sizeof g_config.mqtt_prefix);
+            LOAD_STR("mqtt_host",   mqtt_host);
+            LOAD_STR("mqtt_user",   mqtt_user);
+            LOAD_STR("mqtt_pass",   mqtt_pass);
+            LOAD_STR("mqtt_prefix", mqtt_prefix);
             if (get_uint(buf, tk, nt, "mqtt_port", &u) && u > 0) g_config.mqtt_port = (uint16_t)u;
 
             if (get_uint(buf, tk, nt, "net_dhcp", &u)) g_config.net_dhcp = u ? 1 : 0;
@@ -222,23 +259,24 @@ bool config_load(void) {
             get_ip(buf, tk, nt, "net_mask", g_config.net_mask);
             get_ip(buf, tk, nt, "net_gw",   g_config.net_gw);
             get_ip(buf, tk, nt, "net_dns",  g_config.net_dns);
-            /* Validate on the way IN, not just at the CLI/API. get_str() only
-             * length-clamps, so before this a hand-edited or damaged
-             * /config.json put arbitrary bytes straight into net_hostname, and
-             * netif_init() copies that into HOST_NAME[] and onto the wire as
-             * DHCP option 12. An invalid stored value keeps the default set by
-             * config_defaults() above rather than failing the whole load —
-             * consistent with how every other field here degrades. */
-            { char hn[sizeof g_config.net_hostname];
+            /* Validate on the way IN, not just at the CLI/API: before this, a
+             * hand-edited or damaged /config.json put arbitrary bytes straight
+             * into net_hostname, and netif_init() copies that into HOST_NAME[]
+             * and onto the wire as DHCP option 12. Read into a buffer sized
+             * like load_str()'s so an over-long value is refused rather than
+             * clamped into a valid-looking label; an invalid stored value keeps
+             * the default from config_defaults() rather than failing the whole
+             * load, consistent with how every other field here degrades. */
+            { char hn[192];
               if (get_str(buf, tk, nt, "net_hostname", hn, sizeof hn) &&
                   !config_hostname_set(g_config.net_hostname, sizeof g_config.net_hostname, hn))
                   LOG_WARN("cfg", "net_hostname in config is not a valid label — using \"%s\"",
                            g_config.net_hostname); }
 
-            get_str(buf, tk, nt, "web_user", g_config.web_user, sizeof g_config.web_user);
-            get_str(buf, tk, nt, "web_pass", g_config.web_pass, sizeof g_config.web_pass);
+            LOAD_CRED("web_user", web_user);
+            LOAD_CRED("web_pass", web_pass);
 
-            get_str(buf, tk, nt, "fw_url", g_config.fw_url, sizeof g_config.fw_url);
+            LOAD_STR("fw_url", fw_url);
         } else {
             LOG_WARN("config", "config.json parse failed (%d) — using defaults", nt);
         }

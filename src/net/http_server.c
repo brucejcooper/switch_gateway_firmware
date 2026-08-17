@@ -27,6 +27,7 @@
 #include "jsmn.h"
 #include "mapping.h"        /* mapping_target_t, TARGET_*, MAX_TARGETS_PER_BTN */
 #include "config.h"         /* config_hostname_set() — /api/net validation */
+#include "strfit.h"         /* str_set()/STR_MAX_LEN() — the shared fits-or-fails rule */
 
 #include "pico/time.h"
 #include <string.h>
@@ -149,8 +150,17 @@ static void release_sock0_conn(conn_t *c) {
 
 void http_server_init(void) {
     const ic_snapshot_t *sn = intercore_snapshot();
-    snprintf(s_user, sizeof s_user, "%s", sn && sn->web_user[0] ? sn->web_user : "admin");
-    snprintf(s_pass, sizeof s_pass, "%s", sn && sn->web_pass[0] ? sn->web_pass : "admin");
+    /* Fall back to admin/admin only when there is NO snapshot at all (pure
+     * bootstrap). An EMPTY credential in a real snapshot is not "unset" — a
+     * fresh device gets admin/admin from config_defaults(), so empty can only
+     * mean config_load() deliberately cleared an unusable stored credential
+     * (see LOAD_CRED, config.c). Defaulting that back to admin/admin would
+     * turn a damaged config into an auth downgrade, which is exactly what the
+     * clearing exists to prevent; check_auth() refuses while it stays empty. */
+    snprintf(s_user, sizeof s_user, "%s", sn ? sn->web_user : "admin");
+    snprintf(s_pass, sizeof s_pass, "%s", sn ? sn->web_pass : "admin");
+    if (!s_user[0] || !s_pass[0])
+        LOG_ERR("http", "web credential unusable — UI locked until /config.json is repaired");
     for (size_t i = 0; i < N_SOCK; i++) s_conn[i].sn = k_socks[i];
     /* Arm the always-ours sockets now; socket 0 is armed on demand by the tick. */
     for (size_t i = 0; i < N_BASE; i++) arm_listen(&s_conn[i]);
@@ -199,6 +209,12 @@ static int b64decode(const char *in, uint8_t *out, int outcap) {
 
 /* Validate Basic auth against the snapshot credentials. */
 static bool check_auth(const char *req) {
+    /* Fail CLOSED on a missing credential. config_load() clears web_user or
+     * web_pass when the stored value is unusable, deliberately refusing to
+     * fall back to the compiled admin/admin default — a damaged config must
+     * not become an auth downgrade. Without this check an empty password
+     * would instead make "<user>:" a valid login. */
+    if (!s_user[0] || !s_pass[0]) return false;
     const char *v = find_header(req, "Authorization");
     if (!v || strncasecmp(v, "Basic ", 6) != 0) return false;
     uint8_t dec[96];
@@ -335,6 +351,26 @@ static void jstr_key(const char *js, const jsmntok_t *t, int n, const char *key,
     if (len >= (int)cap) len = (int)cap - 1;
     memcpy(out, js + t[i].start, len); out[len] = '\0';
 }
+/* Strict jstr_key(): extract `key` into dst[cap], or fail if it does not fit.
+ * Returns false — leaving dst untouched — when the key is missing, is not a
+ * string, or its value is too long. Callers guard with jhas() first, so a
+ * false here means "too long" and deserves a 400.
+ *
+ * This is what jstr_key() structurally cannot do: it clamps to cap and so
+ * destroys the evidence, silently handing the caller a DIFFERENT value that
+ * then passes every downstream check. jsmn already knows the token's true
+ * length, so the comparison costs nothing and happens before any copy. */
+static bool jstr_set(const char *js, const jsmntok_t *t, int n, const char *key,
+                     char *dst, size_t cap) {
+    int i = jfind(js, t, n, key);
+    if (i < 0 || t[i].type != JSMN_STRING) return false;
+    int len = t[i].end - t[i].start;
+    if (len < 0 || (size_t)len >= cap) return false;
+    memcpy(dst, js + t[i].start, (size_t)len);
+    dst[len] = '\0';
+    return true;
+}
+
 static bool jbool_key(const char *js, const jsmntok_t *t, int n, const char *key, bool def) {
     int i = jfind(js, t, n, key);
     if (i < 0) return def;
@@ -390,6 +426,17 @@ static uint64_t parse_members_at(const char *js, const jsmntok_t *t, int n, int 
 }
 
 static void resp_ok(conn_t *c) { resp_text(c, "200 OK", "application/json", "{\"ok\":true}"); }
+
+/* 400 for an over-long field, naming the field and its real maximum so the
+ * caller learns where the boundary is rather than just that they crossed it.
+ * `cap` is the destination's sizeof, so the limit quoted can never drift from
+ * the one actually enforced. */
+static void resp_too_long(conn_t *c, const char *field, size_t cap) {
+    char msg[128];
+    snprintf(msg, sizeof msg, "{\"error\":\"%s is too long (max %u characters)\"}",
+             field, STR_MAX_LEN(cap));
+    resp_text(c, "400 Bad Request", "application/json", msg);
+}
 static void push_cmd_resp(conn_t *c, const ic_cmd_t *cmd) {
     if (intercore_push_cmd(cmd)) resp_ok(c);
     else resp_text(c, "503 Service Unavailable", "application/json", "{\"error\":\"busy\"}");
@@ -478,26 +525,17 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
         if (jip(body, tk, nt, "gw",   cmd.set_netcfg.gw))   f |= IC_NET_F_GW;
         if (jip(body, tk, nt, "dns",  cmd.set_netcfg.dns))  f |= IC_NET_F_DNS;
         if (jhas(body, tk, nt, "hostname")) {
-            /* Read into a buffer one byte LARGER than the destination field.
-             * jstr_key() silently truncates to fit its cap, so reading
-             * straight into the 32-byte command field turned an over-long
-             * hostname into a perfectly valid 31-char one BEFORE the rule
-             * below ever saw it: the API answered 200 and stored a name the
-             * caller never asked for, while the CLI rejected the same input
-             * (measured on the bench — a 32-char POST stored 31 'a's). The
-             * extra byte keeps anything too long for the field still too long
-             * for the rule, so it is refused instead of silently substituted.
-             *
-             * Reject here rather than leaving it to core 0: this request is
+            /* Reject here rather than leaving it to core 0: this request is
              * answered as soon as the command is pushed, so core 0's gate can
              * only drop the field silently — the caller saw {"ok":true} and
              * the web UI toasted "Saved" for a hostname that never changed.
              * Same rule and normalisation as the CLI, which has always
-             * reported bad_hostname. */
-            char hn[sizeof cmd.set_netcfg.hostname + 1];
-            jstr_key(body, tk, nt, "hostname", hn, sizeof hn);
-            if (!config_hostname_set(cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname,
-                                     hn)) {
+             * reported bad_hostname. jstr_set() refuses an over-long value
+             * instead of clamping it into a valid-looking shorter one. */
+            if (!jstr_set(body, tk, nt, "hostname",
+                          cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname) ||
+                !config_hostname_set(cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname,
+                                     cmd.set_netcfg.hostname)) {
                 resp_text(c, "400 Bad Request", "application/json",
                           "{\"error\":\"hostname must be 1-31 chars of a-z 0-9 -, "
                           "not starting or ending with -\"}");
@@ -510,18 +548,28 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
     }
     if (strcmp(path, "/api/mqtt") == 0) {
         cmd.type = IC_CMD_SET_MQTTCFG; uint16_t f = 0;
-        if (jhas(body, tk, nt, "host"))   { jstr_key(body, tk, nt, "host",   cmd.set_mqttcfg.host,   sizeof cmd.set_mqttcfg.host);   f |= IC_MQTT_F_HOST; }
+        /* Too long is a 400 naming the field and its real maximum, not a
+         * silent truncation: a shortened broker password or topic prefix
+         * saves, reports success, and then just fails to connect / makes HA
+         * lose every entity, with nothing anywhere saying why. */
+        if (jhas(body, tk, nt, "host"))   { if (!jstr_set(body, tk, nt, "host",   cmd.set_mqttcfg.host,   sizeof cmd.set_mqttcfg.host))   { resp_too_long(c, "host",   sizeof cmd.set_mqttcfg.host);   return; } f |= IC_MQTT_F_HOST; }
         if (jhas(body, tk, nt, "port"))   { cmd.set_mqttcfg.port = (uint16_t)jint_key(body, tk, nt, "port", 1883);                   f |= IC_MQTT_F_PORT; }
-        if (jhas(body, tk, nt, "user"))   { jstr_key(body, tk, nt, "user",   cmd.set_mqttcfg.user,   sizeof cmd.set_mqttcfg.user);   f |= IC_MQTT_F_USER; }
-        if (jhas(body, tk, nt, "pass"))   { jstr_key(body, tk, nt, "pass",   cmd.set_mqttcfg.pass,   sizeof cmd.set_mqttcfg.pass);   f |= IC_MQTT_F_PASS; }
-        if (jhas(body, tk, nt, "prefix")) { jstr_key(body, tk, nt, "prefix", cmd.set_mqttcfg.prefix, sizeof cmd.set_mqttcfg.prefix); f |= IC_MQTT_F_PREFIX; }
+        if (jhas(body, tk, nt, "user"))   { if (!jstr_set(body, tk, nt, "user",   cmd.set_mqttcfg.user,   sizeof cmd.set_mqttcfg.user))   { resp_too_long(c, "user",   sizeof cmd.set_mqttcfg.user);   return; } f |= IC_MQTT_F_USER; }
+        if (jhas(body, tk, nt, "pass"))   { if (!jstr_set(body, tk, nt, "pass",   cmd.set_mqttcfg.pass,   sizeof cmd.set_mqttcfg.pass))   { resp_too_long(c, "pass",   sizeof cmd.set_mqttcfg.pass);   return; } f |= IC_MQTT_F_PASS; }
+        if (jhas(body, tk, nt, "prefix")) { if (!jstr_set(body, tk, nt, "prefix", cmd.set_mqttcfg.prefix, sizeof cmd.set_mqttcfg.prefix)) { resp_too_long(c, "prefix", sizeof cmd.set_mqttcfg.prefix); return; } f |= IC_MQTT_F_PREFIX; }
         cmd.set_mqttcfg.fields = f;
         push_cmd_resp(c, &cmd); return;
     }
     if (strcmp(path, "/api/auth") == 0) {
-        char u[32] = {0}, p[48] = {0};
-        jstr_key(body, tk, nt, "user", u, sizeof u);
-        jstr_key(body, tk, nt, "pass", p, sizeof p);
+        /* Sized from the command fields, not hand-picked literals, so these
+         * cannot drift apart from what actually gets stored. A truncated
+         * credential here was the worst case of the whole family: it saved,
+         * reported success, and then would not let you back in — and there is
+         * no CLI verb to reset web credentials, so recovery meant reading the
+         * shortened value back out of /config.json over serial. */
+        char u[sizeof cmd.set_auth.user] = {0}, p[sizeof cmd.set_auth.pass] = {0};
+        if (!jstr_set(body, tk, nt, "user", u, sizeof u)) { resp_too_long(c, "user", sizeof u); return; }
+        if (!jstr_set(body, tk, nt, "pass", p, sizeof p)) { resp_too_long(c, "pass", sizeof p); return; }
         if (!u[0] || !p[0]) {
             resp_text(c, "400 Bad Request", "application/json",
                       "{\"error\":\"user and pass required\"}");

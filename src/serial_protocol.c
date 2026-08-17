@@ -18,6 +18,7 @@
 #include "mapping.h"
 #include "button_fsm.h"
 #include "config.h"
+#include "strfit.h"   /* str_set()/STR_MAX_LEN() — the shared fits-or-fails rule */
 #include "state_cache.h"
 #include "button_actions.h"
 #include "net/ha_bridge.h"
@@ -110,6 +111,14 @@ static void handle_line(const char *line) {
 /* Print an err: <reason> line and return. Reason is a short token. */
 static void txt_err(const char *reason) {
     printf("err: %s\n", reason);
+}
+
+/* "this field was too long" — names the field and its real maximum, so the
+ * caller learns where the boundary is instead of just that they crossed it.
+ * Keeps the err: <token> shape (err: <field>_too_long) the CLI's other errors
+ * use, with the limit as trailing detail. */
+static void txt_err_len(const char *field, unsigned max_len) {
+    printf("err: %s_too_long (max %u chars)\n", field, max_len);
 }
 
 static void txt_ok(void) {
@@ -966,8 +975,9 @@ static void cmd_cfg(char **saveptr) {
         }
         else if (strcasecmp(key, "fw_url") == 0) {
             /* empty value clears the override (compiled-in default applies) */
-            strncpy(g_config.fw_url, val, sizeof g_config.fw_url - 1);
-            g_config.fw_url[sizeof g_config.fw_url - 1] = '\0';
+            if (!str_set(g_config.fw_url, sizeof g_config.fw_url, val)) {
+                txt_err_len("fw_url", STR_MAX_LEN(sizeof g_config.fw_url)); return;
+            }
             /* fwupdate.c reads this from the intercore snapshot, which is built
              * once at core1_launch — so the new URL is not live until a reboot.
              * Without this note the next `check` silently polls the OLD url and
@@ -2003,11 +2013,16 @@ static void cmd_mqtt(char **sp) {
     while ((tok = strtok_r(NULL, " \t", sp))) {
         char *eq = strchr(tok, '='); if (!eq) continue;
         *eq = '\0'; const char *k = tok, *v = eq + 1;
-        if      (!strcasecmp(k, "host"))   { strncpy(g_config.mqtt_host,   v, sizeof g_config.mqtt_host - 1);   any = true; }
+        /* str_set() refuses rather than truncates, and always terminates —
+         * these four used strncpy(dst, v, sizeof dst - 1) with no explicit
+         * NUL, safe only because the field's last byte happened never to be
+         * written non-zero. The error names the real limit so "too long" does
+         * not leave the user guessing where the boundary is. */
+        if      (!strcasecmp(k, "host"))   { if (!str_set(g_config.mqtt_host,   sizeof g_config.mqtt_host,   v)) { txt_err_len("host",   STR_MAX_LEN(sizeof g_config.mqtt_host));   return; } any = true; }
         else if (!strcasecmp(k, "port"))   { g_config.mqtt_port = (uint16_t)atoi(v);                            any = true; }
-        else if (!strcasecmp(k, "user"))   { strncpy(g_config.mqtt_user,   v, sizeof g_config.mqtt_user - 1);   any = true; }
-        else if (!strcasecmp(k, "pass"))   { strncpy(g_config.mqtt_pass,   v, sizeof g_config.mqtt_pass - 1);   any = true; }
-        else if (!strcasecmp(k, "prefix")) { strncpy(g_config.mqtt_prefix, v, sizeof g_config.mqtt_prefix - 1); any = true; }
+        else if (!strcasecmp(k, "user"))   { if (!str_set(g_config.mqtt_user,   sizeof g_config.mqtt_user,   v)) { txt_err_len("user",   STR_MAX_LEN(sizeof g_config.mqtt_user));   return; } any = true; }
+        else if (!strcasecmp(k, "pass"))   { if (!str_set(g_config.mqtt_pass,   sizeof g_config.mqtt_pass,   v)) { txt_err_len("pass",   STR_MAX_LEN(sizeof g_config.mqtt_pass));   return; } any = true; }
+        else if (!strcasecmp(k, "prefix")) { if (!str_set(g_config.mqtt_prefix, sizeof g_config.mqtt_prefix, v)) { txt_err_len("prefix", STR_MAX_LEN(sizeof g_config.mqtt_prefix)); return; } any = true; }
         else { txt_err("bad_key"); return; }
     }
     if (!any) { txt_err("no_fields"); return; }
@@ -2461,21 +2476,37 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         if (f && !config_save()) LOG_ERR("cli", "config_save failed — netcfg not persisted");
         break;
     }
+    /* Backstop only: /api/mqtt and /api/auth reject an over-long value up front
+     * with a 400 so the caller actually sees it. These commands cross the
+     * intercore seam into the single writer of g_config, though, and the
+     * source fields are the same size as the destinations — so a value can
+     * only fail here if a future core-1 producer skips that check. Refuse and
+     * LOG rather than truncate: a silently shortened password or prefix saves,
+     * reports success, and then simply does not work. */
     case IC_CMD_SET_MQTTCFG: {
         uint16_t f = c->set_mqttcfg.fields;
-        if (f & IC_MQTT_F_HOST)   { strncpy(g_config.mqtt_host,   c->set_mqttcfg.host,   sizeof g_config.mqtt_host   - 1); g_config.mqtt_host[sizeof g_config.mqtt_host - 1] = '\0'; }
+        if (f & IC_MQTT_F_HOST)   { if (!str_set(g_config.mqtt_host,   sizeof g_config.mqtt_host,   c->set_mqttcfg.host))   LOG_WARN("cli", "ignored over-long mqtt host from web/API"); }
         if (f & IC_MQTT_F_PORT)   g_config.mqtt_port = c->set_mqttcfg.port;
-        if (f & IC_MQTT_F_USER)   { strncpy(g_config.mqtt_user,   c->set_mqttcfg.user,   sizeof g_config.mqtt_user   - 1); g_config.mqtt_user[sizeof g_config.mqtt_user - 1] = '\0'; }
-        if (f & IC_MQTT_F_PASS)   { strncpy(g_config.mqtt_pass,   c->set_mqttcfg.pass,   sizeof g_config.mqtt_pass   - 1); g_config.mqtt_pass[sizeof g_config.mqtt_pass - 1] = '\0'; }
-        if (f & IC_MQTT_F_PREFIX) { strncpy(g_config.mqtt_prefix, c->set_mqttcfg.prefix, sizeof g_config.mqtt_prefix - 1); g_config.mqtt_prefix[sizeof g_config.mqtt_prefix - 1] = '\0'; }
+        if (f & IC_MQTT_F_USER)   { if (!str_set(g_config.mqtt_user,   sizeof g_config.mqtt_user,   c->set_mqttcfg.user))   LOG_WARN("cli", "ignored over-long mqtt user from web/API"); }
+        if (f & IC_MQTT_F_PASS)   { if (!str_set(g_config.mqtt_pass,   sizeof g_config.mqtt_pass,   c->set_mqttcfg.pass))   LOG_WARN("cli", "ignored over-long mqtt pass from web/API"); }
+        if (f & IC_MQTT_F_PREFIX) { if (!str_set(g_config.mqtt_prefix, sizeof g_config.mqtt_prefix, c->set_mqttcfg.prefix)) LOG_WARN("cli", "ignored over-long mqtt prefix from web/API"); }
         if (f && !config_save()) LOG_ERR("cli", "config_save failed — mqttcfg not persisted");
         break;
     }
     case IC_CMD_SET_AUTH:
-        strncpy(g_config.web_user, c->set_auth.user, sizeof g_config.web_user - 1);
-        g_config.web_user[sizeof g_config.web_user - 1] = '\0';
-        strncpy(g_config.web_pass, c->set_auth.pass, sizeof g_config.web_pass - 1);
-        g_config.web_pass[sizeof g_config.web_pass - 1] = '\0';
+        /* Both or neither, via temporaries: a half-applied credential change
+         * (new user kept, new password refused) would lock the operator out
+         * just as effectively as a truncated one, and writing straight into
+         * g_config would do exactly that — str_set() commits the first field
+         * before the second is ever judged. */
+        { char u[sizeof g_config.web_user], p[sizeof g_config.web_pass];
+          if (!str_set(u, sizeof u, c->set_auth.user) ||
+              !str_set(p, sizeof p, c->set_auth.pass)) {
+              LOG_WARN("cli", "ignored over-long web credential from web/API");
+              break;
+          }
+          memcpy(g_config.web_user, u, sizeof u);
+          memcpy(g_config.web_pass, p, sizeof p); }
         if (!config_save()) LOG_ERR("cli", "config_save failed — web auth not persisted");
         break;
     case IC_CMD_SET_MAPPING: {

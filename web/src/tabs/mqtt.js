@@ -5,11 +5,14 @@ import { saver, textField, numField, num } from '../util.js';
 export function renderMqtt(state) {
   const m = (state.cfg && state.cfg.mqtt) || {};
 
-  const host = textField('Broker host', m.host, { placeholder: '192.168.1.10' });
+  // maxlength mirrors the firmware field sizes (config.h); the device rejects
+  // an over-long value with a 400 naming the limit, this just stops you typing
+  // past it in the first place.
+  const host = textField('Broker host', m.host, { placeholder: '192.168.1.10', maxlength: 63 });
   const port = numField('Port', m.port ?? 1883, { min: '1', max: '65535' });
-  const user = textField('Username', m.user, { placeholder: '(optional)' });
-  const prefix = textField('Topic prefix', m.prefix, { placeholder: 'lighting' });
-  const pass = h('input', { type: 'password', placeholder: m.have_pass ? '•••••• (unchanged)' : '(none)' });
+  const user = textField('Username', m.user, { placeholder: '(optional)', maxlength: 47 });
+  const prefix = textField('Topic prefix', m.prefix, { placeholder: 'lighting', maxlength: 23 });
+  const pass = h('input', { type: 'password', maxlength: 63, placeholder: m.have_pass ? '•••••• (unchanged)' : '(none)' });
 
   const save = h('button', { class: 'btn primary' }, 'Save MQTT');
   save.addEventListener('click', saver('/api/mqtt', () => {
