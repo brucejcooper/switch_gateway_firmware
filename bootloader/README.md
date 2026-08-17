@@ -406,9 +406,20 @@ hard-won rules, now encoded in `main.c`:
    Every BOOT_STUCK path blinks the LED 10× then calls `reset_usb_boot()` —
    the device lands in BOOTSEL, **remotely re-flashable**, instead of
    blinking forever behind a closed case. **Contract: the app must clear
-   `scratch[2]` and disable the watchdog early in `main()`** (before anything
-   slower than 8 s — bus discovery is). `../src/main.c` does this
-   unconditionally; it is a no-op in the standalone boot path.
+   `scratch[2]` and disable the watchdog before it arms its own** — not
+   necessarily as the very first thing in `main()`. The clear/disable must
+   still land before anything slower than 8 s (bus discovery is), but
+   nothing before it may be either: whatever runs between the bootloader's
+   jump and the app's own watchdog arm is, for those 8 s, covered by the
+   *bootloader's* still-ticking watchdog rather than by nothing at all. This
+   matters because the hang classes this hardening exists to catch (see the
+   two entries above) live in early init, not in the main loop — a
+   clear/disable placed before that code ran would defeat the very coverage
+   it's meant to provide. `../src/main.c` hands off immediately before its
+   own `watchdog_enable(5000, 1)` call — after USB/LED init and the core 1
+   launch, before `fs_init()`/discovery — unconditionally; it is a no-op in
+   the standalone boot path (the watchdog isn't enabled yet there either
+   way).
 
 ## The relocated app build: `light_switch_ota` (opt-in, `../CMakeLists.txt`)
 

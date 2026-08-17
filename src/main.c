@@ -80,15 +80,6 @@ void wd_feed(void) {
 }
 
 int main(void) {
-    /* If the OTA bootloader launched us with its watchdog-armed jump
-     * (bootloader/main.c "HARDENING #2"), prove we're alive: clear the
-     * attempt marker and disable its 8 s watchdog before anything slow
-     * (discovery takes far longer than 8 s). Harmless in the standalone
-     * build — the watchdog isn't enabled yet and scratch[2] is unused.
-     * Our own watchdog is armed at main-loop entry as before. */
-    watchdog_hw->scratch[2] = 0;
-    hw_clear_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_ENABLE_BITS);
-
     cdc_out_init();     /* before any LOG_* / core 1 launch: arms the output ring */
     stdio_init_all();
     alarm_pool_init_default();
@@ -106,23 +97,42 @@ int main(void) {
     intercore_init();
     core1_launch();
 
-    /* Watchdog armed HERE, before anything slow, rather than at main-loop entry.
+    /* HARDENING (2026-08-17): hand off from the OTA bootloader's
+     * watchdog-armed jump (bootloader/main.c "HARDENING #2") to our own
+     * watchdog HERE — immediately before arming it below — rather than
+     * clearing the attempt marker and disabling the bootloader's 8 s
+     * watchdog as the very first thing in main(), before anything had
+     * replaced it.
      *
-     * main() clears the bootloader's watchdog-armed jump above (it must — the
-     * bootloader gives 8 s and boot legitimately needs longer), and until now
-     * nothing replaced it until the main loop started. Everything between was
-     * unprotected: fs_init's first-boot format, and above all the BLOCKING slave
-     * discovery, which costs 2 s per configured-but-absent slave (a 1 s
-     * DISC_TIMEOUT_MS at each of two bauds) and so can run to ~9 s on a bus where
-     * nothing answers. A hang in that window produced no reset, no strike counted
-     * by the bootloader, and no BOOTSEL — just a device that pings (the W5100S
-     * answers ICMP in hardware) and does nothing else.
+     * That earlier placement left the whole stretch above — USB enumeration
+     * settling (busy_wait_ms), and core 1's own bring-up (intercore_init +
+     * core1_launch) — running with NO watchdog live at all: the
+     * bootloader's was just switched off and ours hadn't armed yet. Both
+     * documented hardware hang classes (bootloader/README.md's "Hardware
+     * bring-up findings" — the PRIMASK-masked-interrupts bug and the
+     * sane-looking-app-hangs-in-early-init case HARDENING #2 exists for)
+     * live in exactly this kind of early-init code. A hang here produced no
+     * reset, no strike counted by the bootloader, and no BOOTSEL — a
+     * silently bricked device needing the physical BOOTSEL button, which is
+     * precisely the failure mode HARDENING #2 was built to close; it was
+     * just being disarmed one window too early to actually cover it.
      *
-     * Legitimately-slow discovery does not trip it: the blocking waits feed via
-     * wd_feed(), which is also what makes this safe to arm this early — core 1 is
-     * already launched above, so the heartbeat gating is live, and the 15 s grace
-     * covers its startup. (The DALI ballast interrogation is NOT in this window;
-     * dirty_poll_arm_scan returns immediately and the main loop drives it.) */
+     * Moving the clear+disable to here instead means the bootloader's 8 s
+     * watchdog now stays live across that entire stretch (comfortably
+     * within budget on a healthy boot: a fixed 2.5 s wait plus two fast init
+     * calls), and a hang anywhere in it is caught, reset, and counted by the
+     * bootloader exactly as HARDENING #2 intends. Below this point picks up
+     * exactly where the old placement's coverage began: fs_init's
+     * first-boot format and the BLOCKING slave discovery loop (2 s per
+     * configured-but-absent slave — can run to ~9 s on a bus where nothing
+     * answers) are governed by OUR OWN 5 s watchdog + wd_feed(), unchanged
+     * from before — discovery still runs entirely after the arm below, not
+     * before it, so a legitimately slow bus scan still can't be reaped by
+     * either watchdog. Harmless in the standalone build either way: the
+     * watchdog isn't enabled yet and scratch[2] is unused SRAM there. */
+    watchdog_hw->scratch[2] = 0;
+    hw_clear_bits(&watchdog_hw->ctrl, WATCHDOG_CTRL_ENABLE_BITS);
+
     /* Read the reset cause BEFORE arming. watchdog_enable() writes the scratch
      * magic that watchdog_enable_caused_reboot() tests, so arming first would
      * make a reset from the BOOTLOADER's watchdog (which never wrote that magic)
