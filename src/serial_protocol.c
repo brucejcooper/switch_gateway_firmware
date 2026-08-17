@@ -541,64 +541,10 @@ static void cmd_set_coil(char **saveptr) {
 }
 
 /* ── help ───────────────────────────────────────────────────────────────── */
-static void cmd_help(void) {
-    printf("help                                       list commands\n");
-    printf("show config                                global tunables\n");
-    printf("show mappings                              list all mappings\n");
-    printf("show mapping <fix> <btn>                   one mapping\n");
-    printf("show relay [<ch>]                          relay state (one or all)\n");
-    printf("show dali [<slave> [<addr>]]               DALI state\n");
-    printf("show group <slave> [<group>]               DALI group state\n");
-    printf("show present <slave>                       present ballast addresses\n");
-    printf("show provision                             provisioning status\n");
-    printf("relay <ch> [on=true|false|toggle]          bare=get, else set\n");
-    printf("dali <slave> <addr|gN> [key=val ...]       bare=get; keys: on bri min max\n");
-    printf("                                           power_on sys_fail fade_rate fade_time\n");
-    printf("                                           group (gN) also: members=0,1  add=2  remove=1\n");
-    printf("cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms\n");
-    printf("                                           fw_url (reboot to apply)\n");
-    printf("                                           reversal_window_ms baud relay_slaves=1,2 dali_slaves=2,3 (reboot to apply)\n");
-    printf("tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n");
-    printf("btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n");
-    printf("dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result (dropped-not-resubmitted on gw reboot)\n");
-    printf("read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n");
-    printf("identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n");
-    printf("blink <slave> <addr>                       flash one ballast to locate it physically\n");
-    printf("gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n");
-    printf("dq [slave]                                 dump command-queue client state + counters\n");
-    printf("mbq [slave] | gw <slave>                  queue transport state / gateway counters\n");
-    printf("mbq drop-reply|no-ack <slave> <n>          §4 loss drill / backpressure drill\n");
-    printf("soak [<slave> <addr> [n=] [depth=] [path=direct|bg|user]] | stop   queue soak\n");
-    printf("busload [reset]                            RS-485 bus occupancy, split per slave\n");
-    printf("dstate [slave]                             DALI world model: presence, sweep, verify marks\n");
-    printf("dim <slave> <addr> {up|down}               step one ballast\n");
-    printf("dim <slave> g<group> {up|down}             step one group\n");
-    printf("provision <slave> {all|new|<addr>}         commission: all / incremental / re-provision collided <addr>\n");
-    printf("provision abort                            stop commissioning\n");
-    printf("scan <slave>                               blocking full scan\n");
-    printf("discover                                   re-probe all configured slaves (blocking)\n");
-    printf("ping <slave> [relay|dali]                  one ping at current master baud (kind inferred if omitted)\n");
-    printf("set_slave_baud <slave> {9600|19200|38400} [relay|dali]  tell slave to switch its UART baud\n");
-    printf("baud [<rate> [save]]                       show / set UART baud (live; 'save' persists)\n");
-    printf("rs485 [{tx|always}]                         show / set RS485 DE mode (saved; tx=DE while transmitting)\n");
-    printf("mqtt [show | set host= port= user= pass= prefix=]  broker config (reboot to apply)\n");
-    printf("net  [show | set dhcp= ip= mask= gw= dns=]   network config (reboot to apply)\n");
-    printf("net  ping <ip> [count]                      ICMP echo from the device (default 4)\n");
-    printf("ls [<path>]                                list files in path (default /)\n");
-    printf("cat <path>                                 dump file contents to console\n");
-    printf("map <fix> <btn> [targets=<s>:<a>,...]     bare=get; targets= deletes (a=N or gN)\n");
-    printf("log <level>                                set verbosity (off|err|warn|info|dbg)\n");
-    printf("show log                                   current verbosity\n");
-    printf("get_input <slave> <reg> [count]            raw FC04 read input registers\n");
-    printf("get_holding <slave> <reg> [count]          raw FC03 read holding registers\n");
-    printf("set_holding <slave> <reg> <value>          raw FC06 write holding register\n");
-    printf("get_coils <slave> <reg> [count]            raw FC01 read coils\n");
-    printf("set_coil <slave> <reg> {true|false|toggle} raw FC05 write coil\n");
-    printf("  (reg/value accept decimal or 0x-prefixed hex)\n");
-    printf("echo {on|off}                              echo input + backspace editing (or show state)\n");
-    printf("reboot                                     watchdog reset\n");
-    printf("resync                                     re-emit hello + all state + mappings\n");
-}
+/* cmd_help is defined below the dispatch table (~handle_text_line) — its body
+ * is just "print every entry's help text", so it needs the table to exist
+ * first. Forward-declared here since earlier code doesn't call it directly. */
+static void cmd_help(void);
 
 /* ── show subcommands ──────────────────────────────────────────────────── */
 static void cmd_show(char **saveptr) {
@@ -2141,6 +2087,153 @@ static void cmd_net(char **sp) {
     printf("ok (reboot to apply)\n");
 }
 
+/* ── CLI dispatch table ────────────────────────────────────────────────────
+ * Single source of truth for both dispatch (handle_text_line) and `help`
+ * output. Replaces a hand-written strcasecmp chain that had drifted from
+ * cmd_help's separately hand-written verb list — cmd_cfg grew
+ * gw_diag_interval_ms/dali_sweep_interval_ms/relay_byteswap keys that help
+ * never mentioned (fixed below, in the "cfg" entry's help text).
+ *
+ * Matching is strcasecmp EXACT-match (never prefix), so table order cannot
+ * introduce ambiguity — no verb here is a prefix of another in a way that
+ * would matter. Still, first match wins, top to bottom, same as the old
+ * chain. */
+typedef void (*cli_handler_t)(char **saveptr);
+
+/* Thin wrappers: cmd_help/cmd_reboot take no CLI args, so their signature is
+ * (void), not (char **) like the rest — wrap rather than change them. */
+static void cmd_help_v(char **saveptr)   { (void)saveptr; cmd_help(); }
+static void cmd_reboot_v(char **saveptr) { (void)saveptr; cmd_reboot(); }
+
+/* dstate/resync were inlined in the old dispatch chain with no named
+ * handler; given one each here so every table entry is a plain function. */
+static void cmd_dstate(char **saveptr) {
+    char *ss2 = strtok_r(NULL, " \t", saveptr);
+    long sl = -1;
+    if (ss2 && !parse_int_range_auto(ss2, 0, 247, &sl)) { txt_err("invalid_slave"); return; }
+    dali_state_debug_print((int)sl);
+}
+static void cmd_resync(char **saveptr) {
+    (void)saveptr;
+    LOG_INFO("cli", "resync");
+    serial_tx_hello();
+    lighting_resync_emit();
+    serial_tx_config_full();
+    txt_ok();
+}
+
+typedef struct {
+    const char *verb;
+    cli_handler_t fn;
+    const char *help;   /* one or more lines, printed verbatim by `help` */
+} cli_cmd_t;
+
+static const cli_cmd_t cli_commands[] = {
+    { "help", cmd_help_v,
+      "help                                       list commands\n" },
+    { "show", cmd_show,
+      "show config                                global tunables\n"
+      "show mappings                              list all mappings\n"
+      "show mapping <fix> <btn>                   one mapping\n"
+      "show relay [<ch>]                          relay state (one or all)\n"
+      "show dali [<slave> [<addr>]]               DALI state\n"
+      "show group <slave> [<group>]               DALI group state\n"
+      "show present <slave>                       present ballast addresses\n"
+      "show provision                             provisioning status\n"
+      "show log                                   current verbosity\n" },
+    { "relay", cmd_relay,
+      "relay <ch> [on=true|false|toggle]          bare=get, else set\n" },
+    { "btn", cmd_btn,
+      "btn <fixture> <button> [tap|press|release]  synthesize a button event (test)\n" },
+    { "dali", cmd_dali,
+      "dali <slave> <addr|gN> [key=val ...]       bare=get; keys: on bri min max\n"
+      "                                           power_on sys_fail fade_rate fade_time\n"
+      "                                           group (gN) also: members=0,1  add=2  remove=1\n" },
+    { "cfg", cmd_cfg,
+      "cfg [key=val ...]                          bare=get; long_press_ms dim_repeat_ms\n"
+      "                                           reversal_window_ms gw_diag_interval_ms\n"
+      "                                           dali_sweep_interval_ms relay_byteswap\n"
+      "                                           fw_url (reboot to apply)\n"
+      "                                           baud relay_slaves=1,2 dali_slaves=2,3 (reboot to apply)\n" },
+    { "tombstone", cmd_tombstone,
+      "tombstone dali <s> <a> | group <s> <g> | gw <s>   retire a removed device's retained MQTT topics\n" },
+    { "mqtt", cmd_mqtt,
+      "mqtt [show | set host= port= user= pass= prefix=]  broker config (reboot to apply)\n" },
+    { "net", cmd_net,
+      "net  [show | set dhcp= ip= mask= gw= dns=]   network config (reboot to apply)\n"
+      "net  ping <ip> [count]                      ICMP echo from the device (default 4)\n" },
+    { "dali_raw", cmd_dali_raw,
+      "dali_raw <slave> <cmd16> [twice]           send raw 16-bit DALI frame, report result (dropped-not-resubmitted on gw reboot)\n" },
+    { "read_mem", cmd_read_mem,
+      "read_mem <slave> <addr> <bank> <off> <n>   read n bytes from a ballast memory bank (hex)\n" },
+    { "identify", cmd_identify,
+      "identify <slave> <addr>                    read a ballast's GTIN + serial (bank 0)\n" },
+    { "blink", cmd_blink,
+      "blink <slave> <addr>                       flash one ballast to locate it physically\n" },
+    { "gw_reboot", cmd_gw_reboot,
+      "gw_reboot <slave>                          reboot a TinyModbus gateway (recover stuck bus)\n" },
+    { "dq", cmd_dq,
+      "dq [slave]                                 dump command-queue client state + counters\n" },
+    { "mbq", cmd_mbq,
+      "mbq [slave] | gw <slave>                  queue transport state / gateway counters\n"
+      "mbq drop-reply|no-ack <slave> <n>          §4 loss drill / backpressure drill\n" },
+    { "soak", cmd_soak,
+      "soak [<slave> <addr> [n=] [depth=] [path=direct|bg|user]] | stop   queue soak\n" },
+    { "dstate", cmd_dstate,
+      "dstate [slave]                             DALI world model: presence, sweep, verify marks\n" },
+    { "busload", cmd_busload,
+      "busload [reset]                            RS-485 bus occupancy, split per slave\n" },
+    { "dim", cmd_dim,
+      "dim <slave> <addr> {up|down}               step one ballast\n"
+      "dim <slave> g<group> {up|down}             step one group\n" },
+    { "provision", cmd_provision,
+      "provision <slave> {all|new|<addr>}         commission: all / incremental / re-provision collided <addr>\n"
+      "provision abort                            stop commissioning\n" },
+    { "scan", cmd_scan,
+      "scan <slave>                               blocking full scan\n" },
+    { "discover", cmd_discover,
+      "discover                                   re-probe all configured slaves (blocking)\n" },
+    { "ping", cmd_ping,
+      "ping <slave> [relay|dali]                  one ping at current master baud (kind inferred if omitted)\n" },
+    { "set_slave_baud", cmd_set_slave_baud,
+      "set_slave_baud <slave> {9600|19200|38400} [relay|dali]  tell slave to switch its UART baud\n" },
+    { "baud", cmd_baud,
+      "baud [<rate> [save]]                       show / set UART baud (live; 'save' persists)\n" },
+    { "rs485", cmd_rs485,
+      "rs485 [{tx|always}]                         show / set RS485 DE mode (saved; tx=DE while transmitting)\n" },
+    { "ls", cmd_ls,
+      "ls [<path>]                                list files in path (default /)\n" },
+    { "cat", cmd_cat,
+      "cat <path>                                 dump file contents to console\n" },
+    { "map", cmd_map,
+      "map <fix> <btn> [targets=<s>:<a>,...]     bare=get; targets= deletes (a=N or gN)\n" },
+    { "log", cmd_log,
+      "log <level>                                set verbosity (off|err|warn|info|dbg)\n" },
+    { "get_input", cmd_get_input,
+      "get_input <slave> <reg> [count]            raw FC04 read input registers\n" },
+    { "get_holding", cmd_get_holding,
+      "get_holding <slave> <reg> [count]          raw FC03 read holding registers\n" },
+    { "set_holding", cmd_set_holding,
+      "set_holding <slave> <reg> <value>          raw FC06 write holding register\n" },
+    { "get_coils", cmd_get_coils,
+      "get_coils <slave> <reg> [count]            raw FC01 read coils\n" },
+    { "set_coil", cmd_set_coil,
+      "set_coil <slave> <reg> {true|false|toggle} raw FC05 write coil\n"
+      "  (reg/value accept decimal or 0x-prefixed hex)\n" },
+    { "echo", cmd_echo,
+      "echo {on|off}                              echo input + backspace editing (or show state)\n" },
+    { "reboot", cmd_reboot_v,
+      "reboot                                     watchdog reset\n" },
+    { "resync", cmd_resync,
+      "resync                                     re-emit hello + all state + mappings\n" },
+};
+#define CLI_COMMANDS_COUNT (sizeof(cli_commands) / sizeof(cli_commands[0]))
+
+static void cmd_help(void) {
+    for (size_t i = 0; i < CLI_COMMANDS_COUNT; i++)
+        fputs(cli_commands[i].help, stdout);
+}
+
 /* ── Top-level text dispatcher ─────────────────────────────────────────── */
 static void handle_text_line(const char *original_line) {
     LOG_DBG("cli", "rx: %s", original_line);   /* normal traffic, not an event → DEBUG */
@@ -2155,168 +2248,11 @@ static void handle_text_line(const char *original_line) {
     char *cmd = strtok_r(buf, " \t", &saveptr);
     if (!cmd) return;
 
-    if (strcasecmp(cmd, "help") == 0) {
-        cmd_help();
-        return;
-    }
-    if (strcasecmp(cmd, "show") == 0) {
-        cmd_show(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "relay") == 0) {
-        cmd_relay(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "btn") == 0) {
-        cmd_btn(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "dali") == 0) {
-        cmd_dali(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "cfg") == 0) {
-        cmd_cfg(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "tombstone") == 0) {
-        cmd_tombstone(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "mqtt") == 0) {
-        cmd_mqtt(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "net") == 0) {
-        cmd_net(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "dali_raw") == 0) {
-        cmd_dali_raw(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "read_mem") == 0) {
-        cmd_read_mem(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "identify") == 0) {
-        cmd_identify(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "blink") == 0) {
-        cmd_blink(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "gw_reboot") == 0) {
-        cmd_gw_reboot(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "dq") == 0) {
-        cmd_dq(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "mbq") == 0) {
-        cmd_mbq(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "soak") == 0) {
-        cmd_soak(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "dstate") == 0) {
-        char *ss2 = strtok_r(NULL, " \t", &saveptr);
-        long sl = -1;
-        if (ss2 && !parse_int_range_auto(ss2, 0, 247, &sl)) { txt_err("invalid_slave"); return; }
-        dali_state_debug_print((int)sl);
-        return;
-    }
-    if (strcasecmp(cmd, "busload") == 0) {
-        cmd_busload(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "dim") == 0) {
-        cmd_dim(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "provision") == 0) {
-        cmd_provision(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "scan") == 0) {
-        cmd_scan(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "discover") == 0) {
-        cmd_discover(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "ping") == 0) {
-        cmd_ping(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "set_slave_baud") == 0) {
-        cmd_set_slave_baud(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "baud") == 0) {
-        cmd_baud(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "rs485") == 0) {
-        cmd_rs485(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "ls") == 0) {
-        cmd_ls(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "cat") == 0) {
-        cmd_cat(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "map") == 0) {
-        cmd_map(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "log") == 0) {
-        cmd_log(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "get_input") == 0) {
-        cmd_get_input(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "get_holding") == 0) {
-        cmd_get_holding(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "set_holding") == 0) {
-        cmd_set_holding(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "get_coils") == 0) {
-        cmd_get_coils(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "set_coil") == 0) {
-        cmd_set_coil(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "echo") == 0) {
-        cmd_echo(&saveptr);
-        return;
-    }
-    if (strcasecmp(cmd, "reboot") == 0) {
-        cmd_reboot();
-        return;
-    }
-    if (strcasecmp(cmd, "resync") == 0) {
-        LOG_INFO("cli", "resync");
-        serial_tx_hello();
-        lighting_resync_emit();
-        serial_tx_config_full();
-        txt_ok();
-        return;
+    for (size_t i = 0; i < CLI_COMMANDS_COUNT; i++) {
+        if (strcasecmp(cmd, cli_commands[i].verb) == 0) {
+            cli_commands[i].fn(&saveptr);
+            return;
+        }
     }
 
     LOG_WARN("cli", "parse err: unknown_command for input %s", original_line);
