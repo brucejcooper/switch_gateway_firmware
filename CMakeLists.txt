@@ -128,60 +128,96 @@ target_compile_definitions(light_switch PRIVATE JSMN_STATIC)
 # ── WIZnet W5100S networking (ioLibrary_Driver) — core 1 only ───────────────
 set(IOLIB ${CMAKE_CURRENT_LIST_DIR}/lib/ioLibrary_Driver)
 
-# Build-time patch: ioLibrary recv() returns SOCK_BUSY before checking whether
-# data is actually present in non-block mode (upstream issue #173), which leaves
-# the MQTT CONNACK unread forever. We keep the submodule pristine and apply the
-# one-line fix here, idempotently, so it's repeatable and trivially removable
-# once upstream fixes #173. Reverse-check first to detect an already-patched
-# tree (re-configures, dirty checkouts); a forward-apply failure is non-fatal
-# (warns) so an upstream fix that obsoletes the patch doesn't break the build.
-set(IOLIB_RECV_PATCH ${CMAKE_CURRENT_LIST_DIR}/patches/0001-ioLibrary-recv-nonblock-issue-173.patch)
-execute_process(
-    COMMAND git apply --reverse --check ${IOLIB_RECV_PATCH}
-    WORKING_DIRECTORY ${IOLIB}
-    RESULT_VARIABLE _iolib_patch_rev ERROR_QUIET OUTPUT_QUIET)
-if(_iolib_patch_rev EQUAL 0)
-    message(STATUS "ioLibrary recv() #173 patch: already applied")
-else()
-    execute_process(
-        COMMAND git apply ${IOLIB_RECV_PATCH}
-        WORKING_DIRECTORY ${IOLIB}
-        RESULT_VARIABLE _iolib_patch_app ERROR_QUIET OUTPUT_QUIET)
-    if(_iolib_patch_app EQUAL 0)
-        message(STATUS "ioLibrary recv() #173 patch: applied")
-    else()
-        message(WARNING "ioLibrary recv() #173 patch did not apply — upstream may "
-            "have fixed #173. Verify Ethernet/socket.c recv() non-block handling "
-            "and remove patches/0001-ioLibrary-recv-nonblock-issue-173.patch if so.")
-    endif()
-endif()
+# Re-run configure whenever a patch OR one of the sources it patches changes.
+# Without this, the patches sit entirely outside the build graph: the setup step
+# this project documents (`git submodule update --init --recursive`, see
+# CLAUDE.md) resets the submodule working tree and silently DISCARDS both
+# patches, and a following `make -C build` never re-runs configure (CMakeLists
+# is unchanged), so the firmware compiles against unpatched sources with no
+# warning at all. Listing the patched files here makes that revert re-trigger
+# configure, which re-applies and re-verifies below.
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    ${CMAKE_CURRENT_LIST_DIR}/patches/0001-ioLibrary-recv-nonblock-issue-173.patch
+    ${CMAKE_CURRENT_LIST_DIR}/patches/0002-dhcp-configurable-hostname.patch
+    ${IOLIB}/Ethernet/socket.c
+    ${IOLIB}/Internet/DHCP/dhcp.c)
 
-# Build-time patch: ioLibrary's DHCP client hardcodes the option-12 hostname to
-# "WIZnet" + a 6-hex-char MAC suffix in a fixed 7-byte array. We want a clean,
-# configurable hostname (so the router registers e.g. "lights" in local DNS), so
-# this patch widens HOST_NAME[] to 32 bytes (netif.c overwrites it from config)
-# and drops the MAC suffix. Same pristine-submodule + idempotent-apply approach
-# as the recv patch above; remove both the patch file and this block to revert.
-set(IOLIB_HOSTNAME_PATCH ${CMAKE_CURRENT_LIST_DIR}/patches/0002-dhcp-configurable-hostname.patch)
-execute_process(
-    COMMAND git apply --reverse --check ${IOLIB_HOSTNAME_PATCH}
-    WORKING_DIRECTORY ${IOLIB}
-    RESULT_VARIABLE _iolib_host_rev ERROR_QUIET OUTPUT_QUIET)
-if(_iolib_host_rev EQUAL 0)
-    message(STATUS "ioLibrary DHCP hostname patch: already applied")
-else()
+# Apply one of our ioLibrary patches idempotently, then PROVE it landed by
+# looking for a marker only the patched source contains.
+#
+# The verification is the load-bearing half, and it is deliberately fatal. The
+# apply's own exit status is not trustworthy evidence: it is skipped entirely on
+# the already-applied path, and a reverted submodule can leave the tree
+# unpatched without any apply ever running. Reading the source is the only check
+# that holds in all three cases (fresh apply, already applied, silently
+# reverted).
+#
+# This replaces a `message(WARNING)`, whose stated intent was to let an upstream
+# fix that obsoletes a patch through without breaking the build. That trade is
+# wrong here — a warning scrolls past a build that still succeeds, and these
+# patches are not both optional:
+#   - 0001 unpatched: the MQTT CONNACK is never read; no Home Assistant at all.
+#   - 0002 unpatched: `HOST_NAME[]` is the compiled-in 8-byte "WIZnet\0" array
+#     while netif.c (netif_init) copies up to 32 bytes into it through an
+#     `extern uint8_t HOST_NAME[]` of incomplete type — no compiler diagnostic
+#     is possible — overflowing by up to 24 bytes directly over `DHCP_CHADDR[6]`
+#     (the DHCP client MAC) declared immediately after it in dhcp.c. The default
+#     "lights" fits the unpatched array by luck; any longer hostname corrupts.
+# If upstream ever does obsolete a patch, this stops the build and a human
+# updates or removes it — a deliberate decision rather than a silent one.
+function(iolib_patch _patch _file _marker _what)
     execute_process(
-        COMMAND git apply ${IOLIB_HOSTNAME_PATCH}
+        COMMAND git apply --reverse --check ${_patch}
         WORKING_DIRECTORY ${IOLIB}
-        RESULT_VARIABLE _iolib_host_app ERROR_QUIET OUTPUT_QUIET)
-    if(_iolib_host_app EQUAL 0)
-        message(STATUS "ioLibrary DHCP hostname patch: applied")
+        RESULT_VARIABLE _rev ERROR_QUIET OUTPUT_QUIET)
+    if(_rev EQUAL 0)
+        message(STATUS "ioLibrary ${_what} patch: already applied")
     else()
-        message(WARNING "ioLibrary DHCP hostname patch did not apply — verify "
-            "Internet/DHCP/dhcp.c HOST_NAME handling and "
-            "patches/0002-dhcp-configurable-hostname.patch.")
+        execute_process(
+            COMMAND git apply ${_patch}
+            WORKING_DIRECTORY ${IOLIB}
+            RESULT_VARIABLE _app ERROR_QUIET OUTPUT_QUIET)
+        if(_app EQUAL 0)
+            message(STATUS "ioLibrary ${_what} patch: applied")
+        else()
+            message(STATUS "ioLibrary ${_what} patch: apply reported failure — "
+                "checking the source directly")
+        endif()
     endif()
-endif()
+
+    file(READ ${IOLIB}/${_file} _src)
+    string(FIND "${_src}" "${_marker}" _hit)
+    if(_hit EQUAL -1)
+        message(FATAL_ERROR
+            "ioLibrary ${_what} patch is NOT present in ${_file}.\n"
+            "Refusing to build: this patch is load-bearing (see the comment above "
+            "iolib_patch() in CMakeLists.txt for what breaks without it).\n"
+            "Most likely `git submodule update` reset lib/ioLibrary_Driver and "
+            "discarded it. Re-run cmake to re-apply, or if upstream has genuinely "
+            "obsoleted ${_patch}, update or remove that patch and this check.")
+    endif()
+endfunction()
+
+# ioLibrary recv() returns SOCK_BUSY before checking whether data is actually
+# present in non-block mode (upstream issue #173), which leaves the MQTT CONNACK
+# unread forever. We keep the submodule pristine and apply the one-line fix here
+# so it's repeatable and trivially removable once upstream fixes #173.
+iolib_patch(
+    ${CMAKE_CURRENT_LIST_DIR}/patches/0001-ioLibrary-recv-nonblock-issue-173.patch
+    Ethernet/socket.c
+    "(sock_io_mode & (1 << sn)) && (recvsize == 0)"
+    "recv() #173")
+
+# ioLibrary's DHCP client hardcodes the option-12 hostname to "WIZnet" + a
+# 6-hex-char MAC suffix in a fixed 8-byte array. We want a clean, configurable
+# hostname (so the router registers e.g. "lights" in local DNS), so this patch
+# widens HOST_NAME[] to 32 bytes (netif.c overwrites it from config) and drops
+# the MAC suffix. Same pristine-submodule + idempotent-apply approach as above.
+iolib_patch(
+    ${CMAKE_CURRENT_LIST_DIR}/patches/0002-dhcp-configurable-hostname.patch
+    Internet/DHCP/dhcp.c
+    "HOST_NAME[32]"
+    "DHCP hostname")
 
 target_sources(light_switch PRIVATE
     ${IOLIB}/Ethernet/wizchip_conf.c
