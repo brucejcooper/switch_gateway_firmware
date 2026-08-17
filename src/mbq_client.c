@@ -622,8 +622,22 @@ static bool issue_queue_txn_acked(slave_t *s, uint8_t ci, bool with_ack) {
     /* The backpressure drill withholds the ack so the gateway's response queue
      * fills and its arbiter stalls (spec §2's backpressure rule). Nothing else
      * changes: ack_pending survives and is delivered once the drill ends, so
-     * the queue drains and the run recovers to full rate. */
-    if (with_ack && s->withhold_acks > 0) { s->withhold_acks--; with_ack = false; }
+     * the queue drains and the run recovers to full rate.
+     *
+     * Spend the budget only when there is an ack actually DUE
+     * (s->ack_pending != 0): with nothing outstanding, `ctl`'s ack field comes
+     * out 0 whether with_ack is left true or forced false (ack_pending &
+     * SEQ_MASK is 0 either way), so decrementing here withholds nothing at the
+     * gateway. Every such request — issued whenever a result has not yet been
+     * consumed, e.g. while staging the very first command, or immediately
+     * after a reply already cleared ack_pending — still counted against `n`,
+     * so `mbq no-ack <slave> <n>` could exhaust its whole budget without ever
+     * making the gateway's response queue fill, and the drill would read
+     * clean (gate V4, QUEUE-PROTOCOL.md §10) having withheld nothing. */
+    if (with_ack && s->ack_pending != 0 && s->withhold_acks > 0) {
+        s->withhold_acks--;
+        with_ack = false;
+    }
     uint8_t ctl  = with_ack ? (uint8_t)(s->ack_pending & SEQ_MASK) : 0u;
 
     if (ci != NO_CMD) {
