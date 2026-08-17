@@ -23,6 +23,19 @@ import time
 import serial
 
 
+def resolve_port(preferred):
+    """Return `preferred` if given, else the first available USB-CDC port.
+    Exits with a clear message if none is found, rather than raising an
+    IndexError on an empty glob that a caller might mistake for a parsing bug."""
+    if preferred:
+        return preferred
+    cands = sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))
+    if not cands:
+        sys.exit("no controller serial port found (no /dev/tty.usbmodem* or "
+                  "/dev/ttyACM*) — pass --port explicitly")
+    return cands[0]
+
+
 def main():
     ap = argparse.ArgumentParser(description="DALI ballast inventory + collision scan")
     ap.add_argument("slave", type=int, help="DALI gateway Modbus slave id")
@@ -30,17 +43,31 @@ def main():
     ap.add_argument("--all", action="store_true", help="probe all 64 addresses, not just present")
     cfg = ap.parse_args()
 
-    port = cfg.port or sorted(glob.glob("/dev/tty.usbmodem*") + glob.glob("/dev/ttyACM*"))[0]
+    port = resolve_port(cfg.port)
     ser = serial.Serial(port, 115200, timeout=0.2)
     time.sleep(0.5)
     ser.reset_input_buffer()
+
+    def drain(wait):
+        """Read until `wait` s pass with no more bytes arriving (extending the
+        deadline by 0.15 s each time bytes show up), rather than a flat sleep.
+        Much faster on quick replies (log warn, show present) and stops a slow
+        reply (identify, up to 8 s) from being truncated mid-frame into a bogus
+        'absent'/'?' row when it lands right at the edge of a fixed sleep."""
+        buf = b""
+        deadline = time.time() + wait
+        while time.time() < deadline:
+            chunk = ser.read(4096)
+            if chunk:
+                buf += chunk
+                deadline = time.time() + 0.15
+        return buf
 
     def cmd(c, wait):
         ser.reset_input_buffer()
         ser.write((c + "\n").encode())
         ser.flush()
-        time.sleep(wait)
-        return [l for l in ser.read(8000).decode("utf-8", "replace").splitlines()
+        return [l for l in drain(wait).decode("utf-8", "replace").splitlines()
                 if l.strip() and not l.startswith("#") and not l.startswith("{")]
 
     cmd("log warn", 0.3)
@@ -86,5 +113,5 @@ def main():
 if __name__ == "__main__":
     try:
         main()
-    except (IndexError, KeyboardInterrupt) as e:
+    except KeyboardInterrupt as e:
         sys.exit(str(e) or "interrupted")
