@@ -478,15 +478,26 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
         if (jip(body, tk, nt, "gw",   cmd.set_netcfg.gw))   f |= IC_NET_F_GW;
         if (jip(body, tk, nt, "dns",  cmd.set_netcfg.dns))  f |= IC_NET_F_DNS;
         if (jhas(body, tk, nt, "hostname")) {
-            jstr_key(body, tk, nt, "hostname", cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname);
-            /* Reject here rather than leaving it to core 0. This request is
-             * answered as soon as the command is pushed, so core 0's own gate
-             * can only drop the field silently — the caller saw {"ok":true}
-             * and the web UI toasted "Saved" for a hostname that never
-             * changed. Same rule and same normalisation as the CLI, which has
-             * always reported bad_hostname. */
+            /* Read into a buffer one byte LARGER than the destination field.
+             * jstr_key() silently truncates to fit its cap, so reading
+             * straight into the 32-byte command field turned an over-long
+             * hostname into a perfectly valid 31-char one BEFORE the rule
+             * below ever saw it: the API answered 200 and stored a name the
+             * caller never asked for, while the CLI rejected the same input
+             * (measured on the bench — a 32-char POST stored 31 'a's). The
+             * extra byte keeps anything too long for the field still too long
+             * for the rule, so it is refused instead of silently substituted.
+             *
+             * Reject here rather than leaving it to core 0: this request is
+             * answered as soon as the command is pushed, so core 0's gate can
+             * only drop the field silently — the caller saw {"ok":true} and
+             * the web UI toasted "Saved" for a hostname that never changed.
+             * Same rule and normalisation as the CLI, which has always
+             * reported bad_hostname. */
+            char hn[sizeof cmd.set_netcfg.hostname + 1];
+            jstr_key(body, tk, nt, "hostname", hn, sizeof hn);
             if (!config_hostname_set(cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname,
-                                     cmd.set_netcfg.hostname)) {
+                                     hn)) {
                 resp_text(c, "400 Bad Request", "application/json",
                           "{\"error\":\"hostname must be 1-31 chars of a-z 0-9 -, "
                           "not starting or ending with -\"}");

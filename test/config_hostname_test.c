@@ -112,9 +112,10 @@ int main(void) {
         CHECK(strcmp(dst, "lights") == 0);
     }
 
-    /* http_server.c normalises /api/net's command buffer in place, so dst and
-     * src alias. The copy runs strictly forward and never re-reads an index it
-     * has written, which is what makes that safe. */
+    /* dst == src is a supported property of the copy (strictly forward, never
+     * re-reading a written index). No caller relies on it today — /api/net
+     * reads into its own oversized buffer so a too-long value stays visible —
+     * but it is pinned so the property does not quietly regress. */
     g_case = "in-place normalisation (dst == src)";
     {
         char buf[32];

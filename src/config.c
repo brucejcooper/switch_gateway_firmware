@@ -47,9 +47,10 @@ bool config_hostname_set(char *dst, size_t cap, const char *src) {
      * the wrong way to fail if that ever stops being true. */
     size_t n = strlen(src);
     if (n >= cap) return false;
-    /* dst == src is supported and used (http_server.c normalises /api/net's
-     * command buffer in place): the copy runs strictly forward, writing index
-     * i only after reading it, and never re-reads an index it has written. */
+    /* dst == src is supported (though no caller relies on it today — /api/net
+     * reads into its own buffer so an over-long value stays detectable): the
+     * copy runs strictly forward, writing index i only after reading it, and
+     * never re-reads an index it has written. */
     for (size_t i = 0; i < n; i++) {
         char ch = src[i];
         dst[i] = (ch >= 'A' && ch <= 'Z') ? (char)(ch - 'A' + 'a') : ch;
