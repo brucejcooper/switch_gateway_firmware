@@ -1302,13 +1302,33 @@ static void resolve_version(slave_t *s, const uint8_t *b, uint8_t n) {
      * bytecount + 32 data + 2 CRC = 37 bytes. */
     if (n < 37u) { s->st = S_DRAIN; return; }   /* unreadable: let behaviour decide */
     const char *v = (const char *)(b + 3);
+    const uint8_t vlen = (uint8_t)(GW_VERSION_REGS * 2u);   /* the 32 data bytes */
     unsigned maj = 0, min = 0;
-    const char *p = NULL;
-    for (uint8_t i = 0; i + 1u < 32u; i++)
-        if (v[i] == 'v' && v[i + 1u] >= '0' && v[i + 1u] <= '9') { p = &v[i + 1u]; break; }
-    if (p) {
-        while (*p >= '0' && *p <= '9') maj = maj * 10u + (unsigned)(*p++ - '0');
-        if (*p == '.') { p++; while (*p >= '0' && *p <= '9') min = min * 10u + (unsigned)(*p++ - '0'); }
+    /* Every scan below is bounded by vlen, and nothing leans on the block
+     * containing a NUL or a '.'/' ' terminator — it is a FREE-FORM string from
+     * off-device, so it gets no more trust than any other gateway reply. The
+     * previous `while (*p >= '0' ...)` walked a raw pointer with no end: the
+     * 'v' can match as late as v[30], so a digit run to the end of the field
+     * would read past cb_buf[40] and on into the rest of slave_t (same class
+     * as the jfind overread fixed in a8d30f4). Digits also saturate at 255
+     * instead of wrapping, so the packed compare below and the uint8_t stored
+     * in gw_major/gw_minor can never disagree about what was reported — a
+     * "v256.0" used to compare as compatible while reporting itself as v0.0. */
+    uint8_t i = 0;
+    bool have_ver = false;
+    for (; i + 1u < vlen; i++)
+        if (v[i] == 'v' && v[i + 1u] >= '0' && v[i + 1u] <= '9') { i++; have_ver = true; break; }
+    if (have_ver) {
+        for (; i < vlen && v[i] >= '0' && v[i] <= '9'; i++) {
+            maj = maj * 10u + (unsigned)(v[i] - '0');
+            if (maj > 255u) maj = 255u;
+        }
+        if (i < vlen && v[i] == '.') {
+            for (i++; i < vlen && v[i] >= '0' && v[i] <= '9'; i++) {
+                min = min * 10u + (unsigned)(v[i] - '0');
+                if (min > 255u) min = 255u;
+            }
+        }
         s->gw_major = (uint8_t)maj;
         s->gw_minor = (uint8_t)min;
         s->stats.gw_ver_major = s->gw_major;

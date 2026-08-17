@@ -721,6 +721,28 @@ int main(void) {
     CHECK(!stats().incompatible);
     CHECK(mbq_client_can_submit(SLAVE));
 
+    /* The version block is a free-form 32-byte STRING, so the parser may not
+     * assume a NUL or a '.'/' ' terminator inside it. Here the only "v<digit>"
+     * sits at the very end of the field (indices 30/31), so the major-digit
+     * scan starts on the field's LAST byte, and the reply keeps going: this
+     * string is 34 chars, so "87" lands in the two bytes past the field (the
+     * frame's CRC slot) and more stale bytes follow in cb_buf. A parser bounded
+     * by the field reads only the "9"; the unbounded pointer walk this replaces
+     * ran straight on through the CRC into the rest of cb_buf and reported 987.
+     * The hex run contains no 'v', so the match at index 30 is the first. */
+    g_case = "version parse: digits run past the end of the field";
+    g_now_us = 1000000u;
+    memset(&PEND, 0, sizeof PEND);
+    gw_reset_all();
+    GW.ver = "DALI 1.0 aabbccddeeffaabbccddev987";
+    CHECK(strlen(GW.ver) == 34);         /* 32-byte field + 2 bytes past it */
+    mbq_client_init();
+    mbq_client_add_slave(SLAVE);
+    run_ms(400);
+    CHECK(stats().gw_ver_major == 9);    /* the field's own digit, not 987 */
+    CHECK(stats().gw_ver_minor == 0);    /* no '.' follows it inside the field */
+    CHECK(!stats().incompatible);        /* 9.0 >= the 1.0 minimum */
+
     begin("compat latch: wrong reply length");
     {
         cap_t a = {0};
