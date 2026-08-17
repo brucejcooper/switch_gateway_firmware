@@ -16,6 +16,9 @@
 
 global_config_t g_config;
 
+#define CONFIG_PATH     "/config.json"
+#define CONFIG_PATH_TMP "/config.json.tmp"
+
 slave_kind_t slave_kind(uint8_t slave_id) {
     if (slave_id == 0) return SLAVE_KIND_UNKNOWN;  /* broadcast */
     for (int i = 0; i < g_config.relay_slave_count; i++)
@@ -132,7 +135,13 @@ static bool migrate_legacy_modbus(void) {
 bool config_load(void) {
     config_defaults();
 
-    FILE *fp = fopen("/config.json", "r");
+    /* A power cut between config_save()'s fclose() and rename() leaves the new
+     * config sitting in the .tmp file with the old CONFIG_PATH still intact
+     * and authoritative — discard the orphaned .tmp so a later save doesn't
+     * confuse it for anything meaningful (mirrors mapping_load(), mapping.c). */
+    remove(CONFIG_PATH_TMP);
+
+    FILE *fp = fopen(CONFIG_PATH, "r");
     char buf[1024];
     size_t n = 0;
     if (fp) { n = fread(buf, 1, sizeof(buf) - 1, fp); fclose(fp); }
@@ -189,7 +198,16 @@ bool config_load(void) {
 }
 
 bool config_save(void) {
-    FILE *fp = fopen("/config.json", "w");
+    /* Write the full config to a .tmp file first, then rename() it over the
+     * live path — littlefs rename is a single atomic metadata commit, so a
+     * power cut anywhere in this function leaves either the old config or
+     * the new one intact, never a truncated one. The old fopen(path, "w")
+     * destroyed the old config before the new one was durable: a cut
+     * mid-write silently dropped whatever fields came after the truncation
+     * point, reverting them to compiled defaults on the next boot —
+     * including mqtt/network config, which bricks connectivity until
+     * physical access (same defect fixed for mappings in cc19f7b). */
+    FILE *fp = fopen(CONFIG_PATH_TMP, "w");
     if (!fp) return false;
     fprintf(fp,
         "{\"long_press_ms\":%u,\"dim_repeat_ms\":%u,\"reversal_window_ms\":%u,"
@@ -229,6 +247,16 @@ bool config_save(void) {
         g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3],
         g_config.net_hostname,
         g_config.web_user, g_config.web_pass, g_config.fw_url);
-    fclose(fp);
+    /* pico-vfs's littlefs backend exposes no separate fsync(); fclose()
+     * reaches lfs_file_close(), which syncs the file's data to flash before
+     * returning, so this is the actual durability boundary. */
+    bool ok = true;
+    if (fflush(fp) != 0) ok = false;
+    if (fclose(fp) != 0) ok = false;
+    if (!ok) return false;
+    if (rename(CONFIG_PATH_TMP, CONFIG_PATH) != 0) {
+        LOG_ERR("config", "save failed: rename %s -> %s", CONFIG_PATH_TMP, CONFIG_PATH);
+        return false;
+    }
     return true;
 }
