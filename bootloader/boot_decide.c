@@ -20,8 +20,22 @@ boot_action_t boot_decide(const struct boot_control *bc, bool bc_valid,
     /* Rule 3: active image already proven good. */
     if (bc->flags & BC_F_CONFIRMED) return BOOT_ACTIVE;
 
-    /* Rules 4/5: active image is unconfirmed — check the retry budget. */
-    if (bc->boot_attempts > max_boot_attempts) return BOOT_ROLLBACK;
+    /* Rules 4/5: active image is unconfirmed — check the retry budget.
+     * `>=`, not `>`: boot_attempts is bumped BEFORE each jump (main()'s
+     * shared "about to boot an unconfirmed image" step), so by the time this
+     * runs on the Nth boot of a given candidate, boot_attempts already holds
+     * N-1 (0 on the very first attempt). max_boot_attempts=3 must mean the
+     * candidate gets exactly 3 real boot attempts before a 4th boot rolls it
+     * back — attempts 0,1,2 (the first three boots) still read `< 3` here
+     * and get BOOT_ACTIVE; attempts==3 (about to be the FOURTH boot) is the
+     * first value that reads `>= 3` and rolls back. A plain `>` here let
+     * boot_attempts==max_boot_attempts (the Nth boot, not yet an (N+1)th)
+     * through as BOOT_ACTIVE too, silently granting one extra attempt beyond
+     * whatever the constant said — see MAX_BOOT_ATTEMPTS's own comment
+     * (bootloader/main.c) and bootloader/README.md's rule list, which
+     * document max_boot_attempts=3 as "three attempts" and must actually
+     * mean it. */
+    if (bc->boot_attempts >= max_boot_attempts) return BOOT_ROLLBACK;
     return BOOT_ACTIVE;
 }
 

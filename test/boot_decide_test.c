@@ -88,41 +88,50 @@ int main(void) {
         CHECK(boot_decide(&bc, true, 3) == BOOT_ACTIVE);
     }
 
-    /* ── Rules 4/5: no PENDING, no CONFIRMED -> pure attempts-vs-budget. ── */
+    /* ── Rules 4/5: no PENDING, no CONFIRMED -> pure attempts-vs-budget.
+     *    Compared with `>=` (fixed off-by-one, 2026-08-17): max_boot_attempts
+     *    names the exact number of real boot attempts a candidate gets, so
+     *    boot_attempts in [0, max) — i.e. the 1st through max'th boot —
+     *    reads BOOT_ACTIVE, and boot_attempts == max (what would be the
+     *    (max+1)'th boot) is the first value that rolls back. ─────────── */
     {
         unsigned max = 3;
-        for (uint32_t attempts = 0; attempts <= max; attempts++) {
+        for (uint32_t attempts = 0; attempts < max; attempts++) {
             struct boot_control bc = mk(0, attempts);
             CHECK(boot_decide(&bc, true, max) == BOOT_ACTIVE);
         }
-        for (uint32_t attempts = max + 1; attempts <= max + 5; attempts++) {
+        for (uint32_t attempts = max; attempts <= max + 5; attempts++) {
             struct boot_control bc = mk(0, attempts);
             CHECK(boot_decide(&bc, true, max) == BOOT_ROLLBACK);
         }
     }
 
     /* ── Same rules 4/5, swept across several max_boot_attempts policy
-     *    values, including the max_boot_attempts == 0 edge (any attempt
-     *    beyond the very first unconfirmed boot rolls back immediately). ── */
+     *    values, including the max_boot_attempts == 0 edge (every unconfirmed
+     *    boot rolls back immediately — a candidate gets zero real attempts). ── */
     {
         unsigned maxes[] = { 0, 1, 2, 5, 10 };
         for (size_t m = 0; m < sizeof maxes / sizeof maxes[0]; m++) {
             unsigned max = maxes[m];
-            struct boot_control at_max = mk(0, max);
-            CHECK(boot_decide(&at_max, true, max) == BOOT_ACTIVE);
+            if (max > 0) {
+                struct boot_control below_max = mk(0, max - 1);
+                CHECK(boot_decide(&below_max, true, max) == BOOT_ACTIVE);
+            }
 
-            struct boot_control one_over = mk(0, max + 1);
-            CHECK(boot_decide(&one_over, true, max) == BOOT_ROLLBACK);
+            struct boot_control at_max = mk(0, max);
+            CHECK(boot_decide(&at_max, true, max) == BOOT_ROLLBACK);
         }
     }
 
     /* ── boot_attempts == 0 with no flags at all (e.g. a freshly-written,
      *    all-zero record with neither PENDING nor CONFIRMED — shouldn't
      *    arise in practice via ota_stage.c, but boot_decide must still do
-     *    something sane): well within any nonzero budget -> ACTIVE. ────── */
+     *    something sane): a first attempt, so ACTIVE under any NONZERO
+     *    budget; max_boot_attempts == 0 grants no attempts at all, so that
+     *    same first attempt rolls back immediately (0 >= 0). ────────────── */
     {
         struct boot_control bc = mk(0, 0);
-        CHECK(boot_decide(&bc, true, 0) == BOOT_ACTIVE);   /* 0 <= 0 */
+        CHECK(boot_decide(&bc, true, 0) == BOOT_ROLLBACK);   /* 0 >= 0: no budget at all */
         CHECK(boot_decide(&bc, true, 5) == BOOT_ACTIVE);
     }
 

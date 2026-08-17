@@ -76,19 +76,27 @@
  *      Active image already proven good (ota_stage_confirm() /
  *      ota_mark_valid() ran) — boot it, no attempt bookkeeping needed.
  *   4. bc_valid && !(flags & BC_F_PENDING) && !(flags & BC_F_CONFIRMED)
- *        && boot_attempts > max_boot_attempts             -> BOOT_ROLLBACK
+ *        && boot_attempts >= max_boot_attempts            -> BOOT_ROLLBACK
  *      Unconfirmed AND already burned through the retry budget: crash loop.
  *   5. bc_valid && !(flags & BC_F_PENDING) && !(flags & BC_F_CONFIRMED)
- *        && boot_attempts <= max_boot_attempts            -> BOOT_ACTIVE
+ *        && boot_attempts < max_boot_attempts             -> BOOT_ACTIVE
  *      Unconfirmed but still within budget — try again. (main() is
  *      responsible for bumping boot_attempts and persisting it via bc_write()
  *      *before* jumping, so a crash this attempt is visible next boot; see
  *      bootloader/README.md.)
  *
- * boot_attempts and max_boot_attempts are compared with plain `>`, so
- * boot_attempts == max_boot_attempts is still within budget (one more try);
- * boot_attempts == max_boot_attempts + 1 is the first attempt that rolls
- * back.
+ * boot_attempts and max_boot_attempts are compared with `>=`, so
+ * max_boot_attempts really does mean "this many attempts": boot_attempts
+ * holds the count of PRIOR attempts (bumped after each one, before the next
+ * jump — see rule 5's parenthetical), so a fresh candidate reads 0 on its
+ * first boot, 1 on its second, ..., max_boot_attempts-1 on its
+ * max_boot_attempts'th (still BOOT_ACTIVE — `< max_boot_attempts`), and
+ * max_boot_attempts on what would be attempt number max_boot_attempts+1
+ * (BOOT_ROLLBACK — the candidate never gets that extra try). A plain `>`
+ * here would let boot_attempts == max_boot_attempts itself through as one
+ * more BOOT_ACTIVE, silently granting max_boot_attempts+1 real attempts —
+ * see MAX_BOOT_ATTEMPTS's own comment (bootloader/main.c), which documents
+ * exactly three and must mean it.
  */
 typedef enum {
     BOOT_ACTIVE,

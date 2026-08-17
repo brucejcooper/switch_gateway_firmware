@@ -106,9 +106,9 @@ rationale of each):
    image is waiting, regardless of the active image's own state.
 3. `bc_valid && (flags & BC_F_CONFIRMED)` (no PENDING) → `BOOT_ACTIVE` —
    already proven good.
-4. Unconfirmed, no PENDING, `boot_attempts > max_boot_attempts` →
+4. Unconfirmed, no PENDING, `boot_attempts >= max_boot_attempts` →
    `BOOT_ROLLBACK` — crash loop.
-5. Unconfirmed, no PENDING, `boot_attempts <= max_boot_attempts` →
+5. Unconfirmed, no PENDING, `boot_attempts < max_boot_attempts` →
    `BOOT_ACTIVE` — still within the retry budget.
 
 `boot_decide()` itself **never returns `BOOT_STUCK`** — it has no access to
