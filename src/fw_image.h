@@ -62,6 +62,18 @@ struct fw_trailer {
 extern const uint8_t FW_PUBKEY[32];
 
 /*
+ * Copy the trailer out of the last sizeof(struct fw_trailer) bytes of a
+ * total_len-byte artifact at base. Centralises the "is there even room for a
+ * trailer" guard: returns false (leaving *out untouched) if total_len is too
+ * short, true otherwise. Every other trailer-extraction call site in the
+ * firmware (fw_verify() below, ota_stage.c, the bootloader's commit/rollback
+ * path, and the host tests) should go through this rather than open-coding
+ * `memcpy(&t, base + (total_len - sizeof t), sizeof t)` — that underflow
+ * guard then lives in exactly one place.
+ */
+bool fw_trailer_at(const uint8_t *base, uint32_t total_len, struct fw_trailer *out);
+
+/*
  * Locate the trailer at the end of buf (last sizeof(struct fw_trailer)
  * bytes of the total_len-byte artifact), and verify:
  *   1. magic matches FW_TRAILER_MAGIC;

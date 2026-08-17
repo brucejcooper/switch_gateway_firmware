@@ -43,9 +43,10 @@ static int fail = 0;
 
 /* ── ota_stage.c's OTA_STAGE_HOST_TEST seam: a RAM array standing in for the
  * STAGING flash region (PART_XIP(STAGING_OFF) on target). Real STAGING_SIZE
- * is 832 KB; every image this test stages is far smaller, so a much smaller
- * buffer is fine — ota_stage.c's own bounds check is against the real
- * STAGING_SIZE constant regardless of this buffer's size. */
+ * is 576 KB (three-slot re-carve — see partition_map.h); every image this
+ * test stages is far smaller, so a much smaller buffer is fine —
+ * ota_stage.c's own bounds check is against the real STAGING_SIZE constant
+ * regardless of this buffer's size. */
 #define TEST_STAGING_CAP (64u * 1024u)
 static uint8_t g_staging[TEST_STAGING_CAP];
 
@@ -153,7 +154,7 @@ int main(void) {
     CHECK((bc.flags & BC_F_PENDING) != 0);
     CHECK(bc.staged_len == total_len);
     struct fw_trailer trailer;
-    memcpy(&trailer, g_image + img_len, sizeof trailer);
+    CHECK(fw_trailer_at(g_image, total_len, &trailer));
     CHECK(memcmp(bc.staged_sha512, trailer.sha512, sizeof bc.staged_sha512) == 0);
 
     /* ── (b) one-byte-corrupted image: verify fails, no record written ── */

@@ -152,7 +152,8 @@ int main(void) {
      * bootloader that boots without fw_verify()ing anything first. This is
      * an explicit, narrow, documented exception to "never run an
      * unverified image" — see the prominent callout in README.md, which
-     * also covers why it doesn't (yet) get worse than the status quo.
+     * also covers why it doesn't (yet) get worse than the status quo. Two
+     * hardenings below, both scoped to this one factory path:
      *
      * HARDENING (2026-07-25): even without a length to verify, the app
      * slot's vector table can be sanity-checked for free: a real app's
@@ -162,7 +163,29 @@ int main(void) {
      * jumping into it hangs the chip with USB dead, needing a physical
      * BOOTSEL press to recover (learned the hard way the night this was
      * written). Failing here routes to BOOT_STUCK, which now lands in
-     * BOOTSEL: remotely re-flashable. */
+     * BOOTSEL: remotely re-flashable.
+     *
+     * HARDENING #2 (2026-07-25): a sane-LOOKING app can still hang in early
+     * init (observed on the bench: the relocated app passes the vector check,
+     * the jump executes, then nothing — no USB, unrecoverable without the
+     * physical BOOTSEL button). Close that gap too: arm the hardware
+     * watchdog before jumping and count attempts in a watchdog SCRATCH
+     * register (they survive watchdog resets). A hung app → watchdog reset
+     * ≤8 s → back here with the marker set → after 3 strikes, BOOT_STUCK →
+     * BOOTSEL, remotely re-flashable. Gated on the vector check above still
+     * holding (action still BOOT_ACTIVE) — no point arming a retry budget
+     * for an app slot hardening #1 already condemned. A healthy app must
+     * clear scratch[2] and disable this watchdog before arming its own —
+     * not necessarily as the very first thing in main(), just before
+     * anything slower than 8 s (see README.md's "Contract" and src/main.c,
+     * which hands off immediately before its own watchdog_enable() call so
+     * the bootloader's watchdog stays live across USB/core-1 bring-up
+     * instead of being disarmed before anything replaces it). scratch[2]/[3]
+     * chosen to stay clear of the SDK's watchdog_reboot vector protocol in
+     * [4..7]. */
+    #define BL_WD_MAGIC     0x0B007D06u
+    #define BL_WD_TIMEOUT_MS 8000u
+    #define BL_WD_MAX_TRIES  3u
     if (action == BOOT_ACTIVE && !bc_valid) {
         const volatile uint32_t *v = (const volatile uint32_t *)PART_XIP(APP_OFF);
         uint32_t sp = v[0], pc = v[1];
@@ -171,38 +194,20 @@ int main(void) {
                      (pc & ~1u) >= PART_XIP(APP_OFF) &&
                      (pc & ~1u) <  PART_XIP(APP_OFF) + APP_SIZE;
         if (!sp_ok || !pc_ok) action = BOOT_STUCK;
-    }
 
-    /* HARDENING #2 (2026-07-25): a sane-LOOKING app can still hang in early
-     * init (observed on the bench: the relocated app passes the vector check,
-     * the jump executes, then nothing — no USB, unrecoverable without the
-     * physical BOOTSEL button). Close that gap on the factory (!bc_valid)
-     * path: arm the hardware watchdog before jumping and count attempts in a
-     * watchdog SCRATCH register (they survive watchdog resets). A hung app →
-     * watchdog reset ≤8 s → back here with the marker set → after 3 strikes,
-     * BOOT_STUCK → BOOTSEL, remotely re-flashable. A healthy app must clear
-     * scratch[2] and disable this watchdog before arming its own — not
-     * necessarily as the very first thing in main(), just before anything
-     * slower than 8 s (see README.md's "Contract" and src/main.c, which
-     * hands off immediately before its own watchdog_enable() call so the
-     * bootloader's watchdog stays live across USB/core-1 bring-up instead of
-     * being disarmed before anything replaces it). scratch[2]/[3] chosen to
-     * stay clear of the SDK's watchdog_reboot vector protocol in [4..7]. */
-    #define BL_WD_MAGIC     0x0B007D06u
-    #define BL_WD_TIMEOUT_MS 8000u
-    #define BL_WD_MAX_TRIES  3u
-    if (action == BOOT_ACTIVE && !bc_valid) {
-        uint32_t attempts = 0;
-        if (watchdog_caused_reboot() &&
-            watchdog_hw->scratch[2] == BL_WD_MAGIC)
-            attempts = watchdog_hw->scratch[3];
-        if (attempts >= BL_WD_MAX_TRIES) {
-            watchdog_hw->scratch[2] = 0;
-            action = BOOT_STUCK;
-        } else {
-            watchdog_hw->scratch[2] = BL_WD_MAGIC;
-            watchdog_hw->scratch[3] = attempts + 1;
-            watchdog_enable(BL_WD_TIMEOUT_MS, true);
+        if (action == BOOT_ACTIVE) {
+            uint32_t attempts = 0;
+            if (watchdog_caused_reboot() &&
+                watchdog_hw->scratch[2] == BL_WD_MAGIC)
+                attempts = watchdog_hw->scratch[3];
+            if (attempts >= BL_WD_MAX_TRIES) {
+                watchdog_hw->scratch[2] = 0;
+                action = BOOT_STUCK;
+            } else {
+                watchdog_hw->scratch[2] = BL_WD_MAGIC;
+                watchdog_hw->scratch[3] = attempts + 1;
+                watchdog_enable(BL_WD_TIMEOUT_MS, true);
+            }
         }
     }
 

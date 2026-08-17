@@ -252,9 +252,10 @@ bool ota_stage_finish(uint32_t total_len) {
 
     /* fw_verify() already proved this trailer (magic/length/hash/signature
      * all check out), so its sha512 is exactly "recompute the digest of the
-     * staged image" — copy it rather than re-hash. */
+     * staged image" — copy it rather than re-hash. fw_verify() above already
+     * guarantees total_len >= sizeof(trailer), so this cannot fail. */
     struct fw_trailer trailer;
-    memcpy(&trailer, img + (total_len - sizeof trailer), sizeof trailer);
+    fw_trailer_at(img, total_len, &trailer);
 
     /* ── preserve the OUTGOING active image's length for the bootloader's
      * benefit (true-rollback phase) ──────────────────────────────────────

@@ -32,17 +32,24 @@ const uint8_t FW_PUBKEY[32] = {
     0xC3, 0x74, 0x8B, 0x53, 0xDB, 0x12, 0x51, 0x69,
 };
 
-bool fw_verify(const uint8_t *buf, uint32_t total_len, const uint8_t *pubkey32) {
-    if (!buf || !pubkey32) return false;
+bool fw_trailer_at(const uint8_t *base, uint32_t total_len, struct fw_trailer *out) {
+    if (!base || !out) return false;
     if (total_len < sizeof(struct fw_trailer)) return false;
 
-    uint32_t trailer_off = total_len - (uint32_t)sizeof(struct fw_trailer);
-
-    /* Copy out (rather than cast in place): buf may not be 4-byte aligned
+    /* Copy out (rather than cast in place): base may not be 4-byte aligned
      * (e.g. a flash XIP pointer at an arbitrary offset), and this also
-     * insulates the signed-prefix pointer below from buf's own alignment. */
+     * insulates callers' signed-prefix pointers from base's own alignment. */
+    uint32_t trailer_off = total_len - (uint32_t)sizeof(struct fw_trailer);
+    memcpy(out, base + trailer_off, sizeof *out);
+    return true;
+}
+
+bool fw_verify(const uint8_t *buf, uint32_t total_len, const uint8_t *pubkey32) {
+    if (!buf || !pubkey32) return false;
+
     struct fw_trailer trailer;
-    memcpy(&trailer, buf + trailer_off, sizeof trailer);
+    if (!fw_trailer_at(buf, total_len, &trailer)) return false;
+    uint32_t trailer_off = total_len - (uint32_t)sizeof(struct fw_trailer);
 
     if (trailer.magic != FW_TRAILER_MAGIC) return false;
     if (trailer.img_len != trailer_off) return false;   /* == total_len - sizeof(trailer) */

@@ -139,7 +139,7 @@ static void place(uint32_t off, const uint8_t *buf, uint32_t len) {
 static void seed_confirmed_active(const uint8_t *img, uint32_t total_len) {
     place(APP_OFF, img, total_len);
     struct fw_trailer t;
-    memcpy(&t, img + total_len - sizeof t, sizeof t);
+    CHECK(fw_trailer_at(img, total_len, &t));
 
     struct boot_control bc;
     memset(&bc, 0, sizeof bc);
@@ -162,7 +162,7 @@ static void stage_candidate(const uint8_t *img, uint32_t total_len) {
     bool have_old = bc_read(&old);
 
     struct fw_trailer t;
-    memcpy(&t, img + total_len - sizeof t, sizeof t);
+    CHECK(fw_trailer_at(img, total_len, &t));
 
     struct boot_control bc;
     memset(&bc, 0, sizeof bc);
@@ -315,7 +315,7 @@ static void test_pending_confirmed_persists_clear(void) {
     place(STAGING_OFF, imgC, total_c);
 
     struct fw_trailer t;
-    memcpy(&t, imgC + total_c - sizeof t, sizeof t);
+    CHECK(fw_trailer_at(imgC, total_c, &t));
 
     struct boot_control bc;
     memset(&bc, 0, sizeof bc);

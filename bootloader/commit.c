@@ -423,8 +423,10 @@ boot_action_t try_rollback(struct boot_control *bc) {
      * same "recompute from the trailer fw_verify() just proved" pattern
      * ota_stage_finish() uses, rather than carrying over anything stale
      * from the crash-looping record being replaced. */
+    /* fw_verify(active, bc->backup_len, ...) just succeeded above, so
+     * backup_len >= sizeof(trailer) is already guaranteed — this cannot fail. */
     struct fw_trailer trailer;
-    memcpy(&trailer, active + (bc->backup_len - sizeof trailer), sizeof trailer);
+    fw_trailer_at(active, bc->backup_len, &trailer);
 
     struct boot_control restored;
     memset(&restored, 0, sizeof restored);
