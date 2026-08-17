@@ -161,9 +161,11 @@ void dq_set_bg_burst(uint8_t slave_id, bool on);
  * Returns false only for an unknown slave. */
 bool dq_add_delta(uint8_t slave_id, bool is_group, uint8_t addr, int8_t steps);
 
-/* Per-loop driver: drive the underlying client (mbq_client_tick), then ship any
- * pending backlog commands into free gateway slots. Call every main-loop
- * iteration. */
+/* Per-loop driver: collect the underlying client's completions
+ * (mbq_client_collect), then ship any pending backlog commands into free
+ * gateway slots. Call every main-loop iteration. The client TRANSMITS
+ * separately, asked for by the bus when it falls idle (mbq_client.h) — this
+ * function only frees slots and stages work into them. */
 void dq_tick(void);
 
 /* Blocking submit-and-wait, for the text CLI (dali_raw / read_mem). Submits one

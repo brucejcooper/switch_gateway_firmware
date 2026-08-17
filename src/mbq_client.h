@@ -49,14 +49,18 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-/* Gateway command-queue depth, and therefore the master's in-flight cap.
- * MUST match the gateway's CMDQ_DEPTH (TinyModbus/src/cq.h) — controller and
- * gateway are a matched firmware set with no negotiation and no fallback
- * (spec §8), so deploy them together. Two is "executing + next", which is all
- * a one-frame-at-a-time DALI bus can use; the wire format is depth-agnostic,
- * so raising it is a one-line change on both sides and nothing on the wire
- * moves. The cap is the flow control — A_FULL is only the backstop (task-07
- * lesson). */
+/* The GATEWAY's command-queue depth. MUST match the gateway's CMDQ_DEPTH
+ * (TinyModbus/src/cq.h) — controller and gateway are a matched firmware set
+ * with no negotiation and no fallback (spec §8), so deploy them together. Two
+ * is "executing + next", which is all a one-frame-at-a-time DALI bus can use;
+ * the wire format is depth-agnostic, so raising it is a one-line change on
+ * both sides and nothing on the wire moves.
+ *
+ * This is NOT a client-side admission cap — the client has none. A_FULL IS
+ * the flow control (spec §5, decided 2026-08-12): the client submits until
+ * the gateway refuses and re-offers immediately. What this constant actually
+ * bounds is MBQ_INFLIGHT_MAX below — how many commands the client must be
+ * able to REMEMBER, not a limit it imposes on itself. */
 #define CMDQ_DEPTH     2u
 #define MBQ_CMD_BYTES  4u   /* one command: addr, data, flags, dtr0 */
 
@@ -132,8 +136,14 @@ typedef enum {
                              * rather than falling into `lost`.                  */
 } mbq_result_t;
 
-/* Delivered once when a submitted command resolves. Runs from mbq_client_tick()
- * context (core-0 main loop). cb may be NULL for fire-and-forget commands. */
+/* Delivered once when a submitted command resolves. Fires from one of TWO
+ * core-0 main-loop contexts: mbq_client_collect() (the normal path, called
+ * every iteration via dq_tick, with s_resolving held for its duration) or
+ * from drive()'s recovery-give-up when a stalled §4 recovery poll's own
+ * deadline expires (reached via the bus offer callback inside modbus_poll(),
+ * NOT under s_resolving). See mbq_client_collect()/mbq_client_drive() below
+ * for what production actually calls and why the second context is safe. cb
+ * may be NULL for fire-and-forget commands. */
 typedef void (*mbq_cb_t)(uint8_t slave_id, mbq_result_t result, uint8_t response8,
                          void *ctx);
 
@@ -169,11 +179,26 @@ bool mbq_client_can_submit(uint8_t slave_id);
 bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
                        bool idempotent, mbq_cb_t cb, void *ctx);
 
-/* Per-loop driver: advance every slave's FSM — resolve a completed
- * transaction through the §4 rules, deliver terminals once, arm and check
- * result deadlines, and issue the next request (enqueue, ack/poll, recovery
- * poll or boot_count read) when its pacing timer allows. Call every main-loop
- * iteration. */
+/* mbq_client_collect() takes in whatever reply arrived, resolves it through
+ * the §4 rules, and delivers terminals once. Call every main-loop iteration —
+ * dq_tick() does this before it ships anything, so a slot freed this tick is
+ * available to the scheduler in the same tick (dali_queue.c).
+ *
+ * mbq_client_drive() issues the next request (enqueue, ack/poll, recovery
+ * poll or boot_count read) for every eligible slave, when its pacing timer
+ * allows. Production does NOT call this directly: the transport asks each
+ * slave for work when the bus falls idle (modbus_register_offer / mbq_offer,
+ * inside modbus_poll()). That offer path is also where a stalled §4 recovery
+ * poll gives up and fires its callback — outside mbq_client_collect()'s
+ * s_resolving guard (see mbq_cb_t above). That is safe: a submit triggered
+ * from such a callback is pure bookkeeping (it stages a command; it does not
+ * transmit), and the multi-command disposal s_resolving actually protects
+ * against (dispose_tracked(), reachable only from inside handle_reply()) is
+ * never called from drive()'s path.
+ *
+ * mbq_client_tick() is collect()+drive() in one call. Nothing in the firmware
+ * calls it — it exists for the host test, which has no transport to offer it
+ * work and so drives the client directly every iteration. */
 void mbq_client_collect(void);
 void mbq_client_drive(void);
 void mbq_client_tick(void);

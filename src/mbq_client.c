@@ -17,9 +17,17 @@
  * The first three states run once per slave at registration: identify the
  * firmware, then clear anything a previous controller epoch left in the
  * gateway's response queue (spec §4, "controller reboot"), then establish the
- * boot_count the recovery rules classify against. Only after that is the
- * "nothing in the response queue that isn't mine" invariant true, and that
- * invariant is what lets the ack-less corner adopt an orphan head as its own.
+ * boot_count the recovery rules classify against. The no-baseline adopt rule
+ * below (apply_head, resolve_recovery_reply) does NOT depend on the drain
+ * having succeeded — it is gated on `seq_known` alone, and that is sufficient
+ * by construction: until this slave's first accept byte, the controller has
+ * bound nothing to a seq, so ANY head it sees cannot be its own — it is
+ * necessarily a leftover from a previous epoch, drain-clean or not. A drain
+ * that gave up early (DRAIN_MAX_POLLS) just means there may be MORE leftovers
+ * still to swallow; it does not change what an untracked head means while
+ * seq_known is false. mbq_client_stats().drained records whether the drain
+ * converged cleanly, but that is diagnostic only (see the CLI dump) — it
+ * gates no recovery decision.
  *
  * ACK DISCIPLINE (spec §5): every request carries the ack for the most recent
  * result consumed, and keeps carrying it until a reply proves the head moved.
@@ -156,8 +164,10 @@ enum { H_OK = 0u, H_FAILED = 1u, H_NAK = 2u };   /* head-entry status; cq.h is a
 
 /* Bound on the registration drain. RESPQ_DEPTH is 4, so five polls empty a
  * full queue; a gateway still producing heads after that is not draining and
- * the client proceeds anyway (with the adopt rule disabled) rather than
- * refusing to ever talk to it. */
+ * the client proceeds anyway rather than refusing to ever talk to it. The
+ * no-baseline adopt rule (seq_known == false) is unaffected either way — see
+ * the file header — so giving up here only costs the mbq_client_stats().
+ * drained diagnostic, not correctness. */
 #define DRAIN_MAX_POLLS   6u
 
 /* The §8 compat latch's version half. FC04 0x0200 is a free-form STRING
@@ -243,8 +253,6 @@ typedef struct {
     uint8_t  last_head;         /* hseq of the most recent reply */
     uint8_t  last_seq;          /* most recently accepted seq */
     bool     seq_known;         /* last_seq is meaningful in the current epoch */
-    bool     epoch_clean;       /* the drain succeeded: nothing in the gateway's
-                                 * response queue predates this controller      */
 
     /* Recovery bookkeeping (§4). */
     uint8_t  rec_cmd;           /* command whose reply was lost, or NO_CMD */
@@ -1386,7 +1394,6 @@ static void resolve_failure(slave_t *s) {
         if (s->st == S_DRAIN && ++s->drain_polls >= DRAIN_MAX_POLLS) {
             LOG_WARN("mbq", "slave %u: no answer to the epoch drain — proceeding "
                      "without a clean epoch", s->slave_id);
-            s->epoch_clean = false;
             s->st = S_IDLE;
         }
         return;
@@ -1468,7 +1475,6 @@ static void handle_reply(slave_t *s) {
                                        (uint64_t)MBQ_RESULT_DEADLINE_MS * 1000u;
                     return;
                 }
-                s->epoch_clean = true;
                 s->stats.drained = true;
                 s->bc_reason = BC_BASELINE;
                 s->st = S_BOOT_CHECK;
@@ -1494,11 +1500,6 @@ static void handle_reply(slave_t *s) {
     }
 
     resolve_queue_reply(s, &r);
-
-    /* Whatever this reply settled, the next SPECULATIVE poll is worth issuing
-     * only once the oldest in-flight command could plausibly have finished. A
-     * submit arriving before then still goes out immediately — this gate is on
-     * polls alone. */
 
     /* An R4 poll that did not bring back the result it was chasing escalates to
      * the cold-path arbiter. */
@@ -1609,12 +1610,6 @@ static void drive(slave_t *s) {
         return;
     }
 
-    /* Results outstanding, or an ack still to be delivered. Before spending a
-     * transaction on a poll, give the scheduler its chance: if there is room
-     * for another command, the right next transaction is an enqueue that
-     * carries the ack and collects the result in the same frame, and only the
-     * layer above knows whether a command is waiting. Polling here instead is
-     * what costs the second transaction per DALI frame. */
     /* Results outstanding, or an ack still owed: poll. There is nothing to
      * predict and nothing to wait for — Modbus is master-slave, so a result
      * only arrives when we ask, and asking sooner gets it sooner.
@@ -1901,7 +1896,7 @@ void mbq_client_debug_print(int slave_id) {
         cdc_out_printf("mbq slave %u: %s%s gw=v%u.%u boot_count=%u%s\n",
                        s->slave_id, state_name(s->st), s->busy ? " (on wire)" : "",
                        s->gw_major, s->gw_minor, s->stats.boot_count,
-                       s->epoch_clean ? "" : " EPOCH-UNCLEAN");
+                       s->stats.drained ? "" : " EPOCH-UNCLEAN");
         if (link_down(s))
             cdc_out_printf("  LINK DOWN for %lu ms (%u consecutive no-reply)%s\n",
                            (unsigned long)((MBQ_NOW_US() - s->link_down_us) / 1000u),

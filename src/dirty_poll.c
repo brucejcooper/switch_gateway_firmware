@@ -35,9 +35,6 @@ typedef enum {
     DPOLL_AWAITING_BALLAST,
 } dpoll_state_t;
 
-/* Consecutive failed reads before a gateway is declared unreachable. */
-#define GATEWAY_FAIL_THRESHOLD 3u
-
 typedef struct {
     dpoll_state_t state;
     bool          active;
@@ -162,10 +159,10 @@ static void relay_health_cb(int res, uint8_t *buf, void *ctx) {
         }
     } else if (rp->reachable) {
         if (rp->fail_count < 0xFF) rp->fail_count++;
-        if (rp->fail_count >= GATEWAY_FAIL_THRESHOLD) {
+        if (rp->fail_count >= LINK_DOWN_FAILS) {
             rp->reachable = false;
             LOG_WARN("dirty", "relay board %u unreachable (%u consecutive read failures)",
-                     slave, GATEWAY_FAIL_THRESHOLD);
+                     slave, LINK_DOWN_FAILS);
             lighting_emit_gateway_state(slave, false);
         }
     }
@@ -189,7 +186,7 @@ void dirty_poll_mark_active(uint8_t slave_id) {
 
 
 /* Track a gateway's Modbus reachability and emit state_gateway on transition.
- * `ok` = this read of the gateway succeeded. Debounced by GATEWAY_FAIL_THRESHOLD
+ * `ok` = this read of the gateway succeeded. Debounced by LINK_DOWN_FAILS
  * so a single timeout doesn't flap availability. */
 static void gateway_report(uint8_t slave_id, int idx, bool ok) {
     dpoll_t *dp = &s_dp[idx];
@@ -202,13 +199,13 @@ static void gateway_report(uint8_t slave_id, int idx, bool ok) {
         }
     } else if (dp->reachable) {
         if (dp->fail_count < 0xFF) dp->fail_count++;
-        if (dp->fail_count >= GATEWAY_FAIL_THRESHOLD) {
+        if (dp->fail_count >= LINK_DOWN_FAILS) {
             dp->reachable = false;
             dp->active    = false;   /* stop fast-polling a dead gateway; the
                                         60s background check still probes it and
                                         recovers it (and a command re-activates) */
             LOG_WARN("dirty", "gateway %u unreachable (%u consecutive read failures)",
-                     slave_id, GATEWAY_FAIL_THRESHOLD);
+                     slave_id, LINK_DOWN_FAILS);
             lighting_emit_gateway_state(slave_id, false);
         }
     }
@@ -334,9 +331,22 @@ void dirty_poll_tick(void) {
          * transactions are both the earliest and the cheapest liveness signal
          * available — far better than the 30 s sysinfo poll, which was the only
          * other candidate once the dirty sweep went away. A Modbus exception
-         * does NOT count: that is the gateway alive and disagreeing. */
+         * does NOT count: that is the gateway alive and disagreeing.
+         *
+         * NOTE this is a DOUBLE debounce, honestly: the boolean below is
+         * already `mbq_client_consec_fail() < LINK_DOWN_FAILS`, i.e. the
+         * client has not yet declared the link down, and gateway_report()
+         * then debounces its OWN dp->fail_count against the same
+         * LINK_DOWN_FAILS before flipping `reachable`. So a DALI gateway's
+         * state_gateway transition lags a relay board's (relay_health_cb
+         * debounces once, directly on its own read failures) by up to another
+         * LINK_DOWN_FAILS ticks of this loop. Not fixed here — the constant
+         * duplication that made this loop's `GATEWAY_FAIL_THRESHOLD` compare
+         * against LINK_DOWN_FAILS's own counter without saying so is what's
+         * in scope; the double-debounce timing predates that and is a
+         * separate question. */
         gateway_report(slave_id, i,
-                       mbq_client_consec_fail(slave_id) < GATEWAY_FAIL_THRESHOLD);
+                       mbq_client_consec_fail(slave_id) < LINK_DOWN_FAILS);
     }
 }
 

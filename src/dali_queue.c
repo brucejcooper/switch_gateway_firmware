@@ -58,14 +58,18 @@
  * Dim steps are not stored as commands at all — see the delta counters below. */
 #define DQ_CLASS_MAX     8u   /* per-class ring capacity (max over the classes) */
 
-/* The scheduler's in-flight cap IS the gateway's command-queue depth. Under v4
- * the master tracks accepts minus results and simply stops at the cap; the
- * gateway's A_FULL is the backstop, not the flow control (task-07 lesson). Note
- * v2 needed every class strictly BELOW the depth, because a submit carried its
- * own status read-back and so needed a slot it already knew was free. A v4
- * enqueue is its own frame and needs no free slot in advance, so a class may
- * fill the queue completely — that retired constraint is what buys the
- * one-transaction-per-DALI-frame steady state. */
+/* Each class's GATEWAY DEPTH is the SCHEDULER's own ordering policy, not the
+ * protocol's flow control — that is A_FULL (spec §5, decided 2026-08-12): the
+ * client has no in-flight cap of its own, and submits until the gateway
+ * refuses. What depth actually bounds is s->outstanding: commands this
+ * scheduler has SHIPPED to the client and not yet had resolved, i.e. how much
+ * of a class's commitment is allowed to sit ahead of the priority ladder
+ * (see DQ_PIPELINE_MAX below). Note v2 needed every class strictly BELOW the
+ * depth, because a submit carried its own status read-back and so needed a
+ * slot it already knew was free. A v4 enqueue is its own frame and needs no
+ * free slot in advance, so a class may fill the queue completely — that
+ * retired constraint is what buys the one-transaction-per-DALI-frame steady
+ * state. */
 /* How much of the PIPELINE the scheduler keeps filled — client staging plus
  * whatever the gateway holds, which is what s->outstanding counts.
  *
@@ -361,8 +365,11 @@ static uint8_t pending_total(const dq_slave_t *s) {
 
 /* Client completion trampoline: map the generic outcome + response8 to a
  * dq_result_t and hand it to the producer's callback, then release the
- * trampoline and the in-flight slot. Runs from mbq_client_tick (main-loop)
- * context, invoked exactly once per submitted command. */
+ * trampoline and the in-flight slot. Runs from core-0 main-loop context,
+ * invoked exactly once per submitted command — from mbq_client_collect() (via
+ * dq_tick, below) on the normal path, or occasionally from inside drive()'s
+ * recovery-give-up when a stalled §4 poll times out (mbq_client.h has the
+ * full contract). */
 static void dq_mbq_cb(uint8_t slave_id, mbq_result_t r, uint8_t response8, void *ctx) {
     dq_pending_t *p = (dq_pending_t *)ctx;
     dq_result_cb_t cb  = p->cb;
