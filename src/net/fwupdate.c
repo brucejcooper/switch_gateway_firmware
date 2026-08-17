@@ -279,6 +279,15 @@ int fwupdate_status_json(char *buf, int cap) {
     n = acc_str(buf, cap, n, fwupdate_title());
     n = acc(buf, cap, n, ",\"last_error\":");
     n = acc_str(buf, cap, n, fwupdate_last_error());
+    /* Distinct from "last_error" above: that field is fwupdate.c's own —
+     * why the last MANIFEST check aborted (DNS/socket/http status on the
+     * small JSON fetch). This one is ota.c's — why the IMAGE install itself
+     * failed (bad HTTP status/signature/flash write/timeout on the actual
+     * firmware download+flash). Conflating them would make "last_error"
+     * ambiguous about which phase failed; kept separate instead, populated
+     * only when there's actually something to report. */
+    n = acc(buf, cap, n, ",\"ota_error\":");
+    n = acc_str(buf, cap, n, ota_state() == OTA_FAIL ? ota_last_error() : "");
     n = acc(buf, cap, n, ",\"release_url\":");
     n = acc_str(buf, cap, n, fwupdate_release_url());
     n = acc(buf, cap, n, ",\"notes\":");

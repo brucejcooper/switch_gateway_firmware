@@ -34,11 +34,12 @@ typedef enum { OTA_IDLE, OTA_RUNNING, OTA_SUCCESS, OTA_FAIL } ota_state_t;
 void ota_init(void);
 
 /* Begin a firmware download from an http:// URL. A no-op while a run is
- * already OTA_RUNNING — call ota_state() first if you need to know whether
- * the request will be honoured. url is parsed (ota_parse_url()) and copied
- * into internal storage immediately, so the caller's buffer need not outlive
- * this call. A URL that fails to parse leaves state() == OTA_FAIL right
- * away (no socket touched). */
+ * already OTA_RUNNING, OR while a just-succeeded install is still waiting for
+ * its post-install reboot to actually land — call ota_state() first if you
+ * need to know whether the request will be honoured. url is parsed
+ * (ota_parse_url()) and copied into internal storage immediately, so the
+ * caller's buffer need not outlive this call. A URL that fails to parse
+ * leaves state() == OTA_FAIL right away (no socket touched). */
 void ota_trigger(const char *url);
 
 /* Advance the OTA state machine one step. Call every core-1 tick, alongside
@@ -64,9 +65,17 @@ void ota_on_event(const ic_event_t *e);
 /* Current state. OTA_IDLE until the first ota_trigger(); OTA_RUNNING for the
  * whole resolve/download/flash/verify pipeline; OTA_SUCCESS/OTA_FAIL are
  * terminal until the next ota_trigger() (a successful run also pushes
- * IC_CMD_REBOOT, so in practice the device reboots before anything polls
- * OTA_SUCCESS for long). */
+ * IC_CMD_REBOOT — retried from ota_poll() until it's actually delivered, see
+ * ota.c's s_reboot_pending — so in practice the device reboots before
+ * anything polls OTA_SUCCESS for long; ota_trigger() itself refuses a new
+ * job for as long as that reboot is still pending). */
 ota_state_t ota_state(void);
+
+/* Why the current/last run ended in OTA_FAIL — a short, human-readable
+ * reason ("http status 404", "bad signature", "ack timeout", ...), or "" if
+ * the run hasn't failed. Mirrors fwupdate_last_error(); valid until the next
+ * ota_trigger(). */
+const char *ota_last_error(void);
 
 /* Download progress 0..100, based on bytes handed to core 0 so far vs.
  * httpc_content_length(). 0 outside OTA_RUNNING or before the response

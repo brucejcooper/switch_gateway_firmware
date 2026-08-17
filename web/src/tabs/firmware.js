@@ -49,7 +49,8 @@ export function renderFirmware() {
     const stateLine =
       running ? h('div', { class: 'note' }, 'Updating… ' + (o.pct || 0) + '%')
       : o.state === 'success' ? h('div', { class: 'note' }, 'Update complete')
-      : o.state === 'fail' ? h('div', { class: 'note err' }, 'Update failed')
+      : o.state === 'fail'
+        ? h('div', { class: 'note err' }, 'Update failed' + (o.ota_error ? ': ' + o.ota_error : ''))
       : null;
 
     mount(body,

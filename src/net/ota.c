@@ -70,8 +70,10 @@ bool ota_parse_url(const char *url, char *host, int host_cap, uint16_t *port, ch
 #include "dns_resolve.h"
 #include "http_client.h"
 #include "ota_stage.h"   /* g_ota_buf, OTA_BUF_SZ */
+#include "log.h"         /* LOG_ERR — ota_fail() reason */
 
 #include "pico/time.h"
+#include <stdio.h>        /* snprintf — O.reason */
 
 /* Sole socket this module ever touches: the same revocable DHCP-socket-0 loan
  * ping.c/http_server.c use (netif.h). One #define, per the task brief. */
@@ -115,11 +117,25 @@ static struct {
     uint32_t     total_sent;              /* bytes handed to core 0 so far */
     bool         final_flush;             /* this AWAIT_ACK's flush was the last one */
     uint32_t     t_ms;                    /* phase-entry timestamp for the bounded waits */
+    char         reason[40];              /* why the last run ended in OTA_FAIL; "" otherwise
+                                            * (mirrors fwupdate.c's F.last_err/fw_abort()) */
 } O;
 
 /* Boot-lifetime (not per-job) one-shot: reset only in ota_init(), so a new
  * ota_trigger() never re-arms the healthy-boot confirmation. */
 static bool s_confirmed;
+
+/* Set once ota_succeed() wants the device rebooted; cleared only once
+ * IC_CMD_REBOOT is actually delivered. Boot-lifetime, like s_confirmed —
+ * reset only in ota_init() — so it survives O being memset by a would-be
+ * ota_trigger() (see the busy-guard in ota_trigger() below, which refuses a
+ * new job for exactly as long as this stays true). See ota_poll()'s retry
+ * loop for why a bare fire-and-forget push here isn't good enough: a
+ * dropped push left the device sitting in OTA_SUCCESS with a fully-staged,
+ * still-PENDING candidate and no reboot ever coming, which is precisely the
+ * window a re-trigger could then race against ota_stage_begin()'s own
+ * PENDING-invalidation fix (see ota_stage.c). */
+static bool s_reboot_pending;
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 
@@ -149,9 +165,15 @@ static void ota_release_sock(void) {
     }
 }
 
-/* Any failure path: best-effort discard whatever core 0 may have staged
- * (harmless/no-op if no session was ever begun) and go terminal. */
-static void ota_fail(void) {
+/* Any failure path: log + record why (mirrors fwupdate.c's fw_abort() —
+ * before this, ota_state()==OTA_FAIL was the ONLY thing that survived any
+ * failure anywhere in this file: a bad signature, a flash write error, a
+ * DNS/socket timeout and a bad HTTP status all looked identical to every
+ * caller), best-effort discard whatever core 0 may have staged (harmless/
+ * no-op if no session was ever begun), and go terminal. */
+static void ota_fail(const char *why) {
+    LOG_ERR("ota", "install failed: %s", why);
+    snprintf(O.reason, sizeof O.reason, "%s", why);
     ic_cmd_t c; memset(&c, 0, sizeof c);
     c.type = IC_CMD_OTA_ABORT;
     intercore_push_cmd(&c);
@@ -164,9 +186,12 @@ static void ota_succeed(void) {
     ota_release_sock();
     O.state = OTA_SUCCESS;
     O.phase = OS_DONE;
-    ic_cmd_t c; memset(&c, 0, sizeof c);
-    c.type = IC_CMD_REBOOT;
-    intercore_push_cmd(&c);
+    /* The actual push is retried from ota_poll() until intercore_push_cmd()
+     * succeeds (queue-full is the only way it can fail) — see s_reboot_pending's
+     * doc comment above and the retry at the top of ota_poll(). A fire-and-
+     * forget push here could silently strand the device in OTA_SUCCESS with a
+     * staged, still-PENDING candidate and no reboot ever coming. */
+    s_reboot_pending = true;
 }
 
 /* httpc_get_start's on_body callback: append into g_ota_buf. Runs inside
@@ -190,20 +215,31 @@ void ota_init(void) {
     O.state = OTA_IDLE;
     O.phase = OS_IDLE;
     s_confirmed = false;
+    s_reboot_pending = false;
 }
 
 void ota_trigger(const char *url) {
-    if (O.state == OTA_RUNNING) return;   /* one job at a time */
+    /* One job at a time — and, while a just-succeeded install is still
+     * waiting for its IC_CMD_REBOOT to land (s_reboot_pending), refuse a
+     * re-trigger too: STAGING already holds a verified candidate that
+     * boot-control's still-PENDING record names, so starting a NEW download
+     * here would begin erasing it out from under that record before the
+     * reboot ever happens. ota_stage_begin() (src/ota_stage.c) now defends
+     * against this independently (it invalidates a stale PENDING record
+     * before touching STAGING), but refusing the retrigger here closes the
+     * common case at the source instead of relying solely on that. */
+    if (O.state == OTA_RUNNING || s_reboot_pending) return;
     memset(&O, 0, sizeof O);
     if (!ota_parse_url(url, O.host, sizeof O.host, &O.port, O.path, sizeof O.path)) {
-        O.state = OTA_FAIL;
-        O.phase = OS_DONE;
+        ota_fail("bad url");
         return;
     }
     O.state = OTA_RUNNING;
     O.phase = OS_ACQUIRE_SOCK;
     O.t_ms  = now_ms();
 }
+
+const char *ota_last_error(void) { return O.reason; }
 
 void ota_mark_valid(void) {
     ic_cmd_t c; memset(&c, 0, sizeof c);
@@ -231,8 +267,17 @@ void ota_on_event(const ic_event_t *e) {
         return;
     case IC_EVT_OTA_STATUS:
         if (O.phase != OS_AWAIT_STATUS) return;
-        if (e->ota_status.code == OTA_OK) ota_succeed();
-        else ota_fail();
+        if (e->ota_status.code == OTA_OK) {
+            ota_succeed();
+        } else {
+            /* Translate core 0's outcome code to text here — it's otherwise
+             * discarded the instant it reaches ota_fail(), the same gap
+             * fixed for every network-side failure in this file (see
+             * ota_fail()'s doc comment). */
+            ota_fail(e->ota_status.code == OTA_FLASH_FAIL
+                          ? "flash write failed"
+                          : "bad signature");
+        }
         return;
     default:
         return;
@@ -249,6 +294,17 @@ void ota_poll(void) {
         ota_mark_valid();
     }
 
+    /* IC_CMD_REBOOT retry (see ota_succeed()/s_reboot_pending's doc comments):
+     * independent of O.phase — this must keep retrying even though O.phase is
+     * OS_DONE by the time s_reboot_pending is ever set. Bounded and cheap
+     * (one push attempt per tick) if the command queue happens to be
+     * transiently full; intercore_push_cmd() itself never blocks. */
+    if (s_reboot_pending) {
+        ic_cmd_t c; memset(&c, 0, sizeof c);
+        c.type = IC_CMD_REBOOT;
+        if (intercore_push_cmd(&c)) s_reboot_pending = false;
+    }
+
     switch (O.phase) {
     case OS_IDLE:
     case OS_DONE:
@@ -256,7 +312,7 @@ void ota_poll(void) {
 
     case OS_ACQUIRE_SOCK:
         if (!netif_ready() || !netif_sock0_acquire()) {
-            if (now_ms() - O.t_ms > OTA_ACQUIRE_TIMEOUT_MS) ota_fail();
+            if (now_ms() - O.t_ms > OTA_ACQUIRE_TIMEOUT_MS) ota_fail("socket acquire timeout");
             return;
         }
         O.have_sock = true;
@@ -274,7 +330,7 @@ void ota_poll(void) {
         uint8_t ip[4];
         dnsr_status_t s = dnsr_poll(ip);
         if (s == DNSR_PENDING) return;
-        if (s == DNSR_FAILED) { ota_fail(); return; }
+        if (s == DNSR_FAILED) { ota_fail("dns lookup failed"); return; }
         memcpy(O.ip, ip, 4);
         O.phase = OS_HTTP_START;
         return;
@@ -296,7 +352,31 @@ void ota_poll(void) {
 
     case OS_DOWNLOADING: {
         httpc_status_t st = httpc_poll();
-        if (st == HTTPC_FAILED) { ota_fail(); return; }
+        if (st == HTTPC_FAILED) { ota_fail("http request failed"); return; }
+
+        /* Unlike the manifest path (fwupdate.c's FS_FETCHING), this loop
+         * never checked the response status — a 404/500 error page streamed
+         * straight into g_ota_buf and, on a small enough body, could reach
+         * ota_stage_write()/STAGING before the next check ever ran (the
+         * header parse and the "leftover" body bytes it hands to
+         * ota_body_cb() both happen inside this same httpc_poll() call, see
+         * http_client.c). Checking status_code here, BEFORE looking at
+         * O.fill/done below, means a bad status is caught on the very same
+         * tick the header completes — before this phase ever reaches the
+         * flush-to-core-0 branch that would burn an erase/program cycle on
+         * an error page, and long before it could reach fw_verify() and
+         * come back as the misleading "bad signature" (OTA_VERIFY_FAIL).
+         * httpc_status_code() reads 0 until the header block has parsed, so
+         * this can't misfire on a still-arriving header (matches
+         * fwupdate.c:364's identical check on the manifest fetch). */
+        int code = httpc_status_code();
+        if (code != 0 && code != 200) {
+            char why[40];
+            snprintf(why, sizeof why, "http status %d", code);
+            ota_fail(why);
+            return;
+        }
+
         bool done = (st == HTTPC_DONE);
 
         if (done && O.fill == 0) { O.phase = OS_SEND_END; return; }
@@ -316,7 +396,7 @@ void ota_poll(void) {
     }
 
     case OS_AWAIT_ACK:
-        if (now_ms() - O.t_ms > OTA_ACK_TIMEOUT_MS) ota_fail();
+        if (now_ms() - O.t_ms > OTA_ACK_TIMEOUT_MS) ota_fail("ack timeout");
         return;   /* otherwise: ota_on_event() advances the phase */
 
     case OS_SEND_END: {
@@ -330,7 +410,7 @@ void ota_poll(void) {
     }
 
     case OS_AWAIT_STATUS:
-        if (now_ms() - O.t_ms > OTA_STATUS_TIMEOUT_MS) ota_fail();
+        if (now_ms() - O.t_ms > OTA_STATUS_TIMEOUT_MS) ota_fail("status timeout");
         return;   /* otherwise: ota_on_event() finishes the run */
     }
 }
