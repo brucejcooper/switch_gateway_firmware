@@ -1,8 +1,10 @@
 /*
  * ha_bridge.c — Home Assistant discovery + availability + translation (core 1).
  *
- * Reproduces bridge/mqtt_bridge.py: MQTT auto-discovery, the availability model,
- * event->state-topic translation, and inbound command translation (jsmn).
+ * MQTT auto-discovery, the availability model, event->state-topic translation,
+ * and inbound command translation (jsmn) — the duties the retired
+ * bridge/mqtt_bridge.py host used to perform, now on-board (controller
+ * CLAUDE.md, "On-board MQTT bridge").
  *
  * Everything that can burst is published INCREMENTALLY, gated on free socket-TX
  * space, a bounded amount per tick:
@@ -1015,7 +1017,11 @@ void ha_bridge_publish_event(const ic_event_t *e) {
         break;
     case IC_EVT_SCAN_COMPLETE:   /* handled by the sweep cursor, not here */
         break;
-    case IC_EVT_FAULT:           /* mqtt_bridge.py logs faults only — no topic */
+    case IC_EVT_FAULT:           /* carries per-ballast lamp_fail/power_cycle
+                                  * flags; the web UI's read model consumes it
+                                  * (web_state.c) but there is no HA MQTT
+                                  * entity/topic for it — nothing to publish
+                                  * here */
         break;
     case IC_EVT_PING_REQ:        /* routed to ping_submit in the drain, never published */
         break;

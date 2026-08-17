@@ -1,10 +1,16 @@
 /*
  * core1.c — the second core: network bridge entry point + liveness.
  *
- * For now this is a stub: it registers as the flash lockout victim, beats its
- * heartbeat, and drains (discards) the core0->core1 event queue so it does not
- * back up. The W5100S socket state machine, coreMQTT, and the HA translation
- * layer replace the discard over the following commits.
+ * core1_entry() registers as the flash lockout victim, parks on the
+ * config-ready gate, then brings up the W5100S netif and the MQTT connection
+ * manager from the config snapshot and runs the tick roster every loop:
+ * netif_tick (link/DHCP/PHY), mqtt_app_tick (coreMQTT connection SM),
+ * ha_bridge_tick (HA discovery + availability sweep + the event->MQTT pump,
+ * which also routes IC_EVT_PING_REQ to ping_submit), ping_tick (CLI network
+ * ping), http_server_tick (the config web UI), ota_poll and fwupdate_poll
+ * (pull-based OTA). It beats its heartbeat throughout (core 0's watchdog feed
+ * depends on it staying fresh) — see controller/CLAUDE.md for the launch-order
+ * and flash-lockout gotchas.
  *
  * Core 1 owns SPI0 (the W5100S) exclusively; core 0 owns the RS-485 UART/PIO and
  * USB CDC. The only shared state is the two inter-core queues, the heartbeat,

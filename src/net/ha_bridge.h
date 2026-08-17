@@ -2,10 +2,11 @@
 /*
  * ha_bridge.h — Home Assistant translation layer on core 1.
  *
- * Reproduces mqtt_bridge.py's duties in C: MQTT auto-discovery, the availability
- * model, event->state-topic translation, and inbound command translation. Driven
- * by the mqtt_app connected/message hooks plus a tick for the incremental
- * discovery publish.
+ * MQTT auto-discovery, the availability model, event->state-topic translation,
+ * and inbound command translation — the duties the retired bridge/mqtt_bridge.py
+ * host used to perform, now on-board (controller CLAUDE.md, "On-board MQTT
+ * bridge"). Driven by the mqtt_app connected/message hooks plus a tick for the
+ * incremental discovery publish.
  */
 
 #include "intercore.h"
