@@ -6,6 +6,18 @@
 
 mapping_record_t g_mappings[MAX_FIXTURES][MAX_BUTTONS];
 
+/* Shadow of g_mappings at the last SUCCESSFUL save; mapping_save() skips the
+ * tmp-write+rename when the table is byte-identical to it. Same flash-wear
+ * defence as config.c's s_saved_shadow (see there), and mapping_save() is the
+ * costlier of the two to spare — a populated table is several data blocks, so
+ * a mapping-set that an HA automation republishes unchanged would erase
+ * several sectors per repeat. Set only right after a durable rename, so it can
+ * never mark unpersisted state clean; the first save of a boot always writes
+ * (shadow invalid) and establishes the baseline. g_mappings is memset in
+ * mapping_load() so trailing/padding bytes in unused records are stable. */
+static mapping_record_t s_map_shadow[MAX_FIXTURES][MAX_BUTTONS];
+static bool s_map_shadow_valid = false;
+
 /* Mappings persist as line-delimited JSON: a version header line, then one
  * self-describing object per binding.  Explicit (de)serialisation keeps the
  * on-disk format decoupled from the in-memory struct — unlike the old raw
@@ -142,6 +154,9 @@ bool mapping_load(void) {
 }
 
 bool mapping_save(void) {
+    if (s_map_shadow_valid && memcmp(s_map_shadow, g_mappings, sizeof g_mappings) == 0)
+        return true;   /* table unchanged since the last durable save — no write */
+
     /* Write the full table to a .tmp file first, then rename() it over the
      * live path — littlefs rename is a single atomic metadata commit, so a
      * power cut anywhere in this function leaves either the old table or
@@ -172,6 +187,8 @@ bool mapping_save(void) {
         LOG_ERR("mapping", "save failed: rename %s -> %s", MAPPINGS_PATH_TMP, MAPPINGS_PATH);
         return false;
     }
+    memcpy(s_map_shadow, g_mappings, sizeof g_mappings);   /* durable on-disk baseline */
+    s_map_shadow_valid = true;
     return true;
 }
 

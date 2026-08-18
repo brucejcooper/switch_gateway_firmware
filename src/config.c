@@ -20,6 +20,22 @@
 
 global_config_t g_config;
 
+/* Shadow of g_config as it was at the last SUCCESSFUL save or load.
+ * config_save() skips the whole tmp-write+rename when g_config is
+ * byte-identical to this, killing flash wear from the common "re-apply the
+ * same value" path: an HA automation that republishes a config value on a
+ * timer (a normal, non-malicious sync pattern) otherwise drove a full 2-file
+ * littlefs write every tick with no rate limit — worst case reached the
+ * region's erase budget in weeks (flash-wear review). A byte-identical
+ * g_config always serialises to a byte-identical file (every field
+ * config_save writes lives in g_config, and config_defaults() memset the
+ * struct so padding is stable), so skipping never drops a write that would
+ * change the file. Set ONLY after a fully durable save (or right after a
+ * load), so a failed rename leaves it stale and the next identical save
+ * still retries. */
+static global_config_t s_saved_shadow;
+static bool s_shadow_valid = false;
+
 #define CONFIG_PATH     "/config.json"
 #define CONFIG_PATH_TMP "/config.json.tmp"
 
@@ -594,7 +610,17 @@ bool config_load(void) {
         }
     }
 
-    if (migrate_legacy_modbus() || web_pass_migrated) config_save();
+    if (migrate_legacy_modbus() || web_pass_migrated) {
+        /* Persist the migrated values. If this save fails, leave the shadow
+         * INVALID so the next config_save() retries rather than treating the
+         * unpersisted migration as the on-disk baseline. */
+        if (!config_save()) return true;
+    }
+    /* g_config now matches what's on disk (either no migration ran, or the
+     * migration save above succeeded) — adopt it as the clean baseline so
+     * re-applying a loaded value is a no-op write, not a flash cycle. */
+    s_saved_shadow = g_config;
+    s_shadow_valid = true;
     return true;
 }
 
@@ -610,6 +636,9 @@ _Static_assert(CFG_SCHEMA_N == 16,
     "CFG_SCHEMA changed size — update config_save()'s fprintf (config.c) to match");
 
 bool config_save(void) {
+    if (s_shadow_valid && memcmp(&s_saved_shadow, &g_config, sizeof g_config) == 0)
+        return true;   /* nothing changed since the last durable save — no write */
+
     /* Write the full config to a .tmp file first, then rename() it over the
      * live path — littlefs rename is a single atomic metadata commit, so a
      * power cut anywhere in this function leaves either the old config or
@@ -729,5 +758,7 @@ bool config_save(void) {
         LOG_ERR("config", "save failed: rename %s -> %s", CONFIG_PATH_TMP, CONFIG_PATH);
         return false;
     }
+    s_saved_shadow = g_config;   /* durable now — this is the on-disk baseline */
+    s_shadow_valid = true;
     return true;
 }
