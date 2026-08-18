@@ -19,6 +19,7 @@
  */
 #include "../src/config.h"
 #include "../src/strfit.h"
+#include "../src/jsmn_util.h"
 #include "../src/log.h"
 
 #include <stdio.h>
@@ -193,6 +194,38 @@ int main(void) {
             CHECK(strlen(dst) == F[k].cap - 1);
             CHECK(STR_MAX_LEN(F[k].cap) == (unsigned)(F[k].cap - 1));
         }
+    }
+
+    /* jfind() (jsmn_util.h) on a DANGLING KEY — a key token with no value
+     * token after it. This project builds jsmn without JSMN_STRICT, and in
+     * lenient mode such documents parse with a POSITIVE token count
+     * ({"key"} -> 2 tokens, {"a":1,"key"} -> 4), so the i+1==n case is
+     * reachable on real input — a hand-damaged /config.json is exactly the
+     * document config_load() exists to survive. config.c's pre-consolidation
+     * find_key() returned the out-of-bounds index n here (an uninitialised-
+     * token read); the shared jfind() must return "absent" instead. Pinned
+     * so the bounds check is never "simplified" away as unreachable. */
+    g_case = "jfind: dangling key parses positively and must read as absent";
+    {
+        jsmn_parser jp; jsmntok_t tk[8];
+        const char *docs[] = { "{\"key\"}", "{\"key\":}", "{\"a\":1,\"key\"}" };
+        for (size_t k = 0; k < sizeof docs / sizeof docs[0]; k++) {
+            jsmn_init(&jp);
+            int n = jsmn_parse(&jp, docs[k], strlen(docs[k]), tk, 8);
+            CHECK(n > 0);                          /* the premise: lenient jsmn ACCEPTS these */
+            CHECK(jfind(docs[k], tk, n, "key") == -1);
+            CHECK(!jhas(docs[k], tk, n, "key"));
+            char d[8] = "keep";
+            CHECK(jstr_get(docs[k], tk, n, "key", d, sizeof d) == JSTR_ABSENT);
+            CHECK(strcmp(d, "keep") == 0);
+        }
+        /* And the well-formed neighbour still resolves. */
+        jsmn_init(&jp);
+        const char *ok = "{\"a\":1,\"key\":\"v\"}";
+        int n = jsmn_parse(&jp, ok, strlen(ok), tk, 8);
+        CHECK(n > 0);
+        int i = jfind(ok, tk, n, "key");
+        CHECK(i > 0 && jtok_eq(ok, &tk[i], "v"));
     }
 
     if (g_fails == 0) printf("PASS: all config hostname checks passed\n");

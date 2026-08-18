@@ -25,6 +25,7 @@
 #include "socket.h"
 #include "wizchip_conf.h"   /* getSn_SR / getSn_RX_RSR / getSn_TX_FSR / Sn_* */
 #include "jsmn.h"
+#include "jsmn_util.h"      /* jtok_eq/jfind/jint/jstr_set/... — shared jsmn helper layer */
 #include "mapping.h"        /* mapping_target_t, TARGET_*, MAX_TARGETS_PER_BTN */
 #include "config.h"         /* config_hostname_set() — /api/net validation */
 #include "strfit.h"         /* str_set()/STR_MAX_LEN() — the shared fits-or-fails rule */
@@ -321,75 +322,19 @@ static void resp_state(conn_t *c) {
 }
 
 /* ── JSON request parsing (jsmn) + write dispatch ───────────────────────────*/
-
-static bool jeq(const char *js, const jsmntok_t *t, const char *s) {
-    int len = t->end - t->start;
-    return t->type == JSMN_STRING && (int)strlen(s) == len &&
-           strncmp(js + t->start, s, len) == 0;
-}
-static int jfind(const char *js, const jsmntok_t *t, int n, const char *key) {
-    for (int i = 1; i < n; i++) if (jeq(js, &t[i], key)) return (i + 1 < n) ? i + 1 : -1;
-    return -1;
-}
-static long jint(const char *js, const jsmntok_t *t) {
-    char b[16]; int len = t->end - t->start; if (len < 0) return 0;
-    if (len >= (int)sizeof b) len = (int)sizeof b - 1;
-    memcpy(b, js + t->start, len); b[len] = '\0'; return strtol(b, NULL, 10);
-}
-static bool jhas(const char *js, const jsmntok_t *t, int n, const char *key) {
-    return jfind(js, t, n, key) >= 0;
-}
-static int jint_key(const char *js, const jsmntok_t *t, int n, const char *key, int def) {
-    int i = jfind(js, t, n, key); return i < 0 ? def : (int)jint(js, &t[i]);
-}
-static void jstr_key(const char *js, const jsmntok_t *t, int n, const char *key,
-                     char *out, size_t cap) {
-    out[0] = '\0';
-    int i = jfind(js, t, n, key);
-    if (i < 0) return;
-    int len = t[i].end - t[i].start; if (len < 0) { out[0] = '\0'; return; }
-    if (len >= (int)cap) len = (int)cap - 1;
-    memcpy(out, js + t[i].start, len); out[len] = '\0';
-}
-/* Strict jstr_key(): extract `key` into dst[cap], or fail if it does not fit.
- * Returns false — leaving dst untouched — when the key is missing, is not a
- * string, or its value is too long. Callers guard with jhas() first, so a
- * false here means "too long" and deserves a 400.
- *
- * This is what jstr_key() structurally cannot do: it clamps to cap and so
- * destroys the evidence, silently handing the caller a DIFFERENT value that
- * then passes every downstream check. jsmn already knows the token's true
- * length, so the comparison costs nothing and happens before any copy. */
-static bool jstr_set(const char *js, const jsmntok_t *t, int n, const char *key,
-                     char *dst, size_t cap) {
-    int i = jfind(js, t, n, key);
-    if (i < 0 || t[i].type != JSMN_STRING) return false;
-    int len = t[i].end - t[i].start;
-    if (len < 0 || (size_t)len >= cap) return false;
-    memcpy(dst, js + t[i].start, (size_t)len);
-    dst[len] = '\0';
-    return true;
-}
-
-static bool jbool_key(const char *js, const jsmntok_t *t, int n, const char *key, bool def) {
-    int i = jfind(js, t, n, key);
-    if (i < 0) return def;
-    char ch = js[t[i].start];
-    return ch == 't' || ch == 'T' || ch == '1';
-}
+/* jtok_eq/jfind/jhas/jint/jint_key/jstr_set/jstr_clamped/jbool_key/jip are the
+ * shared helpers, jsmn_util.h — see that header for why jstr_set() (not
+ * jstr_clamped, this file's old jstr_key) is the one every NEW write handler
+ * below uses, and why jstr_clamped survives only for jip()'s dotted-quad
+ * scratch and the "mode" string a few lines down. jtri() stays local: it
+ * decodes the {on: true|false|"toggle"} tri-state used only by the DALI/
+ * relay/group write handlers here, not a generic jsmn primitive. */
 static bool jtri(const char *js, const jsmntok_t *t, int n, const char *key, ic_tri_t *out) {
     int i = jfind(js, t, n, key);
     if (i < 0) return false;
-    if (jeq(js, &t[i], "toggle"))                          *out = IC_TRI_TOGGLE;
-    else if (jeq(js, &t[i], "on") || jeq(js, &t[i], "true")) *out = IC_TRI_ON;
+    if (jtok_eq(js, &t[i], "toggle"))                              *out = IC_TRI_TOGGLE;
+    else if (jtok_eq(js, &t[i], "on") || jtok_eq(js, &t[i], "true")) *out = IC_TRI_ON;
     else { char ch = js[t[i].start]; *out = (ch == 't' || ch == '1') ? IC_TRI_ON : IC_TRI_OFF; }
-    return true;
-}
-static bool jip(const char *js, const jsmntok_t *t, int n, const char *key, uint8_t ip[4]) {
-    char b[20]; jstr_key(js, t, n, key, b, sizeof b);
-    unsigned a0, a1, a2, a3;
-    if (sscanf(b, "%u.%u.%u.%u", &a0, &a1, &a2, &a3) != 4) return false;
-    ip[0] = (uint8_t)a0; ip[1] = (uint8_t)a1; ip[2] = (uint8_t)a2; ip[3] = (uint8_t)a3;
     return true;
 }
 /* Walk a JSON targets array [{slave,addr|group},...] at value-token `ai`. */
@@ -402,9 +347,9 @@ static uint8_t parse_targets_at(const char *js, const jsmntok_t *t, int n, int a
         int sz = t[i].size; i++;
         int sl = 0, addr = 0, grp = -1;
         for (int f = 0; f < sz && i + 1 < n; f++) {
-            if      (jeq(js, &t[i], "slave")) sl   = (int)jint(js, &t[i + 1]);
-            else if (jeq(js, &t[i], "addr"))  addr = (int)jint(js, &t[i + 1]);
-            else if (jeq(js, &t[i], "group")) grp  = (int)jint(js, &t[i + 1]);
+            if      (jtok_eq(js, &t[i], "slave")) sl   = (int)jint(js, &t[i + 1]);
+            else if (jtok_eq(js, &t[i], "addr"))  addr = (int)jint(js, &t[i + 1]);
+            else if (jtok_eq(js, &t[i], "group")) grp  = (int)jint(js, &t[i + 1]);
             i += 2;
         }
         out[c].slave = (uint8_t)sl;
@@ -612,7 +557,7 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
             cmd.type = IC_CMD_PROVISION_ABORT; cmd.provision_abort.slave = slave;
             push_cmd_resp(c, &cmd); return;
         }
-        char mode[12]; jstr_key(body, tk, nt, "mode", mode, sizeof mode);
+        char mode[12]; jstr_clamped(body, tk, nt, "mode", mode, sizeof mode);
         cmd.type = IC_CMD_PROVISION_START;
         cmd.provision_start.slave = slave;
         cmd.provision_start.mode  = strcmp(mode, "new") == 0     ? IC_PROV_UNADDRESSED

@@ -11,6 +11,7 @@
 #include "strfit.h"
 #include "log.h"
 #include "jsmn.h"
+#include "jsmn_util.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -90,38 +91,23 @@ void config_defaults(void) {
 }
 
 /* ── jsmn helpers ────────────────────────────────────────────────────────── */
-static bool tok_eq(const char *js, const jsmntok_t *t, const char *s) {
-    int len = t->end - t->start;
-    return t->type == JSMN_STRING && (int)strlen(s) == len &&
-           strncmp(js + t->start, s, len) == 0;
-}
-static int find_key(const char *js, const jsmntok_t *t, int n, const char *key) {
-    for (int i = 1; i < n; i++) if (tok_eq(js, &t[i], key)) return i + 1;
-    return -1;
-}
+/* jtok_eq/jfind/jstr_get/jip are the shared helpers, jsmn_util.h — see that
+ * header for the jstr_key()/get_str() clamp-bug history (e875365, 23761ba)
+ * this file used to have its own copy of. get_uint() and get_u8_array() stay
+ * here: neither is duplicated in http_server.c/ha_bridge.c (both parse
+ * numeric fields with the simpler, unvalidated jint()/jint_key() instead —
+ * config-load wants get_uint()'s stricter "reject, don't default, on
+ * malformed input" contract, which is config.c-specific), and
+ * get_u8_array() is tied to this file's MAX_RELAY_SLAVES/MAX_DALI_SLAVES
+ * slave-list shape. */
 static bool get_uint(const char *js, const jsmntok_t *t, int n, const char *key, unsigned *out) {
-    int i = find_key(js, t, n, key);
+    int i = jfind(js, t, n, key);
     if (i < 0) return false;
     char b[16]; int len = t[i].end - t[i].start; if (len >= (int)sizeof b) len = (int)sizeof b - 1;
     memcpy(b, js + t[i].start, len); b[len] = '\0';
     char *e; long v = strtol(b, &e, 10);
     if (e == b || v < 0) return false;
     *out = (unsigned)v; return true;
-}
-static bool get_str(const char *js, const jsmntok_t *t, int n, const char *key, char *out, size_t cap) {
-    int i = find_key(js, t, n, key);
-    if (i < 0 || t[i].type != JSMN_STRING) return false;
-    int len = t[i].end - t[i].start; if (len >= (int)cap) len = (int)cap - 1;
-    memcpy(out, js + t[i].start, len); out[len] = '\0';
-    return true;
-}
-static bool get_ip(const char *js, const jsmntok_t *t, int n, const char *key, uint8_t ip[4]) {
-    char b[20];
-    if (!get_str(js, t, n, key, b, sizeof b)) return false;
-    unsigned a0, a1, a2, a3;
-    if (sscanf(b, "%u.%u.%u.%u", &a0, &a1, &a2, &a3) != 4) return false;
-    ip[0] = (uint8_t)a0; ip[1] = (uint8_t)a1; ip[2] = (uint8_t)a2; ip[3] = (uint8_t)a3;
-    return true;
 }
 /* Parse a JSON array of small uints at key into out, returns count. */
 /* Returns the element count, or -1 if the key is ABSENT (or not an array).
@@ -132,7 +118,7 @@ static bool get_ip(const char *js, const jsmntok_t *t, int n, const char *key, u
  * silently reverted to the compiled default on the next boot. */
 static int get_u8_array(const char *js, const jsmntok_t *t, int n, const char *key,
                         uint8_t *out, uint8_t max) {
-    int i = find_key(js, t, n, key);
+    int i = jfind(js, t, n, key);
     if (i < 0 || t[i].type != JSMN_ARRAY) return -1;
     int count = t[i].size; if (count > max) count = max;
     for (int k = 0; k < count; k++) {
@@ -170,29 +156,22 @@ static bool migrate_legacy_modbus(void) {
     return changed;
 }
 
-/* Load one string field STRICTLY. get_str() clamps to the destination's cap,
- * which destroys the evidence that a value was ever too long, so read into a
- * buffer larger than any config string and let str_set() judge whether it
- * fits. Values written by config_save() always fit by construction, so
- * LS_TOO_LONG only ever means a hand-edited or damaged file — but silently
- * substituting a shorter value there is exactly the failure this whole rule
- * exists to prevent. */
-typedef enum { LS_ABSENT, LS_OK, LS_TOO_LONG } load_str_t;
-
-static load_str_t load_str(const char *js, const jsmntok_t *t, int n,
-                           const char *key, char *dst, size_t cap) {
-    /* Comfortably larger than the biggest config string (fw_url[128]); a
-     * value too long for THIS buffer is far too long for any field and is
-     * still correctly refused below. */
-    char tmp[192];
-    if (!get_str(js, t, n, key, tmp, sizeof tmp)) return LS_ABSENT;
-    return str_set(dst, cap, tmp) ? LS_OK : LS_TOO_LONG;
-}
+/* Load one string field STRICTLY, straight into g_config.field. jstr_get()
+ * (jsmn_util.h) already IS the "fits-or-fails, dst untouched otherwise"
+ * extractor — jsmn knows the token's true length, so it can compare directly
+ * against the destination field's own cap and refuse before copying a byte.
+ * That replaces the old load_str()/tmp[192] two-step (read into an
+ * oversized scratch buffer, then let str_set() judge whether it fits the
+ * real field): with a three-state extractor there is nothing left for the
+ * second step to do. Values written by config_save() always fit by
+ * construction, so JSTR_TOO_LONG here only ever means a hand-edited or
+ * damaged file — but silently substituting a shorter value is exactly the
+ * failure this whole rule (and e875365/23761ba) exists to prevent. */
 
 /* Ordinary field: too long -> keep the compiled default and say so. */
 #define LOAD_STR(k, field)                                                      \
-    do { if (load_str(buf, tk, nt, k, g_config.field,                           \
-                      sizeof g_config.field) == LS_TOO_LONG)                    \
+    do { if (jstr_get(buf, tk, nt, k, g_config.field,                          \
+                      sizeof g_config.field) == JSTR_TOO_LONG)                 \
              LOG_WARN("cfg", k " in config exceeds %u chars — keeping default",  \
                       STR_MAX_LEN(sizeof g_config.field)); } while (0)
 
@@ -202,8 +181,8 @@ static load_str_t load_str(const char *js, const jsmntok_t *t, int n,
  * check_auth() (http_server.c) refuses an empty credential, so the device
  * fails CLOSED and stays locked until the config is repaired. */
 #define LOAD_CRED(k, field)                                                     \
-    do { if (load_str(buf, tk, nt, k, g_config.field,                           \
-                      sizeof g_config.field) == LS_TOO_LONG) {                  \
+    do { if (jstr_get(buf, tk, nt, k, g_config.field,                          \
+                      sizeof g_config.field) == JSTR_TOO_LONG) {               \
              g_config.field[0] = '\0';                                          \
              LOG_ERR("cfg", k " in config exceeds %u chars — cleared; web UI "  \
                      "stays locked until /config.json is repaired",             \
@@ -255,21 +234,32 @@ bool config_load(void) {
             if (get_uint(buf, tk, nt, "mqtt_port", &u) && u > 0) g_config.mqtt_port = (uint16_t)u;
 
             if (get_uint(buf, tk, nt, "net_dhcp", &u)) g_config.net_dhcp = u ? 1 : 0;
-            get_ip(buf, tk, nt, "net_ip",   g_config.net_ip);
-            get_ip(buf, tk, nt, "net_mask", g_config.net_mask);
-            get_ip(buf, tk, nt, "net_gw",   g_config.net_gw);
-            get_ip(buf, tk, nt, "net_dns",  g_config.net_dns);
+            jip(buf, tk, nt, "net_ip",   g_config.net_ip);
+            jip(buf, tk, nt, "net_mask", g_config.net_mask);
+            jip(buf, tk, nt, "net_gw",   g_config.net_gw);
+            jip(buf, tk, nt, "net_dns",  g_config.net_dns);
             /* Validate on the way IN, not just at the CLI/API: before this, a
              * hand-edited or damaged /config.json put arbitrary bytes straight
              * into net_hostname, and netif_init() copies that into HOST_NAME[]
-             * and onto the wire as DHCP option 12. Read into a buffer sized
-             * like load_str()'s so an over-long value is refused rather than
-             * clamped into a valid-looking label; an invalid stored value keeps
-             * the default from config_defaults() rather than failing the whole
-             * load, consistent with how every other field here degrades. */
+             * and onto the wire as DHCP option 12. Unlike LOAD_STR/LOAD_CRED,
+             * this does NOT let jstr_get() write straight into
+             * g_config.net_hostname: it reads into a scratch buffer sized like
+             * those macros' effective limit (192, not net_hostname's own 32) so
+             * an over-long value is captured in FULL and correctly rejected by
+             * config_hostname_ok() as "too long", rather than silently
+             * pre-clamped into a valid-looking 31-char prefix that would then
+             * wrongly pass — writing straight into the live field would also
+             * leave an unvalidated raw value sitting there the instant
+             * config_hostname_ok() rejects it, in place of the safe default.
+             * An invalid stored value keeps the default from config_defaults()
+             * rather than failing the whole load, consistent with how every
+             * other field here degrades. */
             { char hn[192];
-              if (get_str(buf, tk, nt, "net_hostname", hn, sizeof hn) &&
-                  !config_hostname_set(g_config.net_hostname, sizeof g_config.net_hostname, hn))
+              jstr_status_t hs = jstr_get(buf, tk, nt, "net_hostname", hn, sizeof hn);
+              bool bad_hostname = (hs == JSTR_TOO_LONG) ||
+                  (hs == JSTR_OK && !config_hostname_set(g_config.net_hostname,
+                                                         sizeof g_config.net_hostname, hn));
+              if (bad_hostname)
                   LOG_WARN("cfg", "net_hostname in config is not a valid label — using \"%s\"",
                            g_config.net_hostname); }
 
