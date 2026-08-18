@@ -322,13 +322,19 @@ static void resp_state(conn_t *c) {
 }
 
 /* ── JSON request parsing (jsmn) + write dispatch ───────────────────────────*/
-/* jtok_eq/jfind/jhas/jint/jint_key/jstr_set/jstr_clamped/jbool_key/jip are the
- * shared helpers, jsmn_util.h — see that header for why jstr_set() (not
- * jstr_clamped, this file's old jstr_key) is the one every NEW write handler
- * below uses, and why jstr_clamped survives only for jip()'s dotted-quad
- * scratch and the "mode" string a few lines down. jtri() stays local: it
- * decodes the {on: true|false|"toggle"} tri-state used only by the DALI/
- * relay/group write handlers here, not a generic jsmn primitive. */
+/* jtok_eq/jfind/jhas/jint/jint_key/jstr_get_unescaped/jstr_clamped/jbool_key/
+ * jip are the shared helpers, jsmn_util.h — see that header for why
+ * jstr_get_unescaped() (via jfield_unescaped() above, not jstr_set(), and
+ * not jstr_clamped — this file's old jstr_key) is what every /api/mqtt,
+ * /api/auth and /api/net(hostname) field below decodes through: the escaped
+ * JSON text jsmn hands back is not what the browser typed (see json_str.h's
+ * header comment for the literal-backslash bug that was), and every one of
+ * these fields is stored and later echoed back as if it were. jstr_clamped
+ * survives only for jip()'s dotted-quad scratch and the "mode" string a few
+ * lines down — see its own comment for why those two are fine with the old
+ * clamp-not-reject behaviour. jtri() stays local: it decodes the
+ * {on: true|false|"toggle"} tri-state used only by the DALI/relay/group
+ * write handlers here, not a generic jsmn primitive. */
 static bool jtri(const char *js, const jsmntok_t *t, int n, const char *key, ic_tri_t *out) {
     int i = jfind(js, t, n, key);
     if (i < 0) return false;
@@ -381,6 +387,39 @@ static void resp_too_long(conn_t *c, const char *field, size_t cap) {
     snprintf(msg, sizeof msg, "{\"error\":\"%s is too long (max %u characters)\"}",
              field, STR_MAX_LEN(cap));
     resp_text(c, "400 Bad Request", "application/json", msg);
+}
+
+/* 400 for a malformed JSON string escape — a dangling backslash, an escape
+ * letter outside RFC 8259 §7's set, bad \uXXXX hex, or a lone UTF-16
+ * surrogate (json_str.h's json_unescape(), the decode step behind
+ * jstr_get_unescaped()/jfield_unescaped() below). Distinct from
+ * resp_too_long() so the caller learns their JSON was broken, not merely
+ * that the value was oversized — jsmn itself accepted the token (it only
+ * validates that an escape's SHAPE is legal, never decodes it; see
+ * json_str.h's header comment), so this is the first point in the pipeline
+ * that actually looks at what the escape decodes to. */
+static void resp_bad_escape(conn_t *c, const char *field) {
+    char msg[96];
+    snprintf(msg, sizeof msg, "{\"error\":\"%s has a malformed JSON string escape\"}", field);
+    resp_text(c, "400 Bad Request", "application/json", msg);
+}
+
+/* jstr_get_unescaped() into dst[cap], translating its four states into the
+ * two failure responses a write handler's string field can produce and
+ * sending the response itself — every NEW-write call site below is just
+ * `if (!jfield_unescaped(...)) return;`. JSTR_ABSENT (present but not a JSON
+ * string — jhas() already gated presence at every call site below) is
+ * folded into "too long" rather than getting its own message: that matches
+ * this file's PRE-existing behaviour, where a false return from jstr_set()
+ * meant the same thing for "wrong type" and "too long" and both produced
+ * resp_too_long(). Splitting that apart is not this pass's job. */
+static bool jfield_unescaped(conn_t *c, const char *js, const jsmntok_t *t, int n,
+                             const char *key, char *dst, size_t cap) {
+    jstr_status_t s = jstr_get_unescaped(js, t, n, key, dst, cap);
+    if (s == JSTR_OK) return true;
+    if (s == JSTR_MALFORMED) resp_bad_escape(c, key);
+    else                     resp_too_long(c, key, cap);
+    return false;
 }
 
 static void push_cmd_resp(conn_t *c, const ic_cmd_t *cmd) {
@@ -502,11 +541,17 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
              * only drop the field silently — the caller saw {"ok":true} and
              * the web UI toasted "Saved" for a hostname that never changed.
              * Same rule and normalisation as the CLI, which has always
-             * reported bad_hostname. jstr_set() refuses an over-long value
-             * instead of clamping it into a valid-looking shorter one. */
-            if (!jstr_set(body, tk, nt, "hostname",
-                          cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname) ||
-                !config_hostname_set(cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname,
+             * reported bad_hostname. jstr_get_unescaped() (via
+             * jfield_unescaped()) refuses an over-long or malformed-escape
+             * value instead of clamping/mis-decoding it into something that
+             * looks valid — and decodes it first, so a hostname typed with
+             * no escapes at all (the overwhelming common case, and the only
+             * legal case once config_hostname_set() below has its say) is
+             * unaffected either way. */
+            if (!jfield_unescaped(c, body, tk, nt, "hostname",
+                                  cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname))
+                return;
+            if (!config_hostname_set(cmd.set_netcfg.hostname, sizeof cmd.set_netcfg.hostname,
                                      cmd.set_netcfg.hostname)) {
                 resp_text(c, "400 Bad Request", "application/json",
                           "{\"error\":\"hostname must be 1-31 chars of a-z 0-9 -, "
@@ -520,15 +565,20 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
     }
     if (strcmp(path, "/api/mqtt") == 0) {
         cmd.type = IC_CMD_SET_MQTTCFG; uint16_t f = 0;
-        /* Too long is a 400 naming the field and its real maximum, not a
-         * silent truncation: a shortened broker password or topic prefix
-         * saves, reports success, and then just fails to connect / makes HA
-         * lose every entity, with nothing anywhere saying why. */
-        if (jhas(body, tk, nt, "host"))   { if (!jstr_set(body, tk, nt, "host",   cmd.set_mqttcfg.host,   sizeof cmd.set_mqttcfg.host))   { resp_too_long(c, "host",   sizeof cmd.set_mqttcfg.host);   return; } f |= IC_MQTT_F_HOST; }
+        /* Too long (decoded) or a malformed escape is a 400 naming the field
+         * (and, for too-long, its real maximum), not a silent truncation or
+         * a stored-verbatim backslash: a shortened or mis-decoded broker
+         * password or topic prefix saves, reports success, and then just
+         * fails to connect / makes HA lose every entity, with nothing
+         * anywhere saying why. jfield_unescaped() (not jstr_set()) so what
+         * gets stored is what was typed, not jsmn's still-escaped token text
+         * — see json_str.h's header comment for the literal-backslash wart
+         * this fixes. */
+        if (jhas(body, tk, nt, "host"))   { if (!jfield_unescaped(c, body, tk, nt, "host",   cmd.set_mqttcfg.host,   sizeof cmd.set_mqttcfg.host))   return; f |= IC_MQTT_F_HOST; }
         if (jhas(body, tk, nt, "port"))   { cmd.set_mqttcfg.port = (uint16_t)jint_key(body, tk, nt, "port", 1883);                   f |= IC_MQTT_F_PORT; }
-        if (jhas(body, tk, nt, "user"))   { if (!jstr_set(body, tk, nt, "user",   cmd.set_mqttcfg.user,   sizeof cmd.set_mqttcfg.user))   { resp_too_long(c, "user",   sizeof cmd.set_mqttcfg.user);   return; } f |= IC_MQTT_F_USER; }
-        if (jhas(body, tk, nt, "pass"))   { if (!jstr_set(body, tk, nt, "pass",   cmd.set_mqttcfg.pass,   sizeof cmd.set_mqttcfg.pass))   { resp_too_long(c, "pass",   sizeof cmd.set_mqttcfg.pass);   return; } f |= IC_MQTT_F_PASS; }
-        if (jhas(body, tk, nt, "prefix")) { if (!jstr_set(body, tk, nt, "prefix", cmd.set_mqttcfg.prefix, sizeof cmd.set_mqttcfg.prefix)) { resp_too_long(c, "prefix", sizeof cmd.set_mqttcfg.prefix); return; } f |= IC_MQTT_F_PREFIX; }
+        if (jhas(body, tk, nt, "user"))   { if (!jfield_unescaped(c, body, tk, nt, "user",   cmd.set_mqttcfg.user,   sizeof cmd.set_mqttcfg.user))   return; f |= IC_MQTT_F_USER; }
+        if (jhas(body, tk, nt, "pass"))   { if (!jfield_unescaped(c, body, tk, nt, "pass",   cmd.set_mqttcfg.pass,   sizeof cmd.set_mqttcfg.pass))   return; f |= IC_MQTT_F_PASS; }
+        if (jhas(body, tk, nt, "prefix")) { if (!jfield_unescaped(c, body, tk, nt, "prefix", cmd.set_mqttcfg.prefix, sizeof cmd.set_mqttcfg.prefix)) return; f |= IC_MQTT_F_PREFIX; }
         cmd.set_mqttcfg.fields = f;
         push_cmd_resp(c, &cmd); return;
     }
@@ -540,8 +590,8 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
          * no CLI verb to reset web credentials, so recovery meant reading the
          * shortened value back out of /config.json over serial. */
         char u[sizeof cmd.set_auth.user] = {0}, p[sizeof cmd.set_auth.pass] = {0};
-        if (!jstr_set(body, tk, nt, "user", u, sizeof u)) { resp_too_long(c, "user", sizeof u); return; }
-        if (!jstr_set(body, tk, nt, "pass", p, sizeof p)) { resp_too_long(c, "pass", sizeof p); return; }
+        if (!jfield_unescaped(c, body, tk, nt, "user", u, sizeof u)) return;
+        if (!jfield_unescaped(c, body, tk, nt, "pass", p, sizeof p)) return;
         if (!u[0] || !p[0]) {
             resp_text(c, "400 Bad Request", "application/json",
                       "{\"error\":\"user and pass required\"}");

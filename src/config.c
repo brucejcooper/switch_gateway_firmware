@@ -9,6 +9,7 @@
 
 #include "config.h"
 #include "strfit.h"
+#include "json_str.h"
 #include "log.h"
 #include "jsmn.h"
 #include "jsmn_util.h"
@@ -294,17 +295,23 @@ static bool migrate_legacy_modbus(void) {
     return changed;
 }
 
-/* jstr_get() (jsmn_util.h) is the "fits-or-fails, dst untouched otherwise"
- * extractor the CFG_STR/CFG_CRED/CFG_HOSTNAME cases below load through —
- * jsmn knows the token's true length, so it can compare directly against the
- * destination field's own cap and refuse before copying a byte. That replaces
- * the old load_str()/tmp[192] two-step (read into an oversized scratch
- * buffer, then let str_set() judge whether it fits the real field): with a
- * three-state extractor there is nothing left for the second step to do.
- * Values written by config_save() always fit by construction, so
- * JSTR_TOO_LONG here only ever means a hand-edited or damaged file — but
- * silently substituting a shorter value is exactly the failure this whole
- * rule (and e875365/23761ba) exists to prevent. */
+/* jstr_get_unescaped() (jsmn_util.h) is the "fits-or-fails, dst untouched
+ * otherwise" extractor the CFG_STR/CFG_CRED/CFG_HOSTNAME cases below load
+ * through — jsmn knows the token's true length, so it can measure the
+ * DECODED length and compare directly against the destination field's own
+ * cap, refusing before copying a byte. That replaces the old load_str()/
+ * tmp[192] two-step (read into an oversized scratch buffer, then let
+ * str_set() judge whether it fits the real field): with a four-state
+ * extractor there is nothing left for a second step to do.
+ * Values written by config_save() always fit AND are always validly escaped
+ * by construction (json_escape(), config.c), so JSTR_TOO_LONG/JSTR_MALFORMED
+ * here only ever mean a hand-edited or damaged file — but silently
+ * substituting a shorter or differently-decoded value is exactly the failure
+ * this whole rule (and e875365/23761ba, plus the config_save() corruption
+ * story in json_str.h) exists to prevent. jstr_get_unescaped() is jstr_get()'s
+ * unescaping twin (jsmn_util.h) — config.c is the one caller in this firmware
+ * that needs the DECODED four-state contract on load; every other consumer of
+ * a config string still goes through plain jstr_get()/jstr_set(). */
 
 bool config_load(void) {
     config_defaults();
@@ -344,25 +351,39 @@ bool config_load(void) {
              *     which is a behaviour change worth watching for on upgrade
              *     (a config file already carrying an out-of-range value will
              *     start logging on every boot until it's corrected).
-             *   - CFG_STR: too long -> keep the default and warn (was
-             *     LOAD_STR).
-             *   - CFG_CRED: too long -> do NOT fall back to the compiled
-             *     default. That would silently re-open the web UI on
-             *     admin/admin because a config file was damaged, turning a
-             *     corrupt file into an auth downgrade. Clear it instead:
-             *     check_auth() (http_server.c) refuses an empty credential,
-             *     so the device fails CLOSED and stays locked until the
-             *     config is repaired (was LOAD_CRED).
-             *   - CFG_HOSTNAME: not a valid label -> keep the default and
-             *     warn. Reads into a 192-byte scratch buffer — generously
-             *     larger than net_hostname's own 32 — so an over-long value
-             *     is captured in FULL and correctly rejected as "too long"
-             *     by config_hostname_ok(), rather than silently pre-clamped
+             *   - CFG_STR: too long (decoded) -> keep the default and warn
+             *     (was LOAD_STR). A MALFORMED escape (dangling backslash,
+             *     bad \uXXXX, a lone surrogate — jstr_get_unescaped()'s new
+             *     4th state) degrades the SAME way: keep the default and
+             *     warn. config_save() never writes a malformed escape, so
+             *     reaching this means the file was hand-edited or damaged —
+             *     exactly the case the too-long path already exists for.
+             *   - CFG_CRED: too long (decoded) OR malformed -> do NOT fall
+             *     back to the compiled default. That would silently re-open
+             *     the web UI on admin/admin because a config file was
+             *     damaged, turning a corrupt file into an auth downgrade.
+             *     Clear it instead: check_auth() (http_server.c) refuses an
+             *     empty credential, so the device fails CLOSED and stays
+             *     locked until the config is repaired (was LOAD_CRED). A
+             *     malformed escape gets exactly the same fail-closed
+             *     treatment as too-long — a credential jstr_get_unescaped()
+             *     can't make sense of must never be treated as "absent,
+             *     keep default", for the same reason.
+             *   - CFG_HOSTNAME: not a valid label (including too-long or a
+             *     malformed escape) -> keep the default and warn. Reads into
+             *     a 192-byte scratch buffer — generously larger than
+             *     net_hostname's own 32 — so an over-long value is captured
+             *     in FULL and correctly rejected as "too long" by
+             *     config_hostname_ok(), rather than silently pre-clamped
              *     into a valid-looking 31-char prefix that would then
              *     wrongly pass. Writing straight into the live field would
              *     also leave an unvalidated raw value sitting there the
              *     instant config_hostname_ok() rejects it, in place of the
-             *     safe default. */
+             *     safe default. (A malformed escape can't actually produce a
+             *     valid hostname even if it decoded — config_hostname_ok()'s
+             *     charset rejects raw backslashes/quotes/control bytes
+             *     regardless — but jstr_get_unescaped() is checked first so
+             *     the log names the real cause.) */
             for (size_t si = 0; si < CFG_SCHEMA_N; si++) {
                 const cfg_field_t *f = &CFG_SCHEMA[si];
                 switch (f->kind) {
@@ -376,26 +397,36 @@ bool config_load(void) {
                 }
                 case CFG_STR: {
                     char *dst = (char *)&g_config + f->offset;
-                    if (jstr_get(buf, tk, nt, f->key, dst, f->size) == JSTR_TOO_LONG)
+                    jstr_status_t s = jstr_get_unescaped(buf, tk, nt, f->key, dst, f->size);
+                    if (s == JSTR_TOO_LONG)
                         LOG_WARN("cfg", "%s in config exceeds %u chars — keeping default",
                                  f->key, STR_MAX_LEN(f->size));
+                    else if (s == JSTR_MALFORMED)
+                        LOG_WARN("cfg", "%s in config has a malformed JSON escape — keeping default",
+                                 f->key);
                     break;
                 }
                 case CFG_CRED: {
                     char *dst = (char *)&g_config + f->offset;
-                    if (jstr_get(buf, tk, nt, f->key, dst, f->size) == JSTR_TOO_LONG) {
+                    jstr_status_t s = jstr_get_unescaped(buf, tk, nt, f->key, dst, f->size);
+                    if (s == JSTR_TOO_LONG) {
                         dst[0] = '\0';
                         LOG_ERR("cfg", "%s in config exceeds %u chars — cleared; web UI "
                                 "stays locked until /config.json is repaired",
                                 f->key, STR_MAX_LEN(f->size));
+                    } else if (s == JSTR_MALFORMED) {
+                        dst[0] = '\0';
+                        LOG_ERR("cfg", "%s in config has a malformed JSON escape — cleared; web UI "
+                                "stays locked until /config.json is repaired",
+                                f->key);
                     }
                     break;
                 }
                 case CFG_HOSTNAME: {
                     char *dst = (char *)&g_config + f->offset;
                     char hn[192];
-                    jstr_status_t hs = jstr_get(buf, tk, nt, f->key, hn, sizeof hn);
-                    bool bad = (hs == JSTR_TOO_LONG) ||
+                    jstr_status_t hs = jstr_get_unescaped(buf, tk, nt, f->key, hn, sizeof hn);
+                    bool bad = (hs == JSTR_TOO_LONG) || (hs == JSTR_MALFORMED) ||
                                (hs == JSTR_OK && !config_hostname_set(dst, f->size, hn));
                     if (bad)
                         LOG_WARN("cfg", "%s in config is not a valid label — using \"%s\"",
@@ -482,21 +513,74 @@ bool config_save(void) {
     uint8_t dc = g_config.dali_slaves_pending ? g_config.pending_dali_slave_count : g_config.dali_slave_count;
     for (int i = 0; i < dc; i++)
         fprintf(fp, "%s%u", i ? "," : "", ds[i]);
+    fprintf(fp, "],");
+
+    /* Every string field from here on goes through json_escape() into this
+     * one scratch buffer before being printed. Before this, config_save()
+     * fprintf'd each field's raw bytes straight between the surrounding
+     * quotes — a single `"` or `\` in, say, an MQTT password (set validly
+     * over the CLI, which has never restricted the character set) corrupted
+     * the whole document: jsmn_parse() fails on the next boot and
+     * config_load() falls back to config_defaults() for EVERY field,
+     * including web_user/web_pass — one bad byte in one field silently
+     * reopened the web UI on admin/admin. See json_str.h's header comment
+     * for the full story.
+     *
+     * One shared buffer, not one per field: each field is escaped and
+     * printed immediately in its own fprintf() before the next field is
+     * escaped into the same memory, so only one field's escaped text needs
+     * to exist at a time. Sized for the largest field (fw_url[128]) at RFC
+     * 8259's worst case — every byte expands to `\u00XX`, 6 bytes — so
+     * 6*127+1 = 763 covers fw_url's real 127-char maximum with a little
+     * headroom to 769; that covers every other, smaller string field a
+     * fortiori. Lives on config_save's stack, which runs on core 0's main
+     * loop — 769 bytes there is unremarkable.
+     *
+     * SAVE_ESC() escaping a field can't actually fail: every field already
+     * satisfies its own strfit.h cap (str_set()/config_apply_str() enforce
+     * that on every write path, long before it reaches here), and esc[] is
+     * sized for the worst-case expansion of the largest of them. But per
+     * this codebase's "never trust shouldn't-happen" rule (see e.g.
+     * get_uint()'s handling of a malformed numeric token, above), a failure
+     * here still aborts the save cleanly rather than assert or silently
+     * write a short/wrong field: close and discard the half-written .tmp
+     * file and return false WITHOUT renaming, so a failure here leaves
+     * CONFIG_PATH exactly as it was — config_load() keeps reading the last
+     * good file instead of ever seeing a truncated one. */
+    char esc[6 * 128 + 1];
+#define SAVE_ESC(field) \
+    do { \
+        if (!json_escape(esc, sizeof esc, (field))) { \
+            LOG_ERR("config", "save failed: could not escape %s (bug — see json_str.h)", #field); \
+            fclose(fp); remove(CONFIG_PATH_TMP); return false; \
+        } \
+    } while (0)
+
+    SAVE_ESC(g_config.mqtt_host);
+    fprintf(fp, "\"mqtt_host\":\"%s\",\"mqtt_port\":%u,", esc, g_config.mqtt_port);
+    SAVE_ESC(g_config.mqtt_user);
+    fprintf(fp, "\"mqtt_user\":\"%s\",", esc);
+    SAVE_ESC(g_config.mqtt_pass);
+    fprintf(fp, "\"mqtt_pass\":\"%s\",", esc);
+    SAVE_ESC(g_config.mqtt_prefix);
+    fprintf(fp, "\"mqtt_prefix\":\"%s\",", esc);
     fprintf(fp,
-        "],\"mqtt_host\":\"%s\",\"mqtt_port\":%u,\"mqtt_user\":\"%s\","
-        "\"mqtt_pass\":\"%s\",\"mqtt_prefix\":\"%s\","
         "\"net_dhcp\":%u,\"net_ip\":\"%u.%u.%u.%u\",\"net_mask\":\"%u.%u.%u.%u\","
-        "\"net_gw\":\"%u.%u.%u.%u\",\"net_dns\":\"%u.%u.%u.%u\","
-        "\"net_hostname\":\"%s\","
-        "\"web_user\":\"%s\",\"web_pass\":\"%s\",\"fw_url\":\"%s\"}\n",
-        g_config.mqtt_host, g_config.mqtt_port, g_config.mqtt_user,
-        g_config.mqtt_pass, g_config.mqtt_prefix, g_config.net_dhcp,
+        "\"net_gw\":\"%u.%u.%u.%u\",\"net_dns\":\"%u.%u.%u.%u\",",
+        g_config.net_dhcp,
         g_config.net_ip[0], g_config.net_ip[1], g_config.net_ip[2], g_config.net_ip[3],
         g_config.net_mask[0], g_config.net_mask[1], g_config.net_mask[2], g_config.net_mask[3],
         g_config.net_gw[0], g_config.net_gw[1], g_config.net_gw[2], g_config.net_gw[3],
-        g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3],
-        g_config.net_hostname,
-        g_config.web_user, g_config.web_pass, g_config.fw_url);
+        g_config.net_dns[0], g_config.net_dns[1], g_config.net_dns[2], g_config.net_dns[3]);
+    SAVE_ESC(g_config.net_hostname);
+    fprintf(fp, "\"net_hostname\":\"%s\",", esc);
+    SAVE_ESC(g_config.web_user);
+    fprintf(fp, "\"web_user\":\"%s\",", esc);
+    SAVE_ESC(g_config.web_pass);
+    fprintf(fp, "\"web_pass\":\"%s\",", esc);
+    SAVE_ESC(g_config.fw_url);
+    fprintf(fp, "\"fw_url\":\"%s\"}\n", esc);
+#undef SAVE_ESC
     /* pico-vfs's littlefs backend exposes no separate fsync(); fclose()
      * reaches lfs_file_close(), which syncs the file's data to flash before
      * returning, so this is the actual durability boundary. */

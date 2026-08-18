@@ -55,6 +55,7 @@
  */
 #include "jsmn.h"
 #include "strfit.h"
+#include "json_str.h"  /* json_escape()/json_unescape() — jstr_*_unescaped() below */
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -137,6 +138,30 @@ static inline bool jstr_set(const char *js, const jsmntok_t *t, int n, const cha
     return true;
 }
 
+/* jstr_set()'s UNESCAPING twin — same strict contract (dst COMPLETELY
+ * UNTOUCHED unless the key is present, is a JSON string, and its DECODED
+ * value fits cap), but the bytes stored are what json_unescape() decodes the
+ * token span to, not the raw span jstr_set() copies verbatim. Use this at
+ * any boundary where the JSON string may legitimately contain a `"`, a `\`,
+ * a control character, or a `\uXXXX` escape and the caller wants the actual
+ * value, not jsmn's still-escaped token text — see json_str.h's header
+ * comment for why jstr_set() alone was a silent-transcription bug (a
+ * browser-sent `ab"cd` was being stored as the six bytes `ab\"cd`).
+ * Length policy: the DECODED length is checked against cap, because the
+ * decoded form is what actually gets stored — a 70-byte escaped span for a
+ * 40-byte string still fits a 48-byte field. For any value that contains no
+ * escapes, decoded length == raw length, so this behaves identically to
+ * jstr_set() for every caller migrating from it — no change for the common
+ * case, only for the one that used to be silently wrong. */
+static inline bool jstr_set_unescaped(const char *js, const jsmntok_t *t, int n, const char *key,
+                                      char *dst, size_t cap) {
+    int i = jfind(js, t, n, key);
+    if (i < 0 || t[i].type != JSMN_STRING) return false;
+    int len = t[i].end - t[i].start;
+    if (len < 0) return false;
+    return json_unescape(dst, cap, js + t[i].start, (size_t)len);
+}
+
 /* The OLD clamping string extractor, renamed from the original jstr_key() so
  * its truncating nature is visible at every call site instead of hiding
  * behind an innocuous name — that hidden truncation is exactly what e875365
@@ -192,7 +217,7 @@ static inline bool jip(const char *js, const jsmntok_t *t, int n, const char *ke
  * string was expected) — config.c's original get_str() treated that the same
  * way, and config-load degrading to "keep the default" for a malformed field
  * is consistent with how every other field there degrades. */
-typedef enum { JSTR_ABSENT, JSTR_OK, JSTR_TOO_LONG } jstr_status_t;
+typedef enum { JSTR_ABSENT, JSTR_OK, JSTR_TOO_LONG, JSTR_MALFORMED } jstr_status_t;
 
 static inline jstr_status_t jstr_get(const char *js, const jsmntok_t *t, int n,
                                      const char *key, char *dst, size_t cap) {
@@ -203,5 +228,34 @@ static inline jstr_status_t jstr_get(const char *js, const jsmntok_t *t, int n,
     if ((size_t)len >= cap) return JSTR_TOO_LONG;
     memcpy(dst, js + t[i].start, (size_t)len);
     dst[len] = '\0';
+    return JSTR_OK;
+}
+
+/* jstr_get()'s UNESCAPING twin, for the same config-LOAD use as jstr_get()
+ * (see its own comment above) but where the stored value went through
+ * json_escape() on the way out — i.e. every string field this file now
+ * saves via config_save(). Adds a 4th state jstr_get()'s three cannot
+ * express: a present, JSON-string-typed value whose escape sequences are
+ * broken (dangling backslash, bad \uXXXX, a lone surrogate) — JSTR_MALFORMED,
+ * distinct from JSTR_TOO_LONG so a caller can log the right diagnosis
+ * instead of "too long" for a field that decodes short but decodes wrong.
+ * config.c's config_load() treats JSTR_MALFORMED the same way it treats
+ * JSTR_TOO_LONG for each field kind (CFG_STR: warn + keep default; CFG_CRED:
+ * clear + fail closed, never fall back to the compiled admin/admin default —
+ * a damaged escape in a credential is exactly the "config file is damaged"
+ * case that rule exists for; CFG_HOSTNAME: warn + keep default). Absent, or
+ * present-but-wrong-type, is still JSTR_ABSENT — unchanged from jstr_get().
+ * Length policy matches jstr_set_unescaped(): the cap check is against the
+ * DECODED length, since that's what's actually stored. */
+static inline jstr_status_t jstr_get_unescaped(const char *js, const jsmntok_t *t, int n,
+                                               const char *key, char *dst, size_t cap) {
+    int i = jfind(js, t, n, key);
+    if (i < 0 || t[i].type != JSMN_STRING) return JSTR_ABSENT;
+    int len = t[i].end - t[i].start;
+    if (len < 0) return JSTR_ABSENT;
+    size_t need = json_unescape_core(NULL, 0, js + t[i].start, (size_t)len);
+    if (need == (size_t)-1) return JSTR_MALFORMED;
+    if (need >= cap) return JSTR_TOO_LONG;
+    if (!json_unescape(dst, cap, js + t[i].start, (size_t)len)) return JSTR_MALFORMED; /* can't happen, see json_unescape()'s own comment */
     return JSTR_OK;
 }

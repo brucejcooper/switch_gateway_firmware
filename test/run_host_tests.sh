@@ -20,7 +20,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 CC="${CC:-cc}"
 
-# All 14 tests currently compile warning-free under -Wall -Wextra, so
+# All 15 tests currently compile warning-free under -Wall -Wextra, so
 # warnings are treated as build failures (-Werror) to keep it that way.
 # If a future test needs to add a warning-producing header/pattern, drop
 # -Werror for that one row and note it here instead of loosening this for
@@ -91,6 +91,10 @@ TEST_SOURCES+=("fwupdate_test.c ../src/net/fwupdate.c")
 TEST_NAMES+=("http_client_test")
 TEST_FLAGS+=("-DHTTP_CLIENT_HOST_TEST -I ../src/net")
 TEST_SOURCES+=("http_client_test.c ../src/net/http_client.c")
+
+TEST_NAMES+=("json_str_test")
+TEST_FLAGS+=("-DJSMN_STATIC -I ../src -I ../lib/jsmn")
+TEST_SOURCES+=("json_str_test.c")
 
 TEST_NAMES+=("mbq_client_test")
 TEST_FLAGS+=("-DMBQ_CLIENT_HOST_TEST -I ../src")

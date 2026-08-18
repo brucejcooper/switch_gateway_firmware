@@ -765,7 +765,24 @@ static const char *reset_reason_str(uint8_t rr) {
     return "unknown";
 }
 
-static void json_escape(const char *in, char *out, size_t cap) {
+/* Renamed from json_escape() (its name since this file existed) to
+ * ha_escape_out() only to stop colliding with json_str.h's RFC-8259-exact
+ * json_escape() — jsmn_util.h now pulls that header in (for
+ * jstr_get_unescaped()) and both are file-scope in every TU that includes
+ * jsmn_util.h, so two `static` functions of the same name and different
+ * signatures no longer compile together. Purely a rename: this function's
+ * behaviour is untouched and deliberately stays lossier than json_escape()
+ * — it degrades a raw control byte to a space rather than a real \u00XX
+ * escape, and truncates the same way jstr_clamped() does rather than
+ * refusing to fit — because it is a best-effort OUTBOUND encoder for
+ * human-facing text (a release URL, a firmware note, a provisioning
+ * message) that already went through its own producer, not a boundary
+ * where a wrong or truncated byte can corrupt this device's own config or
+ * downgrade its auth. See json_str.h's header comment for why ha_bridge.c's
+ * INBOUND payload parsers are excluded from this pass entirely — this
+ * function is the one piece of this file the rename had to touch, and nothing
+ * about what it does. */
+static void ha_escape_out(const char *in, char *out, size_t cap) {
     size_t o = 0;
     for (; *in && o + 2 < cap; in++) {
         unsigned char c = (unsigned char)*in;
@@ -789,8 +806,8 @@ static char s_fw_pub_notes[256];
 static void pub_fw_state(void) {
     const char *P = mqtt_app_prefix();
     char rel[256], notes[512];
-    json_escape(fwupdate_release_url(), rel, sizeof rel);
-    json_escape(fwupdate_notes(), notes, sizeof notes);
+    ha_escape_out(fwupdate_release_url(), rel, sizeof rel);
+    ha_escape_out(fwupdate_notes(), notes, sizeof notes);
     /* OMIT release_url when we have none — do not publish "". HA validates the
      * field as a URL and an empty string fails, which makes it discard the WHOLE
      * payload ("Schema violation ... invalid url"), so installed_version and
@@ -1003,7 +1020,7 @@ void ha_bridge_publish_event(const ic_event_t *e) {
     }
     case IC_EVT_PROVISION: {
         char msg[2 * 80];
-        json_escape(e->provision.msg, msg, sizeof msg);
+        ha_escape_out(e->provision.msg, msg, sizeof msg);
         snprintf(top, sizeof top, "%s/provision/%u/status", P, e->provision.slave);
         snprintf(pl, sizeof pl, "{\"state\":\"%s\",\"msg\":\"%s\",\"devices_found\":%u}",
                  prov_state_name(e->provision.state), msg, e->provision.count);
