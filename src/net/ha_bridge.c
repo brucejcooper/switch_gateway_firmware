@@ -17,6 +17,7 @@
 #include "ha_bridge.h"
 #include "mqtt_app.h"
 #include "intercore.h"
+#include "config.h"      /* config_field_range() — CFG_SCHEMA is authoritative for cfg limits */
 #include "dali_provision.h"   /* prov_state_name */
 #include "web_state.h"   /* fan-out: feed the web read model from the event drain */
 #include "ping.h"        /* IC_EVT_PING_REQ is routed here, not published */
@@ -457,13 +458,22 @@ static void disc_gw_diag(uint8_t slave, uint8_t k) {
 /* Controller-config entities. The tables live at file scope and the step bounds
  * are DERIVED from their sizes rather than hardcoded (k < 4, k - 4, k == 6,
  * total 7), so adding a fifth number silently published nothing — the new entity
- * sat in the table but past the guard. */
-static const struct { const char *key, *name; int lo, hi, step; } CFG_NUM[] = {
-    { "long_press_ms",          "Long-Press (ms)",            100,   5000,   50 },
-    { "dim_repeat_ms",          "Dim Repeat (ms)",             50,   2000,   10 },
-    { "reversal_window_ms",     "Reversal Window (ms)",        50,   2000,   10 },
-    { "gw_diag_interval_ms",    "Gateway Diag Poll (ms)",       0, 600000, 1000 },
-    { "dali_sweep_interval_ms", "DALI Background Sweep (ms)",   0, 600000, 1000 },
+ * sat in the table but past the guard.
+ *
+ * lo/hi used to be hardcoded here — a second copy of the exact numbers
+ * CFG_SCHEMA (config.c) enforces, free to drift from it (and, before the
+ * schema existed, nothing enforced them at all: this table was pure UI
+ * decoration). disc_controller() now reads them from config_field_range()
+ * at publish time, so what HA advertises as the widget's min/max IS what
+ * config_apply_u32() will actually accept — one number, one place. step is
+ * left here: it is a pure UI increment with no enforcement counterpart in
+ * the schema. */
+static const struct { const char *key, *name; int step; } CFG_NUM[] = {
+    { "long_press_ms",          "Long-Press (ms)",             50 },
+    { "dim_repeat_ms",          "Dim Repeat (ms)",             10 },
+    { "reversal_window_ms",     "Reversal Window (ms)",        10 },
+    { "gw_diag_interval_ms",    "Gateway Diag Poll (ms)",    1000 },
+    { "dali_sweep_interval_ms", "DALI Background Sweep (ms)",1000 },
 };
 static const struct { const char *key, *name, *icon; } CFG_SENS[] = {
     { "fw_version", "Firmware",    "mdi:chip" },
@@ -493,13 +503,18 @@ static void disc_controller(uint8_t k) {
         return;
     }
     if (k < CFG_NUM_N) {
+        /* CFG_SCHEMA is authoritative (config.c); every CFG_NUM row names a
+         * schema key, so this lookup cannot fail in practice — 0/0 would only
+         * mean the two tables have drifted apart. */
+        uint32_t lo = 0, hi = 0;
+        config_field_range(CFG_NUM[k].key, &lo, &hi);
         int n = snprintf(s_pl, PL_CAP,
             "{\"unique_id\":\"%s_cfg_%s\",\"name\":\"%s\","
             "\"command_topic\":\"%s/config/%s/set\",\"state_topic\":\"%s/config/state\","
-            "\"value_template\":\"{{ value_json.%s }}\",\"min\":%d,\"max\":%d,\"step\":%d,"
+            "\"value_template\":\"{{ value_json.%s }}\",\"min\":%lu,\"max\":%lu,\"step\":%d,"
             "\"mode\":\"box\",\"availability_topic\":\"%s/availability\",\"entity_category\":\"config\"", idp(),
             CFG_NUM[k].key, CFG_NUM[k].name, P, CFG_NUM[k].key, P, CFG_NUM[k].key,
-            CFG_NUM[k].lo, CFG_NUM[k].hi, CFG_NUM[k].step, P);
+            (unsigned long)lo, (unsigned long)hi, CFG_NUM[k].step, P);
         dev_controller(n);
         snprintf(objid, sizeof objid, "%s_cfg_%s", idp(), CFG_NUM[k].key); pub_cfg("number", objid);
     } else {
@@ -1044,6 +1059,22 @@ void ha_bridge_publish_event(const ic_event_t *e) {
 /* ── inbound MQTT -> ic_cmd_t ────────────────────────────────────────────── */
 static uint8_t s_prov_target[MAX_DALI_SLAVES];
 
+/* Validate a parsed JSON/text integer against `key`'s CFG_SCHEMA range
+ * (config.c) BEFORE it is cast down into the u16/u32 set_cfg intercore
+ * field — this is the fix for the wrap that used to live here: a raw
+ * `(uint16_t)jint(...)` accepted anything, so a publish of
+ * long_press_ms=70000 silently became 4464 and got accepted as if it were a
+ * deliberate, in-range value. Negative input is rejected outright (never
+ * legal for any of these fields); an unrecognised key also fails closed
+ * (config_field_range() returns false) rather than being treated as
+ * unbounded. */
+static bool cfg_num_in_range(const char *key, long jv) {
+    if (jv < 0) return false;
+    uint32_t lo, hi;
+    if (!config_field_range(key, &lo, &hi)) return false;
+    return (uint32_t)jv >= lo && (uint32_t)jv <= hi;
+}
+
 static int split(char *s, char d, char **out, int max) {
     int n = 0;
     out[n++] = s;
@@ -1275,20 +1306,57 @@ static void ha_on_message(const char *topic, uint16_t tlen,
             jsmn_parser jp; jsmntok_t tk[24]; jsmn_init(&jp);
             int nt = jsmn_parse(&jp, pay, strlen(pay), tk, 24);
             int i;
-            if ((i = jfind(pay, tk, nt, "long_press_ms")) >= 0)      { c.set_cfg.fields |= IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = (uint16_t)jint(pay, &tk[i]); }
-            if ((i = jfind(pay, tk, nt, "dim_repeat_ms")) >= 0)      { c.set_cfg.fields |= IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = (uint16_t)jint(pay, &tk[i]); }
-            if ((i = jfind(pay, tk, nt, "reversal_window_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = (uint16_t)jint(pay, &tk[i]); }
+            /* Each numeric field is range-checked against its CFG_SCHEMA row
+             * (config.c) before the cast into the u16/u32 intercore field —
+             * this used to be a bare `(uint16_t)jint(...)`, which let e.g.
+             * long_press_ms=70000 wrap to 4464 and get accepted as if it were
+             * a deliberate value. Out of range: skip the field and log —
+             * this is a rare, user-initiated command (a config write), not
+             * the MQTT hot path, so LOG is fine here (see ha_on_message's
+             * existing "HA online" LOG_INFO on this same function). */
+            if ((i = jfind(pay, tk, nt, "long_press_ms")) >= 0) {
+                long jv = jint(pay, &tk[i]);
+                if (cfg_num_in_range("long_press_ms", jv)) { c.set_cfg.fields |= IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = (uint16_t)jv; }
+                else LOG_WARN("mqtt", "config/set long_press_ms out of range — field skipped");
+            }
+            if ((i = jfind(pay, tk, nt, "dim_repeat_ms")) >= 0) {
+                long jv = jint(pay, &tk[i]);
+                if (cfg_num_in_range("dim_repeat_ms", jv)) { c.set_cfg.fields |= IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = (uint16_t)jv; }
+                else LOG_WARN("mqtt", "config/set dim_repeat_ms out of range — field skipped");
+            }
+            if ((i = jfind(pay, tk, nt, "reversal_window_ms")) >= 0) {
+                long jv = jint(pay, &tk[i]);
+                if (cfg_num_in_range("reversal_window_ms", jv)) { c.set_cfg.fields |= IC_CFG_F_REVERSAL; c.set_cfg.reversal_window_ms = (uint16_t)jv; }
+                else LOG_WARN("mqtt", "config/set reversal_window_ms out of range — field skipped");
+            }
+            /* Boolean: no range to enforce, same as before. */
             if ((i = jfind(pay, tk, nt, "relay_byteswap")) >= 0)     { c.set_cfg.fields |= IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = jint(pay, &tk[i]) ? 1u : 0u; }
-            if ((i = jfind(pay, tk, nt, "gw_diag_interval_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_GW_DIAG; c.set_cfg.gw_diag_interval_ms = (uint32_t)jint(pay, &tk[i]); }
-            if ((i = jfind(pay, tk, nt, "dali_sweep_interval_ms")) >= 0) { c.set_cfg.fields |= IC_CFG_F_DALI_SWEEP; c.set_cfg.dali_sweep_interval_ms = (uint32_t)jint(pay, &tk[i]); }
+            if ((i = jfind(pay, tk, nt, "gw_diag_interval_ms")) >= 0) {
+                long jv = jint(pay, &tk[i]);
+                if (cfg_num_in_range("gw_diag_interval_ms", jv)) { c.set_cfg.fields |= IC_CFG_F_GW_DIAG; c.set_cfg.gw_diag_interval_ms = (uint32_t)jv; }
+                else LOG_WARN("mqtt", "config/set gw_diag_interval_ms out of range — field skipped");
+            }
+            if ((i = jfind(pay, tk, nt, "dali_sweep_interval_ms")) >= 0) {
+                long jv = jint(pay, &tk[i]);
+                if (cfg_num_in_range("dali_sweep_interval_ms", jv)) { c.set_cfg.fields |= IC_CFG_F_DALI_SWEEP; c.set_cfg.dali_sweep_interval_ms = (uint32_t)jv; }
+                else LOG_WARN("mqtt", "config/set dali_sweep_interval_ms out of range — field skipped");
+            }
         } else if (ns >= 3 && !strcmp(seg[2], "set")) {
-            uint16_t v = (uint16_t)atoi(pay); const char *f = seg[1];
-            if      (!strcmp(f, "long_press_ms"))      { c.set_cfg.fields = IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = v; }
-            else if (!strcmp(f, "dim_repeat_ms"))      { c.set_cfg.fields = IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = v; }
-            else if (!strcmp(f, "reversal_window_ms")) { c.set_cfg.fields = IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = v; }
-            else if (!strcmp(f, "relay_byteswap"))     { c.set_cfg.fields = IC_CFG_F_RELAY_BYTESWAP; c.set_cfg.relay_byteswap = v ? 1u : 0u; }
-            else if (!strcmp(f, "gw_diag_interval_ms")) { c.set_cfg.fields = IC_CFG_F_GW_DIAG; c.set_cfg.gw_diag_interval_ms = (uint32_t)strtoul(pay, NULL, 10); }
-            else if (!strcmp(f, "dali_sweep_interval_ms")) { c.set_cfg.fields = IC_CFG_F_DALI_SWEEP; c.set_cfg.dali_sweep_interval_ms = (uint32_t)strtoul(pay, NULL, 10); }
+            const char *f = seg[1];
+            char *e; long jv = strtol(pay, &e, 10);
+            bool have_num = (e != pay);
+            if (!strcmp(f, "relay_byteswap")) {
+                c.set_cfg.fields = IC_CFG_F_RELAY_BYTESWAP;
+                c.set_cfg.relay_byteswap = atoi(pay) ? 1u : 0u;   /* boolean: no range */
+            } else if (have_num && cfg_num_in_range(f, jv)) {
+                if      (!strcmp(f, "long_press_ms"))          { c.set_cfg.fields = IC_CFG_F_LONG_PRESS; c.set_cfg.long_press_ms = (uint16_t)jv; }
+                else if (!strcmp(f, "dim_repeat_ms"))          { c.set_cfg.fields = IC_CFG_F_DIM_REPEAT; c.set_cfg.dim_repeat_ms = (uint16_t)jv; }
+                else if (!strcmp(f, "reversal_window_ms"))     { c.set_cfg.fields = IC_CFG_F_REVERSAL;   c.set_cfg.reversal_window_ms = (uint16_t)jv; }
+                else if (!strcmp(f, "gw_diag_interval_ms"))    { c.set_cfg.fields = IC_CFG_F_GW_DIAG;    c.set_cfg.gw_diag_interval_ms = (uint32_t)jv; }
+                else if (!strcmp(f, "dali_sweep_interval_ms")) { c.set_cfg.fields = IC_CFG_F_DALI_SWEEP; c.set_cfg.dali_sweep_interval_ms = (uint32_t)jv; }
+            } else if (have_num) {
+                LOG_WARN("mqtt", "config/%s/set out of range — field skipped", f);
+            }
         }
         if (c.set_cfg.fields) ic_push_cmd(&c);
         return;

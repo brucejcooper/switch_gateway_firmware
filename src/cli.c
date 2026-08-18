@@ -36,7 +36,6 @@
 #include "mapping.h"
 #include "button_fsm.h"
 #include "config.h"
-#include "strfit.h"   /* str_set()/STR_MAX_LEN() — the shared fits-or-fails rule */
 #include "state_cache.h"
 #include "button_actions.h"
 #include "net/ha_bridge.h"
@@ -941,6 +940,30 @@ static void cmd_tombstone(char **saveptr) {
  * keys: long_press_ms dim_repeat_ms reversal_window_ms baud fw_url (reboot to apply)
  *       relay_slaves=1,2  dali_slaves=2,3  (comma lists, reboot to apply — see
  *       config.h's pending_relay/dali_slave_* fields). fw_version is read-only. */
+/* Parse `val` as decimal and route it through config_apply_u32(key, ...),
+ * printing the CLI's usual err: line (naming the real range, not just that
+ * the value was rejected) and returning false on failure. `key` must be one
+ * of CFG_SCHEMA's numeric/bool keys — every call site below only reaches this
+ * after its own strcasecmp has matched one, so UNKNOWN_KEY/INVALID here would
+ * mean this file and config.c's schema have drifted apart; fail closed rather
+ * than silently accept if that ever happens. Shared by cmd_cfg (long_press_ms
+ * etc.) and cmd_mqtt (port) so the error text is written once. */
+static bool cfg_apply_numeric_cli(const char *key, const char *val) {
+    uint32_t u = (uint32_t)strtoul(val, NULL, 10);
+    cfg_apply_result_t r = config_apply_u32(key, u);
+    if (r == CFG_APPLY_OK) return true;
+    if (r == CFG_APPLY_OUT_OF_RANGE) {
+        uint32_t mn = 0, mx = 0;
+        config_field_range(key, &mn, &mx);
+        char msg[64];
+        snprintf(msg, sizeof msg, "%s_out_of_range (%lu..%lu)", key, (unsigned long)mn, (unsigned long)mx);
+        txt_err(msg);
+    } else {
+        txt_err("bad_field");
+    }
+    return false;
+}
+
 static void cmd_cfg(char **saveptr) {
     char *kv = strtok_r(NULL, " \t", saveptr);
     if (!kv) { emit_state_cfg(); txt_ok(); return; }
@@ -950,14 +973,19 @@ static void cmd_cfg(char **saveptr) {
         if (!eq) { txt_err("bad_arg expected key=value"); return; }
         *eq = '\0';
         const char *key = kv, *val = eq + 1;
-        if      (strcasecmp(key, "long_press_ms") == 0)      g_config.long_press_ms = (uint16_t)atoi(val);
-        else if (strcasecmp(key, "dim_repeat_ms") == 0)      g_config.dim_repeat_ms = (uint16_t)atoi(val);
-        else if (strcasecmp(key, "reversal_window_ms") == 0) g_config.reversal_window_ms = (uint16_t)atoi(val);
-        else if (strcasecmp(key, "gw_diag_interval_ms") == 0) g_config.gw_diag_interval_ms = (uint32_t)strtoul(val, NULL, 10);
-        else if (strcasecmp(key, "dali_sweep_interval_ms") == 0) g_config.dali_sweep_interval_ms = (uint32_t)strtoul(val, NULL, 10);
+        /* Schema-covered numerics: config_apply_u32() enforces CFG_SCHEMA's
+         * range (config.c) — previously atoi() with no bound at all, so e.g.
+         * long_press_ms=70000 silently wrapped to 4464 downstream. */
+        if      (strcasecmp(key, "long_press_ms") == 0)          { if (!cfg_apply_numeric_cli("long_press_ms", val)) return; }
+        else if (strcasecmp(key, "dim_repeat_ms") == 0)          { if (!cfg_apply_numeric_cli("dim_repeat_ms", val)) return; }
+        else if (strcasecmp(key, "reversal_window_ms") == 0)     { if (!cfg_apply_numeric_cli("reversal_window_ms", val)) return; }
+        else if (strcasecmp(key, "gw_diag_interval_ms") == 0)    { if (!cfg_apply_numeric_cli("gw_diag_interval_ms", val)) return; }
+        else if (strcasecmp(key, "dali_sweep_interval_ms") == 0) { if (!cfg_apply_numeric_cli("dali_sweep_interval_ms", val)) return; }
         else if (strcasecmp(key, "baud") == 0)               modbus_set_baud((uint32_t)atoi(val));
-        else if (strcasecmp(key, "relay_byteswap") == 0)
-            g_config.relay_byteswap = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
+        else if (strcasecmp(key, "relay_byteswap") == 0) {
+            uint32_t u = (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0) ? 1u : 0u;
+            config_apply_u32("relay_byteswap", u);   /* CFG_BOOL: always CFG_APPLY_OK */
+        }
         else if (strcasecmp(key, "relay_slaves") == 0) {
             /* Persist-only, reboot-to-apply — see the field comment in config.h.
              * Consumers bind slave_id -> array index at boot, so rewriting the
@@ -973,9 +1001,11 @@ static void cmd_cfg(char **saveptr) {
             deferred = true;
         }
         else if (strcasecmp(key, "fw_url") == 0) {
-            /* empty value clears the override (compiled-in default applies) */
-            if (!str_set(g_config.fw_url, sizeof g_config.fw_url, val)) {
-                txt_err_len("fw_url", STR_MAX_LEN(sizeof g_config.fw_url)); return;
+            /* empty value clears the override (compiled-in default applies) —
+             * config_apply_str()'s CFG_STR case allows an empty string, same
+             * as the str_set() call this replaces. */
+            if (config_apply_str("fw_url", val) != CFG_APPLY_OK) {
+                txt_err_len("fw_url", config_field_maxlen("fw_url")); return;
             }
             /* fwupdate.c reads this from the intercore snapshot, which is built
              * once at core1_launch — so the new URL is not live until a reboot.
@@ -1806,16 +1836,19 @@ static void cmd_mqtt(char **sp) {
     while ((tok = strtok_r(NULL, " \t", sp))) {
         char *eq = strchr(tok, '='); if (!eq) continue;
         *eq = '\0'; const char *k = tok, *v = eq + 1;
-        /* str_set() refuses rather than truncates, and always terminates —
-         * these four used strncpy(dst, v, sizeof dst - 1) with no explicit
-         * NUL, safe only because the field's last byte happened never to be
-         * written non-zero. The error names the real limit so "too long" does
-         * not leave the user guessing where the boundary is. */
-        if      (!strcasecmp(k, "host"))   { if (!str_set(g_config.mqtt_host,   sizeof g_config.mqtt_host,   v)) { txt_err_len("host",   STR_MAX_LEN(sizeof g_config.mqtt_host));   return; } any = true; }
-        else if (!strcasecmp(k, "port"))   { g_config.mqtt_port = (uint16_t)atoi(v);                            any = true; }
-        else if (!strcasecmp(k, "user"))   { if (!str_set(g_config.mqtt_user,   sizeof g_config.mqtt_user,   v)) { txt_err_len("user",   STR_MAX_LEN(sizeof g_config.mqtt_user));   return; } any = true; }
-        else if (!strcasecmp(k, "pass"))   { if (!str_set(g_config.mqtt_pass,   sizeof g_config.mqtt_pass,   v)) { txt_err_len("pass",   STR_MAX_LEN(sizeof g_config.mqtt_pass));   return; } any = true; }
-        else if (!strcasecmp(k, "prefix")) { if (!str_set(g_config.mqtt_prefix, sizeof g_config.mqtt_prefix, v)) { txt_err_len("prefix", STR_MAX_LEN(sizeof g_config.mqtt_prefix)); return; } any = true; }
+        /* config_apply_str() refuses rather than truncates (strfit.h's rule),
+         * and always terminates — these four used strncpy(dst, v, sizeof dst
+         * - 1) with no explicit NUL, safe only because the field's last byte
+         * happened never to be written non-zero. The error names the real
+         * limit so "too long" does not leave the user guessing where the
+         * boundary is. `port` now goes through config_apply_u32() the same
+         * way — previously a bare atoi() accepted anything, including 0 or a
+         * value that silently wrapped past 65535 through the uint16_t cast. */
+        if      (!strcasecmp(k, "host"))   { if (config_apply_str("mqtt_host",   v) != CFG_APPLY_OK) { txt_err_len("host",   config_field_maxlen("mqtt_host"));   return; } any = true; }
+        else if (!strcasecmp(k, "port"))   { if (!cfg_apply_numeric_cli("mqtt_port", v)) return; any = true; }
+        else if (!strcasecmp(k, "user"))   { if (config_apply_str("mqtt_user",   v) != CFG_APPLY_OK) { txt_err_len("user",   config_field_maxlen("mqtt_user"));   return; } any = true; }
+        else if (!strcasecmp(k, "pass"))   { if (config_apply_str("mqtt_pass",   v) != CFG_APPLY_OK) { txt_err_len("pass",   config_field_maxlen("mqtt_pass"));   return; } any = true; }
+        else if (!strcasecmp(k, "prefix")) { if (config_apply_str("mqtt_prefix", v) != CFG_APPLY_OK) { txt_err_len("prefix", config_field_maxlen("mqtt_prefix")); return; } any = true; }
         else { txt_err("bad_key"); return; }
     }
     if (!any) { txt_err("no_fields"); return; }
@@ -1870,7 +1903,9 @@ static void cmd_net(char **sp) {
         else if (!strcasecmp(k, "gw"))   { if (!parse_ip4(v, g_config.net_gw))   { txt_err("bad_ip"); return; } any = true; }
         else if (!strcasecmp(k, "dns"))  { if (!parse_ip4(v, g_config.net_dns))  { txt_err("bad_ip"); return; } any = true; }
         else if (!strcasecmp(k, "hostname")) {
-            if (!config_hostname_set(g_config.net_hostname, sizeof g_config.net_hostname, v)) {
+            /* config_apply_str()'s CFG_HOSTNAME row calls config_hostname_set()
+             * itself — same charset/lowercasing rule, same error either way. */
+            if (config_apply_str("net_hostname", v) != CFG_APPLY_OK) {
                 txt_err("bad_hostname"); return;
             }
             any = true;

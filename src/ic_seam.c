@@ -441,13 +441,30 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
     }
     case IC_CMD_SET_CFG: {
         bool any = false;
-        if (c->set_cfg.fields & IC_CFG_F_LONG_PRESS) { g_config.long_press_ms      = c->set_cfg.long_press_ms;      any = true; }
-        if (c->set_cfg.fields & IC_CFG_F_DIM_REPEAT) { g_config.dim_repeat_ms      = c->set_cfg.dim_repeat_ms;      any = true; }
-        if (c->set_cfg.fields & IC_CFG_F_REVERSAL)   { g_config.reversal_window_ms = c->set_cfg.reversal_window_ms; any = true; }
+        /* Schema-covered numerics/bool route through config_apply_u32(), which
+         * range-checks against CFG_SCHEMA (config.c) before writing — this is
+         * the backstop layer: the CLI/HTTP-API/ha_bridge callers already
+         * range-check their own way in, but this seam is the single writer of
+         * g_config and a future core-1 producer could skip that check, so an
+         * out-of-range value is skipped (not clamped or wrapped) and logged,
+         * matching the hostname/mqtt-string backstop pattern below. */
+        #define APPLY_CFG_U32(FLAG, KEY, VAL) do {                                  \
+            if (c->set_cfg.fields & (FLAG)) {                                       \
+                cfg_apply_result_t r = config_apply_u32((KEY), (VAL));              \
+                if (r == CFG_APPLY_OK) any = true;                                  \
+                else if (r == CFG_APPLY_OUT_OF_RANGE)                               \
+                    LOG_WARN("cli", "ic set_cfg: " KEY " out of range — field skipped"); \
+            } } while (0)
+        APPLY_CFG_U32(IC_CFG_F_LONG_PRESS,      "long_press_ms",          c->set_cfg.long_press_ms);
+        APPLY_CFG_U32(IC_CFG_F_DIM_REPEAT,      "dim_repeat_ms",          c->set_cfg.dim_repeat_ms);
+        APPLY_CFG_U32(IC_CFG_F_REVERSAL,        "reversal_window_ms",     c->set_cfg.reversal_window_ms);
+        APPLY_CFG_U32(IC_CFG_F_RELAY_BYTESWAP,  "relay_byteswap",        c->set_cfg.relay_byteswap);
+        APPLY_CFG_U32(IC_CFG_F_GW_DIAG,          "gw_diag_interval_ms",    c->set_cfg.gw_diag_interval_ms);
+        APPLY_CFG_U32(IC_CFG_F_DALI_SWEEP,       "dali_sweep_interval_ms", c->set_cfg.dali_sweep_interval_ms);
+        #undef APPLY_CFG_U32
+        /* baud is not in CFG_SCHEMA — modbus_set_baud() owns its own divisor
+         * validity, unchanged. */
         if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
-        if (c->set_cfg.fields & IC_CFG_F_RELAY_BYTESWAP) { g_config.relay_byteswap = c->set_cfg.relay_byteswap ? true : false; any = true; }
-        if (c->set_cfg.fields & IC_CFG_F_GW_DIAG)    { g_config.gw_diag_interval_ms = c->set_cfg.gw_diag_interval_ms; any = true; }
-        if (c->set_cfg.fields & IC_CFG_F_DALI_SWEEP) { g_config.dali_sweep_interval_ms = c->set_cfg.dali_sweep_interval_ms; any = true; }
         if (any && !config_save()) LOG_ERR("cli", "config_save failed — set_cfg not persisted");
         /* de_mode applies live and self-persists; keep it out of the `any` save. */
         if ((c->set_cfg.fields & IC_CFG_F_DE_MODE) && c->set_cfg.de_mode < MODBUS_DE_MAX)
@@ -467,10 +484,11 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
          * command can also arrive from a future core-1 producer that hasn't
          * checked. Keep the gate, and say so when it fires — silently dropping
          * the field while config_save() below still reported success is what
-         * made a rejected hostname look like it had been applied. */
+         * made a rejected hostname look like it had been applied. Routed
+         * through config_apply_str()'s CFG_HOSTNAME row, which is exactly
+         * config_hostname_set() underneath. */
         if (f & IC_NET_F_HOSTNAME) {
-            if (!config_hostname_set(g_config.net_hostname, sizeof g_config.net_hostname,
-                                     c->set_netcfg.hostname))
+            if (config_apply_str("net_hostname", c->set_netcfg.hostname) != CFG_APPLY_OK)
                 LOG_WARN("cli", "ignored invalid hostname from web/API");
         }
         if (f && !config_save()) LOG_ERR("cli", "config_save failed — netcfg not persisted");
@@ -482,14 +500,17 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
      * source fields are the same size as the destinations — so a value can
      * only fail here if a future core-1 producer skips that check. Refuse and
      * LOG rather than truncate: a silently shortened password or prefix saves,
-     * reports success, and then simply does not work. */
+     * reports success, and then simply does not work. Routed through
+     * config_apply_str()/config_apply_u32() (config.c) instead of str_set()
+     * directly, so this backstop enforces the SAME rule (including mqtt_port's
+     * range, previously unchecked here) as every other writer. */
     case IC_CMD_SET_MQTTCFG: {
         uint16_t f = c->set_mqttcfg.fields;
-        if (f & IC_MQTT_F_HOST)   { if (!str_set(g_config.mqtt_host,   sizeof g_config.mqtt_host,   c->set_mqttcfg.host))   LOG_WARN("cli", "ignored over-long mqtt host from web/API"); }
-        if (f & IC_MQTT_F_PORT)   g_config.mqtt_port = c->set_mqttcfg.port;
-        if (f & IC_MQTT_F_USER)   { if (!str_set(g_config.mqtt_user,   sizeof g_config.mqtt_user,   c->set_mqttcfg.user))   LOG_WARN("cli", "ignored over-long mqtt user from web/API"); }
-        if (f & IC_MQTT_F_PASS)   { if (!str_set(g_config.mqtt_pass,   sizeof g_config.mqtt_pass,   c->set_mqttcfg.pass))   LOG_WARN("cli", "ignored over-long mqtt pass from web/API"); }
-        if (f & IC_MQTT_F_PREFIX) { if (!str_set(g_config.mqtt_prefix, sizeof g_config.mqtt_prefix, c->set_mqttcfg.prefix)) LOG_WARN("cli", "ignored over-long mqtt prefix from web/API"); }
+        if (f & IC_MQTT_F_HOST)   { if (config_apply_str("mqtt_host",   c->set_mqttcfg.host)   != CFG_APPLY_OK) LOG_WARN("cli", "ignored over-long mqtt host from web/API"); }
+        if (f & IC_MQTT_F_PORT)   { if (config_apply_u32("mqtt_port", c->set_mqttcfg.port)      != CFG_APPLY_OK) LOG_WARN("cli", "ignored out-of-range mqtt port from web/API"); }
+        if (f & IC_MQTT_F_USER)   { if (config_apply_str("mqtt_user",   c->set_mqttcfg.user)   != CFG_APPLY_OK) LOG_WARN("cli", "ignored over-long mqtt user from web/API"); }
+        if (f & IC_MQTT_F_PASS)   { if (config_apply_str("mqtt_pass",   c->set_mqttcfg.pass)   != CFG_APPLY_OK) LOG_WARN("cli", "ignored over-long mqtt pass from web/API"); }
+        if (f & IC_MQTT_F_PREFIX) { if (config_apply_str("mqtt_prefix", c->set_mqttcfg.prefix) != CFG_APPLY_OK) LOG_WARN("cli", "ignored over-long mqtt prefix from web/API"); }
         if (f && !config_save()) LOG_ERR("cli", "config_save failed — mqttcfg not persisted");
         break;
     }
@@ -497,16 +518,27 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         /* Both or neither, via temporaries: a half-applied credential change
          * (new user kept, new password refused) would lock the operator out
          * just as effectively as a truncated one, and writing straight into
-         * g_config would do exactly that — str_set() commits the first field
-         * before the second is ever judged. */
+         * g_config would do exactly that — config_apply_str() commits the
+         * first field before the second is ever judged. Length-validate both
+         * into temporaries first (str_set(), same as before); only once BOTH
+         * fit does either get written, and that write goes through
+         * config_apply_str() so the actual commit shares the same code path
+         * (and CFG_CRED's empty-value guard) every other credential write
+         * uses. Neither config_apply_str() call below can fail in practice —
+         * the temporaries are already length-checked, and /api/auth already
+         * refuses an empty user/pass before this command is ever built — but
+         * it is still checked rather than assumed. */
         { char u[sizeof g_config.web_user], p[sizeof g_config.web_pass];
           if (!str_set(u, sizeof u, c->set_auth.user) ||
               !str_set(p, sizeof p, c->set_auth.pass)) {
               LOG_WARN("cli", "ignored over-long web credential from web/API");
               break;
           }
-          memcpy(g_config.web_user, u, sizeof u);
-          memcpy(g_config.web_pass, p, sizeof p); }
+          if (config_apply_str("web_user", u) != CFG_APPLY_OK ||
+              config_apply_str("web_pass", p) != CFG_APPLY_OK) {
+              LOG_WARN("cli", "web credential apply failed unexpectedly");
+              break;
+          } }
         if (!config_save()) LOG_ERR("cli", "config_save failed — web auth not persisted");
         break;
     case IC_CMD_SET_MAPPING: {

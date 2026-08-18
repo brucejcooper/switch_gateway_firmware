@@ -111,6 +111,56 @@ bool config_hostname_ok(const char *s);
  * shows in local DNS are all the same string. */
 bool config_hostname_set(char *dst, size_t cap, const char *src);
 
+/* ── Config field schema — the single writer-side rule for every field ─────
+ * See config.c's CFG_SCHEMA[] for the field table itself (name, storage
+ * offset, limits) and the drift story that made it necessary: the same
+ * "long_press_ms is 100..5000" rule used to live as a UI hint in
+ * ha_bridge.c's CFG_NUM[] (never enforced), a raw (uint16_t) cast in the same
+ * file's MQTT parse (silently wrapped an out-of-range value), and an
+ * unchecked atoi() in cli.c's cmd_cfg — three copies, none of them agreeing,
+ * none of them actually bounding anything. Every writer (CLI, the intercore
+ * command dispatch, the on-board HTTP API, ha_bridge's MQTT parse) now
+ * funnels through the two apply functions below instead of hand-rolling its
+ * own parse-and-poke. */
+typedef enum {
+    CFG_APPLY_OK,             /* validated and written to g_config */
+    CFG_APPLY_UNKNOWN_KEY,    /* no schema row named `key` */
+    CFG_APPLY_OUT_OF_RANGE,   /* numeric value outside the schema row's min/max */
+    CFG_APPLY_TOO_LONG,       /* string value does not fit the field (strfit.h rule) */
+    CFG_APPLY_INVALID,        /* wrong-kind API for this key, or a hostname/credential
+                                * that failed its own rule (bad label; empty credential) */
+} cfg_apply_result_t;
+
+/* Validate + write a numeric or bool field, addressed by its schema key
+ * (e.g. "long_press_ms", "mqtt_port", "relay_byteswap"). Range-checked
+ * against the schema row before anything is written — out of range leaves
+ * g_config untouched. CORE-0-ONLY: writes g_config, the single-writer struct
+ * core 0 owns. */
+cfg_apply_result_t config_apply_u32(const char *key, uint32_t value);
+
+/* Validate + write a string, hostname, or credential field, addressed by its
+ * schema key (e.g. "mqtt_host", "net_hostname", "web_user"). A too-long value
+ * (CFG_STR/CFG_CRED) or an invalid label (CFG_HOSTNAME, via
+ * config_hostname_set()) leaves g_config untouched. A credential field
+ * additionally refuses an empty value (CFG_APPLY_INVALID) — today's rule for
+ * a web-credential write; the both-or-neither pairing for a full
+ * user+pass change stays in ic_seam.c, not here. CORE-0-ONLY: writes
+ * g_config. */
+cfg_apply_result_t config_apply_str(const char *key, const char *value);
+
+/* Pure lookup: the [min,max] a numeric schema field enforces, or false if
+ * `key` names no numeric field. Touches only the read-only schema table, so
+ * unlike the two functions above this is safe to call from EITHER core —
+ * e.g. so ha_bridge.c's HA-discovery number entities (core 1) advertise the
+ * exact bounds config_apply_u32() (core 0) enforces, instead of a second,
+ * driftable copy of the same numbers. */
+bool config_field_range(const char *key, uint32_t *min, uint32_t *max);
+
+/* Pure lookup: the longest value (NUL excluded) a string/hostname/credential
+ * schema field will accept, or 0 if `key` names no such field. Same
+ * either-core safety as config_field_range(). */
+unsigned config_field_maxlen(const char *key);
+
 typedef enum {
     SLAVE_KIND_UNKNOWN = 0,
     SLAVE_KIND_RELAY,

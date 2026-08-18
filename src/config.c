@@ -55,6 +55,144 @@ bool config_hostname_set(char *dst, size_t cap, const char *src) {
     return true;
 }
 
+/* ── Config field schema ─────────────────────────────────────────────────
+ * One row per field = one place that knows its name, storage, and limits.
+ * Before this table, the same rule was duplicated and drifted: ha_bridge.c's
+ * CFG_NUM[] declared long_press_ms/dim_repeat_ms/etc.'s ranges, but only as a
+ * min/max HINT for Home Assistant's number-entity widget — nothing in the
+ * firmware actually enforced them. The same file's MQTT parse cast straight
+ * into the u16 intercore field with `(uint16_t)jint(...)`, so a raw publish
+ * of long_press_ms=70000 silently wrapped to 4464 and got stored. cli.c's
+ * `cfg` verb used plain atoi() with no bound at all. Three copies of "what is
+ * a legal long_press_ms", none of them agreeing, and only one of them (the HA
+ * hint) written down anywhere.
+ *
+ * offset is offsetof(global_config_t, field) — the row IS the field's storage
+ * location, so config_apply_u32()/config_apply_str() below can write through
+ * a `(char *)&g_config + offset` cast instead of a hand-written switch over
+ * every field name. size is the destination buffer's sizeof (strings only —
+ * strfit.h's "fits or fails" cap); min/max are the enforced range (numerics
+ * only). Making the ranges enforced for the first time (rather than just
+ * advertised) is a deliberate behaviour change — see config_load()'s comment
+ * and the schema task's report for the full list.
+ *
+ * Deliberately NOT in this table (existing hand-written code stays exactly as
+ * it is): baud (modbus_set_baud() owns the UART divisor + live-apply logic),
+ * de_mode (live-apply + self-persist), relay_slaves/dali_slaves (pending,
+ * reboot-to-apply rewrite machinery — see the field comment in config.h),
+ * net_ip/mask/gw/dns (dotted-quad quartets via jip(), not a single scalar). */
+typedef enum {
+    CFG_U16,
+    CFG_U32,
+    CFG_BOOL,
+    CFG_STR,
+    CFG_HOSTNAME,
+    CFG_CRED,
+} cfg_kind_t;
+
+typedef struct {
+    const char *key;    /* the JSON/CLI field name — same string every layer uses */
+    cfg_kind_t  kind;
+    size_t      offset; /* offsetof(global_config_t, field) */
+    size_t      size;   /* strings: sizeof(field), the strfit.h cap; numerics: unused */
+    uint32_t    min, max; /* numerics only (CFG_U16/CFG_U32); ignored otherwise */
+} cfg_field_t;
+
+static const cfg_field_t CFG_SCHEMA[] = {
+    /* numerics — min/max are what CFG_NUM[] (ha_bridge.c) has always
+     * advertised to HA; they become enforced here for the first time. */
+    { "long_press_ms",          CFG_U16, offsetof(global_config_t, long_press_ms),          0, 100,   5000   },
+    { "dim_repeat_ms",          CFG_U16, offsetof(global_config_t, dim_repeat_ms),          0, 50,    2000   },
+    { "reversal_window_ms",     CFG_U16, offsetof(global_config_t, reversal_window_ms),     0, 50,    2000   },
+    { "gw_diag_interval_ms",    CFG_U32, offsetof(global_config_t, gw_diag_interval_ms),    0, 0,     600000 },
+    { "dali_sweep_interval_ms", CFG_U32, offsetof(global_config_t, dali_sweep_interval_ms), 0, 0,     600000 },
+    { "mqtt_port",              CFG_U16, offsetof(global_config_t, mqtt_port),              0, 1,     65535  },
+
+    /* bool */
+    { "relay_byteswap", CFG_BOOL, offsetof(global_config_t, relay_byteswap), 0, 0, 1 },
+
+    /* ordinary strings — too long keeps the compiled default (LOAD_STR rule) */
+    { "mqtt_host",   CFG_STR, offsetof(global_config_t, mqtt_host),   sizeof g_config.mqtt_host,   0, 0 },
+    { "mqtt_user",   CFG_STR, offsetof(global_config_t, mqtt_user),   sizeof g_config.mqtt_user,   0, 0 },
+    { "mqtt_pass",   CFG_STR, offsetof(global_config_t, mqtt_pass),   sizeof g_config.mqtt_pass,   0, 0 },
+    { "mqtt_prefix", CFG_STR, offsetof(global_config_t, mqtt_prefix), sizeof g_config.mqtt_prefix, 0, 0 },
+    { "fw_url",      CFG_STR, offsetof(global_config_t, fw_url),      sizeof g_config.fw_url,      0, 0 },
+
+    /* hostname — config_hostname_set() owns the charset + lowercasing rule */
+    { "net_hostname", CFG_HOSTNAME, offsetof(global_config_t, net_hostname), sizeof g_config.net_hostname, 0, 0 },
+
+    /* credentials — too long fails CLOSED on load (LOAD_CRED rule below);
+     * an empty value is refused on apply (see config_apply_str()). */
+    { "web_user", CFG_CRED, offsetof(global_config_t, web_user), sizeof g_config.web_user, 0, 0 },
+    { "web_pass", CFG_CRED, offsetof(global_config_t, web_pass), sizeof g_config.web_pass, 0, 0 },
+};
+#define CFG_SCHEMA_N (sizeof CFG_SCHEMA / sizeof CFG_SCHEMA[0])
+
+static const cfg_field_t *cfg_field_find(const char *key) {
+    if (!key) return NULL;
+    for (size_t i = 0; i < CFG_SCHEMA_N; i++)
+        if (strcmp(CFG_SCHEMA[i].key, key) == 0) return &CFG_SCHEMA[i];
+    return NULL;
+}
+
+cfg_apply_result_t config_apply_u32(const char *key, uint32_t value) {
+    const cfg_field_t *f = cfg_field_find(key);
+    if (!f) return CFG_APPLY_UNKNOWN_KEY;
+    void *p = (char *)&g_config + f->offset;
+    switch (f->kind) {
+    case CFG_U16:
+        if (value < f->min || value > f->max) return CFG_APPLY_OUT_OF_RANGE;
+        *(uint16_t *)p = (uint16_t)value;
+        return CFG_APPLY_OK;
+    case CFG_U32:
+        if (value < f->min || value > f->max) return CFG_APPLY_OUT_OF_RANGE;
+        *(uint32_t *)p = value;
+        return CFG_APPLY_OK;
+    case CFG_BOOL:
+        /* No range to enforce — any nonzero value is "on", same as the
+         * hand-written `v ? true : false` every caller used before. */
+        *(bool *)p = value ? true : false;
+        return CFG_APPLY_OK;
+    default:
+        return CFG_APPLY_INVALID;  /* a string-kind key used with the numeric API */
+    }
+}
+
+cfg_apply_result_t config_apply_str(const char *key, const char *value) {
+    if (!value) return CFG_APPLY_INVALID;
+    const cfg_field_t *f = cfg_field_find(key);
+    if (!f) return CFG_APPLY_UNKNOWN_KEY;
+    char *dst = (char *)&g_config + f->offset;
+    switch (f->kind) {
+    case CFG_STR:
+        return str_set(dst, f->size, value) ? CFG_APPLY_OK : CFG_APPLY_TOO_LONG;
+    case CFG_CRED:
+        /* A blank credential is never a legitimate write — refusing it here
+         * backstops every caller, the same way the both-or-neither pairing
+         * in ic_seam.c's IC_CMD_SET_AUTH backstops a half-applied change. */
+        if (!value[0]) return CFG_APPLY_INVALID;
+        return str_set(dst, f->size, value) ? CFG_APPLY_OK : CFG_APPLY_TOO_LONG;
+    case CFG_HOSTNAME:
+        return config_hostname_set(dst, f->size, value) ? CFG_APPLY_OK : CFG_APPLY_INVALID;
+    default:
+        return CFG_APPLY_INVALID;  /* a numeric-kind key used with the string API */
+    }
+}
+
+bool config_field_range(const char *key, uint32_t *min, uint32_t *max) {
+    const cfg_field_t *f = cfg_field_find(key);
+    if (!f || (f->kind != CFG_U16 && f->kind != CFG_U32)) return false;
+    if (min) *min = f->min;
+    if (max) *max = f->max;
+    return true;
+}
+
+unsigned config_field_maxlen(const char *key) {
+    const cfg_field_t *f = cfg_field_find(key);
+    if (!f || (f->kind != CFG_STR && f->kind != CFG_CRED && f->kind != CFG_HOSTNAME)) return 0;
+    return STR_MAX_LEN(f->size);
+}
+
 slave_kind_t slave_kind(uint8_t slave_id) {
     if (slave_id == 0) return SLAVE_KIND_UNKNOWN;  /* broadcast */
     for (int i = 0; i < g_config.relay_slave_count; i++)
@@ -156,37 +294,17 @@ static bool migrate_legacy_modbus(void) {
     return changed;
 }
 
-/* Load one string field STRICTLY, straight into g_config.field. jstr_get()
- * (jsmn_util.h) already IS the "fits-or-fails, dst untouched otherwise"
- * extractor — jsmn knows the token's true length, so it can compare directly
- * against the destination field's own cap and refuse before copying a byte.
- * That replaces the old load_str()/tmp[192] two-step (read into an
- * oversized scratch buffer, then let str_set() judge whether it fits the
- * real field): with a three-state extractor there is nothing left for the
- * second step to do. Values written by config_save() always fit by
- * construction, so JSTR_TOO_LONG here only ever means a hand-edited or
- * damaged file — but silently substituting a shorter value is exactly the
- * failure this whole rule (and e875365/23761ba) exists to prevent. */
-
-/* Ordinary field: too long -> keep the compiled default and say so. */
-#define LOAD_STR(k, field)                                                      \
-    do { if (jstr_get(buf, tk, nt, k, g_config.field,                          \
-                      sizeof g_config.field) == JSTR_TOO_LONG)                 \
-             LOG_WARN("cfg", k " in config exceeds %u chars — keeping default",  \
-                      STR_MAX_LEN(sizeof g_config.field)); } while (0)
-
-/* Credential: too long -> do NOT fall back to the compiled default. That
- * would silently re-open the web UI on admin/admin because a config file was
- * damaged, turning a corrupt file into an auth downgrade. Clear it instead:
- * check_auth() (http_server.c) refuses an empty credential, so the device
- * fails CLOSED and stays locked until the config is repaired. */
-#define LOAD_CRED(k, field)                                                     \
-    do { if (jstr_get(buf, tk, nt, k, g_config.field,                          \
-                      sizeof g_config.field) == JSTR_TOO_LONG) {               \
-             g_config.field[0] = '\0';                                          \
-             LOG_ERR("cfg", k " in config exceeds %u chars — cleared; web UI "  \
-                     "stays locked until /config.json is repaired",             \
-                     STR_MAX_LEN(sizeof g_config.field)); } } while (0)
+/* jstr_get() (jsmn_util.h) is the "fits-or-fails, dst untouched otherwise"
+ * extractor the CFG_STR/CFG_CRED/CFG_HOSTNAME cases below load through —
+ * jsmn knows the token's true length, so it can compare directly against the
+ * destination field's own cap and refuse before copying a byte. That replaces
+ * the old load_str()/tmp[192] two-step (read into an oversized scratch
+ * buffer, then let str_set() judge whether it fits the real field): with a
+ * three-state extractor there is nothing left for the second step to do.
+ * Values written by config_save() always fit by construction, so
+ * JSTR_TOO_LONG here only ever means a hand-edited or damaged file — but
+ * silently substituting a shorter value is exactly the failure this whole
+ * rule (and e875365/23761ba) exists to prevent. */
 
 bool config_load(void) {
     config_defaults();
@@ -208,14 +326,91 @@ bool config_load(void) {
         int nt = jsmn_parse(&jp, buf, n, tk, 96);
         if (nt > 0) {
             unsigned u;
-            if (get_uint(buf, tk, nt, "long_press_ms", &u))      g_config.long_press_ms      = (uint16_t)u;
-            if (get_uint(buf, tk, nt, "dim_repeat_ms", &u))      g_config.dim_repeat_ms      = (uint16_t)u;
-            if (get_uint(buf, tk, nt, "reversal_window_ms", &u)) g_config.reversal_window_ms = (uint16_t)u;
-            if (get_uint(buf, tk, nt, "gw_diag_interval_ms", &u)) g_config.gw_diag_interval_ms = u;
-            if (get_uint(buf, tk, nt, "dali_sweep_interval_ms", &u)) g_config.dali_sweep_interval_ms = u;
-            if (get_uint(buf, tk, nt, "baud", &u) && u > 0)      g_config.baud               = u;
-            if (get_uint(buf, tk, nt, "de_mode", &u))            g_config.de_mode            = (uint8_t)u;
-            if (get_uint(buf, tk, nt, "relay_byteswap", &u))     g_config.relay_byteswap     = u ? true : false;
+
+            /* Every CFG_SCHEMA field loads through this one loop instead of
+             * one hand-written line per field — see the schema's own header
+             * comment (above cfg_field_t, top of this file) for the drift
+             * story that made that necessary. Each kind degrades exactly the
+             * way it always did, with one deliberate addition (flagged
+             * below):
+             *   - numeric/bool: absent, or present-but-malformed (get_uint's
+             *     own "reject, don't default" contract) -> keep the compiled
+             *     default, no warning — unchanged.
+             *     Present-but-OUT-OF-RANGE is NEW: the schema's ranges used
+             *     to be only a UI hint (ha_bridge.c's CFG_NUM[]) and were
+             *     never checked on load at all, so e.g. a hand-edited
+             *     long_press_ms=70000 loaded verbatim. Now it is rejected
+             *     like any other bad value — default kept, warning logged —
+             *     which is a behaviour change worth watching for on upgrade
+             *     (a config file already carrying an out-of-range value will
+             *     start logging on every boot until it's corrected).
+             *   - CFG_STR: too long -> keep the default and warn (was
+             *     LOAD_STR).
+             *   - CFG_CRED: too long -> do NOT fall back to the compiled
+             *     default. That would silently re-open the web UI on
+             *     admin/admin because a config file was damaged, turning a
+             *     corrupt file into an auth downgrade. Clear it instead:
+             *     check_auth() (http_server.c) refuses an empty credential,
+             *     so the device fails CLOSED and stays locked until the
+             *     config is repaired (was LOAD_CRED).
+             *   - CFG_HOSTNAME: not a valid label -> keep the default and
+             *     warn. Reads into a 192-byte scratch buffer — generously
+             *     larger than net_hostname's own 32 — so an over-long value
+             *     is captured in FULL and correctly rejected as "too long"
+             *     by config_hostname_ok(), rather than silently pre-clamped
+             *     into a valid-looking 31-char prefix that would then
+             *     wrongly pass. Writing straight into the live field would
+             *     also leave an unvalidated raw value sitting there the
+             *     instant config_hostname_ok() rejects it, in place of the
+             *     safe default. */
+            for (size_t si = 0; si < CFG_SCHEMA_N; si++) {
+                const cfg_field_t *f = &CFG_SCHEMA[si];
+                switch (f->kind) {
+                case CFG_U16: case CFG_U32: case CFG_BOOL: {
+                    if (!get_uint(buf, tk, nt, f->key, &u)) break;
+                    cfg_apply_result_t r = config_apply_u32(f->key, u);
+                    if (r == CFG_APPLY_OUT_OF_RANGE)
+                        LOG_WARN("cfg", "%s in config is out of range (%lu..%lu) — keeping default",
+                                 f->key, (unsigned long)f->min, (unsigned long)f->max);
+                    break;
+                }
+                case CFG_STR: {
+                    char *dst = (char *)&g_config + f->offset;
+                    if (jstr_get(buf, tk, nt, f->key, dst, f->size) == JSTR_TOO_LONG)
+                        LOG_WARN("cfg", "%s in config exceeds %u chars — keeping default",
+                                 f->key, STR_MAX_LEN(f->size));
+                    break;
+                }
+                case CFG_CRED: {
+                    char *dst = (char *)&g_config + f->offset;
+                    if (jstr_get(buf, tk, nt, f->key, dst, f->size) == JSTR_TOO_LONG) {
+                        dst[0] = '\0';
+                        LOG_ERR("cfg", "%s in config exceeds %u chars — cleared; web UI "
+                                "stays locked until /config.json is repaired",
+                                f->key, STR_MAX_LEN(f->size));
+                    }
+                    break;
+                }
+                case CFG_HOSTNAME: {
+                    char *dst = (char *)&g_config + f->offset;
+                    char hn[192];
+                    jstr_status_t hs = jstr_get(buf, tk, nt, f->key, hn, sizeof hn);
+                    bool bad = (hs == JSTR_TOO_LONG) ||
+                               (hs == JSTR_OK && !config_hostname_set(dst, f->size, hn));
+                    if (bad)
+                        LOG_WARN("cfg", "%s in config is not a valid label — using \"%s\"",
+                                 f->key, dst);
+                    break;
+                }
+                }
+            }
+
+            /* Fields NOT in CFG_SCHEMA (baud, de_mode, the slave lists, the
+             * network quartets) — see the schema's own header comment for
+             * why each stays hand-written; unchanged from before this
+             * refactor. */
+            if (get_uint(buf, tk, nt, "baud", &u) && u > 0)      g_config.baud    = u;
+            if (get_uint(buf, tk, nt, "de_mode", &u))            g_config.de_mode = (uint8_t)u;
 
             /* >= 0 means the key was present — including an empty list, which
              * legitimately means "no slaves of this kind". Only a missing key
@@ -227,46 +422,11 @@ bool config_load(void) {
             int dc = get_u8_array(buf, tk, nt, "dali_slaves", ds, MAX_DALI_SLAVES);
             if (dc >= 0) { memcpy(g_config.dali_slave_ids, ds, (size_t)dc); g_config.dali_slave_count = (uint8_t)dc; }
 
-            LOAD_STR("mqtt_host",   mqtt_host);
-            LOAD_STR("mqtt_user",   mqtt_user);
-            LOAD_STR("mqtt_pass",   mqtt_pass);
-            LOAD_STR("mqtt_prefix", mqtt_prefix);
-            if (get_uint(buf, tk, nt, "mqtt_port", &u) && u > 0) g_config.mqtt_port = (uint16_t)u;
-
             if (get_uint(buf, tk, nt, "net_dhcp", &u)) g_config.net_dhcp = u ? 1 : 0;
             jip(buf, tk, nt, "net_ip",   g_config.net_ip);
             jip(buf, tk, nt, "net_mask", g_config.net_mask);
             jip(buf, tk, nt, "net_gw",   g_config.net_gw);
             jip(buf, tk, nt, "net_dns",  g_config.net_dns);
-            /* Validate on the way IN, not just at the CLI/API: before this, a
-             * hand-edited or damaged /config.json put arbitrary bytes straight
-             * into net_hostname, and netif_init() copies that into HOST_NAME[]
-             * and onto the wire as DHCP option 12. Unlike LOAD_STR/LOAD_CRED,
-             * this does NOT let jstr_get() write straight into
-             * g_config.net_hostname: it reads into a scratch buffer sized like
-             * those macros' effective limit (192, not net_hostname's own 32) so
-             * an over-long value is captured in FULL and correctly rejected by
-             * config_hostname_ok() as "too long", rather than silently
-             * pre-clamped into a valid-looking 31-char prefix that would then
-             * wrongly pass — writing straight into the live field would also
-             * leave an unvalidated raw value sitting there the instant
-             * config_hostname_ok() rejects it, in place of the safe default.
-             * An invalid stored value keeps the default from config_defaults()
-             * rather than failing the whole load, consistent with how every
-             * other field here degrades. */
-            { char hn[192];
-              jstr_status_t hs = jstr_get(buf, tk, nt, "net_hostname", hn, sizeof hn);
-              bool bad_hostname = (hs == JSTR_TOO_LONG) ||
-                  (hs == JSTR_OK && !config_hostname_set(g_config.net_hostname,
-                                                         sizeof g_config.net_hostname, hn));
-              if (bad_hostname)
-                  LOG_WARN("cfg", "net_hostname in config is not a valid label — using \"%s\"",
-                           g_config.net_hostname); }
-
-            LOAD_CRED("web_user", web_user);
-            LOAD_CRED("web_pass", web_pass);
-
-            LOAD_STR("fw_url", fw_url);
         } else {
             LOG_WARN("config", "config.json parse failed (%d) — using defaults", nt);
         }
@@ -275,6 +435,17 @@ bool config_load(void) {
     if (migrate_legacy_modbus()) config_save();
     return true;
 }
+
+/* config_save() below is NOT schema-driven — its single fprintf is correct
+ * and complete, and rewriting a hand-tuned format string into a loop bought
+ * nothing but risk (see the task report for the full reasoning). This pins
+ * the one thing cheap to check at compile time: the schema's field COUNT, so
+ * an add/remove there — 15 fields today — forces a look at config_save()'s
+ * fprintf instead of the two silently drifting apart. It cannot catch a
+ * field that changes NAME or TYPE without changing the row count; that half
+ * of save/schema consistency rests on review. */
+_Static_assert(CFG_SCHEMA_N == 15,
+    "CFG_SCHEMA changed size — update config_save()'s fprintf (config.c) to match");
 
 bool config_save(void) {
     /* Write the full config to a .tmp file first, then rename() it over the
