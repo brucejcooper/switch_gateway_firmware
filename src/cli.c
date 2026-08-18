@@ -112,6 +112,21 @@ static void txt_err_len(const char *field, unsigned max_len) {
     printf("err: %s_too_long (max %u chars)\n", field, max_len);
 }
 
+/* Route a string field through config_apply_str() and turn each failure into
+ * the right error line: too long names the real limit, and the charset
+ * refusal names the banned bytes ('"', '\\', control) — before this mapper
+ * every non-OK printed as "too_long", so a quote in a password read as a
+ * length problem. `key` is the schema key; `shown` is the CLI-facing field
+ * name (they differ for the mqtt verb: key "mqtt_pass", shown "pass"). */
+static bool cli_apply_str(const char *key, const char *shown, const char *v) {
+    switch (config_apply_str(key, v)) {
+    case CFG_APPLY_OK:       return true;
+    case CFG_APPLY_TOO_LONG: txt_err_len(shown, config_field_maxlen(key)); return false;
+    default:                 printf("err: %s_invalid_chars (no quotes, backslash or control chars)\n", shown);
+                             return false;
+    }
+}
+
 static void txt_ok(void) {
     printf("ok\n");
 }
@@ -1004,9 +1019,7 @@ static void cmd_cfg(char **saveptr) {
             /* empty value clears the override (compiled-in default applies) —
              * config_apply_str()'s CFG_STR case allows an empty string, same
              * as the str_set() call this replaces. */
-            if (config_apply_str("fw_url", val) != CFG_APPLY_OK) {
-                txt_err_len("fw_url", config_field_maxlen("fw_url")); return;
-            }
+            if (!cli_apply_str("fw_url", "fw_url", val)) return;
             /* fwupdate.c reads this from the intercore snapshot, which is built
              * once at core1_launch — so the new URL is not live until a reboot.
              * Without this note the next `check` silently polls the OLD url and
@@ -1844,11 +1857,11 @@ static void cmd_mqtt(char **sp) {
          * boundary is. `port` now goes through config_apply_u32() the same
          * way — previously a bare atoi() accepted anything, including 0 or a
          * value that silently wrapped past 65535 through the uint16_t cast. */
-        if      (!strcasecmp(k, "host"))   { if (config_apply_str("mqtt_host",   v) != CFG_APPLY_OK) { txt_err_len("host",   config_field_maxlen("mqtt_host"));   return; } any = true; }
+        if      (!strcasecmp(k, "host"))   { if (!cli_apply_str("mqtt_host",   "host",   v)) return; any = true; }
         else if (!strcasecmp(k, "port"))   { if (!cfg_apply_numeric_cli("mqtt_port", v)) return; any = true; }
-        else if (!strcasecmp(k, "user"))   { if (config_apply_str("mqtt_user",   v) != CFG_APPLY_OK) { txt_err_len("user",   config_field_maxlen("mqtt_user"));   return; } any = true; }
-        else if (!strcasecmp(k, "pass"))   { if (config_apply_str("mqtt_pass",   v) != CFG_APPLY_OK) { txt_err_len("pass",   config_field_maxlen("mqtt_pass"));   return; } any = true; }
-        else if (!strcasecmp(k, "prefix")) { if (config_apply_str("mqtt_prefix", v) != CFG_APPLY_OK) { txt_err_len("prefix", config_field_maxlen("mqtt_prefix")); return; } any = true; }
+        else if (!strcasecmp(k, "user"))   { if (!cli_apply_str("mqtt_user",   "user",   v)) return; any = true; }
+        else if (!strcasecmp(k, "pass"))   { if (!cli_apply_str("mqtt_pass",   "pass",   v)) return; any = true; }
+        else if (!strcasecmp(k, "prefix")) { if (!cli_apply_str("mqtt_prefix", "prefix", v)) return; any = true; }
         else { txt_err("bad_key"); return; }
     }
     if (!any) { txt_err("no_fields"); return; }

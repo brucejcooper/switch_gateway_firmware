@@ -382,6 +382,7 @@ static void resp_too_long(conn_t *c, const char *field, size_t cap) {
              field, STR_MAX_LEN(cap));
     resp_text(c, "400 Bad Request", "application/json", msg);
 }
+
 static void push_cmd_resp(conn_t *c, const ic_cmd_t *cmd) {
     if (intercore_push_cmd(cmd)) resp_ok(c);
     else resp_text(c, "503 Service Unavailable", "application/json", "{\"error\":\"busy\"}");
@@ -451,6 +452,32 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
     }
     if (strcmp(path, "/api/cfg") == 0) {
         cmd.type = IC_CMD_SET_CFG; uint16_t f = 0;
+        /* Validate numerics against the schema BEFORE the cast packs them into
+         * the u16/u32 intercore fields — the same wrap ha_bridge's MQTT parse
+         * had: a POST of long_press_ms=70000 cast to (uint16_t) lands on 4464,
+         * which is INSIDE the legal range, so core 0's apply gate would accept
+         * a value the caller never sent. The 400 names the real range; baud
+         * and de_mode are not schema fields (special apply paths) and keep
+         * their existing unchecked pack, same as the CLI. */
+        {
+            static const char *NKEYS[] = { "long_press_ms", "dim_repeat_ms",
+                "reversal_window_ms", "gw_diag_interval_ms", "dali_sweep_interval_ms" };
+            for (size_t k = 0; k < sizeof NKEYS / sizeof NKEYS[0]; k++) {
+                if (!jhas(body, tk, nt, NKEYS[k])) continue;
+                long jv = jint_key(body, tk, nt, NKEYS[k], -1);
+                uint32_t lo, hi;
+                if (jv < 0 || !config_field_range(NKEYS[k], &lo, &hi) ||
+                    (uint32_t)jv < lo || (uint32_t)jv > hi) {
+                    char msg[112];
+                    config_field_range(NKEYS[k], &lo, &hi);
+                    snprintf(msg, sizeof msg,
+                             "{\"error\":\"%s out of range (%lu..%lu)\"}",
+                             NKEYS[k], (unsigned long)lo, (unsigned long)hi);
+                    resp_text(c, "400 Bad Request", "application/json", msg);
+                    return;
+                }
+            }
+        }
         if (jhas(body, tk, nt, "long_press_ms"))      { cmd.set_cfg.long_press_ms      = (uint16_t)jint_key(body, tk, nt, "long_press_ms", 0);      f |= IC_CFG_F_LONG_PRESS; }
         if (jhas(body, tk, nt, "dim_repeat_ms"))      { cmd.set_cfg.dim_repeat_ms      = (uint16_t)jint_key(body, tk, nt, "dim_repeat_ms", 0);      f |= IC_CFG_F_DIM_REPEAT; }
         if (jhas(body, tk, nt, "reversal_window_ms")) { cmd.set_cfg.reversal_window_ms = (uint16_t)jint_key(body, tk, nt, "reversal_window_ms", 0); f |= IC_CFG_F_REVERSAL; }
