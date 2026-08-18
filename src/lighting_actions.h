@@ -3,10 +3,10 @@
 #include <stdbool.h>
 
 /*
- * lighting_actions — bridge between button_fsm / serial_protocol and modbus.
+ * lighting_actions — bridge between button_fsm / cli / ic_seam and modbus.
  *
  * Each function enqueues a Modbus action.  The callback updates state_cache
- * and pushes a state_event for serial_poll() to emit to HA.
+ * and pushes a state_event for ic_seam_pump() to emit to HA.
  *
  * These link button
  * events to Modbus writes.
@@ -18,9 +18,9 @@
  * never claims a state the hardware was never told. Callers may ignore the result
  * (the drop is already logged) or react to it. */
 
-/* ── State event queue — written here, drained by serial_poll() ────────────
- * The single definition: serial_poll() (serial_protocol.c) used to hand-copy
- * this struct for its own levt_to_ic() translation, with
+/* ── State event queue — written here, drained by ic_seam_pump() ───────────
+ * The single definition: ic_seam.c (formerly serial_protocol.c) used to
+ * hand-copy this struct for its own levt_to_ic() translation, with
  * lighting_evt_try_pop()'s prototype re-declared there as `void *out` to paper
  * over the duplication. One copy, shared. */
 typedef enum {
@@ -46,8 +46,8 @@ typedef struct {
 } levt_t;
 
 /* Drain one queued state event (FIFO). Returns false when the queue is empty.
- * Called from serial_poll() once per main-loop iteration to forward each event
- * to core 1 as a typed ic_event_t (see levt_to_ic in serial_protocol.c). */
+ * Called from ic_seam_pump() once per main-loop iteration to forward each
+ * event to core 1 as a typed ic_event_t (see levt_to_ic in ic_seam.c). */
 bool lighting_evt_try_pop(levt_t *out);
 
 /* Relay: on/off */
@@ -162,7 +162,7 @@ bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc);
 
 /*
  * Called from dirty_poll when a state change is confirmed by hardware.
- * Emits a state event for serial_poll() to publish.
+ * Emits a state event for ic_seam_pump() to publish.
  */
 void lighting_emit_relay_state(uint8_t channel, bool on);
 void lighting_emit_dali_state(uint8_t slave_id, uint8_t addr,

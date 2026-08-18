@@ -202,7 +202,7 @@ now a single segment.
 
 ### CLI echo defaults ON (2026-06-09)
 
-`echo_on` defaults to **true** (`serial_protocol.c`): the CLI is now a human-only
+`echo_on` defaults to **true** (`cli.c`): the CLI is now a human-only
 interface (machine clients went away with the on-board bridge), so local echo +
 backspace editing is what you want. `echo off` restores a clean byte stream.
 

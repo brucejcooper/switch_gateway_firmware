@@ -10,7 +10,7 @@
  *   - LED heartbeat
  *
  * Replaces:
- *   - lua_init() / lua_poll()  → serial_protocol_init() / serial_poll()
+ *   - lua_init() / lua_poll()  → cli_init()/cli_poll() + ic_seam_pump()
  *   - Lua coroutine scheduler  → button_fsm_tick() + callback model
  *   - DALI coroutine bindings  → lighting_actions + dirty_poll_tick()
  */
@@ -26,7 +26,8 @@
 #include "dq_soak.h"
 #include "dali_state.h"
 #include "dirty_poll.h"
-#include "serial_protocol.h"
+#include "cli.h"
+#include "ic_seam.h"
 #include "dali_provision.h"
 #include "bus_discovery.h"
 #include "core1.h"
@@ -217,7 +218,7 @@ int main(void) {
     button_fsm_init();
     buttongrid_init();
 
-    serial_protocol_init();
+    cli_init();
 
     /* Fill the config snapshot (slave lists + broker/net settings) for core 1,
      * then release it to bring up the network. */
@@ -272,7 +273,8 @@ int main(void) {
         button_fsm_tick();
         dirty_poll_tick();
         dali_provision_tick();
-        serial_poll();
+        cli_poll();          /* (a) USB-CDC input: read + dispatch CLI commands */
+        ic_seam_pump();      /* (b)+(c)+tail: intercore cmd/event drain, ping/provision/log polls */
 
         wd_feed();
     }

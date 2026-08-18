@@ -209,8 +209,9 @@ Each boot, before the main loop starts, the firmware runs:
 | `dali_state.c/h` | the DALI world model: presence, level/status, groups, fade tracking |
 | `dali_commission.c/h` | controller-side IEC 62386-102 commissioning |
 | `dirty_poll.c/h` | relay-board polling + gateway sysinfo/reachability |
-| `serial_protocol.c/h` | USB-CDC text CLI + the core-0/core-1 inter-core seam |
-| `serial_protocol_provision.c` | Provision status → core-1 event forwarding |
+| `cli.c/h` | USB-CDC text CLI (verb table, line editing, `show`/`dali`/`cfg`/...) |
+| `ic_seam.c/h` | The core-0/core-1 inter-core seam — g_config's single writer + event forwarding |
+| `cli_provision.c/h` | Provision status → core-1 event forwarding |
 | `dali_provision.c/h` | DALI commissioning state machine |
 | `intercore.c/h` | The two typed SPSC queues + the config snapshot |
 | `core1.c/h` | Core-1 entry point, heartbeat, flash-lockout victim |
@@ -233,7 +234,8 @@ while (true) {
     dali_state_tick();           // interrogate ballasts: verify, discover, sweep
     dirty_poll_tick();           // relay board + gateway sysinfo
     dali_provision_tick();       // advance commissioning state machine if active
-    serial_poll();               // read text CLI; drain core-1 cmds; forward state events to core 1
+    cli_poll();                  // read text CLI input, dispatch commands
+    ic_seam_pump();              // drain core-1 cmds; forward state events to core 1
     wd_feed();
 }
 ```
@@ -680,7 +682,7 @@ Hardware change
   → dali_state_tick() interrogates the ballast (QUERY STATUS / ACTUAL LEVEL)
      — from a post-command verification mark, or the background sweep
   → lighting_emit_dali_state() pushes levt_t to the core-0 event ring
-  → serial_poll() drains the ring, converts to a typed ic_event_t
+  → ic_seam_pump() drains the ring, converts to a typed ic_event_t
   → intercore_push_event() — onto the core-0 → core-1 SPSC queue
   → core 1: ha_bridge_tick() pops it, builds the MQTT JSON
   → publishes to lighting/dali/<slave>/<addr>/state (+ /config) (retained)
@@ -689,7 +691,7 @@ Hardware change
 
 A command from HA travels the reverse path: core 1's `ha_on_message()` parses
 the MQTT JSON into a typed `ic_cmd_t`, pushes it onto the core-1 → core-0 queue,
-and core 0's `serial_poll()` dispatches it through the same domain entry points
+and core 0's `ic_seam_pump()` dispatches it through the same domain entry points
 the CLI uses.
 
 ---

@@ -24,17 +24,17 @@
  * FC10/FC23 frames that carried them. Comments below that mention them are
  * describing what was replaced. */
 
-/* ── State event queue — written here, drained by serial_poll() ──────────── */
+/* ── State event queue — written here, drained by ic_seam_pump() ──────────── */
 /* We use a simple ring buffer rather than the pico queue_t here because all
  * accesses are on core 0 (callbacks from modbus_poll(), which runs on core 0). */
 /* Sized to hold a full resync burst without overflow. Worst case for
  * MAX_DALI_SLAVES=2: 32 relays + 2*64 ballasts + 2*16 groups + 2 scan_completes
- * = 194 events. Round up to 256. The events drain on every serial_poll()
+ * = 194 events. Round up to 256. The events drain on every ic_seam_pump()
  * iteration, so this only needs to absorb a single synchronous burst. */
 #define EVT_QUEUE_SIZE 256
 
-/* levt_type_t / levt_t now live in lighting_actions.h — serial_protocol.c
- * needs the real type too (levt_to_ic()), not a hand-copy. */
+/* levt_type_t / levt_t now live in lighting_actions.h — ic_seam.c (formerly
+ * serial_protocol.c) needs the real type too (levt_to_ic()), not a hand-copy. */
 
 /* Per-slave/group debounce cache — last emitted (on, bri, members) per group.
  * Zero-init: all groups start as { on=false, bri=0, members=0 }.
@@ -60,7 +60,7 @@ static void push_evt(const levt_t *e) {
     s_evt_head = next;
 }
 
-/* Called by serial_poll() to drain events — prototype in lighting_actions.h */
+/* Called by ic_seam_pump() to drain events — prototype in lighting_actions.h */
 bool lighting_evt_try_pop(levt_t *out) {
     if (s_evt_head == s_evt_tail) return false;
     *out = s_evts[s_evt_tail];
@@ -305,7 +305,7 @@ bool lighting_toggle_async(uint8_t slave_id, uint8_t target, bool is_group) {
 /* Synchronous single-address any-on probe, for the TEXT CLI only.
  *
  * Same question the button's press-time probe asks, same opcode, same reading of
- * the answer — kept here rather than reimplemented in serial_protocol.c so the
+ * the answer — kept here rather than reimplemented in cli.c so the
  * two paths cannot drift on what "on" means. The button's version is async and
  * walks a binding's targets; this one blocks on a single address, which is what
  * a human-typed command wants.

@@ -40,8 +40,9 @@ set(APP_CORE_SRCS
     src/dq_soak.c
     src/dirty_poll.c
     src/bus_discovery.c
-    src/serial_protocol.c
-    src/serial_protocol_provision.c
+    src/cli.c
+    src/ic_seam.c
+    src/cli_provision.c
     src/dali_provision.c
     src/button_fsm_emit.c
     src/log.c

@@ -1,18 +1,21 @@
 /*
- * serial_protocol_provision.c — provisioning message handling.
+ * cli_provision.c — provisioning message handling.
  *
- * Adds to serial_protocol:
+ * Renamed from serial_protocol_provision.c when serial_protocol.c split into
+ * cli.c (the human text CLI) + ic_seam.c (the intercore seam) — see those
+ * files' top comments. This file's own job didn't change:
+ *
  *   Inbound:  "provision_start" → dali_provision_start()
  *             "provision_abort" → dali_provision_abort()
  *   Outbound: "provision_status" emitted whenever g_prov_status changes
  *
  * serial_provision_status_changed() is called from dali_provision.c
  * (via set_status()) whenever the run state or message changes.
- * The actual emit happens on the next serial_poll() tick so it is
+ * The actual emit happens on the next ic_seam_pump() tick so it is
  * always on the main loop, never from a Modbus callback.
  */
 
-#include "serial_protocol.h"
+#include "cli_provision.h"
 #include "dali_provision.h"
 #include "config.h"
 #include "intercore.h"
@@ -31,7 +34,7 @@ void serial_provision_status_changed(void) {
     s_status_dirty = true;
 }
 
-/* Called from serial_poll() each iteration. Forwards a changed provisioning
+/* Called from ic_seam_pump() each iteration. Forwards a changed provisioning
  * status to core 1 (the network bridge). The raw run_state enum is carried —
  * core 1 maps it to the short state string; the free-form msg goes verbatim. */
 void serial_provision_poll(void) {
@@ -48,4 +51,3 @@ void serial_provision_poll(void) {
      * that HA/web shows. Leave it set to retry on the next poll. */
     if (intercore_push_event(&ev)) s_status_dirty = false;
 }
-

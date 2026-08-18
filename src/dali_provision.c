@@ -19,7 +19,7 @@
 #include "dali_provision.h"
 #include "dali_commission.h"
 #include "dirty_poll.h"
-#include "serial_protocol.h"
+#include "cli_provision.h"
 #include "log.h"
 #include "pico/time.h"
 #include <stdio.h>

@@ -14,8 +14,8 @@
  * CROSS-CORE CONTRACT: every function here touches flash and must run ONLY
  * on core 0. Core 1 (network/download) never calls this API directly — it
  * hands bytes across via g_ota_buf below plus the IC_CMD_OTA_* / IC_EVT_OTA_*
- * intercore protocol (intercore.h); src/serial_protocol.c's ic_dispatch_cmd
- * is the sole caller of this module on core 0.
+ * intercore protocol (intercore.h); src/ic_seam.c's ic_dispatch_cmd is the
+ * sole caller of this module on core 0.
  */
 
 /* Cross-core handoff buffer: core 1 (the sole writer) fills it only between

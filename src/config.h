@@ -96,7 +96,7 @@ extern global_config_t g_config;
  * trailing a hyphen. Rejecting anything else keeps an illegal label off the
  * wire (some DHCP servers drop those silently).
  *
- * Lives here rather than in serial_protocol.c (where it started, private and
+ * Lives here rather than in cli.c (where it started, private and
  * core-0-only) because all three write paths need the same rule: the CLI, the
  * web/API command handler on core 1, and config_load() itself — which used to
  * skip validation entirely and let anything in /config.json reach

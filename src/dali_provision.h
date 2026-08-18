@@ -66,7 +66,7 @@ typedef struct {
     char             msg[PROV_STATUS_MSG_MAX];
 } prov_status_t;
 
-/* Global status — readable at any time by serial_protocol */
+/* Global status — readable at any time by cli.c (`show provision`) */
 extern prov_status_t g_prov_status;
 
 /* ── Lifecycle ───────────────────────────────────────────────────────────── */

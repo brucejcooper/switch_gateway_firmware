@@ -22,7 +22,7 @@ global_config_t g_config;
 #define CONFIG_PATH_TMP "/config.json.tmp"
 
 /* See config.h for the rule and why this lives here rather than in
- * serial_protocol.c. Whitelist, not a blacklist: every byte must be one of the
+ * cli.c. Whitelist, not a blacklist: every byte must be one of the
  * permitted characters, so anything else — dots, underscores, spaces, control
  * characters, high-bit/UTF-8 bytes — is rejected without having to enumerate
  * it. */
