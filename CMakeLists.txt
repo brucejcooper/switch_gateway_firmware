@@ -14,7 +14,15 @@ set(CMAKE_C_STANDARD 11)
 
 pico_sdk_init()
 
-add_executable(light_switch
+# ── Application sources shared by 'light_switch' and (opt-in) 'light_switch_ota'
+# below ──────────────────────────────────────────────────────────────────────
+# The OTA target is the SAME app relinked at a different flash offset, so its
+# source set must be identical to this one. Listing the files once here and
+# having both targets consume the same variables is what makes that true
+# structurally, instead of by two hand-maintained lists happening to agree: a
+# file added to one target and forgotten in the other used to compile fine and
+# fail at link, or worse, silently diverge the OTA build.
+set(APP_CORE_SRCS
     src/main.c
     src/intercore.c
     src/core1.c
@@ -41,9 +49,15 @@ add_executable(light_switch
     src/boot_control.c
     src/fw_image.c
     src/ota_stage.c
+)
+
+# SHA-512/ed25519 for OTA image verify (fw_image.c) — also shared, see above.
+set(MONOCYPHER_SRCS
     ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
     ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
 )
+
+add_executable(light_switch ${APP_CORE_SRCS} ${MONOCYPHER_SRCS})
 
 add_subdirectory(lib/pico-vfs)
 
@@ -53,11 +67,10 @@ target_include_directories(light_switch PRIVATE
     ${CMAKE_BINARY_DIR}/generated      # version.h (git-derived FW_VERSION)
 )
 
-# Vendored third-party: don't subject Monocypher to our -Wall -Wextra.
-set_source_files_properties(
-    ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
-    ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
-    PROPERTIES COMPILE_OPTIONS "-w")
+# Vendored third-party: don't subject Monocypher to our -Wall -Wextra. Source
+# file properties are directory-scoped (not per-target), so this one call
+# covers light_switch_ota too even though it's built further down.
+set_source_files_properties(${MONOCYPHER_SRCS} PROPERTIES COMPILE_OPTIONS "-w")
 
 # ── FW_VERSION = base + git describe (tag/hash + -dirty), refreshed each build ──
 set(FW_BASE_VERSION "2.0.1")
@@ -219,11 +232,15 @@ iolib_patch(
     "HOST_NAME[32]"
     "DHCP hostname")
 
-target_sources(light_switch PRIVATE
+# Shared with light_switch_ota below, same reasoning as APP_CORE_SRCS above.
+set(IOLIB_VENDORED_SRCS
     ${IOLIB}/Ethernet/wizchip_conf.c
     ${IOLIB}/Ethernet/socket.c
     ${IOLIB}/Ethernet/W5100S/w5100s.c
     ${IOLIB}/Internet/DHCP/dhcp.c
+)
+set(APP_NET_SRCS
+    ${IOLIB_VENDORED_SRCS}
     ${CMAKE_CURRENT_LIST_DIR}/src/net/wizchip_glue.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/mqtt_app.c
@@ -235,6 +252,9 @@ target_sources(light_switch PRIVATE
     ${CMAKE_CURRENT_LIST_DIR}/src/net/http_client.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/ota.c
     ${CMAKE_CURRENT_LIST_DIR}/src/net/fwupdate.c
+)
+target_sources(light_switch PRIVATE
+    ${APP_NET_SRCS}
     ${GEN_WEB_ASSETS}                  # generated: gzipped Vite UI (web/)
 )
 
@@ -251,13 +271,9 @@ target_include_directories(light_switch PRIVATE
 target_compile_definitions(light_switch PRIVATE _WIZCHIP_=W5100S)
 target_link_libraries(light_switch PRIVATE hardware_spi pico_unique_id)
 
-# Vendored third-party: don't subject ioLibrary to our -Wall -Wextra.
-set_source_files_properties(
-    ${IOLIB}/Ethernet/wizchip_conf.c
-    ${IOLIB}/Ethernet/socket.c
-    ${IOLIB}/Ethernet/W5100S/w5100s.c
-    ${IOLIB}/Internet/DHCP/dhcp.c
-    PROPERTIES COMPILE_OPTIONS "-w")
+# Vendored third-party: don't subject ioLibrary to our -Wall -Wextra. Directory-
+# scoped like the Monocypher one above, so light_switch_ota is covered too.
+set_source_files_properties(${IOLIB_VENDORED_SRCS} PROPERTIES COMPILE_OPTIONS "-w")
 
 # USB CDC for serial protocol (replaces Lua REPL)
 pico_enable_stdio_usb(light_switch 1)
@@ -291,46 +307,19 @@ target_compile_options(light_switch PRIVATE -Wall -Wextra -Wno-unused-parameter)
 # OTA active-app flash offset (src/partition_map.h: APP_OFF, XIP 0x10010000),
 # for bootloader/main.c to jump to. Off by default; -DOTA_APP_LAYOUT=ON to
 # build it. This block is purely additive (appended after the default
-# 'light_switch' target is fully defined above) and duplicates that target's
-# source list into a second executable rather than touching a single line of
-# it, so the default `make -C build light_switch` is byte-for-byte unaffected
-# whether or not this option is set. See bootloader/app_ota.ld's header
-# comment for the relocation/no-boot2 story, and bootloader/README.md's "OTA
+# 'light_switch' target is fully defined above) and reuses that target's
+# APP_CORE_SRCS/MONOCYPHER_SRCS/APP_NET_SRCS variables for its own source
+# list rather than a second hand-maintained copy, so the two executables
+# cannot silently drift apart and the default `make -C build light_switch` is
+# byte-for-byte unaffected whether or not this option is set. See
+# bootloader/app_ota.ld's header comment for the relocation/no-boot2 story,
+# and bootloader/README.md's "OTA
 # artifact vs. this target" section for how a signed OTA image relates to it.
 # ═══════════════════════════════════════════════════════════════════════════
 option(OTA_APP_LAYOUT "Also build 'light_switch_ota': the same app sources linked to run at the OTA active-app flash offset (APP_OFF/APP_SIZE, src/partition_map.h) instead of the standalone default flash origin. Opt-in; never affects the 'light_switch' target." OFF)
 
 if(OTA_APP_LAYOUT)
-    add_executable(light_switch_ota
-        src/main.c
-        src/intercore.c
-        src/core1.c
-        src/modbus.c
-        src/button_actions.c
-        src/button_fsm.c
-        src/state_cache.c
-        src/config.c
-        src/mapping.c
-        src/lighting_actions.c
-        src/dali_state.c
-        src/dali_commission.c
-        src/dali_queue.c
-        src/mbq_client.c
-        src/dq_soak.c
-        src/dirty_poll.c
-        src/bus_discovery.c
-        src/serial_protocol.c
-        src/serial_protocol_provision.c
-        src/dali_provision.c
-        src/button_fsm_emit.c
-        src/log.c
-        src/cdc_out.c
-        src/boot_control.c
-        src/fw_image.c
-        src/ota_stage.c
-        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
-        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
-    )
+    add_executable(light_switch_ota ${APP_CORE_SRCS} ${MONOCYPHER_SRCS})
 
     target_include_directories(light_switch_ota PRIVATE
         ${CMAKE_CURRENT_LIST_DIR}/src
@@ -338,19 +327,13 @@ if(OTA_APP_LAYOUT)
         ${CMAKE_BINARY_DIR}/generated      # version.h — shares gen_version's output with light_switch
     )
 
-    set_source_files_properties(
-        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher.c
-        ${CMAKE_CURRENT_LIST_DIR}/lib/monocypher/monocypher-ed25519.c
-        PROPERTIES COMPILE_OPTIONS "-w")
+    # No set_source_files_properties(... "-w") for Monocypher here: that
+    # property is directory-scoped, not per-target, so the call above (right
+    # after MONOCYPHER_SRCS is defined) already covers this target too.
 
     # Reuse gen_version (already an ALL target above) rather than re-running
     # the same execute_process()/custom command a second time.
     add_dependencies(light_switch_ota gen_version)
-
-    # Reuse the already-built Vite web UI blob (${GEN_WEB_ASSETS}, defined
-    # above for light_switch) as a source here too — same generated file,
-    # built once, consumed by both executables.
-    target_sources(light_switch_ota PRIVATE ${GEN_WEB_ASSETS})
 
     target_link_libraries(light_switch_ota PRIVATE
         pico_stdlib
@@ -369,23 +352,10 @@ if(OTA_APP_LAYOUT)
     target_include_directories(light_switch_ota PRIVATE ${CMAKE_CURRENT_LIST_DIR}/lib/jsmn)
     target_compile_definitions(light_switch_ota PRIVATE JSMN_STATIC)
 
-    target_sources(light_switch_ota PRIVATE
-        ${IOLIB}/Ethernet/wizchip_conf.c
-        ${IOLIB}/Ethernet/socket.c
-        ${IOLIB}/Ethernet/W5100S/w5100s.c
-        ${IOLIB}/Internet/DHCP/dhcp.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/wizchip_glue.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/netif.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/mqtt_app.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/ha_bridge.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/web_state.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/http_server.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/ping.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/dns_resolve.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/http_client.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/ota.c
-        ${CMAKE_CURRENT_LIST_DIR}/src/net/fwupdate.c
-    )
+    # Reuse APP_NET_SRCS (defined above for light_switch) and the already-built
+    # Vite web UI blob (${GEN_WEB_ASSETS}) — same generated file, built once,
+    # consumed by both executables.
+    target_sources(light_switch_ota PRIVATE ${APP_NET_SRCS} ${GEN_WEB_ASSETS})
 
     target_sources(light_switch_ota PRIVATE ${MQTT_SOURCES} ${MQTT_SERIALIZER_SOURCES})
     target_include_directories(light_switch_ota PRIVATE ${MQTT_INCLUDE_PUBLIC_DIRS})
@@ -398,12 +368,8 @@ if(OTA_APP_LAYOUT)
     target_compile_definitions(light_switch_ota PRIVATE _WIZCHIP_=W5100S)
     target_link_libraries(light_switch_ota PRIVATE hardware_spi pico_unique_id)
 
-    set_source_files_properties(
-        ${IOLIB}/Ethernet/wizchip_conf.c
-        ${IOLIB}/Ethernet/socket.c
-        ${IOLIB}/Ethernet/W5100S/w5100s.c
-        ${IOLIB}/Internet/DHCP/dhcp.c
-        PROPERTIES COMPILE_OPTIONS "-w")
+    # No set_source_files_properties(... "-w") for ioLibrary here: directory-
+    # scoped like the Monocypher note above, already covered for this target.
 
     pico_enable_stdio_usb(light_switch_ota 1)
     pico_enable_stdio_uart(light_switch_ota 0)
