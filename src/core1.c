@@ -19,6 +19,7 @@
 
 #include "core1.h"
 #include "intercore.h"
+#include "hardware/sync.h"   /* __dmb() — snapshot acquire barrier */
 #include "net/netif.h"
 #include "net/mqtt_app.h"
 #include "net/ha_bridge.h"
@@ -79,6 +80,11 @@ static void core1_entry(void) {
         s_heartbeat_ms = to_ms_since_boot(get_absolute_time());
         tight_loop_contents();
     }
+    /* Acquire barrier, paired with intercore_set_snapshot()'s release: now
+     * that we've seen s_config_ready set, don't let the snapshot reads below
+     * be ordered before that observation. Guarantees the snapshot core 0
+     * published is fully visible here. */
+    __dmb();
 
     /* Bring up the W5100S and the MQTT connection manager from the config
      * snapshot. Both are non-blocking SMs. */

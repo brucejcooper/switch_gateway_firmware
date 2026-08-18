@@ -261,9 +261,14 @@ bool intercore_pop_cmd(ic_cmd_t *c);
 uint32_t intercore_event_drops(void);
 
 /* ── Config snapshot (core 0 -> core 1) ──────────────────────────────────────
- * The slave lists core 1 needs to build HA discovery. Filled by core 0 before
- * core 1 launch (and is effectively read-only thereafter; a runtime slave-list
- * change needs a reboot to re-discover, like a baud change). */
+ * The slave lists (and net/MQTT/auth config) core 1 needs to build HA
+ * discovery and bring up the network. Filled by core 0 via
+ * intercore_set_snapshot() AFTER core1_launch() but before
+ * core1_config_ready() releases core 1's startup gate — not "before core 1
+ * launch" as an earlier version of this comment said. Effectively read-only
+ * thereafter; a runtime slave-list change needs a reboot to re-discover, like
+ * a baud change. The publish is ordered by a release/acquire __dmb() pair
+ * (intercore_set_snapshot / core1_entry) so core 1 never reads it half-written. */
 typedef struct {
     uint8_t  relay_slaves[MAX_RELAY_SLAVES];
     uint8_t  relay_count;

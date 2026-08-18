@@ -8,6 +8,7 @@
 
 #include "intercore.h"
 #include "pico/util/queue.h"
+#include "hardware/sync.h"   /* __dmb() — snapshot publish barrier */
 
 /* Event queue (core0 -> core1). Sized to hold a full synchronous resync burst
  * without dropping: worst case 32 relays + 2*64 ballasts + 2*16 groups +
@@ -50,5 +51,17 @@ uint32_t intercore_event_drops(void) {
 }
 
 static ic_snapshot_t s_snapshot;
-void intercore_set_snapshot(const ic_snapshot_t *s) { s_snapshot = *s; }
+void intercore_set_snapshot(const ic_snapshot_t *s) {
+    s_snapshot = *s;
+    /* Release barrier: this copy MUST be globally visible before the caller
+     * (main.c) sets the s_config_ready flag core 1 spins on. Today the
+     * ordering holds only INCIDENTALLY — no LTO is configured, so GCC treats
+     * the separate intercore_set_snapshot()/core1_config_ready() cross-TU
+     * calls as memory clobbers it can't reorder around. Turn on LTO, or ever
+     * inline either, and core 1 could observe config_ready==true against a
+     * half-written snapshot and bring up the network on wrong MQTT/slave
+     * config, silently. This makes the ordering enforced, not incidental;
+     * core1_entry() has the paired acquire barrier. */
+    __dmb();
+}
 const ic_snapshot_t *intercore_snapshot(void) { return &s_snapshot; }
