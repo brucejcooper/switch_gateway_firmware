@@ -7,6 +7,16 @@ the macOS/Linux system `cc`, and link the same vendored
 `lib/monocypher/{monocypher.c,monocypher-ed25519.c}` the firmware uses so the
 crypto is identical on both sides.
 
+## Release gate
+
+Before tagging/publishing any OTA release, run `tools/release-check.sh` —
+one command that gates git cleanliness (a dirty tree taints `FW_VERSION`),
+the host test suite, the standalone build, this OTA build+sign+manifest
+flow (including the version/size cross-checks below), and the bootloader
+build, fail-fast with a PASS/FAIL per stage. `--with-e2e` adds a hardware
+round-trip test against the bench device (opt-in, off by default). See the
+script's own header comment for the full stage list and flags.
+
 ## Files
 
 - `fw_keygen.c` — generates an ed25519 keypair. Writes the 64-byte private
