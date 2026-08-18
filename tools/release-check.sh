@@ -266,7 +266,16 @@ run_stage_ota_build() {
         return
     fi
 
-    tools/fw_sign build_ota/light_switch_ota.bin tools/dev_privkey.bin \
+    # Read-only: this is a dry-run gate, not a real release, so it signs with
+    # whatever tools/fw_build_counter currently holds and does NOT bump it —
+    # bumping is a real release's job (tools/README.md's release flow).
+    if [ ! -f tools/fw_build_counter ]; then
+        fail "tools/fw_build_counter missing — see tools/README.md's Anti-rollback build counter section"
+    fi
+    local build_ctr
+    build_ctr="$(cat tools/fw_build_counter)"
+
+    tools/fw_sign build_ota/light_switch_ota.bin tools/dev_privkey.bin "$build_ctr" \
         build_ota/light_switch_ota.signed.bin >/dev/null
 
     tools/fw_manifest.sh "$ver" build_ota/light_switch_ota.signed.bin \

@@ -71,11 +71,14 @@ int main(void) {
     }
 
     /* (2) Invoke the REAL fw_sign CLI (built at /tmp/fw_sign per the header
-     * comment's build command) against the dev private key. */
+     * comment's build command) against the dev private key. build_ctr is
+     * just an arbitrary positive test value here — this test is about
+     * signing/verification agreement, not the anti-rollback logic itself
+     * (see test/ota_stage_test.c / test/boot_commit_test.c for that). */
     {
         char cmd[512];
-        snprintf(cmd, sizeof cmd, "%s %s %s %s", FW_SIGN_BIN, FAKE_APP_PATH,
-                  PRIVKEY_PATH, SIGNED_PATH);
+        snprintf(cmd, sizeof cmd, "%s %s %s %s %s", FW_SIGN_BIN, FAKE_APP_PATH,
+                  PRIVKEY_PATH, "7", SIGNED_PATH);
         int rc = system(cmd);
         CHECK(rc == 0);
     }

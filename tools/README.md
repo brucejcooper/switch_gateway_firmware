@@ -24,9 +24,15 @@ script's own header comment for the full stage list and flags.
   a C array literal ready to paste into `src/fw_image.h`'s `FW_PUBKEY[32]`.
 - `fw_sign.c` — signs a raw app `.bin`: computes SHA-512, builds a
   `struct fw_trailer` (reusing `src/fw_image.h`'s struct/offsets directly —
-  it does not re-derive the layout), signs `magic|img_len|sha512` with
-  ed25519, appends the trailer, writes `<out>.signed.bin`. This is the exact
-  artifact `src/fw_image.c`'s `fw_verify()` accepts.
+  it does not re-derive the layout), signs `magic|img_len|build_ctr|sha512`
+  with ed25519, appends the trailer, writes `<out>.signed.bin`. This is the
+  exact artifact `src/fw_image.c`'s `fw_verify()` accepts. Takes the release
+  build counter as a required argument — see "Anti-rollback build counter"
+  below.
+- `fw_build_counter` — a single committed integer, the anti-rollback build
+  counter's source of truth (starts at `1`). **Bump it by hand once per
+  release** and pass its new value to `fw_sign`; never decrease it, never
+  reuse a value. See "Anti-rollback build counter" below.
 - `fw_manifest.sh` — given a version string + a signed `.bin` + the URL it
   will be published at, emits the manifest JSON (`version`, `board`, `url`,
   `size`, `sha256`, `title`, `release_url`, `notes`) matching the shape
@@ -53,6 +59,46 @@ cc -Wall -Wextra -I ../src -I ../lib/monocypher -o fw_sign fw_sign.c \
 `fw_manifest.sh` needs no build (needs `shasum` or `sha256sum` on PATH,
 present on macOS/Linux by default).
 
+## Anti-rollback build counter
+
+The manifest's `version` field is compared against the device's own
+`FW_VERSION` by plain string **inequality** (`fwupdate_available()`,
+`src/net/fwupdate.c`) — it has no notion of "newer" vs "older", at any layer.
+Combined with the manifest being fetched over plain, unauthenticated HTTP,
+that means whoever controls the manifest response can point `url` at *any*
+previously-published, still-validly-signed OLDER release and the device would
+stage and (absent this mechanism) commit it — a silent downgrade reinstating
+every bug that release ever fixed, with no private key needed and no
+expiry on old signed artifacts.
+
+`struct fw_trailer.build_ctr` (`src/fw_image.h`) closes that hole: it's a
+plain monotonic integer, sealed inside the same signed trailer as the image
+hash, with no relation to `FW_VERSION`/the manifest `version` string at all.
+The device persists the highest `build_ctr` it has ever successfully
+**committed** (`struct boot_control.min_build_ctr`, `src/boot_control.h`) and
+refuses — both in the app (`src/ota_stage.c`, fail-fast) and, authoritatively,
+in the bootloader (`bootloader/commit.c`) — to commit any later candidate
+whose `build_ctr` is lower, even one that verifies perfectly.
+
+**Release-time contract:**
+- `fw_build_counter` in this directory holds the next value to use. It is a
+  plain committed text file (not gitignored) — bump it by hand as part of
+  cutting a release, the same way you'd bump a version number, and commit
+  the bump.
+- **Never decrease it, and never re-sign an old build under an already-used
+  value** — either defeats the whole mechanism for every device that has
+  already seen a higher one.
+- To intentionally *revert* a bad release under this scheme, do not try to
+  "roll back" the counter — re-release the old code under a **new, higher**
+  counter value instead (the standard TUF/AVB pattern: rollback is just
+  "the next release happens to be old code"). The Release flow below already
+  does this correctly as long as you always read the current
+  `fw_build_counter`, sign, and only then bump it for next time.
+- `tools/fw_sign` takes the value as a required argument rather than reading
+  the file itself, so it stays a simple, easily-host-testable tool with no
+  hidden file I/O or path assumptions — the release flow (below) is what
+  reads `fw_build_counter` and threads the value through.
+
 ## Generating a (new) signing key
 
 Only needed once per key generation/rotation — do **not** run this for every
@@ -77,8 +123,14 @@ cmake -S .. -B ../build_ota -DOTA_APP_LAYOUT=ON
 make -C ../build_ota light_switch_ota
 arm-none-eabi-objcopy -O binary ../build_ota/light_switch_ota.elf ../build_ota/light_switch_ota.bin
 
-# 2. Sign it with the dev (or production) private key
-./fw_sign ../build_ota/light_switch_ota.bin dev_privkey.bin ../build_ota/light_switch_ota.signed.bin
+# 2. Sign it with the dev (or production) private key. BUILD_CTR must be
+#    strictly greater than every value ever used before — read it from
+#    fw_build_counter, then bump that file for next time (see "Anti-rollback
+#    build counter" above; do this AFTER a successful sign, not before).
+BUILD_CTR=$(cat fw_build_counter)
+./fw_sign ../build_ota/light_switch_ota.bin dev_privkey.bin "$BUILD_CTR" \
+    ../build_ota/light_switch_ota.signed.bin
+echo $((BUILD_CTR + 1)) > fw_build_counter
 
 # 3. Generate the manifest
 ./fw_manifest.sh 2.1.0 ../build_ota/light_switch_ota.signed.bin \

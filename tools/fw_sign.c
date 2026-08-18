@@ -6,21 +6,29 @@
  *
  * Wire format / signing convention (must match fw_image.h exactly):
  *   [image bytes][struct fw_trailer]
- *   trailer.magic    = FW_TRAILER_MAGIC
- *   trailer.img_len  = size of the input .bin
- *   trailer.sha512   = crypto_sha512(image bytes)
- *   trailer.sig      = crypto_ed25519_sign(privkey, magic|img_len|sha512)
+ *   trailer.magic     = FW_TRAILER_MAGIC
+ *   trailer.img_len   = size of the input .bin
+ *   trailer.build_ctr = the caller-supplied build counter (anti-rollback;
+ *                        see fw_image.h's struct fw_trailer.build_ctr doc
+ *                        comment). Source of truth is tools/fw_build_counter
+ *                        — read it and pass its value here; do NOT invent a
+ *                        value ad hoc, and never reuse/decrease one across
+ *                        releases (see tools/README.md's release flow).
+ *   trailer.sha512    = crypto_sha512(image bytes)
+ *   trailer.sig       = crypto_ed25519_sign(privkey,
+ *                        magic|img_len|build_ctr|sha512)
  *                       i.e. over the trailer's own bytes up to (not
  *                       including) sig itself — offsetof(fw_trailer, sig)
  *                       bytes, straight off the in-memory struct, exactly
  *                       as fw_verify() re-derives it on the device side.
  *
  * Usage:
- *   fw_sign <in.bin> <privkey.bin(64)> <out.signed.bin>
+ *   fw_sign <in.bin> <privkey.bin(64)> <build_ctr> <out.signed.bin>
  *
  * privkey.bin is the 64-byte "expanded" secret key (seed || public_key)
  * produced by fw_keygen / crypto_ed25519_key_pair — the same layout
- * crypto_ed25519_sign expects.
+ * crypto_ed25519_sign expects. build_ctr is a positive decimal integer
+ * (<= UINT32_MAX) — normally the current contents of tools/fw_build_counter.
  *
  * Build:
  *   cc -Wall -Wextra -I ../src -I ../lib/monocypher -o fw_sign fw_sign.c \
@@ -35,6 +43,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <errno.h>
 
 static uint8_t *read_whole_file(const char *path, long *out_len) {
     FILE *f = fopen(path, "rb");
@@ -55,13 +64,34 @@ static uint8_t *read_whole_file(const char *path, long *out_len) {
 }
 
 int main(int argc, char **argv) {
-    if (argc != 4) {
-        fprintf(stderr, "usage: %s <in.bin> <privkey.bin(64)> <out.signed.bin>\n", argv[0]);
+    if (argc != 5) {
+        fprintf(stderr,
+                "usage: %s <in.bin> <privkey.bin(64)> <build_ctr> <out.signed.bin>\n",
+                argv[0]);
         return 2;
     }
-    const char *in_path  = argv[1];
-    const char *key_path = argv[2];
-    const char *out_path = argv[3];
+    const char *in_path       = argv[1];
+    const char *key_path      = argv[2];
+    const char *build_ctr_str = argv[3];
+    const char *out_path      = argv[4];
+
+    /* build_ctr: a positive decimal integer, whole string consumed (no
+     * trailing garbage), fitting uint32_t. Rejecting 0 outright catches an
+     * obviously-wrong invocation early (an empty/uninitialised
+     * tools/fw_build_counter, a typo'd arg) rather than silently signing an
+     * image whose anti-rollback field is indistinguishable from "no record
+     * yet" (boot_control.h's min_build_ctr also starts at 0). */
+    errno = 0;
+    char *endptr = NULL;
+    unsigned long build_ctr_ul = strtoul(build_ctr_str, &endptr, 10);
+    if (build_ctr_str[0] == '\0' || *endptr != '\0' || errno == ERANGE ||
+        build_ctr_ul == 0 || build_ctr_ul > UINT32_MAX) {
+        fprintf(stderr,
+                "error: build_ctr must be a positive integer <= %lu, got '%s'\n",
+                (unsigned long)UINT32_MAX, build_ctr_str);
+        return 1;
+    }
+    uint32_t build_ctr = (uint32_t)build_ctr_ul;
 
     long img_len_l = 0;
     uint8_t *img = read_whole_file(in_path, &img_len_l);
@@ -93,8 +123,9 @@ int main(int argc, char **argv) {
 
     /* Build the trailer exactly per fw_image.h's convention. */
     struct fw_trailer t;
-    t.magic   = FW_TRAILER_MAGIC;
-    t.img_len = img_len;
+    t.magic     = FW_TRAILER_MAGIC;
+    t.img_len   = img_len;
+    t.build_ctr = build_ctr;
     crypto_sha512(t.sha512, img, img_len);
     crypto_ed25519_sign(t.sig, sk, (const uint8_t *)&t, offsetof(struct fw_trailer, sig));
 
@@ -119,8 +150,10 @@ int main(int argc, char **argv) {
         return 1;
     }
 
-    printf("signed: %s (%u bytes image + %zu byte trailer = %lu bytes total) -> %s\n",
-           in_path, img_len, sizeof t, (unsigned long)(img_len + sizeof t), out_path);
+    printf("signed: %s (%u bytes image + %zu byte trailer = %lu bytes total, "
+           "build_ctr=%u) -> %s\n",
+           in_path, img_len, sizeof t, (unsigned long)(img_len + sizeof t),
+           build_ctr, out_path);
 
     free(img);
     return 0;

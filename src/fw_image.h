@@ -42,11 +42,30 @@
 struct fw_trailer {
     uint32_t magic;       /* FW_TRAILER_MAGIC */
     uint32_t img_len;     /* byte length of the image preceding this trailer */
+    uint32_t build_ctr;   /* monotonic release build counter (anti-rollback).
+                            * NOT a version string — purely comparable. Source
+                            * of truth is tools/fw_build_counter, bumped by
+                            * hand once per release (tools/README.md) and
+                            * passed to tools/fw_sign.c. A device persists the
+                            * highest build_ctr it has ever COMMITTED
+                            * (boot_control.h's min_build_ctr) and refuses to
+                            * commit any later candidate — even a validly
+                            * signed one — whose build_ctr is lower. This is
+                            * what stops an attacker who controls the
+                            * (unauthenticated, plain-HTTP) manifest from
+                            * pointing `url` at an OLD, still-validly-signed
+                            * release to silently reinstate a fixed bug: the
+                            * bare `strcmp(latest, installed) != 0` recency
+                            * check in fwupdate_available() has no ordering
+                            * of its own, so this field — checked deep in the
+                            * trust chain (ota_stage.c and, authoritatively,
+                            * the bootloader's commit.c), not at the manifest
+                            * layer — is the actual anti-downgrade gate. */
     uint8_t  sha512[64];  /* SHA-512 digest (crypto_sha512) of the img_len
                             * image bytes */
     uint8_t  sig[64];     /* RFC 8032 Ed25519 (crypto_ed25519_sign) signature
                             * over the preceding fields: magic | img_len |
-                            * sha512 */
+                            * build_ctr | sha512 */
 };
 
 /*

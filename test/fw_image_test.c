@@ -61,15 +61,17 @@ static void hex_to_bytes(const char *hex, uint8_t *out, size_t out_len) {
 
 /* Builds a total_len = img_len + sizeof(struct fw_trailer) buffer: img_len
  * bytes of deterministic "image" content, followed by a correctly signed
- * trailer under (sk, pk). Caller-owned buf must be >= that total length. */
-static uint32_t build_signed_image(uint8_t *buf, uint32_t img_len,
+ * trailer (with the given build_ctr) under (sk, pk). Caller-owned buf must
+ * be >= that total length. */
+static uint32_t build_signed_image(uint8_t *buf, uint32_t img_len, uint32_t build_ctr,
                                     const uint8_t sk[64], const uint8_t pk[32]) {
     for (uint32_t i = 0; i < img_len; i++)
         buf[i] = (uint8_t)(i * 31u + 7u);   /* arbitrary but deterministic */
 
     struct fw_trailer t;
-    t.magic   = FW_TRAILER_MAGIC;
-    t.img_len = img_len;
+    t.magic     = FW_TRAILER_MAGIC;
+    t.img_len   = img_len;
+    t.build_ctr = build_ctr;
     crypto_sha512(t.sha512, buf, img_len);
     crypto_ed25519_sign(t.sig, sk, (const uint8_t *)&t, offsetof(struct fw_trailer, sig));
     (void)pk; /* pk is embedded in sk per crypto_ed25519_key_pair; kept for clarity/signature symmetry */
@@ -152,7 +154,7 @@ static void test_valid_image_verifies(void) {
 
     uint8_t buf[4096];
     uint32_t img_len = 1000;
-    uint32_t total_len = build_signed_image(buf, img_len, sk, pk);
+    uint32_t total_len = build_signed_image(buf, img_len, 1, sk, pk);
 
     CHECK(fw_verify(buf, total_len, pk) == true);
 }
@@ -166,7 +168,7 @@ static void test_tamper_detection(void) {
 
     uint8_t buf[4096];
     uint32_t img_len = 500;
-    uint32_t total_len = build_signed_image(buf, img_len, sk, pk);
+    uint32_t total_len = build_signed_image(buf, img_len, 42, sk, pk);
 
     /* sanity: unmodified buffer verifies before each tamper sub-case */
     CHECK(fw_verify(buf, total_len, pk) == true);
@@ -176,6 +178,19 @@ static void test_tamper_detection(void) {
         uint8_t tampered[4096];
         memcpy(tampered, buf, total_len);
         tampered[img_len / 2] ^= 0xFF;
+        CHECK(fw_verify(tampered, total_len, pk) == false);
+    }
+
+    /* flip a byte in the trailer's build_ctr field — proves build_ctr is
+     * inside the signed prefix (fw_image.h's "magic | img_len | build_ctr |
+     * sha512"), not an unsigned/informational field an attacker could
+     * freely rewrite to dodge the anti-rollback floor downstream
+     * (ota_stage.c / bootloader/commit.c). */
+    {
+        uint8_t tampered[4096];
+        memcpy(tampered, buf, total_len);
+        size_t ctr_off = img_len + offsetof(struct fw_trailer, build_ctr);
+        tampered[ctr_off] ^= 0xFF;
         CHECK(fw_verify(tampered, total_len, pk) == false);
     }
 

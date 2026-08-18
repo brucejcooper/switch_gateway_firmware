@@ -171,6 +171,40 @@ boot_action_t try_commit_staging(struct boot_control *bc) {
         return BOOT_STUCK;
     }
 
+    /* ── anti-rollback floor — THE AUTHORITATIVE GATE ─────────────────────
+     * src/ota_stage.c's ota_stage_finish() already checked this before ever
+     * writing BC_F_PENDING (fail-fast, cheap — see its own doc comment), but
+     * this bootloader must not trust "shouldn't happen" for anything
+     * security-critical (see this file's header comment and the bounds
+     * check at the top of this function) — a hand-crafted/corrupted
+     * boot_control record, or a future bug in the app-side check, must not
+     * be able to commit a downgrade. bc->min_build_ctr is the floor as of
+     * the LAST successful commit: ota_stage_finish() only ever carries it
+     * forward unchanged when staging a candidate; a commit — right here,
+     * below — is the only thing that ever raises it. fw_verify() just above
+     * already proved this trailer's build_ctr is genuinely what the signer
+     * signed (it's inside the signed prefix — fw_image.h), so it's safe to
+     * trust for this comparison.
+     *
+     * fw_trailer_at() cannot fail here: fw_verify() above already fails
+     * closed on any bc->staged_len shorter than sizeof(struct fw_trailer)
+     * (see fw_image.c), so having reached this line proves a trailer really
+     * is present at this offset — same reasoning try_rollback() uses below
+     * for its own post-verify fw_trailer_at() call. */
+    struct fw_trailer candidate_trailer;
+    fw_trailer_at(staging, bc->staged_len, &candidate_trailer);
+    if (candidate_trailer.build_ctr < bc->min_build_ctr) {
+        /* A validly-signed but OLDER release — exactly the downgrade attack
+         * this floor exists to stop (see fw_image.h's build_ctr doc
+         * comment). Active is untouched (this check runs before any flash
+         * copy) — refuse to commit rather than silently reinstating
+         * whatever this build fixed. Same terminal state as any other
+         * refused commit: bc left completely untouched, BC_F_PENDING still
+         * set, next boot re-evaluates from scratch (and will refuse again,
+         * deterministically, until a genuinely newer candidate is staged). */
+        return BOOT_STUCK;
+    }
+
     const uint8_t *active = REGION_PTR(APP_OFF);
 
     /* ── interrupted-commit gate: has THIS commit already completed on a
@@ -346,6 +380,20 @@ boot_action_t try_commit_staging(struct boot_control *bc) {
         return BOOT_STUCK;
     }
 
+    /* Commit succeeded end-to-end — raise the anti-rollback floor to this
+     * candidate's build_ctr. The gate above already proved
+     * candidate_trailer.build_ctr >= bc->min_build_ctr, so this is always a
+     * raise-or-no-op, never a lowering; written as an explicit max() anyway
+     * (rather than an unconditional assignment) for defensive clarity —
+     * this is a security-critical field and should not silently rely on an
+     * invariant proven several lines above surviving future edits. On the
+     * interrupted-commit retry path (commit_already_done == true, above)
+     * this recomputes the exact same value from the exact same (unchanged)
+     * staging trailer, so it's idempotent — no different from any other
+     * field in this record on a retry boot. */
+    if (candidate_trailer.build_ctr > bc->min_build_ctr)
+        bc->min_build_ctr = candidate_trailer.build_ctr;
+
     bc->flags &= ~BC_F_PENDING;
     return BOOT_ACTIVE;
 }
@@ -434,6 +482,43 @@ boot_action_t try_rollback(struct boot_control *bc) {
     memcpy(restored.staged_sha512, trailer.sha512, sizeof restored.staged_sha512);
     restored.flags = BC_F_CONFIRMED;
     restored.boot_attempts = 0;
+    /* ── anti-rollback floor: carry it FORWARD; do NOT adopt the restored
+     * image's own (older, lower) build_ctr ──────────────────────────────
+     * bc->min_build_ctr is the floor as it stood immediately before this
+     * restore. It already reflects the crash-looping candidate's own
+     * commit: try_commit_staging() raised it to that candidate's build_ctr
+     * when THIS now-crash-looping image was committed, before it ever
+     * started crash-looping — see that function's floor-raise comment.
+     * The image being restored here (BACKUP) is, by construction, an OLDER
+     * release than the one that just failed (only a CONFIRMED outgoing
+     * image is ever backed up, and it was outgoing precisely because
+     * something newer replaced it) — its own trailer's build_ctr
+     * (`trailer.build_ctr` above, from BACKUP's own fw_trailer, NOT reused
+     * here) is very likely LOWER than the current floor.
+     *
+     * Setting restored.min_build_ctr = trailer.build_ctr would LOWER the
+     * floor and reopen exactly the downgrade hole this whole scheme exists
+     * to close: an attacker (or a stale manifest) could then re-stage that
+     * SAME bad, higher-build_ctr, still-validly-signed candidate again via
+     * a fresh OTA and have it re-committed, since it would once again read
+     * as "at or above the floor" — silently undoing the protection this
+     * very crash-loop-and-rollback sequence just paid for. The floor tracks
+     * "highest build_ctr ever committed", not "build_ctr of the image
+     * currently running", and must be monotonic: a rollback intentionally
+     * regresses the RUNNING image, but must NOT regress the floor with it.
+     *
+     * Rollback itself is deliberately exempt from the floor check — nothing
+     * above compares bc->backup_len's image against min_build_ctr before
+     * restoring it, only bc_has_valid_backup() + fw_verify(). The restored
+     * image was already trusted once (only a CONFIRMED outgoing image is
+     * ever backed up in the first place), and refusing to roll back to it
+     * merely because its build_ctr happens to be below the (possibly
+     * since-raised) floor would turn a recoverable crash loop into a hard
+     * BOOT_STUCK for no security benefit whatsoever — the floor, preserved
+     * as-is by the line below, still does its job against any FUTURE OTA
+     * exactly as it did before this restore; it simply doesn't get to veto
+     * the one thing standing between this device and bricking itself. */
+    restored.min_build_ctr = bc->min_build_ctr;
     /* backup_len/BC_F_BACKUP_VALID intentionally left clear (the memset
      * above): BACKUP now holds the exact same image as active, not a
      * distinct fallback, so there is nothing left to roll back to until

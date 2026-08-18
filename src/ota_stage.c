@@ -257,6 +257,30 @@ bool ota_stage_finish(uint32_t total_len) {
     struct fw_trailer trailer;
     fw_trailer_at(img, total_len, &trailer);
 
+    /* Read the current boot_control record once, up front — both the
+     * anti-rollback floor check just below and the true-rollback backup
+     * bookkeeping further down need it. */
+    struct boot_control old_bc;
+    bool have_old = bc_read(&old_bc);
+
+    /* ── anti-rollback floor (fail fast, before burning a boot-control flash
+     * write on a candidate the bootloader would refuse to commit anyway) ──
+     * old_bc.min_build_ctr (boot_control.h) is the persisted floor: the
+     * highest build_ctr any image has ever actually been COMMITTED with. No
+     * record yet (very first-ever OTA) -> floor 0, so anything validly
+     * signed passes — correct, there is nothing yet to roll back FROM. A
+     * validly-signed candidate whose OWN build_ctr is below the floor is a
+     * downgrade — the exact attack this field exists to stop (see
+     * fw_image.h's struct fw_trailer.build_ctr doc comment) — so refuse it
+     * exactly like a failed fw_verify(): do not write BC_F_PENDING at all.
+     * This is the cheap, fail-fast half of a defense-in-depth pair — the
+     * bootloader's try_commit_staging() (bootloader/commit.c) re-checks this
+     * independently and is the AUTHORITATIVE gate, since this app-side check
+     * could in principle be skipped by a bug or a hand-crafted boot_control
+     * record. */
+    uint32_t floor = have_old ? old_bc.min_build_ctr : 0;
+    if (trailer.build_ctr < floor) return false;
+
     /* ── preserve the OUTGOING active image's length for the bootloader's
      * benefit (true-rollback phase) ──────────────────────────────────────
      *
@@ -286,8 +310,6 @@ bool ota_stage_finish(uint32_t total_len) {
      * decision fresh from whatever bc_read() returns right now, per the same
      * rule above, so it correctly lands in case (2) and backs up nothing.
      * There is no accumulation across staged-but-never-confirmed images. */
-    struct boot_control old_bc;
-    bool have_old = bc_read(&old_bc);
     bool back_up_outgoing = have_old && old_bc.staged_len > 0 &&
                             (old_bc.flags & BC_F_CONFIRMED) != 0;
 
@@ -296,6 +318,13 @@ bool ota_stage_finish(uint32_t total_len) {
     bc.flags = BC_F_PENDING;
     bc.staged_len = total_len;
     memcpy(bc.staged_sha512, trailer.sha512, sizeof bc.staged_sha512);
+    /* Carry the anti-rollback floor forward UNCHANGED. Staging a candidate
+     * never itself raises it — only a successful commit does
+     * (bootloader/commit.c's try_commit_staging()), because only a commit
+     * has actually proven this candidate becomes the new floor; up to that
+     * point it is just a verified-and-eligible candidate, not yet trusted
+     * more than whatever came before it. */
+    bc.min_build_ctr = floor;
     if (back_up_outgoing) {
         bc.flags |= BC_F_BACKUP_VALID;
         bc.backup_len = old_bc.staged_len;

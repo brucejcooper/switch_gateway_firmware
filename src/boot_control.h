@@ -46,7 +46,24 @@ struct boot_control {
      * word of the original uint32_t reserved[4] — struct size (104 B) and
      * crc32 coverage are unchanged by this rename. */
     uint32_t backup_len;
-    uint32_t reserved[3];        /* zero; keeps the record growable in place */
+    /* Anti-rollback floor: the highest struct fw_trailer.build_ctr
+     * (fw_image.h) any image has ever been successfully COMMITTED with
+     * (bootloader/commit.c's try_commit_staging() — the only place that
+     * raises it). 0 until the first-ever commit (no record yet, or a record
+     * predating this field — see fw_image.h's breaking-change note).
+     * src/ota_stage.c's ota_stage_finish() reads it as a fail-fast gate
+     * before ever staging a candidate, and carries it forward UNCHANGED into
+     * the new PENDING record it writes (staging never raises the floor,
+     * only a real commit does). MUST NEVER DECREASE — not even across a
+     * crash-loop rollback restore: try_rollback() deliberately carries the
+     * pre-rollback floor forward rather than adopting the restored BACKUP
+     * image's own (older, lower) build_ctr, or the very attack this field
+     * exists to stop could be replayed right after a rollback. See that
+     * function's doc comment for the full argument. Repurposes a second word
+     * of the original uint32_t reserved[4] — struct size (104 B) and crc32
+     * coverage are unchanged, same as backup_len's repurpose above. */
+    uint32_t min_build_ctr;
+    uint32_t reserved[2];        /* zero; keeps the record growable in place */
     uint32_t crc32;              /* CRC-32 over every preceding byte of this struct */
 };
 

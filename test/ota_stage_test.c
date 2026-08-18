@@ -88,14 +88,17 @@ static void erase_bc(void) {
 
 /* Builds a total_len = img_len + sizeof(struct fw_trailer) signed artifact
  * into buf: img_len bytes of deterministic content, followed by a correctly
- * signed trailer under sk. Mirrors fw_image_test.c's build_signed_image. */
-static uint32_t build_signed_image(uint8_t *buf, uint32_t img_len, const uint8_t sk[64]) {
+ * signed trailer (with the given build_ctr) under sk. Mirrors
+ * fw_image_test.c's build_signed_image. */
+static uint32_t build_signed_image(uint8_t *buf, uint32_t img_len, uint32_t build_ctr,
+                                    const uint8_t sk[64]) {
     for (uint32_t i = 0; i < img_len; i++)
         buf[i] = (uint8_t)(i * 17u + 11u);
 
     struct fw_trailer t;
-    t.magic   = FW_TRAILER_MAGIC;
-    t.img_len = img_len;
+    t.magic     = FW_TRAILER_MAGIC;
+    t.img_len   = img_len;
+    t.build_ctr = build_ctr;
     crypto_sha512(t.sha512, buf, img_len);
     crypto_ed25519_sign(t.sig, sk, (const uint8_t *)&t, offsetof(struct fw_trailer, sig));
 
@@ -131,7 +134,7 @@ int main(void) {
 
     static uint8_t g_image[24 * 1024];
     uint32_t img_len = 20000;
-    uint32_t total_len = build_signed_image(g_image, img_len, sk);
+    uint32_t total_len = build_signed_image(g_image, img_len, 1, sk);
     CHECK(total_len < TEST_STAGING_CAP);
     CHECK(total_len > 4 * FLASH_SECTOR_SIZE);   /* must span several sectors */
 
@@ -156,6 +159,10 @@ int main(void) {
     struct fw_trailer trailer;
     CHECK(fw_trailer_at(g_image, total_len, &trailer));
     CHECK(memcmp(bc.staged_sha512, trailer.sha512, sizeof bc.staged_sha512) == 0);
+    /* anti-rollback floor: no prior record at all -> floor 0, carried
+     * forward unchanged (staging never raises it, only a commit does — see
+     * ota_stage.c's ota_stage_finish()). */
+    CHECK(bc.min_build_ctr == 0);
 
     /* ── (b) one-byte-corrupted image: verify fails, no record written ── */
     erase_staging();
@@ -177,7 +184,7 @@ int main(void) {
      * image B over it -> B's record backs up A's length ────────────────── */
     static uint8_t g_image_b[24 * 1024];
     uint32_t img_len_b = 8000;   /* deliberately a different length from A (20000) */
-    uint32_t total_len_b = build_signed_image(g_image_b, img_len_b, sk);
+    uint32_t total_len_b = build_signed_image(g_image_b, img_len_b, 2, sk);
     CHECK(total_len_b != total_len);   /* sanity: A and B really are different sizes */
 
     erase_staging();
@@ -264,6 +271,54 @@ int main(void) {
     CHECK((bc.flags & BC_F_PENDING) != 0);      /* still pending */
     CHECK((bc.flags & BC_F_CONFIRMED) == 0);    /* NOT confirmed */
     CHECK(bc.seq == seq_before);                /* no flash write happened at all */
+
+    /* ── (f) anti-rollback floor: ota_stage_finish() refuses a candidate
+     * whose build_ctr is below the persisted floor, and carries the floor
+     * FORWARD UNCHANGED (never raises it — that's the bootloader's job on
+     * an actual commit, see bootloader/commit.c) into one that clears it ──
+     * This is the app-side, fail-fast half of the anti-rollback pair — see
+     * test/boot_commit_test.c for the bootloader's own, authoritative gate,
+     * and for the rollback-preserves-the-floor scenario. */
+    erase_staging();
+    erase_bc();
+
+    /* Seed a record with floor=10 directly, exactly as if a real commit had
+     * already raised it that far (this test's job is ota_stage_finish()'s
+     * own gate, not how the floor got there). */
+    struct boot_control floor_seed;
+    memset(&floor_seed, 0, sizeof floor_seed);
+    floor_seed.flags = BC_F_CONFIRMED;
+    floor_seed.staged_len = 1234;   /* arbitrary, unrelated to this sub-test */
+    floor_seed.min_build_ctr = 10;
+    CHECK(bc_write(&floor_seed) == true);
+
+    /* candidate build_ctr (5) below the floor (10) -> refused outright, no
+     * new record written at all (not even a rejected PENDING one — see
+     * ota_stage_finish()'s early return). */
+    static uint8_t g_low[24 * 1024];
+    uint32_t total_low = build_signed_image(g_low, 3000, 5, sk);
+    ota_stage_begin();
+    stream_in_chunks(g_low, total_low);
+    CHECK(ota_stage_finish(total_low) == false);
+
+    CHECK(bc_read(&bc) == true);
+    CHECK(bc.min_build_ctr == 10);              /* floor untouched */
+    CHECK((bc.flags & BC_F_PENDING) == 0);      /* still the seeded CONFIRMED record */
+    CHECK(bc.staged_len == 1234);               /* nothing about it changed */
+
+    /* candidate build_ctr (10) exactly AT the floor -> accepted; the new
+     * PENDING record carries the floor forward unchanged, not raised —
+     * ota_stage_finish() never raises it, only a bootloader commit does. */
+    static uint8_t g_at[24 * 1024];
+    uint32_t total_at = build_signed_image(g_at, 3000, 10, sk);
+    ota_stage_begin();
+    stream_in_chunks(g_at, total_at);
+    CHECK(ota_stage_finish(total_at) == true);
+
+    CHECK(bc_read(&bc) == true);
+    CHECK((bc.flags & BC_F_PENDING) != 0);
+    CHECK(bc.staged_len == total_at);
+    CHECK(bc.min_build_ctr == 10);              /* carried forward, not raised */
 
     if (fail) {
         printf("FAILED\n");

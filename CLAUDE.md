@@ -85,8 +85,13 @@ Build the tools once (`tools/README.md`), then per release:
 # 1. Build the RELOCATED app + raw .bin
 cmake -S . -B build_ota -DOTA_APP_LAYOUT=ON && make -C build_ota light_switch_ota
 arm-none-eabi-objcopy -O binary build_ota/light_switch_ota.elf build_ota/light_switch_ota.bin
-# 2. Sign it (dev key is tools/dev_privkey.bin — gitignored; rotate for prod)
-tools/fw_sign build_ota/light_switch_ota.bin tools/dev_privkey.bin build_ota/light_switch_ota.signed.bin
+# 2. Sign it (dev key is tools/dev_privkey.bin — gitignored; rotate for prod).
+#    BUILD_CTR is the anti-rollback build counter (tools/fw_build_counter) —
+#    bump the file for next time only AFTER a successful sign.
+BUILD_CTR=$(cat tools/fw_build_counter)
+tools/fw_sign build_ota/light_switch_ota.bin tools/dev_privkey.bin "$BUILD_CTR" \
+    build_ota/light_switch_ota.signed.bin
+echo $((BUILD_CTR + 1)) > tools/fw_build_counter
 # 3. Manifest — version MUST equal the NEW image's FW_VERSION (see gotcha below)
 VER=$(sed -n 's/.*FW_VERSION "\(.*\)".*/\1/p' build_ota/generated/version.h)
 tools/fw_manifest.sh "$VER" build_ota/light_switch_ota.signed.bin \
@@ -124,6 +129,12 @@ The web UI's **Firmware** tab wraps these (`web/src/tabs/firmware.js`).
 
 Trust is the ed25519 signature in the image trailer (baked-in `FW_PUBKEY`), verified
 on-device and again by the bootloader — the manifest `sha256` is informational only.
+The manifest `version` check is a bare string-inequality (no ordering), so the
+trailer also carries a monotonic **anti-rollback build counter**
+(`fw_trailer.build_ctr`, `tools/fw_build_counter`) that the device persists a
+floor for and refuses to commit anything below — see `tools/README.md`'s
+"Anti-rollback build counter" for the full mechanism and the release-time
+contract (bump the counter file every release, never reuse/decrease a value).
 **Caveats:** the *first* OTA over the factory image has no rollback fallback; rotate
 the dev signing key before production (`tools/README.md`).
 
