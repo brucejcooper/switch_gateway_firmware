@@ -283,9 +283,15 @@ typedef struct {
     uint8_t  net_ip[4], net_mask[4], net_gw[4], net_dns[4];
     char     net_hostname[32];
 
-    /* Config web UI Basic-auth credentials (core 1 checks these). */
+    /* Config web UI Basic-auth credentials (core 1 checks these). Carried as
+     * lowercase hex text — the same wire representation config.h stores —
+     * rather than decoded raw bytes: this struct is a plain memcpy of
+     * config.h's fields (see main.c), and decoding is one hex_decode() call
+     * away in http_server.c right where it's needed, so there is no reason
+     * for a second, binary copy of the same value to exist. */
     char     web_user[32];
-    char     web_pass[48];
+    char     web_pass_hash[65];
+    char     web_salt[33];
 
     /* OTA manifest URL override; empty = fwupdate.c's compiled-in default. */
     char     fw_url[128];

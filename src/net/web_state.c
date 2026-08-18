@@ -270,7 +270,7 @@ static int render_members(uint64_t mask, char *out, size_t cap) {
     return n;
 }
 
-/* Build the cfg/net/mqtt tail (no secrets: mqtt_pass and web_pass are omitted). */
+/* Build the cfg/net/mqtt tail (no secrets: mqtt_pass and web_pass_hash/web_salt are omitted). */
 static int render_tail(char *out, size_t cap) {
     const ic_snapshot_t *sn = intercore_snapshot();
     int n = 0;

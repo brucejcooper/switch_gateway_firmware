@@ -227,8 +227,16 @@ in `README.md` (“Config Web UI”). The load-bearing facts:
   independent of MQTT. **Writes** become typed `ic_cmd_t` to core 0 — the new
   `IC_CMD_SET_NETCFG/MQTTCFG/AUTH` + `de_mode` in `SET_CFG`. Config stays
   **core-0-owned** (single writer to `/config.json`).
-- **Auth:** Basic, creds in `/config.json` (`web_user`/`web_pass`, default
-  admin/admin), in the core-0→core-1 snapshot. Plain HTTP (no TLS on W5100S).
+- **Auth:** Basic, default admin/admin unchanged from the user's perspective —
+  but the PASSWORD itself is never stored, only an Argon2id hash + salt
+  (`web_pass_hash`/`web_salt` in `/config.json`; `web_user` stays plaintext,
+  an identifier not a secret). `src/web_auth.{h,c}` owns the KDF (a static
+  32 KB work area shared by both cores under a try-lock — see that file's
+  header for the concurrency argument) and the hex codec; `http_server.c`'s
+  `check_auth()` caches one BLAKE2b digest after a successful KDF verify so
+  the ~1.5 s `/api/state` poll doesn't re-run Argon2id on every request.
+  Snapshot carries the hash+salt (hex text), not the password. Plain HTTP (no
+  TLS on W5100S).
 - **Same hot-path rule as MQTT:** *do NOT log in the http recv/send pump.* All
   http I/O is non-blocking, one ≤2 KB chunk per socket per tick, one request per
   connection then close — keeps MQTT + the watchdog healthy.

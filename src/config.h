@@ -78,9 +78,22 @@ typedef struct {
     char     net_hostname[32];     /* default "lights" */
 
     /* Embedded config web UI (core 1). Basic-auth credentials; default
-     * admin/admin. Plain HTTP (no TLS on the W5100S) — LAN-only fallback. */
+     * admin/admin. Plain HTTP (no TLS on the W5100S) — LAN-only fallback.
+     *
+     * The PASSWORD is never stored — only an Argon2id hash of it. The
+     * device is the sole VERIFIER of web_pass (there is no third party to
+     * present it to), unlike mqtt_pass below, which stays plaintext because
+     * there the device is the CLIENT authenticating outward to the broker.
+     * That asymmetry is why only this credential moved: /config.json is
+     * readable over the CLI (`cat /config.json`) and lands in any flash/UPDI
+     * dump or backup, so a plaintext web_pass sitting there defeated the
+     * point of having a password at all. web_pass_hash/web_salt are each
+     * stored as lowercase hex text (raw 32/16 bytes) rather than binary —
+     * see web_auth.h for the KDF and codec, config.c's CFG_HEX schema kind
+     * for how they load/save/validate like any other config string. */
     char     web_user[32];         /* default "admin" */
-    char     web_pass[48];         /* default "admin" */
+    char     web_pass_hash[65];    /* Argon2id(pass,salt), 32 raw bytes as hex; default = hash of "admin" */
+    char     web_salt[33];         /* 16 raw bytes as hex; fixed for the factory default, random once a password is set */
 
     /* OTA manifest URL override. Empty = the compiled-in default
      * (FWUPDATE_MANIFEST_URL, fwupdate.c). Settable via CLI `cfg fw_url=…`

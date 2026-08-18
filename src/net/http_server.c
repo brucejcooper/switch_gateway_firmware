@@ -18,6 +18,7 @@
 #include "web_state.h"
 #include "netif.h"
 #include "intercore.h"
+#include "web_auth.h"      /* KDF verify/hash + hex codec — check_auth(), POST /api/auth */
 #include "log.h"
 #include "cdc_out.h"       /* cdc_out_history() — GET /api/log */
 #include "fwupdate.h"      /* fwupdate_status_json/announce/install — /api/ota */
@@ -85,9 +86,24 @@ static bool   s_sock0_active = false;   /* are we currently serving on socket 0?
 
 /* Live copy of the Basic-auth credentials. Seeded from the launch snapshot;
  * updated in place when the password is changed via POST /api/auth so the new
- * credentials take effect immediately (core 0 persists them for next boot). */
+ * credentials take effect immediately (core 0 persists them for next boot).
+ *
+ * s_hash_hex/s_salt_hex are the same hex text config.h stores (web_auth.h's
+ * KDF verifies against the raw bytes — see check_auth()). Unlike the old
+ * s_pass, this is NOT the credential the server compares candidates against
+ * directly; it's what a full KDF run is checked against on a cache miss.
+ *
+ * s_authcache_digest/s_authcache_valid are the hot-path shortcut: a BLAKE2b
+ * digest of the last "user:pass" candidate that passed a full KDF verify,
+ * checked with a cheap constant-time compare on every later request instead
+ * of re-running Argon2id on each ~1.5 s web-UI poll. Invalidated (only)
+ * wherever s_hash_hex/s_salt_hex themselves change — see http_server_init()
+ * and the POST /api/auth handler, the only two writers. */
 static char s_user[32];
-static char s_pass[48];
+static char s_hash_hex[65];
+static char s_salt_hex[33];
+static uint8_t s_authcache_digest[WEB_AUTH_HASH_LEN];
+static bool    s_authcache_valid = false;
 
 static uint32_t now_ms(void) { return to_ms_since_boot(get_absolute_time()); }
 
@@ -151,16 +167,24 @@ static void release_sock0_conn(conn_t *c) {
 
 void http_server_init(void) {
     const ic_snapshot_t *sn = intercore_snapshot();
-    /* Fall back to admin/admin only when there is NO snapshot at all (pure
-     * bootstrap). An EMPTY credential in a real snapshot is not "unset" — a
-     * fresh device gets admin/admin from config_defaults(), so empty can only
-     * mean config_load() deliberately cleared an unusable stored credential
-     * (see LOAD_CRED, config.c). Defaulting that back to admin/admin would
+    /* Fall back to admin/admin's factory-default hash+salt only when there is
+     * NO snapshot at all (pure bootstrap) — the same literals
+     * config_defaults() compiles in (config.c), so this fallback and a fresh
+     * device's real snapshot agree. An EMPTY hash/salt in a REAL snapshot is
+     * not "unset" — a fresh device gets the real default hash from
+     * config_defaults(), so empty can only mean config_load() deliberately
+     * cleared an unusable stored credential (see the CFG_HEX/CFG_CRED
+     * fail-closed rules, config.c). Defaulting that back to admin/admin would
      * turn a damaged config into an auth downgrade, which is exactly what the
-     * clearing exists to prevent; check_auth() refuses while it stays empty. */
-    snprintf(s_user, sizeof s_user, "%s", sn ? sn->web_user : "admin");
-    snprintf(s_pass, sizeof s_pass, "%s", sn ? sn->web_pass : "admin");
-    if (!s_user[0] || !s_pass[0])
+     * clearing exists to prevent; check_auth() refuses while either stays
+     * empty. */
+    snprintf(s_user,     sizeof s_user,     "%s", sn ? sn->web_user      : "admin");
+    snprintf(s_hash_hex, sizeof s_hash_hex, "%s", sn ? sn->web_pass_hash
+             : "05143c762a259de70d8e6e2eac4b0a857d816fa43071e968e24680f32d39bd8c");
+    snprintf(s_salt_hex, sizeof s_salt_hex, "%s", sn ? sn->web_salt
+             : "6c6967687473776974636864666c7430");
+    s_authcache_valid = false;
+    if (!s_user[0] || !s_hash_hex[0] || !s_salt_hex[0])
         LOG_ERR("http", "web credential unusable — UI locked until /config.json is repaired");
     for (size_t i = 0; i < N_SOCK; i++) s_conn[i].sn = k_socks[i];
     /* Arm the always-ours sockets now; socket 0 is armed on demand by the tick. */
@@ -208,27 +232,88 @@ static int b64decode(const char *in, uint8_t *out, int outcap) {
     return n;
 }
 
-/* Validate Basic auth against the snapshot credentials. */
+/* Validate Basic auth against the snapshot credentials.
+ *
+ * HOT PATH: called once per request, including every ~1.5 s /api/state poll
+ * from every open web-UI tab — see the file header's "do NOT log / do NOT
+ * block" rule. A full Argon2id run (tens to a few hundred ms on this MCU,
+ * see web_auth.c) on every one of those would starve the connection pump and
+ * mqtt_app_tick() sharing this core, so this function runs the KDF at most
+ * ONCE per credential — the first request after boot or after a password
+ * change — and thereafter compares a cheap BLAKE2b digest
+ * (web_auth_fast_digest(), microseconds) against a cache seeded by that one
+ * KDF verify. The cache is content-addressed by nothing but its own explicit
+ * invalidation: http_server_init() and the POST /api/auth handler are the
+ * ONLY two writers of s_hash_hex/s_salt_hex, and both clear
+ * s_authcache_valid in the same breath, so the cache can never outlive the
+ * credentials it was computed against.
+ *
+ * check_auth() itself never disagrees with the slow path about what counts
+ * as a match — every comparison, fast or slow, goes through
+ * web_auth_verify_equal() (constant-time), and the fast-path digest is only
+ * ever written immediately after a slow-path pass, never predicted. */
 static bool check_auth(const char *req) {
-    /* Fail CLOSED on a missing credential. config_load() clears web_user or
-     * web_pass when the stored value is unusable, deliberately refusing to
-     * fall back to the compiled admin/admin default — a damaged config must
-     * not become an auth downgrade. Without this check an empty password
-     * would instead make "<user>:" a valid login. */
-    if (!s_user[0] || !s_pass[0]) return false;
+    /* Fail CLOSED on a missing credential. config_load() clears the hash (or
+     * salt) when the stored value is unusable, deliberately refusing to fall
+     * back to the compiled admin/admin default — a damaged config must not
+     * become an auth downgrade. Without this check an empty hash would
+     * accept anything hashing to it — impossible for a REAL hash, but an
+     * empty s_hash_hex is exactly the "cleared" marker, not a real hash. */
+    if (!s_user[0] || !s_hash_hex[0] || !s_salt_hex[0]) return false;
     const char *v = find_header(req, "Authorization");
     if (!v || strncasecmp(v, "Basic ", 6) != 0) return false;
     uint8_t dec[96];
     int n = b64decode(v + 6, dec, sizeof dec - 1);
     if (n <= 0) return false;
     dec[n] = '\0';
-    char want[96];
-    int wl = snprintf(want, sizeof want, "%s:%s", s_user, s_pass);
-    if (wl <= 0 || wl != n) return false;
-    /* length-checked compare (not early-out on first diff) */
-    uint8_t diff = 0;
-    for (int i = 0; i < n; i++) diff |= (uint8_t)(dec[i] ^ (uint8_t)want[i]);
-    return diff == 0;
+
+    /* Split "user:pass" (Basic auth's wire format) at the first colon. */
+    char *colon = memchr(dec, ':', (size_t)n);
+    if (!colon) return false;
+    *colon = '\0';
+    const char *cand_user = (const char *)dec;
+    const char *cand_pass = (const char *)colon + 1;
+
+    /* Username is an identifier, not a secret (CFG_CRED's own framing,
+     * config.h) — same plain compare the combined-string version above used
+     * for the whole "user:pass", no behaviour change for this half. */
+    if (strcmp(cand_user, s_user) != 0) return false;
+
+    uint8_t digest[WEB_AUTH_HASH_LEN];
+    web_auth_fast_digest(cand_user, cand_pass, digest);
+
+    bool ok;
+    if (s_authcache_valid && web_auth_verify_equal(digest, s_authcache_digest)) {
+        ok = true;   /* fast path: matches the last candidate that verified */
+    } else {
+        uint8_t salt[WEB_AUTH_SALT_LEN], want_hash[WEB_AUTH_HASH_LEN];
+        if (!web_auth_hex_decode(s_salt_hex, salt, sizeof salt) ||
+            !web_auth_hex_decode(s_hash_hex, want_hash, sizeof want_hash)) {
+            ok = false;   /* can't happen given the emptiness check above, but never trust it */
+        } else {
+            uint8_t got_hash[WEB_AUTH_HASH_LEN];
+            /* retry_ms=0: a single non-blocking attempt. Losing the race for
+             * the shared KDF work area (core 0 or the /api/auth handler mid-
+             * hash) fails CLOSED for this one request rather than blocking
+             * the tick loop — see this function's header comment and
+             * web_auth.c's concurrency argument for why that's safe: the
+             * next poll (or an impatient human's retry) tries again, and a
+             * busy KDF never yields a cheap "yes" for a request that hasn't
+             * actually been checked. */
+            ok = web_auth_hash(cand_pass, salt, got_hash, 0) &&
+                 web_auth_verify_equal(got_hash, want_hash);
+            web_auth_wipe(got_hash, sizeof got_hash);
+        }
+        web_auth_wipe(salt, sizeof salt);
+        web_auth_wipe(want_hash, sizeof want_hash);
+        if (ok) {
+            memcpy(s_authcache_digest, digest, sizeof digest);
+            s_authcache_valid = true;
+        }
+    }
+    web_auth_wipe(digest, sizeof digest);
+    web_auth_wipe(dec, sizeof dec);
+    return ok;
 }
 
 /* ── response builders ───────────────────────────────────────────────────────*/
@@ -600,11 +685,44 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
         cmd.type = IC_CMD_SET_AUTH;
         snprintf(cmd.set_auth.user, sizeof cmd.set_auth.user, "%s", u);
         snprintf(cmd.set_auth.pass, sizeof cmd.set_auth.pass, "%s", p);
-        /* Apply to the live credentials now so the change is effective for the
-         * next request; core 0 persists it for the next boot. */
-        snprintf(s_user, sizeof s_user, "%s", u);
-        snprintf(s_pass, sizeof s_pass, "%s", p);
-        push_cmd_resp(c, &cmd); return;
+        /* Apply to the live credentials now so the change is effective for
+         * the next request; core 0 hashes+persists ITS OWN copy from the same
+         * plaintext (carried in cmd.set_auth.pass, pushed below) for next
+         * boot. This core hashes independently rather than waiting for core
+         * 0's result over the intercore queue — there is no event carrying a
+         * freshly-computed hash back, and adding one just to avoid a second,
+         * cheap-in-context Argon2id call is not worth the new machinery (see
+         * web_auth.h's header comment). The two resulting salts differ; that
+         * is harmless — both are correct salted hashes of the identical
+         * password, and only the persisted (core-0) one survives a reboot. */
+        {
+            uint8_t salt[WEB_AUTH_SALT_LEN], hash[WEB_AUTH_HASH_LEN];
+            web_auth_gen_salt(salt);
+            /* Bounded retry: this POST handler runs synchronously inside one
+             * http_server_tick() call, so blocking here delays the rest of
+             * core 1's tick roster (MQTT pump, other connections) — but only
+             * for this one, rare, explicit admin action, and only up to the
+             * time one concurrent Argon2id call takes (see web_auth.c). On
+             * timeout, fall back to leaving the OLD live credential in place
+             * rather than a half-updated one; the persisted change (pushed
+             * below regardless) still takes effect on the next reboot. */
+            if (web_auth_hash(p, salt, hash, 2000)) {
+                web_auth_hex_encode(salt, sizeof salt, s_salt_hex);
+                web_auth_hex_encode(hash, sizeof hash, s_hash_hex);
+                snprintf(s_user, sizeof s_user, "%s", u);
+                s_authcache_valid = false;   /* new credentials — the old fast-path digest no longer applies */
+            }
+            web_auth_wipe(hash, sizeof hash);
+            web_auth_wipe(salt, sizeof salt);
+        }
+        push_cmd_resp(c, &cmd);
+        /* Wipe every lingering plaintext copy — the local candidate and the
+         * command struct's own copy (intercore_push_cmd() has already copied
+         * cmd.set_auth.pass into the queue by the time push_cmd_resp()
+         * returns, so wiping it here doesn't touch what core 0 receives). */
+        web_auth_wipe(p, sizeof p);
+        web_auth_wipe(cmd.set_auth.pass, sizeof cmd.set_auth.pass);
+        return;
     }
     if (strcmp(path, "/api/mapping") == 0) {
         int fx = jint_key(body, tk, nt, "fixture", -1);

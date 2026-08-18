@@ -13,6 +13,7 @@
 #include "log.h"
 #include "jsmn.h"
 #include "jsmn_util.h"
+#include "web_auth.h"   /* CFG_HEX validation + legacy web_pass migration */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,7 @@ typedef enum {
     CFG_STR,
     CFG_HOSTNAME,
     CFG_CRED,
+    CFG_HEX,     /* lowercase-hex text of a fixed raw byte length — web_pass_hash/web_salt */
 } cfg_kind_t;
 
 typedef struct {
@@ -125,7 +127,20 @@ static const cfg_field_t CFG_SCHEMA[] = {
     /* credentials — too long fails CLOSED on load (LOAD_CRED rule below);
      * an empty value is refused on apply (see config_apply_str()). */
     { "web_user", CFG_CRED, offsetof(global_config_t, web_user), sizeof g_config.web_user, 0, 0 },
-    { "web_pass", CFG_CRED, offsetof(global_config_t, web_pass), sizeof g_config.web_pass, 0, 0 },
+
+    /* web_pass_hash/web_salt — lowercase hex text of the Argon2id hash and
+     * its salt (web_auth.h). Wrong length or non-hex content fails CLOSED on
+     * load exactly like a CRED (config_load()'s CFG_HEX case below), for the
+     * same reason: a damaged config must not silently reopen the web UI, and
+     * there is no compiled-default hash to "fall back to" that wouldn't ALSO
+     * have to be a real Argon2id output. Neither is ever written by a plain
+     * config_apply_str() call from outside config.c — the only writers are
+     * config_load()'s own legacy-password migration and the dedicated
+     * hashing setter (ic_seam.c's IC_CMD_SET_AUTH); this row exists so both
+     * still load/save/validate through the ONE schema-driven path every
+     * other field does, instead of a hand-written third code path. */
+    { "web_pass_hash", CFG_HEX, offsetof(global_config_t, web_pass_hash), sizeof g_config.web_pass_hash, 0, 0 },
+    { "web_salt",      CFG_HEX, offsetof(global_config_t, web_salt),      sizeof g_config.web_salt,      0, 0 },
 };
 #define CFG_SCHEMA_N (sizeof CFG_SCHEMA / sizeof CFG_SCHEMA[0])
 
@@ -175,6 +190,15 @@ cfg_apply_result_t config_apply_str(const char *key, const char *value) {
         return str_set(dst, f->size, value) ? CFG_APPLY_OK : CFG_APPLY_TOO_LONG;
     case CFG_HOSTNAME:
         return config_hostname_set(dst, f->size, value) ? CFG_APPLY_OK : CFG_APPLY_INVALID;
+    case CFG_HEX:
+        /* explen = the raw byte count this field holds (size is sizeof the
+         * hex-text field, i.e. 2*explen + 1 for the NUL). Only config.c's own
+         * load/migration paths ever call this for "web_pass_hash"/"web_salt"
+         * (see the schema row's comment) — checked here anyway, same as
+         * every other kind, rather than trusted because today's callers
+         * happen to behave. */
+        if (!web_auth_hex_valid(value, (f->size - 1) / 2)) return CFG_APPLY_INVALID;
+        return str_set(dst, f->size, value) ? CFG_APPLY_OK : CFG_APPLY_TOO_LONG;
     default:
         return CFG_APPLY_INVALID;  /* a numeric-kind key used with the string API */
     }
@@ -190,7 +214,8 @@ bool config_field_range(const char *key, uint32_t *min, uint32_t *max) {
 
 unsigned config_field_maxlen(const char *key) {
     const cfg_field_t *f = cfg_field_find(key);
-    if (!f || (f->kind != CFG_STR && f->kind != CFG_CRED && f->kind != CFG_HOSTNAME)) return 0;
+    if (!f || (f->kind != CFG_STR && f->kind != CFG_CRED &&
+               f->kind != CFG_HOSTNAME && f->kind != CFG_HEX)) return 0;
     return STR_MAX_LEN(f->size);
 }
 
@@ -226,7 +251,22 @@ void config_defaults(void) {
     g_config.net_dhcp            = 1;
     str_set(g_config.net_hostname, sizeof g_config.net_hostname, "lights");
     str_set(g_config.web_user, sizeof g_config.web_user, "admin");
-    str_set(g_config.web_pass, sizeof g_config.web_pass, "admin");
+    /* Precomputed Argon2id("admin", WEB_AUTH_DEFAULT_SALT_HEX) — see
+     * web_auth.c for the KDF parameters (nb_blocks=32, nb_passes=3,
+     * nb_lanes=1, Argon2id). The salt is a FIXED, public constant rather
+     * than a fresh random one: it is exactly as public as the factory
+     * default password itself always was ("admin" is printed in this repo's
+     * own README), so there is nothing to gain from randomising it, and a
+     * literal here means the compiled default costs a str_set(), not an
+     * Argon2 call, on every boot that hasn't yet loaded a real
+     * /config.json. Regenerate both literals together if WEB_AUTH_NB_*
+     * ever changes — trivial with a throwaway host program: call
+     * web_auth_gen_salt() once to pick a new constant (or keep this one),
+     * then web_auth_hash("admin", that salt, ..., 0) and hex-encode both. */
+    str_set(g_config.web_salt, sizeof g_config.web_salt,
+            "6c6967687473776974636864666c7430");   /* ASCII "lightswitchdflt0" */
+    str_set(g_config.web_pass_hash, sizeof g_config.web_pass_hash,
+            "05143c762a259de70d8e6e2eac4b0a857d816fa43071e968e24680f32d39bd8c");
 }
 
 /* ── jsmn helpers ────────────────────────────────────────────────────────── */
@@ -316,6 +356,11 @@ static bool migrate_legacy_modbus(void) {
 bool config_load(void) {
     config_defaults();
 
+    /* Set by the legacy-plaintext-"web_pass" migration below (schema-loop
+     * scope, but the resave decision at the bottom of this function needs
+     * it) — see that block's own comment. */
+    bool web_pass_migrated = false;
+
     /* A power cut between config_save()'s fclose() and rename() leaves the new
      * config sitting in the .tmp file with the old CONFIG_PATH still intact
      * and authoritative — discard the orphaned .tmp so a later save doesn't
@@ -383,7 +428,17 @@ bool config_load(void) {
              *     valid hostname even if it decoded — config_hostname_ok()'s
              *     charset rejects raw backslashes/quotes/control bytes
              *     regardless — but jstr_get_unescaped() is checked first so
-             *     the log names the real cause.) */
+             *     the log names the real cause.)
+             *   - CFG_HEX: too long, malformed escape, OR not exactly the
+             *     expected count of hex digits -> fail CLOSED exactly like
+             *     CFG_CRED (clear; see that bullet) rather than keep the
+             *     compiled default. A field that doesn't decode to a real
+             *     Argon2id hash/salt is not "absent, use the default" — it
+             *     is either a hand-damaged file or (in web_pass_hash's case)
+             *     the tail end of a migration that didn't complete, and in
+             *     both cases silently falling back to the compiled
+             *     admin/admin hash would be the same auth downgrade the
+             *     CRED rule exists to prevent. */
             for (size_t si = 0; si < CFG_SCHEMA_N; si++) {
                 const cfg_field_t *f = &CFG_SCHEMA[si];
                 switch (f->kind) {
@@ -422,6 +477,24 @@ bool config_load(void) {
                     }
                     break;
                 }
+                case CFG_HEX: {
+                    char *dst = (char *)&g_config + f->offset;
+                    jstr_status_t s = jstr_get_unescaped(buf, tk, nt, f->key, dst, f->size);
+                    if (s == JSTR_OK && !web_auth_hex_valid(dst, (f->size - 1) / 2))
+                        s = JSTR_MALFORMED;   /* right length category, wrong content — same fail-closed path */
+                    if (s == JSTR_TOO_LONG) {
+                        dst[0] = '\0';
+                        LOG_ERR("cfg", "%s in config exceeds %u chars — cleared; web UI "
+                                "stays locked until a new password is set",
+                                f->key, STR_MAX_LEN(f->size));
+                    } else if (s == JSTR_MALFORMED) {
+                        dst[0] = '\0';
+                        LOG_ERR("cfg", "%s in config is not valid hex — cleared; web UI "
+                                "stays locked until a new password is set",
+                                f->key);
+                    }
+                    break;
+                }
                 case CFG_HOSTNAME: {
                     char *dst = (char *)&g_config + f->offset;
                     char hn[192];
@@ -433,6 +506,64 @@ bool config_load(void) {
                                  f->key, dst);
                     break;
                 }
+                }
+            }
+
+            /* One-time migration: a pre-hash /config.json stores the web-UI
+             * password in PLAINTEXT under the (now-retired) "web_pass" key.
+             * If present, hash it now with a FRESH salt (point 2's rule:
+             * generate a salt only when a password is actually being set —
+             * migrating one counts), write web_pass_hash/web_salt, and set
+             * web_pass_migrated so this function's caller re-saves once —
+             * config_save() only ever emits the hashed fields, so "web_pass"
+             * is never written back and this whole block runs at most once
+             * per device. web_auth_hash() is called with retry_ms=0 (a
+             * single attempt): core 1 cannot yet be inside a KDF call at
+             * this point in boot (see web_auth.c's header comment — core 1
+             * is still parked on the config-ready gate), so the shared lock
+             * is uncontended by construction and a retry could never help.
+             * Both the plaintext temporary and the raw hash are wiped right
+             * after use, same as every other plaintext-candidate call site. */
+            {
+                char legacy[48];
+                jstr_status_t ws = jstr_get_unescaped(buf, tk, nt, "web_pass", legacy, sizeof legacy);
+                if (ws == JSTR_OK) {
+                    web_pass_migrated = true;
+                    if (legacy[0]) {
+                        uint8_t salt[WEB_AUTH_SALT_LEN], hash[WEB_AUTH_HASH_LEN];
+                        web_auth_gen_salt(salt);
+                        if (web_auth_hash(legacy, salt, hash, 0)) {
+                            char salt_hex[33], hash_hex[65];
+                            web_auth_hex_encode(salt, sizeof salt, salt_hex);
+                            web_auth_hex_encode(hash, sizeof hash, hash_hex);
+                            str_set(g_config.web_salt,      sizeof g_config.web_salt,      salt_hex);
+                            str_set(g_config.web_pass_hash, sizeof g_config.web_pass_hash, hash_hex);
+                            LOG_INFO("cfg", "migrated legacy plaintext web_pass -> web_pass_hash");
+                        } else {
+                            /* Lock genuinely unavailable (should not happen — see
+                             * above) or a future caller changes the retry budget:
+                             * fail closed exactly like the CFG_HEX load-time rule,
+                             * not "leave the compiled admin/admin default in place". */
+                            g_config.web_pass_hash[0] = '\0';
+                            LOG_ERR("cfg", "legacy web_pass migration failed — web UI stays "
+                                    "locked until a new password is set");
+                        }
+                        web_auth_wipe(hash, sizeof hash);
+                    } else {
+                        /* An empty legacy web_pass was already the fail-closed
+                         * marker under the old CFG_CRED rule — carry that
+                         * forward as an empty hash rather than hashing "". */
+                        g_config.web_pass_hash[0] = '\0';
+                    }
+                    web_auth_wipe(legacy, sizeof legacy);
+                } else if (ws == JSTR_TOO_LONG || ws == JSTR_MALFORMED) {
+                    /* Same fail-closed treatment the old CFG_CRED rule gave a
+                     * damaged web_pass — clear rather than guess, and still
+                     * drop the damaged legacy key by resaving. */
+                    g_config.web_pass_hash[0] = '\0';
+                    LOG_ERR("cfg", "legacy web_pass in config is damaged — cleared; web UI "
+                            "stays locked until a new password is set");
+                    web_pass_migrated = true;
                 }
             }
 
@@ -463,7 +594,7 @@ bool config_load(void) {
         }
     }
 
-    if (migrate_legacy_modbus()) config_save();
+    if (migrate_legacy_modbus() || web_pass_migrated) config_save();
     return true;
 }
 
@@ -471,11 +602,11 @@ bool config_load(void) {
  * and complete, and rewriting a hand-tuned format string into a loop bought
  * nothing but risk (see the task report for the full reasoning). This pins
  * the one thing cheap to check at compile time: the schema's field COUNT, so
- * an add/remove there — 15 fields today — forces a look at config_save()'s
+ * an add/remove there — 16 fields today — forces a look at config_save()'s
  * fprintf instead of the two silently drifting apart. It cannot catch a
  * field that changes NAME or TYPE without changing the row count; that half
  * of save/schema consistency rests on review. */
-_Static_assert(CFG_SCHEMA_N == 15,
+_Static_assert(CFG_SCHEMA_N == 16,
     "CFG_SCHEMA changed size — update config_save()'s fprintf (config.c) to match");
 
 bool config_save(void) {
@@ -576,8 +707,14 @@ bool config_save(void) {
     fprintf(fp, "\"net_hostname\":\"%s\",", esc);
     SAVE_ESC(g_config.web_user);
     fprintf(fp, "\"web_user\":\"%s\",", esc);
-    SAVE_ESC(g_config.web_pass);
-    fprintf(fp, "\"web_pass\":\"%s\",", esc);
+    /* web_pass_hash/web_salt are lowercase hex — json_escape() is a no-op for
+     * that charset, but going through it anyway keeps this file's rule
+     * ("every string field is escaped before it's printed") true without a
+     * carved-out exception for these two. */
+    SAVE_ESC(g_config.web_pass_hash);
+    fprintf(fp, "\"web_pass_hash\":\"%s\",", esc);
+    SAVE_ESC(g_config.web_salt);
+    fprintf(fp, "\"web_salt\":\"%s\",", esc);
     SAVE_ESC(g_config.fw_url);
     fprintf(fp, "\"fw_url\":\"%s\"}\n", esc);
 #undef SAVE_ESC

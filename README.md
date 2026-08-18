@@ -1059,11 +1059,17 @@ client; both share the W5100S.
 - **Access:** browse to the controller's IP (port 80). Find the IP from the
   `DHCP lease` line in the serial log, your DHCP server, or set a static IP via
   the UI / `net` CLI verb.
-- **Auth:** HTTP **Basic auth**, credentials in `/config.json` (`web_user` /
-  `web_pass`), default **`admin` / `admin`**, changeable from the UI's *Password*
-  tab. **Plain HTTP — there is no TLS on the W5100S** — so Basic auth is base64,
-  not encrypted. Treat this as a **LAN-only** commissioning tool, not an
-  internet-facing surface, and change the default password.
+- **Auth:** HTTP **Basic auth**, default **`admin` / `admin`**, changeable from
+  the UI's *Password* tab. The password is never stored in `/config.json` —
+  only an Argon2id hash of it (`web_pass_hash`) and its salt (`web_salt`);
+  `web_user` stays plaintext (an identifier, not a secret). The device is the
+  sole verifier of this credential (unlike `mqtt_pass`, which stays plaintext
+  because the device is the *client* authenticating outward to the broker), so
+  a hash is all persistence needs to hold — `cat /config.json` or a flash/UPDI
+  dump no longer discloses the password itself. **Plain HTTP — there is no TLS
+  on the W5100S** — so Basic auth is base64, not encrypted, over the wire.
+  Treat this as a **LAN-only** commissioning tool, not an internet-facing
+  surface, and change the default password.
 - **What it does:** view live state (gateways, ballasts, groups, button
   fixtures) and edit everything the CLI can — RS-485 baud + DE mode, slave lists,
   per-ballast settings, groups, button bindings, provisioning, network (DHCP /

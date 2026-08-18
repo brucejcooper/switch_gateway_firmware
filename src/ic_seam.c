@@ -29,6 +29,7 @@
 #include "dali_state.h"
 #include "mapping.h"
 #include "config.h"
+#include "web_auth.h" /* IC_CMD_SET_AUTH's hashing setter */
 #include "strfit.h"   /* str_set() — the shared fits-or-fails rule */
 #include "state_cache.h"
 #include "dirty_poll.h"
@@ -515,27 +516,53 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         break;
     }
     case IC_CMD_SET_AUTH:
-        /* Both or neither, via temporaries: a half-applied credential change
-         * (new user kept, new password refused) would lock the operator out
-         * just as effectively as a truncated one, and writing straight into
-         * g_config would do exactly that — config_apply_str() commits the
-         * first field before the second is ever judged. Length-validate both
-         * into temporaries first (str_set(), same as before); only once BOTH
-         * fit does either get written, and that write goes through
-         * config_apply_str() so the actual commit shares the same code path
-         * (and CFG_CRED's empty-value guard) every other credential write
-         * uses. Neither config_apply_str() call below can fail in practice —
-         * the temporaries are already length-checked, and /api/auth already
-         * refuses an empty user/pass before this command is ever built — but
-         * it is still checked rather than assumed. */
-        { char u[sizeof g_config.web_user], p[sizeof g_config.web_pass];
+        /* THE core-0-side hashing setter (web_auth.h's header comment lists
+         * every call site). c->set_auth.pass carries the plaintext candidate
+         * across the intercore queue — transient RAM, never stored — this is
+         * where it gets turned into a fresh salt + Argon2id hash and the
+         * plaintext is wiped.
+         *
+         * Both or neither, via temporaries: a half-applied credential change
+         * (new user kept, new hash refused, or vice versa) would lock the
+         * operator out just as effectively as a truncated one, and writing
+         * straight into g_config would risk exactly that — config_apply_str()
+         * commits each field the instant it's called. Length-validate into
+         * temporaries first (str_set(), same as before); only once user fits
+         * AND the hash is computed does anything get written, and each write
+         * goes through config_apply_str() so the actual commit shares the
+         * same code path (and CFG_CRED/CFG_HEX's own validation) every other
+         * config write uses. None of the three config_apply_str() calls below
+         * can fail in practice — user is already length-checked, and
+         * salt_hex/hash_hex are hex this function just encoded itself — but
+         * each is still checked rather than assumed, same as before. */
+        { char u[sizeof g_config.web_user], p[sizeof c->set_auth.pass];
           if (!str_set(u, sizeof u, c->set_auth.user) ||
               !str_set(p, sizeof p, c->set_auth.pass)) {
               LOG_WARN("cli", "ignored over-long web credential from web/API");
               break;
           }
+          uint8_t salt[WEB_AUTH_SALT_LEN], hash[WEB_AUTH_HASH_LEN];
+          web_auth_gen_salt(salt);
+          /* Bounded retry against the shared KDF work area (web_auth.c's
+           * header comment has the full concurrency argument): the only
+           * realistic contender this instant is core 1's OWN /api/auth
+           * handler hashing this exact same password change for its live
+           * in-RAM credential — a collision self-resolves within one Argon2
+           * call (tens to a few hundred ms), so 2 s is generous, not a real
+           * stall, and this runs in the main loop, not a hot per-tick path. */
+          if (!web_auth_hash(p, salt, hash, 2000)) {
+              web_auth_wipe(p, sizeof p);
+              LOG_ERR("cli", "web credential hash failed (KDF busy) — auth not changed");
+              break;
+          }
+          char salt_hex[33], hash_hex[65];
+          web_auth_hex_encode(salt, sizeof salt, salt_hex);
+          web_auth_hex_encode(hash, sizeof hash, hash_hex);
+          web_auth_wipe(p, sizeof p);
+          web_auth_wipe(hash, sizeof hash);
           if (config_apply_str("web_user", u) != CFG_APPLY_OK ||
-              config_apply_str("web_pass", p) != CFG_APPLY_OK) {
+              config_apply_str("web_salt", salt_hex) != CFG_APPLY_OK ||
+              config_apply_str("web_pass_hash", hash_hex) != CFG_APPLY_OK) {
               LOG_WARN("cli", "web credential apply failed unexpectedly");
               break;
           } }

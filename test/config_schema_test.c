@@ -21,6 +21,7 @@
  *       && /tmp/config_schema_test
  */
 #include "../src/config.h"
+#include "../src/web_auth.h"
 #include "../src/strfit.h"
 #include "../src/log.h"
 
@@ -67,12 +68,28 @@ static struct { const char *key; size_t cap; } STR_FIELDS[] = {
 };
 #define STR_FIELDS_N (sizeof STR_FIELDS / sizeof STR_FIELDS[0])
 
-/* One row per CFG_CRED field: key, cap. */
+/* One row per CFG_CRED field: key, cap. web_pass moved off this table when
+ * the stored web-UI credential became a hash (see HEX_FIELDS below) — the
+ * password itself is no longer a config_apply_str()-settable plain string,
+ * only its Argon2id hash + salt are, and those go through the setter in
+ * ic_seam.c's IC_CMD_SET_AUTH (web_auth.h), not through this generic API
+ * with an arbitrary caller-supplied string. web_user (an identifier, not a
+ * secret) is unaffected. */
 static struct { const char *key; size_t cap; } CRED_FIELDS[] = {
     { "web_user", 32 },
-    { "web_pass", 48 },
 };
 #define CRED_FIELDS_N (sizeof CRED_FIELDS / sizeof CRED_FIELDS[0])
+
+/* One row per CFG_HEX field: key, cap (sizeof the g_config hex-text field,
+ * i.e. 2*rawlen + 1), rawlen (the raw byte count it decodes to). Unlike
+ * CFG_STR, a short-but-fits value is INVALID here — the field holds a fixed-
+ * length hash/salt, not free text, so config_apply_str() must reject
+ * anything that isn't exactly 2*rawlen hex digits, not merely "≤ cap-1". */
+static struct { const char *key; size_t cap, rawlen; } HEX_FIELDS[] = {
+    { "web_pass_hash", 65, 32 },
+    { "web_salt",      33, 16 },
+};
+#define HEX_FIELDS_N (sizeof HEX_FIELDS / sizeof HEX_FIELDS[0])
 
 int main(void) {
     config_defaults();
@@ -205,8 +222,50 @@ int main(void) {
 
         CHECK(config_field_maxlen(k) == (unsigned)(cap - 1));
     }
-    /* g_config actually holds what was last accepted (web_user/web_pass are
-     * fixed fields, unlike the table-driven checks above — spot-check one). */
+
+    g_case = "hex via apply: exact-length valid hex stores; wrong length/non-hex/empty rejected and g_config untouched";
+    for (size_t i = 0; i < HEX_FIELDS_N; i++) {
+        const char *k = HEX_FIELDS[i].key;
+        size_t cap = HEX_FIELDS[i].cap;        /* 2*rawlen + 1 */
+        size_t hexlen = cap - 1;               /* 2*rawlen — the ONLY length CFG_HEX accepts */
+        char *dst = (strcmp(k, "web_pass_hash") == 0) ? g_config.web_pass_hash : g_config.web_salt;
+
+        /* A known-good sentinel first, so the rejections below can confirm
+         * g_config is left untouched, not just that the return code says so.
+         * Built from real hex digits (unlike CRED_FIELDS' arbitrary 'a'
+         * filler above) since 'a' alone IS valid hex and would let a broken
+         * charset check pass by accident. */
+        char sentinel[192];
+        for (size_t j = 0; j < hexlen; j++) sentinel[j] = "0123456789abcdef"[j % 16];
+        sentinel[hexlen] = '\0';
+        CHECK(config_apply_str(k, sentinel) == CFG_APPLY_OK);
+        CHECK(strcmp(dst, sentinel) == 0);
+
+        CHECK(config_apply_str(k, "") == CFG_APPLY_INVALID);   /* empty refused, same as CFG_CRED */
+
+        /* One hex digit short — still every byte a valid hex digit, so this
+         * pins the EXACT-length requirement specifically, not just "has a
+         * non-hex byte somewhere". CFG_STR's "fits within cap" rule would
+         * accept this; CFG_HEX must not. */
+        char short_hex[192];
+        memcpy(short_hex, sentinel, hexlen - 1);
+        short_hex[hexlen - 1] = '\0';
+        CHECK(config_apply_str(k, short_hex) == CFG_APPLY_INVALID);
+
+        /* One character of non-hex content, otherwise a perfectly sized
+         * string — pins the charset check independently of the length one. */
+        char nonhex[192];
+        memcpy(nonhex, sentinel, hexlen);
+        nonhex[0] = 'z';
+        nonhex[hexlen] = '\0';
+        CHECK(config_apply_str(k, nonhex) == CFG_APPLY_INVALID);
+
+        /* None of the rejections above touched g_config. */
+        CHECK(strcmp(dst, sentinel) == 0);
+        CHECK(config_field_maxlen(k) == (unsigned)hexlen);
+    }
+    /* g_config actually holds what was last accepted (web_user is a fixed
+     * field, unlike the table-driven checks above — spot-check it). */
     CHECK(strcmp(g_config.web_user, "operator") != 0);   /* overwritten by the `ok` cap-1 value above */
 
     g_case = "config_field_range: exact bounds for every numeric field";
@@ -238,6 +297,28 @@ int main(void) {
         CHECK(config_field_maxlen(NULL) == 0);
     }
 
+    /* The compiled-in admin/admin credential is a PRECOMPUTED Argon2id
+     * hash+salt literal in config_defaults() — an Argon2 call per boot would
+     * be waste, so the hash was baked at authoring time. That makes the
+     * literal itself the single point of failure for every fresh device:
+     * fail-closed auth means a wrong literal (typo, or a KDF parameter
+     * change without regenerating it) ships devices whose web UI can NEVER
+     * be logged into. Pin it: the stored default must verify against the
+     * password "admin" under the current KDF parameters. If this fails
+     * after a deliberate WEB_AUTH_NB_* change, regenerate both literals per
+     * the comment above them in config.c. */
+    g_case = "config_defaults: precomputed admin hash verifies under current KDF";
+    {
+        config_defaults();
+        uint8_t salt[WEB_AUTH_SALT_LEN], want[WEB_AUTH_HASH_LEN], got[WEB_AUTH_HASH_LEN];
+        CHECK(web_auth_hex_decode(g_config.web_salt, salt, sizeof salt));
+        CHECK(web_auth_hex_decode(g_config.web_pass_hash, want, sizeof want));
+        CHECK(web_auth_hash("admin", salt, got, 0));
+        CHECK(web_auth_verify_equal(got, want));
+        /* And the wrong password must NOT verify against it. */
+        CHECK(web_auth_hash("admin1", salt, got, 0));
+        CHECK(!web_auth_verify_equal(got, want));
+    }
     if (g_fails == 0) printf("PASS: all config schema checks passed\n");
     else              printf("%d CHECK(s) FAILED\n", g_fails);
     return g_fails ? 1 : 0;

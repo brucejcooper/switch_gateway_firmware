@@ -32,6 +32,7 @@
 #include "bus_discovery.h"
 #include "core1.h"
 #include "intercore.h"
+#include "web_auth.h"
 #include "log.h"
 #include "cdc_out.h"
 #include <string.h>
@@ -84,6 +85,13 @@ int main(void) {
     cdc_out_init();     /* before any LOG_* / core 1 launch: arms the output ring */
     stdio_init_all();
     alarm_pool_init_default();
+
+    /* Claim the web-auth KDF's shared spinlock before core 1 exists to
+     * possibly race it (web_auth.c's header comment has the full argument).
+     * Cheap and side-effect-free otherwise, so doing it this early costs
+     * nothing even though the first real caller (config_load()'s legacy-
+     * password migration, below) doesn't run for a while yet. */
+    web_auth_init();
 
     int rc = pico_led_init();
     hard_assert(rc == PICO_OK);
@@ -247,8 +255,9 @@ int main(void) {
     memcpy(snap.net_gw,   g_config.net_gw,   4);
     memcpy(snap.net_dns,  g_config.net_dns,  4);
     memcpy(snap.net_hostname, g_config.net_hostname, sizeof snap.net_hostname);
-    memcpy(snap.web_user, g_config.web_user, sizeof snap.web_user);
-    memcpy(snap.web_pass, g_config.web_pass, sizeof snap.web_pass);
+    memcpy(snap.web_user,      g_config.web_user,      sizeof snap.web_user);
+    memcpy(snap.web_pass_hash, g_config.web_pass_hash, sizeof snap.web_pass_hash);
+    memcpy(snap.web_salt,      g_config.web_salt,      sizeof snap.web_salt);
     memcpy(snap.fw_url,   g_config.fw_url,   sizeof snap.fw_url);
     intercore_set_snapshot(&snap);
     core1_config_ready();   /* core 1 may now bring up netif + MQTT */

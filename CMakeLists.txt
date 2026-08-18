@@ -50,6 +50,7 @@ set(APP_CORE_SRCS
     src/boot_control.c
     src/fw_image.c
     src/ota_stage.c
+    src/web_auth.c
 )
 
 # SHA-512/ed25519 for OTA image verify (fw_image.c) — also shared, see above.
@@ -131,6 +132,8 @@ target_link_libraries(light_switch PRIVATE
     pico_multicore     # core 1 network bridge
     pico_util          # queue_t (inter-core SPSC queues)
     pico_time
+    pico_rand           # web_auth.c: get_rand_64() — web-UI password salt
+    hardware_sync       # web_auth.c: shared spinlock over the Argon2id work area
 )
 
 # jsmn — single-header JSON tokenizer (malloc-free, float-free). JSMN_STATIC so
@@ -348,6 +351,8 @@ if(OTA_APP_LAYOUT)
         pico_multicore
         pico_util
         pico_time
+        pico_rand
+        hardware_sync
     )
 
     target_include_directories(light_switch_ota PRIVATE ${CMAKE_CURRENT_LIST_DIR}/lib/jsmn)
