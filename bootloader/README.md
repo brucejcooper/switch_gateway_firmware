@@ -130,9 +130,20 @@ cc -Wall -Wextra -std=c11 -I ../src -I ../bootloader \
     && /tmp/boot_decide_test
 ```
 
-## The hardware layer: `main.c` (thin, NOT host-tested)
+## The commit/rollback layer: `commit.c` (host-tested) + `main.c` (hardware)
 
-`main()` does exactly four things, each mapped straight to the rules above:
+**Factored 2026-08-17 (`aa74793`):** the commit/rollback orchestration below
+— `try_commit_staging()`, `try_rollback()`, and the sequencing that used to
+live in `main()` — now lives in `commit.c`'s `boot_commit_run()`, which is
+**host-tested** by `test/boot_commit_test.c` (a RAM-backed flash stand-in
+replaying whole boot *sequences*, including power-cut-and-retry). `main()` is
+now thin: it calls `boot_commit_run()` and does the hardware-only steps
+(vector-table sanity, watchdog-armed jump, BOOTSEL fallback) that have no host
+seam. The logic descriptions below are unchanged; only their home moved from
+`main.c` to `commit.c`.
+
+`boot_commit_run()` + `main()` together do exactly four things, each mapped
+straight to the rules above:
 
 1. `bc_read()` the boot-control record, call `boot_decide()`.
 2. **`BOOT_COMMIT_STAGING`** (`try_commit_staging()`): `fw_verify()` the
@@ -321,6 +332,12 @@ first-boot instead of leaving it unwritten.
 
 **Host-tested and verified in this repo:**
 - `boot_decide()` — exhaustively, `test/boot_decide_test.c` (see above).
+- `boot_commit_run()` / `try_commit_staging()` / `try_rollback()` **commit
+  SEQUENCING** — `test/boot_commit_test.c` (2026-08-17), replaying whole boot
+  sequences against a RAM-backed flash array, including the interrupted-commit
+  retry (the `9620301` backup-clobber shape) and a hand-crafted
+  `PENDING|CONFIRMED` record (the `ae1f661` shape). This covers the *ordering
+  and gating* logic; it does NOT cover real flash timing (next section).
 - Everything it's built from (`bc_read`/`bc_write`, `fw_verify`) — already
   covered by `test/boot_control_test.c` and `test/fw_image_test.c` from
   earlier phases.
@@ -331,12 +348,12 @@ first-boot instead of leaving it unwritten.
 
 **NOT validated without real hardware — the first things to bring up
 on-device, in this order:**
-1. **The flash-copy path** (`flash_copy_region()` / the whole
-   `try_commit_staging()` sequence, including the true-rollback phase's
-   commit-time active→`BACKUP` backup copy and `try_rollback()`'s
-   `BACKUP`→active restore copy — all three now share the one generic
-   sector-copy helper): erasing/programming a flash region from a
-   RAM-buffered chunk of another flash region, sector by sector, while
+1. **Real flash TIMING of the flash-copy path** (`flash_copy_region()` — the
+   `try_commit_staging()`/`try_rollback()` *sequencing* around it is now
+   host-tested by `boot_commit_test.c`, see the previous section; what remains
+   unvalidated is only the on-hardware flash mechanics): erasing/programming a
+   flash region from a RAM-buffered chunk of another flash region, sector by
+   sector, while
    running from flash itself. The XIP-unavailable-during-erase/program
    reasoning is architecturally correct per the RP2040 datasheet and matches
    how `src/boot_control.c`/`src/ota_stage.c` already do the equivalent
@@ -525,7 +542,11 @@ been updated to build `light_switch_ota` (not `light_switch`) as its step 1.
 ## Files
 
 - `boot_decide.h` / `boot_decide.c` — the pure decision function (see above).
-- `main.c` — the bootloader executable's `main()` (hardware layer).
+- `commit.h` / `commit.c` — commit/rollback orchestration (`boot_commit_run()`,
+  `try_commit_staging()`, `try_rollback()`); factored out of `main.c`
+  2026-08-17 so it's host-testable (`test/boot_commit_test.c`).
+- `main.c` — the bootloader executable's `main()` (hardware layer: calls
+  `boot_commit_run()`, then the vector-table/watchdog/BOOTSEL hardware steps).
 - `CMakeLists.txt` — standalone pico-sdk project, board = `wiznet_w5100s_evb_pico`.
 - `memmap_bootloader.ld` — custom linker script constraining the bootloader's
   own code+data to `0x0..0xE000` (see "Flash layout" above for why this is a

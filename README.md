@@ -108,10 +108,10 @@ slave at 38400, then walks 19200 (the old canonical speed) and 9600 (the factory
 default) on timeout, sends the per-device set-baud command, and verifies the
 slave came back at 38400 — all logged under the `disc` module tag.
 
-| Slave kind | Set-baud register | Value |
+| Slave kind | Set-baud register | Value (38400) |
 |---|---|---|
-| Waveshare 32CH Relay | FC06 `0x2000` | `0x0002` |
-| TinyModbus DALI gateway | FC06 `0x1013` | `0x0001` |
+| Waveshare 32CH Relay | FC06 `0x2000` | `0x0003` |
+| TinyModbus DALI gateway | FC06 `0x1F03` | `0x0002` |
 
 The set-baud writes are persisted on the slaves, so the fallback path only
 fires once per device. After the first successful boot, subsequent boots
@@ -125,7 +125,7 @@ rate (e.g. left at 38400 from an earlier config), or is at a different slave
 address than configured. Manual recovery is easy from the CLI: `ping <slave>`
 to probe, `discover` to re-run auto-recovery across all configured slaves, or
 `set_slave_baud <slave> {9600|19200|38400}` to push a baud at a known rate.
-The slave-address writes for factory-fresh devices (TinyModbus FC06 `0x1012`
+The slave-address writes for factory-fresh devices (TinyModbus FC06 `0x1F02`
 value `0x0002` or `0x0003`; Waveshare FC06 `0x4000` value `0x0001`) are
 one-time and must be done manually before the first boot.
 
