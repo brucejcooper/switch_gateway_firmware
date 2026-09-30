@@ -1,6 +1,7 @@
 #include "lighting_actions.h"
 #include "dali_provision.h"
 #include "dali_queue.h"
+#include "mbq_client.h"
 #include "modbus.h"
 #include "state_cache.h"
 #include "dirty_poll.h"
@@ -481,6 +482,24 @@ static const uint8_t CFGQ_OPCODE[CFGQ_NFIELDS] = {
 
 static uint64_t s_cfgq_pending[MAX_DALI_SLAVES];  /* ballasts awaiting read, by slave index */
 
+/* Backing off an unavailable gateway. While a gateway's link is declared down
+ * (LINK_DOWN_FAILS consecutive no-replies) its queries cannot drain, so its
+ * backlog class fills and every submit is refused. The reader used to retry
+ * those refusals every tick — a main-loop spin, ~4000 refusals/s, whose rate-
+ * limited WARN still wiped the whole /api/log ring during a 1-minute outage
+ * (house, 2026-09-30). Same rule as dali_state's LINK_RETRY_MS: leave a down
+ * gateway alone and look again every CFGQ_LINK_RETRY_MS; its pending ballasts
+ * stay pending and are read when it answers. A refusal on a HEALTHY link
+ * (ordinary backpressure) waits CFGQ_REFUSED_WAIT_MS instead of one tick. */
+#define CFGQ_LINK_RETRY_MS    5000u
+#define CFGQ_REFUSED_WAIT_MS    20u
+static absolute_time_t s_cfgq_hold[MAX_DALI_SLAVES];   /* don't start before this */
+static absolute_time_t s_cfgq_refill_at;               /* next submit attempt */
+
+static bool cfgq_link_down(uint8_t slave_id) {
+    return mbq_client_consec_fail(slave_id) >= LINK_DOWN_FAILS;
+}
+
 /* One field's query while it is outstanding. Per-field rather than one shared
  * slot: two are live at once, and either may be answered or abandoned alone. */
 typedef struct {
@@ -576,6 +595,11 @@ static void cfgq_commit_ballast(void) {
 static bool cfgq_start_next(void) {
     for (int i = 0; i < g_config.dali_slave_count; i++) {
         if (!s_cfgq_pending[i]) continue;
+        if (!time_reached(s_cfgq_hold[i])) continue;          /* gateway backed off */
+        if (cfgq_link_down(g_config.dali_slave_ids[i])) {
+            s_cfgq_hold[i] = make_timeout_time_ms(CFGQ_LINK_RETRY_MS);
+            continue;
+        }
         uint8_t addr = (uint8_t)__builtin_ctzll(s_cfgq_pending[i]);
         s_cfgq_pending[i] &= ~((uint64_t)1 << addr);
         memset(&s_cfgq, 0, sizeof s_cfgq);
@@ -611,6 +635,18 @@ void lighting_cfg_query_tick(void) {
         return;
     }
 
+    /* The gateway stopped answering mid-ballast: put the ballast back and back
+     * off the whole gateway (see CFGQ_LINK_RETRY_MS). Outstanding queries are
+     * abandoned the same way as above. */
+    if (cfgq_link_down(s_cfgq.slave_id)) {
+        lighting_cfg_query_mark(s_cfgq.slave_id, s_cfgq.addr);
+        s_cfgq_hold[s_cfgq.slave_idx] = make_timeout_time_ms(CFGQ_LINK_RETRY_MS);
+        LOG_DBG("light", "cfg-query: slave %u unavailable — backing off %u ms",
+                s_cfgq.slave_id, CFGQ_LINK_RETRY_MS);
+        s_cfgq.active = false;
+        return;
+    }
+
     /* Collect whatever has landed, and abandon anything past its own deadline
      * (keeping that field's cached value). */
     for (uint8_t f = 0; f < CFGQ_NFIELDS; f++) {
@@ -626,13 +662,17 @@ void lighting_cfg_query_tick(void) {
     /* Refill the window. A NAK/ERR (or a backlog-full retry that eventually
      * times out) leaves that field un-answered and cfgq_commit_ballast keeps
      * its cached value. */
+    if (!time_reached(s_cfgq_refill_at)) return;
     uint8_t addr_byte = (uint8_t)((s_cfgq.addr & 0x3Fu) << 1) | 0x01u;
     while (s_cfgq.live < CFGQ_WINDOW && s_cfgq.next < CFGQ_NFIELDS) {
         uint8_t  f = s_cfgq.next;
         uint16_t g = next_query_gen();
         if (!dq_submit(s_cfgq.slave_id, DQ_PRIO_BACKGROUND, addr_byte, CFGQ_OPCODE[f],
-                       DQ_ANSWER, 0, true, cfgq_result_cb, (void *)(uintptr_t)g))
-            break;   /* backlog full — retry next tick */
+                       DQ_ANSWER, 0, true, cfgq_result_cb, (void *)(uintptr_t)g)) {
+            /* backlog full — back off briefly, not every tick */
+            s_cfgq_refill_at = make_timeout_time_ms(CFGQ_REFUSED_WAIT_MS);
+            break;
+        }
         s_cfgq.q[f].gen      = g;
         s_cfgq.q[f].have     = false;
         s_cfgq.q[f].deadline = make_timeout_time_ms(CFGQ_FIELD_DEADLINE_MS);
