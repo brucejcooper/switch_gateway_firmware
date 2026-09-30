@@ -167,9 +167,10 @@ static bool raw_submit(uint8_t slave, dq_prio_t prio, uint8_t addr, uint8_t data
  * off. For THIS question any disturbance in the response window means someone
  * answered, so DQ_RES_ERR of either kind reads YES. The worst case — a
  * genuinely faulted bus read as "on" — makes a press send OFF, which is
- * harmless. Commissioning must NOT read results this way: there a wrong YES
- * sends the bisect down the wrong branch and programs the wrong gear
- * (dali_commission.c), which is why dq_yes_no() itself stays strict. */
+ * harmless. dq_yes_no() itself stays strict (BUSFAULT = unresolved); callers
+ * that know a garbled answer is still an answer say so explicitly — this probe
+ * and commissioning's COMPARE (dali_commission.c), whose own VERIFY step is the
+ * safety net there. */
 static dq_yes_no_t probe_reading(dq_result_t res, uint8_t answer) {
     if (res == DQ_RES_ERR) return DQ_YN_YES;
     return dq_yes_no(res, answer);

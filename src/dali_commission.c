@@ -12,6 +12,7 @@
 #include "dali_queue.h"
 #include "dali_state.h"
 #include "state_cache.h"
+#include "mapping.h"
 #include "log.h"
 #include "pico/time.h"
 #include <string.h>
@@ -32,6 +33,8 @@
 #define INIT_DATA_ALL      0x00u
 #define INIT_DATA_NO_SHORT 0xFFu
 #define PROG_SHORT(s)      ((uint8_t)(((s) << 1) | 0x01u))
+#define Q_GEAR_PRESENT     0x91u   /* QUERY CONTROL GEAR PRESENT (short-address cmd) */
+#define C_SET_SHORT_ADDR   0x80u   /* SET SHORT ADDRESS (DTR0), send twice */
 
 #define STEP_DEADLINE_MS   1500u   /* one queued frame; generous vs ~40 ms actual */
 #define MAX_VERIFY_FAILS   3u
@@ -47,12 +50,16 @@ typedef enum {
     P_PROGRAM,
     P_VERIFY,
     P_WITHDRAW,
+    P_CHECK_FREE,     /* ask a candidate short address if anyone is on it */
+    P_RESTORE,        /* MODE_ONE: move the last gear back onto the target */
+    P_RESTORE_VERIFY,
     P_TERMINATE,
 } phase_t;
 
 static const char *PHASE_NAME[] = {
     "idle", "initialise", "randomise", "search", "search", "search",
-    "compare", "assign", "verify", "withdraw", "terminate",
+    "compare", "assign", "verify", "withdraw", "check-free", "restore",
+    "restore-verify", "terminate",
 };
 
 static struct {
@@ -68,6 +75,13 @@ static struct {
     bool         resend_pending;  /* re-send SEARCHADDR before PROGRAM */
 
     uint8_t      next_addr;       /* short address being assigned */
+    /* Addresses this run must not hand out (non-ALL modes): the MODE_ONE target
+     * while its gear is being moved off it, every address assigned so far this
+     * run, and every candidate that answered on the wire. */
+    uint64_t     claimed;
+    phase_t      after_check;     /* where P_CHECK_FREE continues when free */
+    bool         restoring;       /* P_CHECK_FREE is checking the target */
+    uint8_t      last_addr;       /* address the most recent gear was given */
     uint8_t      count;           /* successfully addressed this run */
     uint8_t      verify_fails;
     bool         abort_req;
@@ -83,12 +97,38 @@ static struct {
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
+/* True if any button mapping targets this ballast address on our slave. A new
+ * gear must not land on such an address: the mapping would start driving it
+ * (house, 2026-09-30: mappings to 3.17/24/32/40 point at nothing today). */
+static bool addr_is_mapped(uint8_t a) {
+    for (int f = 0; f < MAX_FIXTURES; f++)
+        for (int b = 0; b < MAX_BUTTONS; b++) {
+            const mapping_record_t *r = &g_mappings[f][b];
+            for (int i = 0; i < r->target_count; i++) {
+                const mapping_target_t *t = &r->targets[i];
+                if (t->slave == s.slave_id && !TARGET_IS_GROUP(*t) &&
+                    TARGET_BALLAST_ADDR(*t) == a)
+                    return true;
+            }
+        }
+    return false;
+}
+
+/* Lowest address that is a CANDIDATE for incremental / one-address modes. Not
+ * proof it is free: the presence cache only knows gear that answered a scan
+ * cleanly, so two gear sharing an address (a collision) or gear the scan could
+ * not read look "absent". P_CHECK_FREE asks the address on the wire before it
+ * is used. MODE_ALL never calls this — it renumbers every gear from 0, so every
+ * address is available. */
 static uint8_t lowest_unused_addr(void) {
     int idx = state_cache_slave_idx(s.slave_id);
     if (idx < 0) return 0;
     for (uint8_t a = 0; a < 64; a++) {
+        if (s.claimed & ((uint64_t)1 << a)) continue;
         dali_ballast_state_t *b = state_cache_get_dali((uint8_t)idx, a);
-        if (!b || !b->present) return a;
+        if (b && b->present) continue;
+        if (addr_is_mapped(a)) continue;
+        return a;
     }
     return 64;   /* pool exhausted */
 }
@@ -116,7 +156,7 @@ static void frame_cb(uint8_t slave_id, dq_result_t res, uint8_t answer, void *ct
 /* Submit the frame for the current phase. Returns false if the queue refused it
  * (retried next tick). */
 static bool issue(void) {
-    uint8_t addr, data = 0x00u, flags = 0u;
+    uint8_t addr, data = 0x00u, flags = 0u, dtr0 = 0u;
 
     switch (s.phase) {
         case P_INITIALISE:
@@ -135,6 +175,13 @@ static bool issue(void) {
         case P_VERIFY:     addr = A_VERIFY_SHORT;  data = PROG_SHORT(s.next_addr);
                            flags = DQ_ANSWER; break;
         case P_WITHDRAW:   addr = A_WITHDRAW;  break;
+        case P_CHECK_FREE: addr  = PROG_SHORT(s.restoring ? s.target : s.next_addr);
+                           data  = Q_GEAR_PRESENT; flags = DQ_ANSWER; break;
+        case P_RESTORE:    addr  = PROG_SHORT(s.last_addr); data = C_SET_SHORT_ADDR;
+                           flags = DQ_DTR0 | DQ_TWICE; dtr0 = PROG_SHORT(s.target); break;
+        case P_RESTORE_VERIFY:
+                           addr  = PROG_SHORT(s.target);
+                           data  = Q_GEAR_PRESENT; flags = DQ_ANSWER; break;
         case P_TERMINATE:  addr = A_TERMINATE; break;
         default: return false;
     }
@@ -143,7 +190,7 @@ static bool issue(void) {
     /* NOT idempotent: replaying a PROGRAM or WITHDRAW mid-sequence would corrupt
      * the run, so a gateway reboot must drop it and fail the run rather than
      * silently re-apply a step. */
-    if (!dq_submit(s.slave_id, DQ_PRIO_PROVISION, addr, data, flags, 0,
+    if (!dq_submit(s.slave_id, DQ_PRIO_PROVISION, addr, data, flags, dtr0,
                    false, frame_cb, (void *)(uintptr_t)s.gen))
         return false;
     s.exp_gen  = s.gen;
@@ -187,13 +234,26 @@ static void advance(void) {
              * is why this goes through dq_yes_no() rather than testing the
              * result code directly.
              *
-             * UNRESOLVED must NOT be guessed. This used to read `s.res !=
-             * DQ_RES_NAK`, which folded a bus fault and a dropped command into
-             * "yes" and sent the bisect down the wrong branch — and a bisect
-             * that takes one wrong branch programs a short address onto the
-             * wrong gear. Abort the run instead; DCOM_ERR_TIMEOUT already means
-             * exactly "a step produced no result — bus or transport fault". */
-            dq_yes_no_t yn = dq_yes_no(s.res, s.answer);
+             * A DROPPED/lost command must NOT be guessed — nothing was
+             * learned. Abort the run; DCOM_ERR_TIMEOUT already means exactly
+             * "a step produced no result". This used to read `s.res !=
+             * DQ_RES_NAK`, folding a dropped command into "yes".
+             *
+             * A garbled answer (DQ_RES_ERR) IS an answer, whatever failure
+             * code the gateway put on it. Several gear answering COMPARE at
+             * once is the normal case — it is the whole mechanism — and the
+             * overlapping backward frames reach us as COLLISION or BUSFAULT
+             * depending on which pulse the gateway's decoder tripped on first
+             * (house, 2026-09-30: a four-member group query came back
+             * BUSFAULT). Treating BUSFAULT as unresolved made every COMPARE
+             * over two or more gear abort the run, so a collided address could
+             * never be split. Reading it as YES is safe here: PROGRAM SHORT
+             * ADDRESS only touches gear whose random address equals the search
+             * value, so a wrong YES can only steer the bisect to a value no
+             * gear holds — PROGRAM then addresses nothing and the strict
+             * VERIFY below fails and re-bisects. */
+            dq_yes_no_t yn = (s.res == DQ_RES_ERR) ? DQ_YN_YES
+                                                  : dq_yes_no(s.res, s.answer);
             if (yn == DQ_YN_UNRESOLVED) {
                 s.state = DCOM_ERR_TIMEOUT;
                 s.phase = P_TERMINATE;
@@ -206,8 +266,20 @@ static void advance(void) {
                 if (bb == 24u) {
                     /* Nobody left in the comparison set: either the bus is empty
                      * or we have addressed everything. */
-                    if (s.count == 0u) s.state = DCOM_ERR_NO_BALLASTS;
-                    s.phase = P_TERMINATE;
+                    if (s.count == 0u) {
+                        s.state = DCOM_ERR_NO_BALLASTS;
+                        s.phase = P_TERMINATE;
+                    } else if (s.mode == DCOM_MODE_ONE) {
+                        /* Every gear that shared the target has been moved off
+                         * it, so the target is free again. Give it back to the
+                         * last one moved, so existing mappings to the target
+                         * keep driving one real device. Confirm it is empty on
+                         * the wire first. */
+                        s.restoring = true;
+                        s.phase     = P_CHECK_FREE;
+                    } else {
+                        s.phase = P_TERMINATE;
+                    }
                     break;
                 }
                 s.search |= ((uint32_t)1 << bb);   /* restore the cleared bit */
@@ -249,11 +321,19 @@ static void advance(void) {
                 LOG_INFO("dcom", "slave %u addressed %u (%u total)",
                          s.slave_id, s.next_addr, s.count);
                 /* Advance BEFORE withdrawing, or incremental mode re-picks the
-                 * slot we just filled. */
-                s.next_addr = (s.mode == DCOM_MODE_ALL)
-                            ? (uint8_t)(s.next_addr + 1u)
-                            : lowest_unused_addr();
-                s.phase = P_WITHDRAW;
+                 * slot we just filled. The presence cache does not learn about
+                 * this address until the post-run scan, so claim it here. */
+                s.claimed  |= (uint64_t)1 << s.next_addr;
+                s.last_addr = s.next_addr;
+                if (s.mode == DCOM_MODE_ALL) {
+                    s.next_addr = (uint8_t)(s.next_addr + 1u);
+                    s.phase     = P_WITHDRAW;
+                } else {
+                    s.next_addr = lowest_unused_addr();
+                    /* >= 64 is caught at the next COMPARE (ADDR_EXHAUST). */
+                    s.after_check = P_WITHDRAW;
+                    s.phase = (s.next_addr < 64u) ? P_CHECK_FREE : P_WITHDRAW;
+                }
             } else {
                 if (++s.verify_fails > MAX_VERIFY_FAILS) {
                     s.state = DCOM_ERR_VERIFY;
@@ -267,6 +347,52 @@ static void advance(void) {
             }
             break;
         }
+
+        case P_CHECK_FREE: {
+            /* QUERY CONTROL GEAR PRESENT to one short address. Silence = free.
+             * A clean answer OR a garbled one (two gear answering) = occupied —
+             * the collided addresses this exists for answer garbled. */
+            bool nak = (s.res == DQ_RES_NAK);
+            bool occ = (s.res == DQ_RES_OK || s.res == DQ_RES_ERR);
+            if (!nak && !occ) {                    /* dropped / lost */
+                s.state = DCOM_ERR_TIMEOUT;
+                s.phase = P_TERMINATE;
+                break;
+            }
+            if (s.restoring) {
+                if (nak) {
+                    s.phase = P_RESTORE;
+                } else {
+                    LOG_WARN("dcom", "slave %u: target %u still answers after the move "
+                             "— leaving gear at %u", s.slave_id, s.target, s.last_addr);
+                    s.phase = P_TERMINATE;
+                }
+                break;
+            }
+            if (nak) { s.phase = s.after_check; break; }
+            LOG_INFO("dcom", "slave %u: address %u answers — not free, skipping",
+                     s.slave_id, s.next_addr);
+            s.claimed  |= (uint64_t)1 << s.next_addr;
+            s.next_addr = lowest_unused_addr();
+            if (s.next_addr >= 64u) {
+                s.state = DCOM_ERR_ADDR_EXHAUST;
+                s.phase = P_TERMINATE;
+            }
+            /* else: stay in P_CHECK_FREE and ask the next candidate */
+            break;
+        }
+
+        case P_RESTORE: s.phase = P_RESTORE_VERIFY; break;
+
+        case P_RESTORE_VERIFY:
+            if (s.res == DQ_RES_OK)
+                LOG_INFO("dcom", "slave %u: gear at %u moved back to %u",
+                         s.slave_id, s.last_addr, s.target);
+            else
+                LOG_WARN("dcom", "slave %u: move %u -> %u not confirmed (res %u)",
+                         s.slave_id, s.last_addr, s.target, (unsigned)s.res);
+            s.phase = P_TERMINATE;
+            break;
 
         case P_WITHDRAW:
             /* Gear withdrawn from the comparison set; start the next bisect. */
@@ -306,8 +432,13 @@ bool dcom_start(uint8_t slave_id, dcom_mode_t mode, uint8_t target) {
     s.phase    = P_INITIALISE;
     s.search   = 0xFFFFFFu;
     s.bisect_bit = 24u;
-    /* MODE_ALL renumbers from 0; the others fill the lowest free slot so
-     * existing gear keeps its address. */
+    /* MODE_ALL renumbers every gear from 0, so every address is available. The
+     * others fill the lowest free slot so existing gear keeps its address — and
+     * check each candidate on the wire first (P_CHECK_FREE), because the
+     * presence cache cannot see collided or unread gear. MODE_ONE's target is
+     * claimed while its gear moves off; it is handed back to the last gear
+     * moved once the run confirms it empty (P_RESTORE). */
+    if (mode == DCOM_MODE_ONE) s.claimed = (uint64_t)1 << (target & 63u);
     s.next_addr = (mode == DCOM_MODE_ALL) ? 0u : lowest_unused_addr();
     if (s.next_addr >= 64u) {
         s.state = DCOM_ERR_ADDR_EXHAUST;
@@ -317,6 +448,10 @@ bool dcom_start(uint8_t slave_id, dcom_mode_t mode, uint8_t target) {
     }
     LOG_INFO("dcom", "slave %u commissioning mode=%u from addr %u",
              slave_id, (unsigned)mode, s.next_addr);
+    if (mode != DCOM_MODE_ALL) {
+        s.after_check = P_INITIALISE;
+        s.phase       = P_CHECK_FREE;
+    }
     return true;
 }
 
