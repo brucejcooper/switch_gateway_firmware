@@ -59,13 +59,38 @@ void button_fsm_init(void) {
     memset(s_fsm, 0, sizeof(s_fsm));
 }
 
+/* The cached "any on?" for a binding's DALI targets — the fallback when the
+ * press-time probe does not resolve. Cached arc levels are what the controller
+ * last measured (verification reads, the background sweep), so this is right
+ * far more often than a blind guess; it is only wrong if something changed a
+ * ballast behind the controller's back since the last read. */
+static bool cached_dali_any_on(const mapping_record_t *rec) {
+    for (int i = 0; i < rec->target_count; i++) {
+        const mapping_target_t *t = &rec->targets[i];
+        if (slave_kind(t->slave) != SLAVE_KIND_DALI) continue;
+        int idx = state_cache_slave_idx(t->slave);
+        if (idx < 0) continue;
+        if (TARGET_IS_GROUP(*t)) {
+            if (state_cache_dali_group_any_on((uint8_t)idx, TARGET_GROUP_NUM(*t)))
+                return true;
+        } else {
+            const dali_ballast_state_t *b =
+                state_cache_get_dali((uint8_t)idx, TARGET_BALLAST_ADDR(*t));
+            if (b && b->present && b->arc_level > 0) return true;
+        }
+    }
+    return false;
+}
+
 /* Decide the binding's current "any on?" for a toggle / dim-direction call.
  * DALI targets use the press-time any-on probe (ground truth straight from the
  * ballasts, immune to the group-mask cache going stale across gateway
  * reboots). If the probe never resolved — gateway slow, queue congestion,
- * probe slot taken — assume the DALI side is OFF so the press turns lights on
- * (never leaves them stuck), and WARN so the fallback is visible. Relay
- * targets always use the cache: the controller is the relays' only writer. */
+ * probe slot taken — fall back to the cached levels and WARN so the fallback
+ * is visible. (This used to assume "off", so an unresolved probe on a lit
+ * group turned every press into "on"/dim-up and the lights could not be
+ * switched off from the wall — house, 2026-09-30.) Relay targets always use
+ * the cache: the controller is the relays' only writer. */
 static bool resolve_any_on(uint8_t fixture, uint8_t button, const char **src) {
     const mapping_record_t *rec = mapping_lookup(fixture, button);
     bool relay_on = false, has_dali = false;
@@ -83,11 +108,13 @@ static bool resolve_any_on(uint8_t fixture, uint8_t button, const char **src) {
     switch (lighting_any_on_probe_get(fixture, button)) {
     case ANY_ON_PROBE_ON:  *src = "probe"; return true;
     case ANY_ON_PROBE_OFF: *src = "probe"; return relay_on;
-    default:
-        LOG_WARN("btn", "F%u.B%u any-on probe unresolved — assuming DALI off",
-                 fixture, button);
-        *src = "assumed-off";
-        return relay_on;
+    default: {
+        bool cached = cached_dali_any_on(rec);
+        LOG_WARN("btn", "F%u.B%u any-on probe unresolved — using cache (%s)",
+                 fixture, button, cached ? "on" : "off");
+        *src = "cache-fallback";
+        return relay_on || cached;
+    }
     }
 }
 

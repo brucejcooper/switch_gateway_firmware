@@ -154,6 +154,26 @@ static bool raw_submit(uint8_t slave, dq_prio_t prio, uint8_t addr, uint8_t data
  * assumes off, which the next press self-corrects. */
 
 #define PROBE_QUERY_OPCODE      0x93u    /* QUERY LAMP POWER ON */
+
+/* How every any-on probe reads its result — the button's press-time probe, the
+ * HA toggle and the CLI all go through here so they cannot drift.
+ *
+ * QUERY LAMP POWER ON sent to a GROUP is answered by every lit member at once.
+ * Their backward frames overlap — each may start anywhere in the 5.5-10.5 ms
+ * response window — and the gateway reports the overlap as a collision OR as a
+ * bus fault depending on which pulse it tripped on first. 2026-09-30, house
+ * group 3.6 with four members on: every press came back BUSFAULT, dq_yes_no()
+ * said UNRESOLVED, the button assumed "off" and dimmed UP instead of switching
+ * off. For THIS question any disturbance in the response window means someone
+ * answered, so DQ_RES_ERR of either kind reads YES. The worst case — a
+ * genuinely faulted bus read as "on" — makes a press send OFF, which is
+ * harmless. Commissioning must NOT read results this way: there a wrong YES
+ * sends the bisect down the wrong branch and programs the wrong gear
+ * (dali_commission.c), which is why dq_yes_no() itself stays strict. */
+static dq_yes_no_t probe_reading(dq_result_t res, uint8_t answer) {
+    if (res == DQ_RES_ERR) return DQ_YN_YES;
+    return dq_yes_no(res, answer);
+}
 #define PROBE_DEADLINE_MS       600      /* whole probe, all targets */
 
 typedef struct { uint8_t slave; uint8_t addr_byte; } probe_tgt_t;
@@ -261,7 +281,7 @@ static void toggle_cb(uint8_t slave, dq_result_t res, uint8_t answer, void *ctx)
     s_tog[ix].busy = false;
 
     bool any_on;
-    switch (dq_yes_no(res, answer)) {
+    switch (probe_reading(res, answer)) {
     case DQ_YN_YES: any_on = true;  break;
     case DQ_YN_NO:  any_on = false; break;
     default:
@@ -322,10 +342,10 @@ bool lighting_any_on_probe_sync(uint8_t slave_id, uint8_t addr_byte, bool *any_o
     if (!dq_submit_sync(slave_id, addr_byte, PROBE_QUERY_OPCODE, DQ_ANSWER, 0,
                         true, PROBE_DEADLINE_MS, &res, &ans))
         return false;
-    switch (dq_yes_no(res, ans)) {
+    switch (probe_reading(res, ans)) {
     case DQ_YN_YES: *any_on = true;  return true;
     case DQ_YN_NO:  *any_on = false; return true;
-    default:                     /* bus fault / dropped — no definitive answer */
+    default:                     /* dropped / timed out — no definitive answer */
         return false;
     }
 }
@@ -387,7 +407,7 @@ void lighting_any_on_probe_tick(void) {
         if (!s_probe.have) return;
         s_probe.have      = false;
         s_probe.in_flight = false;
-        switch (dq_yes_no(s_probe.res, s_probe.answer)) {
+        switch (probe_reading(s_probe.res, s_probe.answer)) {
         case DQ_YN_YES:
             probe_finish(true, true, "answered");
             return;
@@ -395,7 +415,7 @@ void lighting_any_on_probe_tick(void) {
             if (++s_probe.tgt_ix >= s_probe.tgt_count)
                 probe_finish(true, false, "all nak");
             return;                           /* next target submitted below next tick */
-        default:                              /* bus fault / dropped — unresolved */
+        default:                              /* dropped / lost — unresolved */
             probe_finish(false, false, "dropped");
             return;
         }
