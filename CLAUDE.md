@@ -544,9 +544,10 @@ CONTROLLER (`dali_commission.c`) as ordinary queued DALI frames.
 **`address <N>` / `new` pick destinations carefully (2026-09-30):** a candidate
 must be absent from the presence cache, unclaimed this run, NOT referenced by any
 mapping, and silent to QUERY CONTROL GEAR PRESENT on the wire (the cache cannot
-see collided gear). In `address <N>` every gear on N is moved off, then N is
-confirmed silent and the LAST gear is moved back onto N (SET SHORT ADDRESS), so
-mappings to N keep one real device; the others land on the lowest free address.
+see collided gear). In `address <N>` the FIRST gear found simply keeps N (it is
+already there — nothing is programmed, it is just withdrawn from the search); every
+other gear on N moves to the lowest free address; at the end N must answer cleanly
+(one gear). Mappings to N keep driving one real device.
 `all` renumbers from 0 — every address is available. A garbled COMPARE reply is
 a YES (several gear answering is the mechanism); only dropped/lost aborts.
 **Collided addresses show PRESENT** (dstate WARNs "two or more gear share this
