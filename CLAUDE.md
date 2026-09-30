@@ -45,8 +45,10 @@ dead-end lands in BOOTSEL), a real end-to-end OTA (manifest from the dev HA's
 `/local/`, install over the dev broker, staging→active commit + backup), and
 **crash-loop rollback** (deliberate bad image → 3 attempts → BACKUP restored →
 healthy boot). See `bootloader/README.md` "Hardware bring-up findings" and
-"Re-running the bench OTA test". Production conversion remains to be done
-(park-in-BOOTSEL procedure below). Flashing procedure gotcha:
+"Re-running the bench OTA test". **The house controller was converted
+2026-09-30** (USB, park-in-BOOTSEL procedure below; full pre-conversion flash
+dump in `~/dev/light_switch/backups/prod-2026-09-30/`) and now updates over the
+air — see "Claude owns the whole release" below. Flashing procedure gotcha:
 **park the device in BOOTSEL first** (`picotool reboot -f -u`), load both
 images, then one reboot — `picotool load -f` alone auto-reboots into a
 half-converted flash.
@@ -101,6 +103,35 @@ tools/fw_manifest.sh "$VER" build_ota/light_switch_ota.signed.bin \
 #      http://ota.8bitcloud.com/light_switch.bin   <- light_switch_ota.signed.bin
 #      http://ota.8bitcloud.com/light_switch.json  <- light_switch.json
 ```
+
+### Claude owns the whole release — publish AND install, without asking
+
+**Bruce's standing instruction (2026-09-30): Claude does the entire delivery.
+Do not hand him files to upload, do not ask him to press "Check"/"Install" in
+HA, do not ask permission for these steps.** Build → sign → publish → trigger
+→ verify, all by Claude:
+
+```sh
+# Publish: ota.8bitcloud.com is Caddy on nimbus (192.168.10.200) serving
+# /srv/appdata/shares/shared/ota read-only (homelab stacks/caddy). Write via ssh
+# as `nimbus` (key auth works non-interactively). Image FIRST, manifest SECOND,
+# so the manifest never points at a missing image.
+scp build_ota/light_switch_ota.signed.bin nimbus:/srv/appdata/shares/shared/ota/light_switch.bin
+scp build_ota/light_switch.json          nimbus:/srv/appdata/shares/shared/ota/light_switch.json
+curl -s http://ota.8bitcloud.com/light_switch.json          # verify version
+curl -s http://ota.8bitcloud.com/light_switch.bin | shasum -a 256   # == signed.bin
+
+# Trigger on the house controller (DHCP, 192.168.1.234, hostname `lights`;
+# web login admin/admin). POST bodies must be JSON — an empty body -> "bad json".
+curl -u admin:admin -X POST -H 'Content-Type: application/json' -d '{}' http://192.168.1.234/api/ota/check
+curl -u admin:admin http://192.168.1.234/api/ota            # wait for "available":true
+curl -u admin:admin -X POST -H 'Content-Type: application/json' -d '{}' http://192.168.1.234/api/ota/install
+# Poll GET /api/ota until "installed" == the new FW_VERSION (~20 s incl. reboot).
+```
+
+After install, check `GET /api/log` (8 KB ring of the CLI log, works with no
+USB attached) for errors. First production OTA done this way: 2.0.1+b356a7a ->
+2.0.1+40d2cc9, 2026-09-30.
 
 **Version gotcha (the #1 footgun):** the device compares the manifest `version`
 against its own `FW_VERSION` by **string inequality** (any difference = "update
