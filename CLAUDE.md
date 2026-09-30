@@ -402,8 +402,11 @@ resets the chip (shows up as `reset_reason` bit5 UPDIRF).
 
 Permanent diagnostics, read with `get_input <slave> 0x0300 16`:
 `reg0 rx_overflow` (FIFO overflow / lost byte) · `reg1 frame_error` (USART
-framing/parity) · `reg2 crc_error` (frame arrived, CRC≠0; foreign-slave frames
-excluded) · `reg3 frames_ok` (denominator) · `reg4 last_fail_len` · `reg5..12`
+framing/parity) · `reg2 crc_error` (frame arrived, CRC≠0) — a CRC-good frame
+addressed to another device is ignored, framing errors included; any CRC-bad
+frame counts, since its address can't be trusted (2026-09-30 — before that,
+`frame_error` was charged per byte and climbed on the OTHER gateways' clean
+traffic) · `reg3 frames_ok` (denominator) · `reg4 last_fail_len` · `reg5..12`
 the bytes of the last CRC-failed frame · **`reg13` internal fault count** ·
 **`reg14` `[tm_err_t | tm_fault_site_t]` of the first internal fault**.
 Counters are zeroed on gateway reset.
