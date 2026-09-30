@@ -293,6 +293,14 @@ bool dq_submit(uint8_t slave_id, dq_prio_t prio, uint8_t addr, uint8_t data,
         LOG_WARN("dq", "submit to unknown DALI slave %u dropped", slave_id);
         return false;
     }
+    /* Someone pressed something. If this gateway was written off as absent,
+     * try it now rather than when the backoff next allows (up to 60 s): a
+     * gateway that has just come back must answer the first press, not the
+     * one a minute later. */
+    if (prio == DQ_PRIO_USER) {
+        modbus_backoff_kick(slave_id);
+        mbq_client_kick(slave_id);
+    }
     dq_class_t *c = &s->cl[class_of(prio)];
     dq_cmd_t entry = { .addr = addr, .data = data,
                        .flags = (uint8_t)(flags & MBQ_QF_MASK), .dtr0 = dtr0,

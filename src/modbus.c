@@ -284,6 +284,22 @@ static void backoff_note(uint8_t slave, bool answered) {
                 slave, (unsigned long)b->backoff_ms);
 }
 
+/* A PERSON is waiting on this slave (a button press, an HA command): stop
+ * waiting out the backoff and try it now. The backoff doubles to a 60 s cap, so
+ * a gateway that came back after an outage could otherwise ignore the wall
+ * switches for up to a minute (house, 2026-09-30, after powering the DALI side
+ * down to refit the panel cover). The next request becomes the probe, and the
+ * ladder restarts at MODBUS_BACKOFF_MIN_MS so a still-dead slave is re-tried on
+ * the short cycle while someone is actively pressing. Cost of a dead slave: one
+ * response timeout per press — bounded by how fast a human presses. */
+void modbus_backoff_kick(uint8_t slave) {
+    mb_backoff_t *b = backoff_for(slave);
+    if (!b || !b->backoff_ms) return;
+    b->backoff_ms = MODBUS_BACKOFF_MIN_MS;
+    b->retry_at   = get_absolute_time();
+    LOG_DBG("modbus", "slave %u: user command — probing now", slave);
+}
+
 /* True if this slave is currently being kept off the wire. */
 static bool backoff_active(uint8_t slave) {
     mb_backoff_t *b = backoff_for(slave);

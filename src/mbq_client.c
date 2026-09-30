@@ -321,6 +321,16 @@ static bool s_resolving;
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
+static slave_t *slave_for(uint8_t slave_id);
+
+/* A user is waiting: drop the transport's own failure pacing (pace_backoff,
+ * up to PACE_DOWN_MS) so the command goes out on the next drive. Paired with
+ * modbus_backoff_kick, which does the same one layer down. */
+void mbq_client_kick(uint8_t slave_id) {
+    slave_t *s = slave_for(slave_id);
+    if (s) s->next_at_us = 0;
+}
+
 static slave_t *slave_for(uint8_t slave_id) {
     for (int i = 0; i < MAX_DALI_SLAVES; i++)
         if (s_sl[i].in_use && s_sl[i].slave_id == slave_id) return &s_sl[i];

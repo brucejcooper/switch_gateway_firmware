@@ -42,6 +42,10 @@ typedef bool (*modbus_offer_fn)(void *ctx);
 void modbus_register_offer(modbus_offer_fn fn, void *ctx);
 
 uint32_t modbus_drop_count(void);
+
+/* A user is waiting on `slave`: if it is in the absent-slave backoff, probe it on
+ * the next request instead of waiting the window out (see modbus.c). */
+void modbus_backoff_kick(uint8_t slave);
 /* High-water mark of the action queue since boot. Should sit at roughly the
  * number of concurrent producers (~3-5); a larger value means something has
  * stopped being single-outstanding and priority is being lost to FIFO order. */

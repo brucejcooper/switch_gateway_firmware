@@ -92,6 +92,7 @@ bool lighting_set_relay(uint8_t channel, bool on) {
     relay_ctx_t *c = &s_relay_ctx[s_relay_ctx_idx++ % RELAY_COUNT];
     c->channel = channel;
     c->on      = on;
+    modbus_backoff_kick(g_config.relay_slave_ids[0]);   /* a person is waiting */
     if (!modbus_set_coil(g_config.relay_slave_ids[0], channel, on, relay_write_cb, c)) {
         LOG_WARN("light", "relay ch=%u %s dropped — queue full", channel, on ? "on" : "off");
         return false;

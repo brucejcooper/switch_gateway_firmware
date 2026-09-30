@@ -169,6 +169,10 @@ void mbq_client_add_slave(uint8_t slave_id);
  * mbq_client.c. The adapter's scheduler gates a submit on this. */
 bool mbq_client_can_submit(uint8_t slave_id);
 
+/* A user command was just submitted for this slave: go now, not after the
+ * failure pacing (see modbus_backoff_kick). */
+void mbq_client_kick(uint8_t slave_id);
+
 /* Stage one command for `slave_id`'s gateway queue. QUEUED, NOT TRANSMITTED:
  * mbq_client_drive() attaches it to the next packet.
  * `cmd` is [addr, data, flags (MBQ_QF_*), dtr0]. `idempotent` = safe to run
