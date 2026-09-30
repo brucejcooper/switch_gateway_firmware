@@ -135,6 +135,7 @@ typedef struct {
     bool     got_status_ok;
     uint8_t  got_level;      /* captured at STEP_LEVEL; the scan path commits later */
     bool     got_level_ok;
+    bool     got_level_mask; /* LEVEL answered MASK (0xFF): gear still starting */
     uint16_t got_groups;
 
     uint8_t  cursor;        /* rotating idle sweep position (present ballasts) */
@@ -472,9 +473,18 @@ static void record(ds_slave_t *d, step_t s) {
             break;
         case STEP_LEVEL:
             /* A query that did not answer cleanly must not publish a fabricated
-             * 0 — keep whatever the cache already holds. */
-            d->got_level_ok = ok;
-            d->got_level    = ok ? answer : cached_arc(d, d->addr);
+             * 0 — keep whatever the cache already holds.
+             *
+             * MASK (0xFF) is not a level either: IEC 62386-102 has QUERY ACTUAL
+             * LEVEL answer MASK while the lamp is still starting up. Drivers
+             * with a slow start answer it to the verify read ~100 ms after an
+             * "on" (house 3.1/3.9/3.19, 2026-09-30), and it used to be published
+             * as brightness 255 until the idle sweep came round minutes later.
+             * Treat it like a fade in progress: keep the cached level, publish
+             * nothing from this read, re-read at FADE_POLL_MS (advance()). */
+            d->got_level_mask = ok && answer == 0xFFu;
+            d->got_level_ok   = ok && !d->got_level_mask;
+            d->got_level      = d->got_level_ok ? answer : cached_arc(d, d->addr);
             break;
         case STEP_GROUPS_LO:
             if (ok) d->got_groups = (uint16_t)((d->got_groups & 0xFF00u) | answer);
@@ -516,7 +526,8 @@ static void advance(ds_slave_t *d) {
         if (!d->is_scan) {
             /* Verification pass ends here: status + level are what a command
              * changes. Group membership is only re-read on a full scan. */
-            commit_ballast(d, d->addr, d->got_level, d->got_status, false, 0);
+            if (!d->got_level_mask)   /* MASK: nothing measured yet — re-read below */
+                commit_ballast(d, d->addr, d->got_level, d->got_status, false, 0);
             d->verify &= ~bit;
             /* Still ramping? Keep re-reading at FADE_POLL_MS until it settles,
              * and PUBLISH EACH SAMPLE. Every one is a real measured level, so HA
@@ -526,7 +537,7 @@ static void advance(ds_slave_t *d) {
              * requested value before the ballast has clamped it to its own
              * min/max. See the "bri" branch of dali_apply_kv, which deliberately
              * reports nothing and lets these reads speak. */
-            if (d->got_status & STATUS_FADE_RUNNING) {
+            if ((d->got_status & STATUS_FADE_RUNNING) || d->got_level_mask) {
                 if (!(d->fade_watch & bit)) {
                     d->fade_watch |= bit;
                     d->fade_give_up_at = make_timeout_time_ms(FADE_TRACK_MAX_MS);
@@ -545,6 +556,13 @@ static void advance(ds_slave_t *d) {
     if (last == STEP_GROUPS_HI) {
         commit_ballast(d, d->addr, d->got_level, d->got_status, true, d->got_groups);
         d->scan  &= ~bit;
+        if (d->got_level_mask) {   /* still starting: follow it like a fade */
+            if (!(d->fade_watch & bit)) {
+                d->fade_watch |= bit;
+                d->fade_give_up_at = make_timeout_time_ms(FADE_TRACK_MAX_MS);
+            }
+            d->fade_next_at = make_timeout_time_ms(FADE_POLL_MS);
+        }
         d->busy   = false;
         d->step   = STEP_STATUS;
         return;
