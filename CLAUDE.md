@@ -541,6 +541,19 @@ number** (stable; the short address is not).
 re-provision the gear at one collided short address. The sequence runs on the
 CONTROLLER (`dali_commission.c`) as ordinary queued DALI frames.
 
+**`address <N>` / `new` pick destinations carefully (2026-09-30):** a candidate
+must be absent from the presence cache, unclaimed this run, NOT referenced by any
+mapping, and silent to QUERY CONTROL GEAR PRESENT on the wire (the cache cannot
+see collided gear). In `address <N>` every gear on N is moved off, then N is
+confirmed silent and the LAST gear is moved back onto N (SET SHORT ADDRESS), so
+mappings to N keep one real device; the others land on the lowest free address.
+`all` renumbers from 0 — every address is available. A garbled COMPARE reply is
+a YES (several gear answering is the mechanism); only dropped/lost aborts.
+**Collided addresses show PRESENT** (dstate WARNs "two or more gear share this
+address") as long as the same bus is also answering cleanly — house 3.1 and 3.3
+were split this way over the web API: `POST /api/provision
+{"slave":3,"mode":"address","target":1}`.
+
 **DALI gotcha that shapes this:** you can't just `INITIALISE`-by-address then
 `PROGRAM SHORT ADDRESS` — PROGRAM only programs the gear the binary search has
 *selected* (SEARCHADDR == its random address). So re-addressing must run the full
