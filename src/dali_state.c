@@ -114,6 +114,10 @@ typedef struct {
     uint64_t scan;        /* ballasts needing a full discovery pass */
     uint64_t present;     /* our current belief */
     uint8_t  strikes[64]; /* consecutive clean no-answers, per address */
+    /* When this bus last gave a CLEAN directed-query result (an answer or a
+     * silence). Proof the bus itself is alive — see presence_from(). */
+    bool     clean_seen;
+    uint32_t clean_ms;
 
     /* the window currently in flight: steps [step, step + win_n) */
     bool     busy;
@@ -242,6 +246,11 @@ static void ds_cb(uint8_t slave_id, dq_result_t res, uint8_t answer, void *ctx) 
     }
 }
 
+/* A garbled answer counts as a collided ballast only if this bus produced a
+ * clean result this recently. A scan steps through addresses every ~100-200 ms,
+ * so a live bus refreshes this constantly; a dead bus never does. */
+#define BUS_ALIVE_MS 5000u
+
 /* Apply the presence evidence rules to one query outcome. Returns true if the
  * ballast is (still) believed present. */
 static bool presence_from(ds_slave_t *d, uint8_t addr, dq_result_t res,
@@ -249,6 +258,8 @@ static bool presence_from(ds_slave_t *d, uint8_t addr, dq_result_t res,
     uint64_t bit = (uint64_t)1 << addr;
     switch (res) {
         case DQ_RES_OK:
+            d->clean_seen = true;
+            d->clean_ms   = to_ms_since_boot(get_absolute_time());
             d->strikes[addr] = 0;
             if (!(d->present & bit)) {
                 d->present |= bit;
@@ -257,6 +268,8 @@ static bool presence_from(ds_slave_t *d, uint8_t addr, dq_result_t res,
             }
             return true;
         case DQ_RES_NAK:
+            d->clean_seen = true;
+            d->clean_ms   = to_ms_since_boot(get_absolute_time());
             /* The only outcome that is evidence of absence: the bus was healthy
              * and nobody answered a directed query.
              *
@@ -276,9 +289,34 @@ static bool presence_from(ds_slave_t *d, uint8_t addr, dq_result_t res,
                          d->slave_id, addr, d->strikes[addr]);
             }
             return (d->present & bit) != 0;
+        case DQ_RES_ERR:
+            /* A garbled answer to a query sent to ONE short address means
+             * something answered — typically two or more gear sharing the
+             * address (a collision: new gear often ships on the same address).
+             * They are real, they switch on and off together with every command
+             * to that address, and HA must show them, not "unavailable" (house,
+             * 2026-09-30: 3.1 and 3.3 were doubled up and hidden). The gateway
+             * labels that overlap COLLISION or BUSFAULT depending on which pulse
+             * its decoder tripped on, so the code cannot tell a collision from a
+             * dead bus — an unpowered bus reads BUSFAULT on EVERY address. The
+             * bus itself can: accept the garble as presence only if this bus
+             * gave a clean answer or silence within BUS_ALIVE_MS. A dead bus
+             * never does, so it cannot conjure 64 phantom ballasts. */
+            if (d->clean_seen &&
+                to_ms_since_boot(get_absolute_time()) - d->clean_ms < BUS_ALIVE_MS) {
+                d->strikes[addr] = 0;
+                if (!(d->present & bit)) {
+                    d->present |= bit;
+                    state_cache_set_dali_present(d->slave_idx, addr, true);
+                    LOG_WARN("dstate", "%u.%u present, answer garbled — two or more "
+                             "gear share this address (collision)", d->slave_id, addr);
+                }
+                return true;
+            }
+            return (d->present & bit) != 0;
         default:
-            /* Collision / bus fault / dropped: evidence about the BUS, not about
-             * this ballast. Freeze the counters and keep the current belief —
+            /* Dropped / lost: evidence about the transport, not about this
+             * ballast. Freeze the counters and keep the current belief —
              * stale-but-never-wrong beats fresh-but-maybe-wrong. */
             return (d->present & bit) != 0;
     }
