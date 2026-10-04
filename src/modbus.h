@@ -3,19 +3,10 @@
 #include <stdint.h>
 #include <stddef.h>
 
-/* ── DE mode (persisted to /modbus_config.txt, as in original) ───────────── */
-typedef enum {
-    MODBUS_DE_WHENTX,
-    MODBUS_DE_ALWAYS,
-    MODBUS_DE_MAX,
-} modbus_de_mode_t;
-
-void set_modbus_de_mode(modbus_de_mode_t mode);
-
-/* Current RS485 DE (transmit) mode, and its short string name
- * ("tx" / "always"). to_str returns "?" for an out-of-range value. */
-modbus_de_mode_t modbus_get_de_mode(void);
-const char *modbus_de_mode_to_str(modbus_de_mode_t mode);
+/* RS-485 DE (driver enable) is asserted only while transmitting. The old
+ * "always" mode — DE held on permanently, for a long-gone transceiver that
+ * needed it — was removed 2026-10-04; a stored "de_mode" key in config.json
+ * is ignored. */
 
 /* Decode a Modbus exception code (the byte after the OR'd-0x80 function code
  * in an error response) into a short human-readable string. Returns "unknown"

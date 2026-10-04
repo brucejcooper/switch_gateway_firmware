@@ -191,7 +191,6 @@ void emit_state_cfg(void) {
     ev.cfg.dim_repeat_ms      = g_config.dim_repeat_ms;
     ev.cfg.reversal_window_ms = g_config.reversal_window_ms;
     ev.cfg.baud               = modbus_get_baud();
-    ev.cfg.de_mode            = (uint8_t)modbus_get_de_mode();
     ev.cfg.relay_byteswap     = g_config.relay_byteswap ? 1u : 0u;
     ev.cfg.gw_diag_interval_ms = g_config.gw_diag_interval_ms;
     ev.cfg.dali_sweep_interval_ms = g_config.dali_sweep_interval_ms;
@@ -467,9 +466,6 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
          * validity, unchanged. */
         if ((c->set_cfg.fields & IC_CFG_F_BAUD) && c->set_cfg.baud > 0) { modbus_set_baud(c->set_cfg.baud); any = true; }
         if (any && !config_save()) LOG_ERR("cli", "config_save failed — set_cfg not persisted");
-        /* de_mode applies live and self-persists; keep it out of the `any` save. */
-        if ((c->set_cfg.fields & IC_CFG_F_DE_MODE) && c->set_cfg.de_mode < MODBUS_DE_MAX)
-            set_modbus_de_mode((modbus_de_mode_t)c->set_cfg.de_mode);
         emit_state_cfg();
         break;
     }

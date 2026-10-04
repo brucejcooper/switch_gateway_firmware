@@ -49,9 +49,8 @@ typedef struct {
     uint8_t  pending_dali_slave_ids[MAX_DALI_SLAVES];
     uint8_t  pending_dali_slave_count;
 
-    /* Modbus bus settings (migrated from /modbus_baud.txt + /modbus_config.txt). */
-    uint32_t baud;                 /* default 19200 */
-    uint8_t  de_mode;              /* modbus_de_mode_t, default 0 (when-tx) */
+    /* Modbus bus settings (migrated from /modbus_baud.txt). */
+    uint32_t baud;                 /* default 38400 */
 
     /* Some Modbus relay boards (e.g. Waveshare Modbus RTU Relay 32CH) return the
      * FC01 coil-status data field with its bytes in REVERSED order (byte0 =

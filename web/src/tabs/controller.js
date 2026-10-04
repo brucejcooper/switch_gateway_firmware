@@ -12,11 +12,6 @@ export function renderController(state) {
   const sw = numField('DALI background sweep (ms, 0=off)', cfg.dali_sweep_interval_ms, { min: '0' });
   const baud = numField('RS-485 baud', cfg.baud, { min: '0' });
 
-  const de = h('select', {},
-    h('option', { value: '0', selected: num(cfg.de_mode) === 0 }, 'When transmitting'),
-    h('option', { value: '1', selected: num(cfg.de_mode) === 1 }, 'Always on'),
-  );
-
   const byteswap = h('input', { type: 'checkbox', checked: num(cfg.relay_byteswap) === 1 });
 
   const save = h('button', { class: 'btn primary' }, 'Save controller config');
@@ -27,15 +22,12 @@ export function renderController(state) {
     gw_diag_interval_ms: num(gd.input.value),
     dali_sweep_interval_ms: num(sw.input.value),
     baud: num(baud.input.value),
-    de_mode: num(de.value),
     relay_byteswap: byteswap.checked ? 1 : 0,
   }), { okMsg: 'Controller config saved' }));
 
   return h('div', { class: 'card' },
     h('h3', {}, 'Controller'),
     h('div', { class: 'grid2' }, lp.wrap, dr.wrap, rw.wrap, gd.wrap, sw.wrap, baud.wrap),
-    h('label', {}, 'DE / driver-enable mode'),
-    de,
     h('label', {}, 'Relay coil byte-swap'),
     h('div', { class: 'row' }, byteswap,
       h('span', { class: 'muted' }, 'Reverse coil read-back byte order (Waveshare 32CH)')),

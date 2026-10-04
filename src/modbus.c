@@ -114,7 +114,6 @@ typedef struct {
     void                *ctx;
 } modbus_action_t;
 
-static modbus_de_mode_t      de_mode    = MODBUS_DE_WHENTX;
 static uint32_t              s_baud     = DEFAULT_BAUD_RATE;
 
 /* t3.5 — the inter-frame silence that DEFINES the end of an RTU frame.
@@ -324,7 +323,6 @@ static bool backoff_should_skip(uint8_t slave, bool *is_probe) {
     return true;
 }
 
-static const char *modbus_de_mode_str[MODBUS_DE_MAX] = { "tx", "always" };
 
 /* Standard Modbus exception codes (MODBUS Application Protocol v1.1b3 §7). */
 const char *modbus_exception_str(uint8_t code) {
@@ -465,9 +463,7 @@ static int64_t release_de(alarm_id_t id, void *userdata) {
     while (uart_get_hw(UART_ID)->fr & UART_UARTFR_BUSY_BITS) {
         ;   /* wait for the final byte to clear the shift register */
     }
-    if (de_mode == MODBUS_DE_WHENTX) {
-        gpio_put(UART_DE_PIN, 0);   /* DE/RE low -> receiver enabled */
-    }
+    gpio_put(UART_DE_PIN, 0);   /* DE/RE low -> receiver enabled */
     /* Transmit is complete and the line has settled. Discard anything the RX
      * FIFO captured during the transmit (the controller's own frame, latched
      * via the muted/floating receiver) and only NOW arm the receiver for the
@@ -484,20 +480,6 @@ static int64_t release_de(alarm_id_t id, void *userdata) {
     return 0;
 }
 
-/* ── Config helpers ──────────────────────────────────────────────────────── */
-void set_modbus_de_mode(modbus_de_mode_t mode) {
-    de_mode = mode;
-    g_config.de_mode = (uint8_t)mode;   /* persisted via the unified config.json */
-    if (!config_save())
-        LOG_ERR("modbus", "config_save failed — de_mode not persisted");
-}
-
-modbus_de_mode_t modbus_get_de_mode(void) { return de_mode; }
-
-const char *modbus_de_mode_to_str(modbus_de_mode_t mode) {
-    if (mode >= MODBUS_DE_MAX) return "?";
-    return modbus_de_mode_str[mode];
-}
 
 void modbus_set_baud(uint32_t baud) {
     modbus_uart_set_baud_runtime(baud); /* live first: s_baud + the UART divisor */
@@ -531,14 +513,11 @@ void modbus_init(void) {
     queue_init(&action_queue,   sizeof(modbus_action_t), 16);
     queue_init(&response_queue, sizeof(modbus_action_t),  20);
 
-    /* Baud + DE mode now come from the unified config (loaded by config_load()
-     * before modbus_init(); migrated once from the legacy /modbus_*.txt files). */
-    de_mode = (g_config.de_mode < MODBUS_DE_MAX) ? (modbus_de_mode_t)g_config.de_mode
-                                                 : MODBUS_DE_WHENTX;
+    /* Baud comes from the unified config (loaded by config_load() before
+     * modbus_init(); migrated once from the legacy /modbus_baud.txt). */
     s_baud  = g_config.baud ? g_config.baud : DEFAULT_BAUD_RATE;
 
-    LOG_INFO("modbus", "init de_mode=%s baud=%lu",
-             modbus_de_mode_str[de_mode], (unsigned long)s_baud);
+    LOG_INFO("modbus", "init baud=%lu", (unsigned long)s_baud);
 
     gpio_init(UART_DE_PIN);
     gpio_put(UART_DE_PIN, 0);

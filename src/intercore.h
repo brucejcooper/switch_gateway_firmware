@@ -104,7 +104,7 @@ typedef struct {
          * so HA's "Commission Status" sensor keeps its detail. */
         struct { uint8_t slave, state, count; char msg[IC_PROV_MSG_MAX]; } provision;
         struct { uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap;
+                 uint32_t baud; uint8_t relay_byteswap;
                  uint32_t gw_diag_interval_ms;
                  uint32_t dali_sweep_interval_ms; } cfg;
         /* CLI network-ping request: send `count` ICMP echoes to ip on core 1. */
@@ -143,7 +143,7 @@ typedef struct {
 #define IC_CFG_F_DIM_REPEAT (1u << 1)
 #define IC_CFG_F_REVERSAL   (1u << 2)
 #define IC_CFG_F_BAUD       (1u << 3)
-#define IC_CFG_F_DE_MODE    (1u << 4)
+/* (1u << 4) was IC_CFG_F_DE_MODE — RS-485 DE mode, retired 2026-10-04. */
 #define IC_CFG_F_RELAY_BYTESWAP (1u << 5)
 #define IC_CFG_F_GW_DIAG    (1u << 6)
 #define IC_CFG_F_DALI_SWEEP (1u << 7)
@@ -207,7 +207,7 @@ typedef struct {
         struct { uint8_t slave, group; uint16_t fields; ic_tri_t on; uint8_t bri;
                  uint64_t members; } set_group;
         struct { uint16_t fields; uint16_t long_press_ms, dim_repeat_ms, reversal_window_ms;
-                 uint32_t baud; uint8_t de_mode; uint8_t relay_byteswap;
+                 uint32_t baud; uint8_t relay_byteswap;
                  uint32_t gw_diag_interval_ms;
                  uint32_t dali_sweep_interval_ms; } set_cfg;
         struct { uint8_t fixture, button, count;

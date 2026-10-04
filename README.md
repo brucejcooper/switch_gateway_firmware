@@ -200,7 +200,7 @@ Each boot, before the main loop starts, the firmware runs:
 | `button_actions.c/h` | PIO button matrix scanner |
 | `button_fsm.c/h` | Per-button state machine (toggle/dim/reversal) |
 | `button_fsm_emit.c` | Pushes typed button events to core 1 |
-| `config.c/h` | Global config, persisted to `/config.json` (timing, slaves, modbus baud, RS485 DE mode, MQTT, net) |
+| `config.c/h` | Global config, persisted to `/config.json` (timing, slaves, modbus baud, MQTT, net) |
 | `mapping.c/h` | Button-to-light mappings, persisted to `/mappings.json` |
 | `state_cache.c/h` | In-memory cache of relay + DALI ballast + group state |
 | `lighting_actions.c/h` | Command dispatch, any-on probe + config-query state machines, state event queue |
@@ -810,7 +810,6 @@ discover                                   re-probe all configured slaves (block
 ping <slave> [relay|dali]                  one ping at current master baud
 set_slave_baud <slave> {9600|19200|38400} [relay|dali]  tell slave to switch its UART baud
 baud [<rate> [save]]                       show / set UART baud (live; 'save' persists)
-rs485 [{tx|always}]                        show / set RS485 DE mode (saved)
 mqtt [show | set host=.. port=.. user=.. pass=.. prefix=..]   broker config (reboot to apply)
 net  [show | set dhcp=.. ip=.. mask=.. gw=.. dns=..]          network config (reboot to apply)
 ls [<path>]                                list files (default /)
@@ -1071,7 +1070,7 @@ client; both share the W5100S.
   Treat this as a **LAN-only** commissioning tool, not an internet-facing
   surface, and change the default password.
 - **What it does:** view live state (gateways, ballasts, groups, button
-  fixtures) and edit everything the CLI can — RS-485 baud + DE mode, slave lists,
+  fixtures) and edit everything the CLI can — RS-485 baud, slave lists,
   per-ballast settings, groups, button bindings, provisioning, network (DHCP /
   static), and the MQTT broker. Network/MQTT changes apply on reboot (core 1
   reads them from the launch snapshot); lighting/baud/DE changes apply live.
@@ -1195,7 +1194,7 @@ and editable from the CLI (`ls`, `cat`) and hand-editable as plain text.
 
 | File | Contents | Format |
 |------|----------|--------|
-| `/config.json` | Timing params, slave IDs, modbus baud, RS485 DE mode, MQTT broker/creds, network config | JSON text |
+| `/config.json` | Timing params, slave IDs, modbus baud, MQTT broker/creds, network config | JSON text |
 | `/mappings.json` | Button-to-light mappings | Line-delimited JSON (`{format,version}` header + one object per binding) |
 
 **Legacy migration (one-time, automatic on first boot of new firmware):**

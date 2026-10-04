@@ -569,13 +569,12 @@ static void cmd_show(char **saveptr) {
     if (strcasecmp(what, "config") == 0) {
         printf("long_press_ms=%u dim_repeat_ms=%u reversal_window_ms=%u "
                "gw_diag_interval_ms=%lu dali_sweep_interval_ms=%lu "
-               "baud=%lu rs485=%s relay_byteswap=%u fw_url=%s relay_slaves=",
+               "baud=%lu relay_byteswap=%u fw_url=%s relay_slaves=",
                g_config.long_press_ms, g_config.dim_repeat_ms,
                g_config.reversal_window_ms,
                (unsigned long)g_config.gw_diag_interval_ms,
                (unsigned long)g_config.dali_sweep_interval_ms,
                (unsigned long)modbus_get_baud(),
-               modbus_de_mode_to_str(modbus_get_de_mode()),
                g_config.relay_byteswap ? 1u : 0u,
                g_config.fw_url[0] ? g_config.fw_url : "(default)");
         for (int i = 0; i < g_config.relay_slave_count; i++) {
@@ -1608,24 +1607,6 @@ static void cmd_baud(char **saveptr) {
            persist ? " (saved)" : " (live only)");
 }
 
-/* ── rs485 transmit (DE) mode ──────────────────────────────────────────── */
-static void cmd_rs485(char **saveptr) {
-    char *arg = strtok_r(NULL, " \t", saveptr);
-    if (!arg) {
-        printf("rs485: %s\n", modbus_de_mode_to_str(modbus_get_de_mode()));
-        return;
-    }
-    for (modbus_de_mode_t m = 0; m < MODBUS_DE_MAX; m++) {
-        if (strcasecmp(arg, modbus_de_mode_to_str(m)) == 0) {
-            LOG_INFO("cli", "rs485 %s", modbus_de_mode_to_str(m));
-            set_modbus_de_mode(m);  /* applies live + persists */
-            printf("rs485: %s (saved)\n", modbus_de_mode_to_str(m));
-            return;
-        }
-    }
-    txt_err("bad_arg");
-}
-
 /* ── ls / cat (pico-vfs littlefs) ──────────────────────────────────────── */
 static void cmd_ls(char **saveptr) {
     const char *path = strtok_r(NULL, " \t", saveptr);
@@ -2042,8 +2023,6 @@ static const cli_cmd_t cli_commands[] = {
       "set_slave_baud <slave> {9600|19200|38400} [relay|dali]  tell slave to switch its UART baud\n" },
     { "baud", cmd_baud,
       "baud [<rate> [save]]                       show / set UART baud (live; 'save' persists)\n" },
-    { "rs485", cmd_rs485,
-      "rs485 [{tx|always}]                         show / set RS485 DE mode (saved; tx=DE while transmitting)\n" },
     { "ls", cmd_ls,
       "ls [<path>]                                list files in path (default /)\n" },
     { "cat", cmd_cat,

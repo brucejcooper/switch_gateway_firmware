@@ -267,7 +267,7 @@ in `README.md` (“Config Web UI”). The load-bearing facts:
   connected pump and the disconnected discard path, so the UI stays live exactly
   when MQTT is down). Core 1 pushes one `IC_CMD_RESYNC` at boot to hydrate it
   independent of MQTT. **Writes** become typed `ic_cmd_t` to core 0 — the new
-  `IC_CMD_SET_NETCFG/MQTTCFG/AUTH` + `de_mode` in `SET_CFG`. Config stays
+  `IC_CMD_SET_NETCFG/MQTTCFG/AUTH`. Config stays
   **core-0-owned** (single writer to `/config.json`).
 - **Auth:** Basic, default admin/admin unchanged from the user's perspective —
   but the PASSWORD itself is never stored, only an Argon2id hash + salt
@@ -326,11 +326,11 @@ absent, so `discover` reporting `1 ok, 2 fail` is the expected result, not a
 fault. (Where two devices do share a slave id they can collide on the wire —
 watch the captured logs for CRC/timeout symptoms.)
 
-**DE mode must be `tx` (2026-08-08).** The rig now has a proper RS-485
-transceiver, so holding DE asserted keeps the controller driving the bus and no
-slave can ever answer — every transaction times out. `rs485 tx` (live, persisted)
-is the correct setting; `rs485 always` only suited the previous non-standard
-driver. Measured right after the swap, with the gateway's counters zeroed by
+**DE is asserted only while transmitting.** (2026-08-08 the rig got a proper
+RS-485 transceiver; holding DE asserted kept the controller driving the bus so no
+slave could answer. The `rs485 {tx|always}` knob that selected this only suited
+the previous non-standard driver, which is gone — it was removed 2026-10-04,
+along with `de_mode` in config.json, the web UI and the intercore config.) Measured right after the swap, with the gateway's counters zeroed by
 `gw_reboot 3`: 3048 frames, **0 rx_overflow / 0 frame_error / 0 crc_error / 0
 internal faults**, across two soaks totalling 1300 DALI frames and 2305 Modbus
 transactions with zero failures. For contrast, the pre-swap counters stood at

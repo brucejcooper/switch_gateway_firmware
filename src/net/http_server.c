@@ -581,8 +581,8 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
          * had: a POST of long_press_ms=70000 cast to (uint16_t) lands on 4464,
          * which is INSIDE the legal range, so core 0's apply gate would accept
          * a value the caller never sent. The 400 names the real range; baud
-         * and de_mode are not schema fields (special apply paths) and keep
-         * their existing unchecked pack, same as the CLI. */
+         * is not a schema field (special apply path) and keeps its existing
+         * unchecked pack, same as the CLI. */
         {
             static const char *NKEYS[] = { "long_press_ms", "dim_repeat_ms",
                 "reversal_window_ms", "gw_diag_interval_ms", "dali_sweep_interval_ms" };
@@ -608,7 +608,6 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
         if (jhas(body, tk, nt, "gw_diag_interval_ms")) { cmd.set_cfg.gw_diag_interval_ms = (uint32_t)jint_key(body, tk, nt, "gw_diag_interval_ms", 0); f |= IC_CFG_F_GW_DIAG; }
         if (jhas(body, tk, nt, "dali_sweep_interval_ms")) { cmd.set_cfg.dali_sweep_interval_ms = (uint32_t)jint_key(body, tk, nt, "dali_sweep_interval_ms", 0); f |= IC_CFG_F_DALI_SWEEP; }
         if (jhas(body, tk, nt, "baud"))               { cmd.set_cfg.baud               = (uint32_t)jint_key(body, tk, nt, "baud", 0);               f |= IC_CFG_F_BAUD; }
-        if (jhas(body, tk, nt, "de_mode"))            { cmd.set_cfg.de_mode            = (uint8_t)jint_key(body, tk, nt, "de_mode", 0);             f |= IC_CFG_F_DE_MODE; }
         if (jhas(body, tk, nt, "relay_byteswap"))     { cmd.set_cfg.relay_byteswap     = (uint8_t)jint_key(body, tk, nt, "relay_byteswap", 0);      f |= IC_CFG_F_RELAY_BYTESWAP; }
         cmd.set_cfg.fields = f;
         push_cmd_resp(c, &cmd); return;
