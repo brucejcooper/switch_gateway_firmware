@@ -61,7 +61,16 @@ static uint8_t s_dirty_ctx_slave[MAX_DALI_SLAVES];
 /* Relay-board reachability: poll each relay slave's coils periodically and emit
  * state_gateway on a transition, exactly like a DALI gateway, so HA marks relay
  * switches unavailable when the board is absent (not just on the system topic). */
-#define RELAY_POLL_INTERVAL_MS 2000u
+#define RELAY_POLL_INTERVAL_MS 2000u   /* while the board is NOT answering */
+/* While it IS answering, every 10 s. The poll is a health check plus an
+ * out-of-band reconcile of the coil cache; the controller is the relays' only
+ * writer, so neither needs 2 s. Every poll also costs the DALI gateways a
+ * false CRC error: the Waveshare board answers faster than their end-of-frame
+ * window, so request + reply reach them glued as one bad frame (house,
+ * 2026-10-01; gateway firmware 225e778 recognises the pair). Losing the board
+ * is still noticed (3 misses = 30 s), finding it again stays on the 2 s
+ * cadence, and a relay press kicks the Modbus backoff itself. */
+#define RELAY_POLL_HEALTHY_MS 10000u
 typedef struct { bool reachable; uint8_t fail_count; uint32_t last_poll_ms; bool awaiting; } rpoll_t;
 static rpoll_t s_rp[MAX_RELAY_SLAVES];
 static uint8_t s_rp_idx[MAX_RELAY_SLAVES];   /* callback ctx → relay-slave index */
@@ -85,7 +94,8 @@ static bool relay_offer(void *ctx) {
     rpoll_t *rp = &s_rp[i];
     if (rp->awaiting) return false;
     uint32_t now_ms = to_ms_since_boot(get_absolute_time());
-    if (now_ms - rp->last_poll_ms < RELAY_POLL_INTERVAL_MS) return false;
+    uint32_t interval = rp->reachable ? RELAY_POLL_HEALTHY_MS : RELAY_POLL_INTERVAL_MS;
+    if (now_ms - rp->last_poll_ms < interval) return false;
     rp->last_poll_ms = now_ms;
     /* Only mark awaiting if the read actually queued — otherwise a dropped
      * action would leave awaiting stuck and we'd never poll this relay again.
