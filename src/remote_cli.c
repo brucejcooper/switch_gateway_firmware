@@ -2,6 +2,7 @@
 #include "remote_cli.h"
 #include "cli.h"
 #include "log.h"
+#include "cdc_out.h"
 #include "pico/stdio.h"
 #include "pico/stdio/driver.h"
 #include "hardware/sync.h"
@@ -71,8 +72,9 @@ uint32_t rcli_ticket_of(rcli_owner_t owner) {
 
 /* ── core 0 ── */
 
-/* A stdio driver that appends to s_out. Enabled only while a remote command
- * runs; USB stays enabled alongside it, so the console sees the output too. */
+/* Appends to s_out. Installed as a stdio driver (printf/putchar) AND as the
+ * cdc_out tap (cdc_out_printf — e.g. `mbq gw`, the soak report) only while a
+ * remote command runs; USB still gets everything too. */
 static void cap_out_chars(const char *buf, int len) {
     uint16_t room = (uint16_t)(sizeof s_out - s_out_len);
     if ((uint16_t)len > room) { s_truncated = true; len = room; }
@@ -94,8 +96,10 @@ void rcli_service(void) {
              s_owner == RCLI_OWNER_HTTP ? "http" : "mqtt", s_line);
     stdio_flush();
     stdio_set_driver_enabled(&s_cap_drv, true);
+    cdc_out_set_tap(cap_out_chars);   /* commands that print via cdc_out_printf */
     cli_exec_line(s_line);
     stdio_flush();
+    cdc_out_set_tap(NULL);
     stdio_set_driver_enabled(&s_cap_drv, false);
 
     irq = spin_lock_blocking(s_lock);

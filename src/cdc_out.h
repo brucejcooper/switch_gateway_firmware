@@ -28,6 +28,12 @@ void cdc_out_init(void);
  * are never half-written). */
 void cdc_out_write(const char *buf, int len);
 
+/* Tap core 0's non-log output (anything not starting "# ", i.e. not a LOG_*
+ * line) into `fn` as well as the console, or NULL to stop. remote_cli uses it
+ * to capture CLI commands that print through cdc_out_printf() rather than
+ * stdio. Core 0 only. */
+void cdc_out_set_tap(void (*fn)(const char *buf, int len));
+
 /* Push as many queued bytes to the USB-CDC as the TX FIFO can accept right now,
  * then return — never blocks. Emits a dropped-count notice first when one is
  * pending and there is room. Call from core-0's main loop (serial_poll). */

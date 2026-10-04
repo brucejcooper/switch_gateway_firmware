@@ -1,4 +1,5 @@
 #include "cdc_out.h"
+#include "pico.h"            /* get_core_num() */
 #include <stdarg.h>
 #include <stdio.h>
 #include "partition_map.h"  /* compiled here purely so its _Static_assert()s run */
@@ -44,8 +45,16 @@ void cdc_out_init(void) {
     critical_section_init(&s_cs);
 }
 
+static void (*volatile s_tap)(const char *buf, int len);
+
+void cdc_out_set_tap(void (*fn)(const char *buf, int len)) { s_tap = fn; }
+
 void cdc_out_write(const char *buf, int len) {
     if (len <= 0) return;
+    /* remote_cli capture: core 0's command output, not its log lines. */
+    void (*tap)(const char *, int) = s_tap;
+    if (tap && get_core_num() == 0 && !(len >= 2 && buf[0] == '#' && buf[1] == ' '))
+        tap(buf, len);
     critical_section_enter_blocking(&s_cs);
     uint32_t used = s_head - s_tail;
     if ((uint32_t)len <= CDC_RING_SZ - used) {
