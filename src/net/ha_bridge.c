@@ -23,6 +23,8 @@
 #include "ping.h"        /* IC_EVT_PING_REQ is routed here, not published */
 #include "ota.h"         /* IC_EVT_OTA_ACK/OTA_STATUS are routed here, not published */
 #include "fwupdate.h"    /* HA 'update' entity: manifest check + install trigger */
+#include "cli.h"         /* CLI_LINE_MAX */
+#include "remote_cli.h"  /* <prefix>/cli/cmd -> <prefix>/cli/result: the CLI over MQTT */
 #include "log.h"
 #include "version.h"     /* FW_VERSION */
 #include "jsmn.h"
@@ -716,6 +718,7 @@ static void subscribe_all(void) {
         "mapping/+/+/set", "mapping/+/+/delete", "binding/+/+/set",
         "config/set", "config/+/set",
         "system/reboot", "update/install", "update/check",
+        "cli/cmd",
     };
     char f[64];
     for (unsigned i = 0; i < sizeof filt / sizeof filt[0]; i++) {
@@ -1187,6 +1190,21 @@ static void ha_on_message(const char *topic, uint16_t tlen,
 
     ic_cmd_t c; memset(&c, 0, sizeof c);
 
+    /* The CLI over MQTT: the payload is one command line, run by the same
+     * dispatcher as USB. Output is published (not retained) to <prefix>/cli/result
+     * by cli_result_pump(). One at a time — a busy slot answers "busy". */
+    if (!strcmp(seg[0], "cli") && ns >= 2 && !strcmp(seg[1], "cmd")) {
+        uint32_t t;
+        if (pn >= CLI_LINE_MAX || !rcli_submit(RCLI_OWNER_MQTT, pay, &t)) {
+            char rt[64];
+            snprintf(rt, sizeof rt, "%s/cli/result", mqtt_app_prefix());
+            pub_str(rt, pn >= CLI_LINE_MAX ? "error: command line too long"
+                                           : (pn ? "error: cli busy" : "error: empty command"),
+                    false);
+        }
+        return;
+    }
+
     /* Out-of-band reboot. Payload-gated ("PRESS"/"REBOOT") so a stray retained or
      * empty message can't reset the controller. This is the remote recovery for a
      * wedged USB stack — core 0 reboots via the watchdog, no USB involved. */
@@ -1395,7 +1413,31 @@ void ha_bridge_init(void) {
     mqtt_app_set_message_cb(ha_on_message);
 }
 
+/* Publish a finished MQTT-issued CLI command's output, then free the slot. The
+ * MQTT network buffer is MQTT_NET_BUF_SIZE (2 KB), so long output is cut and
+ * says so — POST /api/cli returns up to RCLI_OUT_MAX in full. */
+#define CLI_RESULT_MQTT_MAX 1700u
+static void cli_result_pump(bool connected) {
+    uint32_t t = rcli_ticket_of(RCLI_OWNER_MQTT);
+    if (!t) return;
+    const char *out; uint16_t len; bool trunc;
+    if (!rcli_result(t, &out, &len, &trunc)) return;
+    if (connected) {
+        static const char more[] = "\n...[truncated - POST /api/cli for the full output]\n";
+        static char pl[CLI_RESULT_MQTT_MAX + sizeof more];
+        uint16_t n = len;
+        if (n > CLI_RESULT_MQTT_MAX) { n = CLI_RESULT_MQTT_MAX; trunc = true; }
+        memcpy(pl, out, n);
+        if (trunc) { memcpy(pl + n, more, sizeof more - 1); n = (uint16_t)(n + sizeof more - 1); }
+        char rt[64];
+        snprintf(rt, sizeof rt, "%s/cli/result", mqtt_app_prefix());
+        mqtt_app_publish(rt, pl, n, false);
+    }
+    rcli_release(t);   /* disconnected: nowhere to publish — just free the slot */
+}
+
 void ha_bridge_tick(void) {
+    cli_result_pump(mqtt_app_connected());
     /* Disconnected: MQTT gets nothing, but still fold every event into the web
      * read model — the config UI must stay live exactly when the broker is down
      * (its whole point is commissioning before Home Assistant exists). The queue

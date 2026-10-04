@@ -41,6 +41,7 @@ set(APP_CORE_SRCS
     src/dirty_poll.c
     src/bus_discovery.c
     src/cli.c
+    src/remote_cli.c
     src/ic_seam.c
     src/cli_provision.c
     src/dali_provision.c

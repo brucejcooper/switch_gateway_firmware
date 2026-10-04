@@ -26,6 +26,7 @@
 #include "dq_soak.h"
 #include "dali_state.h"
 #include "dirty_poll.h"
+#include "remote_cli.h"
 #include "cli.h"
 #include "ic_seam.h"
 #include "dali_provision.h"
@@ -104,6 +105,7 @@ int main(void) {
      * the filesystem never mounts (so config/mappings can't persist). core 1
      * then parks waiting for the config snapshot before bringing up the network. */
     intercore_init();
+    rcli_init();        /* network CLI mailbox: claim its spinlock before core 1 */
     core1_launch();
 
     /* HARDENING (2026-08-17): hand off from the OTA bootloader's
@@ -283,6 +285,7 @@ int main(void) {
         dirty_poll_tick();
         dali_provision_tick();
         cli_poll();          /* (a) USB-CDC input: read + dispatch CLI commands */
+        rcli_service();      /* (a') a CLI command posted over HTTP/MQTT */
         ic_seam_pump();      /* (b)+(c)+tail: intercore cmd/event drain, ping/provision/log polls */
 
         wd_feed();

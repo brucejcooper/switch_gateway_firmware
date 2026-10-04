@@ -299,6 +299,25 @@ end-to-end system it is fine to change and reflash that firmware too.
   ```
 - **Compile-check only** (no hardware): `make -C ../TinyModbus build`.
 
+## The CLI over the network (2026-10-04) — use this, not USB
+
+The USB CLI's full command set is reachable remotely through the SAME dispatcher
+(`src/remote_cli.c` — single-slot mailbox, core 1 → core 0, stdout captured):
+
+```sh
+# HTTP (web login; house controller 192.168.1.234, admin/admin)
+curl -s -u admin:admin -H 'Content-Type: application/json' \
+     -d '{"cmd":"get_input 2 0x0300 16"}' http://192.168.1.234/api/cli
+# MQTT: publish the line to <prefix>/cli/cmd, read <prefix>/cli/result (not retained)
+mosquitto_pub ... -t lighting/cli/cmd -m 'mbq gw 2'
+```
+
+One command at a time (a second gets `503 cli busy` / `error: cli busy`). HTTP waits
+up to 30 s and returns up to 8 KB of output (`X-Output-Truncated: 1` if longer); MQTT
+results are cut at ~1.7 KB. Only SYNCHRONOUS output is captured — `scan`,
+`provision` etc. print their acknowledgement; later progress is in `/api/log`, which
+also records every remotely issued command (`cli: remote (http|mqtt): ...`).
+
 ## Serial / test rig
 
 - The controller's USB-CDC CLI is at **`/dev/cu.usbmodem112201`** (baud

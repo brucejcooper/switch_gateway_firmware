@@ -2082,6 +2082,8 @@ static void handle_text_line(const char *original_line) {
 }
 
 /* ── Public interface ────────────────────────────────────────────────────── */
+void cli_exec_line(const char *line) { handle_line(line); }
+
 void cli_init(void) {
     /* stdio_usb is enabled by pico_enable_stdio_usb in CMakeLists; the inter-core
      * queues are initialised in main() before core 1 launch. Nothing to do. */

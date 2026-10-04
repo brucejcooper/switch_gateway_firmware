@@ -22,6 +22,8 @@
 #include "log.h"
 #include "cdc_out.h"       /* cdc_out_history() — GET /api/log */
 #include "fwupdate.h"      /* fwupdate_status_json/announce/install — /api/ota */
+#include "remote_cli.h"    /* POST /api/cli — the CLI over HTTP */
+#include "cli.h"           /* CLI_LINE_MAX */
 
 #include "socket.h"
 #include "wizchip_conf.h"   /* getSn_SR / getSn_RX_RSR / getSn_TX_FSR / Sn_* */
@@ -43,6 +45,9 @@
 #define HTTP_BUF         2048u    /* per-conn request reassembly / send staging */
 #define RECV_TIMEOUT_MS  8000u
 #define SEND_TIMEOUT_MS  8000u
+/* POST /api/cli: how long to hold the connection open for core 0 to run the
+ * command. `discover` and the other blocking commands take seconds. */
+#define CLI_WAIT_MS     30000u
 #define DRAIN_TIMEOUT_MS 2000u
 
 /* Managed sockets. Sockets 2-3 are always ours; socket 0 is lent opportunistically
@@ -52,7 +57,7 @@
 #define N_SOCK  (N_BASE + 1)      /* + socket 0 (opportunistic) */
 static const uint8_t k_socks[N_SOCK] = { 2, 3, 0 };
 
-typedef enum { CONN_LISTEN, CONN_RECV, CONN_SEND, CONN_DRAIN } conn_state_t;
+typedef enum { CONN_LISTEN, CONN_RECV, CONN_WAIT, CONN_SEND, CONN_DRAIN } conn_state_t;
 typedef enum { RESP_MEM, RESP_STATE } resp_kind_t;
 typedef enum { PH_HDR, PH_BODY } send_phase_t;
 
@@ -77,6 +82,11 @@ typedef struct {
     /* RESP_STATE streaming */
     web_render_cursor_t cur;
     bool state_done;
+
+    /* POST /api/cli: the remote_cli mailbox ticket this connection holds (0 =
+     * none). Held from submit until the connection is reset, because the
+     * response body streams straight out of the mailbox's output buffer. */
+    uint32_t rcli_ticket;
 
     char buf[HTTP_BUF];
 } conn_t;
@@ -140,6 +150,7 @@ static conn_t *s_logbuf_owner = NULL;
  * later GET /api/log with a permanent 503. */
 static void reset_conn_state(conn_t *c) {
     if (s_logbuf_owner == c) s_logbuf_owner = NULL;
+    if (c->rcli_ticket) { rcli_release(c->rcli_ticket); c->rcli_ticket = 0; }
     c->st = CONN_LISTEN;
     c->rx_len = 0; c->hdr_complete = false; c->content_len = 0; c->body_start = 0;
     c->out_len = c->out_sent = 0; c->mem = NULL; c->mem_len = c->mem_sent = 0;
@@ -521,6 +532,27 @@ static void handle_post(conn_t *c, const char *path, const char *body, int blen)
     }
     ic_cmd_t cmd; memset(&cmd, 0, sizeof cmd);
 
+    /* The CLI over HTTP — {"cmd":"<command line>"}, same dispatcher as USB.
+     * The connection waits (CONN_WAIT) while core 0 runs it, then the captured
+     * output comes back as text/plain. Fits-or-fails: a command line that does
+     * not fit is refused, never truncated into a different command. */
+    if (strcmp(path, "/api/cli") == 0) {
+        char line[CLI_LINE_MAX];
+        if (!jstr_set_unescaped(body, tk, nt, "cmd", line, sizeof line) || !line[0]) {
+            resp_text(c, "400 Bad Request", "application/json",
+                      "{\"error\":\"need {\\\"cmd\\\":\\\"<command line>\\\"}\"}");
+            return;
+        }
+        uint32_t t;
+        if (!rcli_submit(RCLI_OWNER_HTTP, line, &t)) {
+            resp_text(c, "503 Service Unavailable", "application/json",
+                      "{\"error\":\"cli busy\"}");
+            return;
+        }
+        c->rcli_ticket = t;
+        c->st = CONN_WAIT; c->t_ms = now_ms();
+        return;
+    }
     if (strcmp(path, "/api/reboot") == 0) {
         /* Out-of-band reboot: core 0 answers this via the watchdog, without
          * touching USB — the recovery path when the USB CLI/picotool are wedged.
@@ -918,6 +950,19 @@ static void pump(conn_t *c) {
         do_recv(c);
         if (c->st == CONN_RECV && now_ms() - c->t_ms > RECV_TIMEOUT_MS) arm_listen(c);
         break;
+    case CONN_WAIT: {
+        if (sr != SOCK_ESTABLISHED) { arm_listen(c); break; }   /* releases the ticket */
+        const char *out; uint16_t len; bool trunc;
+        if (rcli_result(c->rcli_ticket, &out, &len, &trunc)) {
+            resp_mem(c, "200 OK", trunc ? "X-Output-Truncated: 1\r\n" : NULL,
+                     "text/plain; charset=utf-8", (const uint8_t *)out, len, false);
+        } else if (now_ms() - c->t_ms > CLI_WAIT_MS) {
+            rcli_release(c->rcli_ticket); c->rcli_ticket = 0;   /* frees when it finishes */
+            resp_text(c, "504 Gateway Timeout", "text/plain",
+                      "command still running on core 0 — its output is lost; see /api/log\n");
+        }
+        break;
+    }
     case CONN_SEND:
         if (sr != SOCK_ESTABLISHED) { arm_listen(c); break; }
         do_send(c);

@@ -19,6 +19,10 @@ void cli_poll(void);
 
 #define CLI_LINE_MAX 256
 
+/* Run one command line through the same dispatcher USB uses. Output goes to
+ * stdout. Core 0 only — remote_cli.c calls it with stdout captured. */
+void cli_exec_line(const char *line);
+
 /* ── Functions ic_seam.c reaches into cli.c for ─────────────────────────────
  * Each of these is a CLI feature at heart (the verb that starts it lives in
  * cli.c's dispatch table) that the intercore seam also drives, either because
