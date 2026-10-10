@@ -205,6 +205,7 @@ Each boot, before the main loop starts, the firmware runs:
 | `state_cache.c/h` | In-memory cache of relay + DALI ballast + group state |
 | `lighting_actions.c/h` | Command dispatch, any-on probe + config-query state machines, state event queue |
 | `dali_queue.c/h` | DALI adapter: per-slave priority scheduler + producer API over the generic client |
+| `dali_pending.c/h` | Latest-wins desired-state table per gateway (64 ballast + 16 group slots) that absorbs HA/web/CLI bursts |
 | `mbq_client.c/h` | Generic DALI-agnostic command-queue client (queue protocol v4, one FC 0x41 per transaction) |
 | `dali_state.c/h` | the DALI world model: presence, level/status, groups, fade tracking |
 | `dali_commission.c/h` | controller-side IEC 62386-102 commissioning |
@@ -297,8 +298,12 @@ Physical `press`/`release` frame every interaction; the gesture events
 
 ### Relay channels
 
-The Pico sends a coil write and updates its cache immediately from the Modbus
-write-callback. Relay state is instantaneous — no polling needed after a command.
+A wall button sends its coil write (FC05) at once. HA, web and CLI commands set
+the channel's **desired state** instead; `lighting_relay_tick()` drains those with
+one write in flight at a time, each an FC15 over one byte-aligned bank of 8 coils
+(see [Bursts](#bursts-latest-wins-desired-state)). Either way the cache and HA are
+updated from the write ACK, never from the request. Relay state is
+instantaneous — no polling needed after a command.
 
 The Waveshare board's state is also read in full at boot to synchronise the
 cache with the hardware's actual state (handles Pico restarts while power was on).
@@ -425,7 +430,8 @@ partitioned by priority class, and each class carries **its own gateway depth**:
 | class | storage | in-flight depth | what uses it |
 |---|---|---|---|
 | provisioning | 2 | **1** | the commissioning sequence (each step depends on the previous answer) |
-| user | 8 | 3 | buttons, HA commands, group-membership writes — sized to one button's full fan-out |
+| user | 8 | 3 | wall buttons, toggle probes, group-membership writes — sized to one button's full fan-out |
+| desired state | 80 slots, latest-wins | **2** | HA / web / HTTP API / CLI on-off-level — a table, not a FIFO; see [Bursts](#bursts-latest-wins-desired-state) |
 | config | 3 | 3 | DTR0+SET config writes |
 | verification read | 4 | 3 | the re-read that carries a command's real outcome to HA |
 | background | 2 | **2** | the world-model sweep, config-query rotation |
@@ -459,6 +465,58 @@ rate and min/max clamping govern the result, deliberately not a DAPC computed
 from cache. The counter decrements on **submit** and saturates at ±4: losing a
 step to the clamp or a gateway reboot is invisible in a ramp, whereas replaying
 one would double-step.
+
+### Bursts: latest-wins desired state
+
+**HA commands are not queued as frames.** Siri's "turn off all the lights" is
+~65 separate `light.turn_off` calls arriving within a few ms (HomeKit has no
+"all"), and scenes can be bigger. Dispatched one frame each into the 8-deep user
+class, everything past the eighth was dropped. Measured 2026-10-10 on the house
+with a 107-command burst (61 ballasts, 14 groups, 32 relays, published in 11 ms):
+**57 of 75 DALI commands and 7 of 32 relays lost**, nothing reported to HA, and a
+wall press in the following ~200 ms was itself refused (`backlog full`) or took
+276 ms. The intercore queue lost nothing — core 0 empties it every pass.
+
+Every such command is **absolute**, so only the newest per target matters. Each
+gateway keeps a pending table (`dali_pending.c`): one slot per short address and
+per group, holding off / on (GOTO LAST ACTIVE) / level plus a write stamp. A new
+command overwrites its slot; the table cannot overflow. The scheduler drains it
+as a rung of the ladder — below the user class and dim steps, above config
+writes, verification reads and background — at depth **2**: like background it
+may keep the gateway full but never takes the staging slot, so a wall press
+arriving mid-drain is staged next and waits only for the frames already at the
+gateway. **Buttons always win.**
+
+**Group vs member: oldest-written ships first, and that is all.** A ballast's
+final level is set by whichever of its own slot and its groups' slots executes
+last; in stamp order that is the one written most recently — exactly what a FIFO
+that never overflowed would produce. "group 3.15 OFF, then 3.4 ON" leaves 3.4 on;
+"group OFF" written again afterwards moves the group to newest and everything
+ends off. No membership lookup is involved, so a stale membership cache cannot
+make it wrong (`test/dali_pending_test.c` checks this against a model bus over
+thousands of random streams).
+
+**Buttons vs pending state.** A press skips the table, so an older pending slot
+could otherwise execute after it and undo it (Siri's group OFF still draining
+when someone hits the switch). After a press ships, its own pending slot is
+dropped — or, if anything else is still pending on that gateway, the press is
+re-asserted as the **newest** slot, so nothing older can land after it. That
+costs one idempotent frame, only during a drain. A dim step drops its target's
+pending slot (a step is relative, so there is nothing to re-assert). If the user
+class ever refuses a press, the press goes into the table rather than being lost.
+
+**State stays measured.** Nothing writes the cache from a request. The
+verification read is marked when a slot's frame actually ships, and since the
+table outranks verification reads on a gateway that executes FIFO, the read can
+never run before the command it verifies.
+
+**Relays** get the same rule per channel, drained with one write in flight at a
+time. Each write is **FC15 over one byte-aligned bank of 8 coils** — a single
+data byte. The Waveshare board returns FC01 reads byte-swapped (`relay_byteswap`)
+and its FC15 data order is undocumented; with one data byte there is no byte
+order to get wrong. Coils in the bank nobody asked for are written with their
+last commanded (else measured) value, and a bank with an unknown neighbour falls
+back to FC05 per channel. A 32-relay burst costs 4 transactions instead of 32.
 
 Duplicate idempotent submits that have not shipped are folded, so a repeated
 press or a re-published HA state costs nothing. A class-full refusal is
@@ -495,8 +553,10 @@ class's own depth (see [Scheduler model](#scheduler-model) above). A command
 carries an **idempotency** flag that decides what happens to it if a reboot or a
 never-landed frame catches it. The ladder, highest first: **provisioning**
 (bus-exclusive — while a slave is being commissioned the scheduler admits
-nothing else on it) → **user actions** (brightness/on-off/step, group commands
-including membership writes, the any-on probe) → **config writes** (DTR0+SET) →
+nothing else on it) → **user actions** (wall-button on/off, group-membership
+writes, the any-on probe) → **dim steps** → **desired state** (HA/web/CLI
+on/off/level, latest-wins — see [Bursts](#bursts-latest-wins-desired-state)) →
+**config writes** (DTR0+SET) →
 **verification reads** → **background** (the world-model sweep, config
 rotation). Group-membership writes deliberately share the user class: a group
 command *is* a user action and wants exactly that storage and depth.
@@ -621,7 +681,10 @@ them:
   resuming acks drains it and the rate recovers.
 
 **Observability.** **`dq [slave]`** dumps the per-class pending counts and
-depths, the pending dim deltas and cursor, the in-flight count, and its counters
+depths, the pending dim deltas and cursor, the in-flight count, the
+desired-state table (`desired: N pending, written / overwritten / shipped /
+button` — overwritten is how much a burst coalesced, button how often a press
+cleared or re-asserted a slot), and its counters
 (submitted / ok / nak / err / dropped / refused / coalesced / steps / clamped),
 then the client's own dump. **`mbq [slave]`** is that dump on its own: per-slave
 FSM state, the current ack/head/last-seq binding, estimated response-queue
@@ -690,9 +753,11 @@ Hardware change
 ```
 
 A command from HA travels the reverse path: core 1's `ha_on_message()` parses
-the MQTT JSON into a typed `ic_cmd_t`, pushes it onto the core-1 → core-0 queue,
-and core 0's `ic_seam_pump()` dispatches it through the same domain entry points
-the CLI uses.
+the MQTT JSON into a typed `ic_cmd_t`, pushes it onto the core-1 → core-0 queue
+(64 deep), and core 0's `ic_seam_pump()` dispatches it through the same domain
+entry points the CLI uses — which, for on/off/level, write the target's
+latest-wins desired state rather than queueing a frame (see
+[Bursts](#bursts-latest-wins-desired-state)).
 
 ---
 
@@ -959,6 +1024,17 @@ All topics live under the prefix (default `lighting`).
 | `lighting/provision/<slave>/start/target` | HA → board | No | integer 0–63 (the target address) |
 | `lighting/provision/<slave>/target_state` | board → HA | Yes | current target address |
 | `lighting/provision/<slave>/abort` | HA → board | No | any payload |
+
+**Command semantics.** Light/relay `.../set` commands are **absolute and
+latest-wins per target**: any number may arrive at once (a HomeKit "all off", a
+big scene) and none is dropped — a newer command for the same ballast, group or
+relay simply replaces one that has not gone out yet. Between a group and its
+members, whichever was sent last wins. There is no optimistic echo: the
+`.../state` reply is published from the measured read-back (DALI) or the write
+ACK (relay), so during a large burst HA's state follows the bus as it drains
+(~1.5 s for ~40 ballasts on one gateway). A wall press never queues behind a
+burst — it waits at most for the frames already at the gateway — and is never
+undone by an older pending HA command.
 
 The bindings have two HA-facing forms: the **`binding/...`** text entity (the one
 HA's mapper drives, `s:a` / `s:gN` CSV) and the **`mapping/...`** JSON form (kept
@@ -1326,7 +1402,13 @@ three times a poll costs the same bus time as real work and is invisible
 everywhere else (the bench's dead relay at slave 1 holds ~8 % of the bus
 permanently). Also reports re-sends split into timeout vs DEVICE_BUSY, and slave
 turnaround against the 50 ms response timeout — which distinguishes a reply that
-was *lost* from one that was merely *late*.
+was *lost* from one that was merely *late*. Its last lines are the drop
+counters, printed even at zero: `queue drops: … button event(s), … HA
+command(s)` (the button PIO queue and the core-1 → core-0 queue) and `relay
+desired: … written, … overwritten, … bus writes, pending mask …` (the relay
+desired-state table — bus writes well below written is a burst being coalesced).
+The `action queue: … dropped N` header is the Modbus action queue; HA and
+button relay writes no longer feed it faster than it drains.
 
 **`soak <slave> <addr> [n=<pairs>] [depth=<1-2>] [path=direct|bg|user]`** (bare =
 report, `soak stop` to end an open-ended run) — hammers the gateway command queue with alternating

@@ -234,14 +234,14 @@ int dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const char *val)
         /* Not even OFF is written ahead of the read. The endpoint is certainly
          * level 0, but with a fade time the light is NOT there yet, and a cache
          * that says 0 while the lamp is still ramping down is an inferred value
-         * on a topic that must only carry measured ones. The verification read
-         * marked by lighting_set_on_off reports the real level, including each
+         * on a topic that must only carry measured ones. lighting_set_on_off
+         * only records the desired state; the verification read is marked when
+         * its frame actually ships, and reports the real level, including each
          * step of the ramp.
          *
          * On: GOTO_LAST_ACTIVE restores a level the controller does NOT know.
-         * Don't assume it (the old code guessed max_level/254) — commanded_on is
-         * already set by lighting_set_on_off, and the dirty-poll reports the real
-         * brightness shortly. */
+         * Don't assume it (the old code guessed max_level/254) — the
+         * verification read reports the real brightness shortly. */
         return 2;   /* applied — nothing measured yet to report */
     }
     return dali_cfg_set(slave, addr, key, (uint8_t)atoi(val));
@@ -364,7 +364,7 @@ static void ic_dispatch_cmd(const ic_cmd_t *c) {
         bool on = (c->set_relay.on == IC_TRI_TOGGLE) ? !state_cache_get_relay_on(ch)
                                                      : (c->set_relay.on == IC_TRI_ON);
         lighting_set_relay(ch, on);
-        /* No predictive write and no emit: relay_write_cb caches and emits on the
+        /* No predictive write and no emit: the relay write ACK caches and emits on the
          * write ACK, and a failed write must not leave HA showing the requested
          * state. Emitting here would publish the PRE-command cached value anyway. */
         break;

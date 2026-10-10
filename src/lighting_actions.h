@@ -50,8 +50,26 @@ typedef struct {
  * event to core 1 as a typed ic_event_t (see levt_to_ic in ic_seam.c). */
 bool lighting_evt_try_pop(levt_t *out);
 
-/* Relay: on/off */
+/* One-time setup after dq_init(): hooks the verification read onto the
+ * moment a pending desired state actually ships. */
+void lighting_init(void);
+
+/* Relay: on/off as DESIRED STATE (HA, web, CLI) — latest wins per channel,
+ * drained by lighting_relay_tick() one single-byte FC15 bank at a time, so a
+ * burst is never dropped. The cache and HA update from the write ACK only. */
 bool lighting_set_relay(uint8_t channel, bool on);
+
+/* Relay from a WALL BUTTON: an immediate FC05, ahead of the table, and the
+ * channel's pending state is dropped (buttons always win). */
+bool lighting_button_relay(uint8_t channel, bool on);
+
+/* Main-loop driver for the relay desired-state table. */
+void lighting_relay_tick(void);
+
+/* `busload` observability: channels still pending (bitmask), and counters —
+ * commands written, overwritten before they shipped, and bus writes issued. */
+uint32_t lighting_relay_pending(void);
+void lighting_relay_counters(uint32_t *written, uint32_t *overwritten, uint32_t *writes);
 
 /* Decode one relay channel's on/off from a raw FC01 coil-status payload (the
  * coil-data bytes that follow the Modbus byte-count field). Honors
@@ -145,8 +163,18 @@ typedef enum {
 bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
                              dali_cfg_field_t field, uint8_t value);
 
-/* DALI: on (goto last active) / off */
+/* DALI: on (goto last active) / off, as DESIRED STATE. HA, web, HTTP, CLI and
+ * the async toggle land here: latest wins per target, and the gateway's
+ * pending table drains below buttons (dq_set_desired, dali_pending.h). Never
+ * dropped for lack of queue space; false only for an unknown or provisioning
+ * slave. The level/group setters below behave the same way. */
 bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on);
+
+/* DALI on/off from a WALL BUTTON: shipped straight into the user class, ahead
+ * of every pending desired state, then settled against the table so nothing
+ * older can undo it (dq_button_settle). Buttons always win. */
+bool lighting_button_on_off(uint8_t slave_id, uint8_t dali_addr, bool on);
+bool lighting_button_group_on_off(uint8_t slave_id, uint8_t group, bool on);
 
 /* DALI: step up or down one level (uses ballast fade rate) */
 bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up);
@@ -154,8 +182,9 @@ bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up);
 /* DALI: explicit arc level (DAPC) */
 bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc);
 
-/* DALI group helpers — single bus frame per call. State updates land via the
- * normal per-member dirty-bit polling path; no cache update on send. */
+/* DALI group helpers. on/off and level are desired state like the ballast
+ * setters above; steps accumulate in the delta counters. State updates land via
+ * the per-member verification reads; no cache update on send. */
 bool lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on);
 bool lighting_group_step(uint8_t slave_id, uint8_t group, bool up);
 bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc);

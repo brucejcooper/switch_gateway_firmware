@@ -34,6 +34,7 @@ set(APP_CORE_SRCS
     src/mapping.c
     src/lighting_actions.c
     src/dali_queue.c
+    src/dali_pending.c
     src/dali_state.c
     src/dali_commission.c
     src/mbq_client.c

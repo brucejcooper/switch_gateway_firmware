@@ -191,6 +191,7 @@ int main(void) {
     dali_state_init();
     dali_provision_init();
     dq_init();   /* per-slave gateway command-queue driver state */
+    lighting_init();   /* verification reads ride the pending table's ships */
 
     /* Arm a full DALI interrogation per slave and carry on — do NOT wait for
      * them. An interrogation is a multi-second bus operation and an absent
@@ -279,6 +280,7 @@ int main(void) {
         lighting_any_on_probe_tick();   /* submit probe queries into the gateway queue */
         lighting_cfg_query_tick();      /* submit config queries into the gateway queue */
         dq_tick();                      /* drive the gateway command queue (FC 0x41) */
+        lighting_relay_tick();          /* drain relay desired state (FC15 banks) */
         dq_soak_tick();                 /* bench: queue soak probe (idle unless started) */
         dali_state_tick();              /* controller-owned DALI world model */
         button_fsm_tick();

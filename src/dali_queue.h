@@ -34,6 +34,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include "mbq_client.h"   /* MBQ_QF_* — the wire flag bits, aliased below */
+#include "dali_pending.h" /* dp_op_t — the desired-state table's ops */
 
 /* Command flags. These ARE the wire bits (queue-protocol §1 packs the control
  * flags into the top three bits of the request's first byte), so a command
@@ -160,6 +161,35 @@ void dq_set_bg_burst(uint8_t slave_id, bool on);
  *
  * Returns false only for an unknown slave. */
 bool dq_add_delta(uint8_t slave_id, bool is_group, uint8_t addr, int8_t steps);
+
+/* ---- latest-wins desired state (task 14) -----------------------------------
+ *
+ * Absolute on/off/level commands that do NOT come from a wall button (HA, web
+ * UI, HTTP API, CLI) are not queued as frames. They overwrite a per-target slot
+ * in this gateway's pending table (dali_pending.h), which the scheduler drains
+ * oldest-written first, below buttons and dim steps and above config writes,
+ * verification reads and background — so a burst of any size is never dropped
+ * and never sits in front of a button press.
+ *
+ * dq_set_desired returns false only for an unknown slave. */
+bool dq_set_desired(uint8_t slave_id, bool is_group, uint8_t target,
+                    dp_op_t op, uint8_t arc);
+
+/* A button just commanded `target` directly through DQ_PRIO_USER. Buttons
+ * always win: clears the target's pending slot, or re-asserts the button's
+ * state as the newest slot if anything older is still pending on this gateway
+ * (dp_button). Returns true if it re-asserted. */
+bool dq_button_settle(uint8_t slave_id, bool is_group, uint8_t target,
+                      dp_op_t op, uint8_t arc);
+
+/* Called once for each pending slot as its frame is handed to the client — the
+ * moment to mark the target for its verification read. (lighting_actions owns
+ * the marking; this layer must not reach up into dali_state.) */
+typedef void (*dq_ship_hook_t)(uint8_t slave_id, bool is_group, uint8_t target);
+void dq_set_ship_hook(dq_ship_hook_t hook);
+
+/* Desired-state slots not yet shipped on `slave_id` (0 for an unknown slave). */
+uint32_t dq_pending_count(uint8_t slave_id);
 
 /* Per-loop driver: collect the underlying client's completions
  * (mbq_client_collect), then ship any pending backlog commands into free

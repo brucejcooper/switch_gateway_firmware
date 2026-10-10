@@ -20,7 +20,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")"
 
 CC="${CC:-cc}"
 
-# All 16 tests currently compile warning-free under -Wall -Wextra, so
+# All 18 tests currently compile warning-free under -Wall -Wextra, so
 # warnings are treated as build failures (-Werror) to keep it that way.
 # If a future test needs to add a warning-producing header/pattern, drop
 # -Werror for that one row and note it here instead of loosening this for
@@ -67,6 +67,14 @@ TEST_SOURCES+=("config_schema_test.c ../src/config.c ../src/web_auth.c ../lib/mo
 TEST_NAMES+=("web_auth_test")
 TEST_FLAGS+=("-DWEB_AUTH_HOST_TEST -I ../src -I ../lib/monocypher")
 TEST_SOURCES+=("web_auth_test.c ../src/web_auth.c ../lib/monocypher/monocypher.c")
+
+TEST_NAMES+=("dali_pending_test")
+TEST_FLAGS+=("-I ../src")
+TEST_SOURCES+=("dali_pending_test.c ../src/dali_pending.c")
+
+TEST_NAMES+=("dali_queue_test")
+TEST_FLAGS+=("-I stubs -I ../src")
+TEST_SOURCES+=("dali_queue_test.c ../src/dali_queue.c ../src/dali_pending.c")
 
 TEST_NAMES+=("dns_resolve_test")
 TEST_FLAGS+=("-DDNS_RESOLVE_HOST_TEST -I ../src/net")

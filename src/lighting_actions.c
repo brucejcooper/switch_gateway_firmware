@@ -69,19 +69,88 @@ bool lighting_evt_try_pop(levt_t *out) {
     return true;
 }
 
-/* ── Relay ───────────────────────────────────────────────────────────────── */
+/* ── Relay ───────────────────────────────────────────────────────────────────
+ *
+ * Same latest-wins rule as DALI (task 14). A relay command from HA/web/CLI sets
+ * the channel's desired state and a dirty bit; lighting_relay_tick() drains them
+ * with ONE write in flight at a time, so a burst can never overflow the Modbus
+ * action queue (measured: 7 of 32 relay writes lost to it) and whatever arrives
+ * while a write is out simply folds into the next one.
+ *
+ * Each write is FC15 over ONE byte-aligned bank of 8 coils — a single data byte.
+ * The Waveshare 32CH returns FC01 reads byte-swapped (relay_byteswap), and
+ * whether its FC15 data is swapped the same way is undocumented; with one data
+ * byte there is no byte order to get wrong, and bit order within a byte is the
+ * standard one on this board. A 32-relay burst costs 4 transactions, not 32.
+ * Channels in the bank that were not asked for are written with their last
+ * commanded value (or the measured one if never commanded); if any is unknown
+ * the bank falls back to one FC05 per dirty channel.
+ *
+ * The cache and HA are still updated only from the write ACK — never from the
+ * request. Wall buttons bypass the table (lighting_button_relay). */
+#define RELAY_BANKS (RELAY_COUNT / 8u)
+
+static uint32_t s_relay_dirty;          /* channels with a pending desired state */
+static uint32_t s_relay_want;           /* their desired state (bit = on)        */
+static uint32_t s_relay_cmd;            /* last value written or being written   */
+static uint32_t s_relay_cmd_known;      /* ...for these channels                 */
+static bool     s_relay_busy;           /* a table-driven write is in flight     */
+static uint32_t s_relay_c_written, s_relay_c_overwritten, s_relay_c_writes;
+
+typedef struct { uint32_t mask; uint32_t val; uint32_t asked; } relay_wr_t;
+static relay_wr_t s_relay_wr;           /* the in-flight table write             */
+
 typedef struct { uint8_t channel; bool on; } relay_ctx_t;
-static relay_ctx_t s_relay_ctx[RELAY_COUNT]; /* one per possible in-flight write */
+static relay_ctx_t s_relay_ctx[RELAY_COUNT]; /* one per possible in-flight FC05 */
 static uint8_t     s_relay_ctx_idx = 0;
 
+static void relay_ack(uint8_t ch, bool on) {
+    state_cache_set_relay(ch, on);
+    levt_t e = { .type = LEVT_RELAY, .relay = { ch, on } };
+    push_evt(&e);
+}
+
 static void relay_write_cb(int res, uint8_t *buf, void *ctx) {
+    (void)buf;
     relay_ctx_t *c = (relay_ctx_t *)ctx;
-    if (res > 0) {
-        state_cache_set_relay(c->channel, c->on);
-        levt_t e = { .type = LEVT_RELAY, .relay = { c->channel, c->on } };
-        push_evt(&e);
-    } else {
-        LOG_ERR("light", "relay write failed ch=%u (%d)", c->channel, res);
+    if (res > 0) relay_ack(c->channel, c->on);
+    else LOG_ERR("light", "relay write failed ch=%u (%d)", c->channel, res);
+}
+
+/* One coil, FC05 — the button path and the unknown-neighbour fallback. */
+static bool relay_fc05(uint8_t channel, bool on, modbus_action_cb_t cb) {
+    relay_ctx_t *c = &s_relay_ctx[s_relay_ctx_idx++ % RELAY_COUNT];
+    c->channel = channel;
+    c->on      = on;
+    if (!modbus_set_coil(g_config.relay_slave_ids[0], channel, on, cb, c)) return false;
+    s_relay_cmd       = on ? (s_relay_cmd | (1u << channel)) : (s_relay_cmd & ~(1u << channel));
+    s_relay_cmd_known |= 1u << channel;
+    return true;
+}
+
+static void relay_table_fc05_cb(int res, uint8_t *buf, void *ctx) {
+    s_relay_busy = false;
+    relay_write_cb(res, buf, ctx);
+}
+
+static void relay_bank_cb(int res, uint8_t *buf, void *ctx) {
+    (void)buf; (void)ctx;
+    s_relay_busy = false;
+    if (res <= 0) {
+        LOG_ERR("light", "relay bank write failed mask=%08lx (%d)",
+                (unsigned long)s_relay_wr.mask, res);
+        return;
+    }
+    for (uint8_t ch = 0; ch < RELAY_COUNT; ch++) {
+        uint32_t bit = 1u << ch;
+        if (!(s_relay_wr.mask & bit)) continue;
+        bool on = (s_relay_wr.val & bit) != 0;
+        /* Emit the channels that were asked for (HA expects a reply even when
+         * nothing changed), and any neighbour whose measured state this write
+         * changed; a neighbour re-written with the value it had is not news. */
+        if ((s_relay_wr.asked & bit) || !state_cache_relay_known(ch) ||
+            state_cache_get_relay_on(ch) != on)
+            relay_ack(ch, on);
     }
 }
 
@@ -90,16 +159,84 @@ bool lighting_set_relay(uint8_t channel, bool on) {
         LOG_WARN("light", "relay write dropped — no relay slave configured");
         return false;
     }
-    relay_ctx_t *c = &s_relay_ctx[s_relay_ctx_idx++ % RELAY_COUNT];
-    c->channel = channel;
-    c->on      = on;
+    if (channel >= RELAY_COUNT) return false;
+    uint32_t bit = 1u << channel;
+    if (s_relay_dirty & bit) s_relay_c_overwritten++;
+    s_relay_dirty |= bit;
+    s_relay_want = on ? (s_relay_want | bit) : (s_relay_want & ~bit);
+    s_relay_c_written++;
     modbus_backoff_kick(g_config.relay_slave_ids[0]);   /* a person is waiting */
-    if (!modbus_set_coil(g_config.relay_slave_ids[0], channel, on, relay_write_cb, c)) {
-        LOG_WARN("light", "relay ch=%u %s dropped — queue full", channel, on ? "on" : "off");
+    return true;
+}
+
+bool lighting_button_relay(uint8_t channel, bool on) {
+    if (g_config.relay_slave_count == 0) {
+        LOG_WARN("light", "relay write dropped — no relay slave configured");
         return false;
     }
-    LOG_INFO("light", "relay ch=%u %s", channel, on ? "on" : "off");
+    if (channel >= RELAY_COUNT) return false;
+    modbus_backoff_kick(g_config.relay_slave_ids[0]);   /* a person is waiting */
+    /* Buttons win: anything pending for this channel is older. A table write
+     * already in flight was enqueued first, so this FC05 executes after it. */
+    s_relay_dirty &= ~(1u << channel);
+    if (!relay_fc05(channel, on, relay_write_cb)) {
+        LOG_WARN("light", "button relay ch=%u: action queue full — queued as desired state",
+                 channel);
+        return lighting_set_relay(channel, on);
+    }
+    LOG_INFO("light", "button relay ch=%u %s", channel, on ? "on" : "off");
     return true;
+}
+
+void lighting_relay_tick(void) {
+    if (s_relay_busy || !s_relay_dirty || g_config.relay_slave_count == 0) return;
+    uint8_t slave = g_config.relay_slave_ids[0];
+
+    uint8_t bank = 0;
+    while (bank < RELAY_BANKS && !((s_relay_dirty >> (bank * 8u)) & 0xFFu)) bank++;
+    uint32_t bank_mask = 0xFFu << (bank * 8u);
+    uint32_t dirty     = s_relay_dirty & bank_mask;
+
+    /* Fill the channels nobody asked for: last commanded, else measured. */
+    uint32_t val = s_relay_want & dirty;
+    bool complete = true;
+    for (uint8_t ch = (uint8_t)(bank * 8u); ch < bank * 8u + 8u; ch++) {
+        uint32_t bit = 1u << ch;
+        if (dirty & bit) continue;
+        if (s_relay_cmd_known & bit)        { if (s_relay_cmd & bit) val |= bit; }
+        else if (state_cache_relay_known(ch)) { if (state_cache_get_relay_on(ch)) val |= bit; }
+        else { complete = false; break; }
+    }
+
+    if (!complete) {
+        /* A neighbour's state is unknown — never guess a coil. One FC05. */
+        uint8_t ch = (uint8_t)(bank * 8u);
+        while (!(dirty & (1u << ch))) ch++;
+        bool on = (s_relay_want >> ch) & 1u;
+        if (!relay_fc05(ch, on, relay_table_fc05_cb)) return;   /* action queue full: next tick */
+        s_relay_dirty &= ~(1u << ch);
+        s_relay_busy = true;
+        s_relay_c_writes++;
+        return;
+    }
+
+    uint8_t byte = (uint8_t)(val >> (bank * 8u));
+    if (!modbus_set_coils(slave, (uint16_t)(bank * 8u), 8u, &byte, 1u, relay_bank_cb, NULL))
+        return;                                       /* action queue full: next tick */
+    s_relay_wr.mask = bank_mask;
+    s_relay_wr.val  = val;
+    s_relay_wr.asked = dirty;
+    s_relay_cmd       = (s_relay_cmd & ~bank_mask) | val;
+    s_relay_cmd_known |= bank_mask;
+    s_relay_dirty    &= ~dirty;
+    s_relay_busy = true;
+    s_relay_c_writes++;
+}
+
+uint32_t lighting_relay_pending(void) { return s_relay_dirty; }
+
+void lighting_relay_counters(uint32_t *written, uint32_t *overwritten, uint32_t *writes) {
+    *written = s_relay_c_written; *overwritten = s_relay_c_overwritten; *writes = s_relay_c_writes;
 }
 
 bool lighting_relay_coil_on(const uint8_t *coil_bytes, uint8_t byte_count, uint8_t ch) {
@@ -732,40 +869,89 @@ bool lighting_dali_cfg_write(uint8_t slave_id, uint8_t addr,
  * its members' measured levels: on if any member's arc level is non-zero, level
  * the maximum of them. */
 
-bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
+/* ── Absolute commands: latest-wins desired state (task 14) ───────────────────
+ *
+ * HA, the web UI, the HTTP API, the CLI and the async toggle do not queue frames
+ * any more. They overwrite the target's slot in the gateway's pending table and
+ * the scheduler drains it as capacity frees up (dali_pending.h, dq_set_desired).
+ * A burst used to be dispatched straight into the 8-deep user class and the rest
+ * dropped — measured 2026-10-10 on the house, a 107-command no-op burst lost 57
+ * of 75 DALI commands and 7 of 32 relays, and nothing told HA. The table cannot
+ * overflow: the newest command per target is all that is kept.
+ *
+ * Nothing here writes the cache. The verification read is marked when each
+ * frame actually ships (pending_shipped below), and the measured result is what
+ * HA sees.
+ *
+ * Wall buttons do NOT come through here — see lighting_button_* below. */
+static bool desired(uint8_t slave_id, bool is_group, uint8_t target,
+                    dp_op_t op, uint8_t arc, const char *what) {
     if (dali_provision_busy_slave(slave_id)) {
-        LOG_DBG("light", "dali %u.%u %s skipped — slave provisioning",
-                slave_id, dali_addr, on ? "on" : "off");
+        LOG_DBG("light", "%s %u.%s%u skipped — slave provisioning",
+                what, slave_id, is_group ? "G" : "", target);
         return false;
     }
-    bool ok;
-    if (on) {
-        /* GOTO_LAST_ACTIVE (0x0A). Address byte: short address, command form
-         * (A0=1). Idempotent. */
-        uint8_t addr_byte = (uint8_t)((dali_addr & 0x3F) << 1) | 0x01u;
-        ok = raw_submit(slave_id, DQ_PRIO_USER, addr_byte, 0x0Au, 0, 0, true);
-    } else {
-        /* OFF — DAPC level 0 as a queued frame. The controller emits the frame
-         * itself rather than writing 0 to a gateway register and having the
-         * gateway synthesise it. Address byte is DAPC form (bit 0 clear);
-         * idempotent — re-sending level 0 has no cumulative effect. */
-        uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
-        ok = raw_submit(slave_id, DQ_PRIO_USER, dapc_addr, 0x00u, 0, 0, true);
-    }
-    if (!ok) {
-        LOG_WARN("light", "dali %u.%u %s dropped — queue full",
-                 slave_id, dali_addr, on ? "on" : "off");
-        return false;
-    }
-    LOG_INFO("light", "dali %u.%u %s",
-             slave_id, dali_addr, on ? "on" : "off");
-    /* Reflect the change in the cache immediately so a rapid follow-up toggle
-     * reads the new state, then mark the slave active so dirty-poll confirms the
-     * exact level.  Gated on a successful enqueue so a dropped write can't leave
-     * the cache claiming a state the hardware never received. */
+    if (!dq_set_desired(slave_id, is_group, target, op, arc)) return false;
     dirty_poll_mark_active(slave_id);
-    dali_state_mark_dirty(slave_id, dali_addr);   /* read back what actually happened */
     return true;
+}
+
+/* Ship hook: a pending slot's frame just left for the gateway — read back what
+ * it actually did. */
+static void pending_shipped(uint8_t slave_id, bool is_group, uint8_t target) {
+    if (is_group) dali_state_mark_dirty_group(slave_id, target);
+    else          dali_state_mark_dirty(slave_id, target);
+}
+
+void lighting_init(void) {
+    dq_set_ship_hook(pending_shipped);
+}
+
+bool lighting_set_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
+    return desired(slave_id, false, dali_addr, on ? DP_ON : DP_OFF, 0, on ? "on" : "off");
+}
+
+/* ── Wall buttons: straight into the user class — buttons always win ─────────
+ *
+ * A press ships ahead of every pending desired state (the user class outranks
+ * the pending rung, and the pending rung never takes the staging slot), then
+ * dq_button_settle() makes sure nothing older still in the table can undo it:
+ * the target's own pending slot is dropped, or — if anything else is pending on
+ * that gateway — the press is re-asserted as the newest slot. If the user class
+ * itself refuses the frame, the press goes into the table instead of being lost.
+ */
+static bool button_dali(uint8_t slave_id, bool is_group, uint8_t target,
+                        dp_op_t op, uint8_t arc) {
+    if (dali_provision_busy_slave(slave_id)) {
+        LOG_DBG("light", "button %u.%s%u skipped — slave provisioning",
+                slave_id, is_group ? "G" : "", target);
+        return false;
+    }
+    dp_slot_t sl = { .op = (uint8_t)op, .arc = arc };
+    uint8_t addr, data;
+    dp_frame(dp_index(is_group, target), &sl, &addr, &data);
+    if (raw_submit(slave_id, DQ_PRIO_USER, addr, data, 0, 0, true)) {
+        dq_button_settle(slave_id, is_group, target, op, arc);
+        dirty_poll_mark_active(slave_id);
+        if (is_group) dali_state_mark_dirty_group(slave_id, target);
+        else          dali_state_mark_dirty(slave_id, target);
+    } else {
+        LOG_WARN("light", "button %u.%s%u: user class full — queued as desired state",
+                 slave_id, is_group ? "G" : "", target);
+        if (!dq_set_desired(slave_id, is_group, target, op, arc)) return false;
+        dirty_poll_mark_active(slave_id);
+    }
+    LOG_INFO("light", "button %u.%s%u %s", slave_id, is_group ? "G" : "", target,
+             op == DP_ON ? "on" : op == DP_OFF ? "off" : "level");
+    return true;
+}
+
+bool lighting_button_on_off(uint8_t slave_id, uint8_t dali_addr, bool on) {
+    return button_dali(slave_id, false, dali_addr, on ? DP_ON : DP_OFF, 0);
+}
+
+bool lighting_button_group_on_off(uint8_t slave_id, uint8_t group, bool on) {
+    return button_dali(slave_id, true, group, on ? DP_ON : DP_OFF, 0);
 }
 
 bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
@@ -796,66 +982,21 @@ bool lighting_dali_step(uint8_t slave_id, uint8_t dali_addr, bool up) {
 }
 
 bool lighting_dali_set_level(uint8_t slave_id, uint8_t dali_addr, uint8_t arc) {
-    if (dali_provision_busy_slave(slave_id)) {
-        LOG_DBG("light", "dali %u.%u bri skipped — slave provisioning",
-                slave_id, dali_addr);
-        return false;
-    }
-    /* DAPC as a queued frame (address byte in DAPC form — bit 0 clear — and the
-     * arc level as the data byte). The ballast clamps to its own min/max, so the
-     * read-back remains the authority on what actually happened.
-     * Idempotent: re-sending the same level has no cumulative effect. */
-    uint8_t dapc_addr = (uint8_t)((dali_addr & 0x3Fu) << 1);
-    if (!raw_submit(slave_id, DQ_PRIO_USER, dapc_addr, arc, 0, 0, true)) {
-        LOG_WARN("light", "dali %u.%u bri=%u dropped — queue full",
-                 slave_id, dali_addr, arc);
-        return false;
-    }
-    LOG_INFO("light", "dali %u.%u bri=%u", slave_id, dali_addr, arc);
-    dirty_poll_mark_active(slave_id);
-    dali_state_mark_dirty(slave_id, dali_addr);
-    return true;
+    /* DAPC. The ballast clamps to its own min/max, so the read-back remains the
+     * authority on what actually happened. */
+    return desired(slave_id, false, dali_addr, DP_LEVEL, arc, "bri");
 }
 
 /* ── DALI group helpers ──────────────────────────────────────────────────── */
-/* Group address byte: bit 7 = 1 (group), bits 5..1 = group# (0-15) << 1,
- * bit 0 = 0 → DAPC form, bit 0 = 1 → command form. Like every other send in
- * this file these go out through raw_submit() → dq_submit() → FC 0x41. */
+/* Same desired-state path; the group's slot is ordered against its members' by
+ * write stamp (dali_pending.h), so whichever was asked for last wins. */
 
 bool lighting_group_set_level(uint8_t slave_id, uint8_t group, uint8_t arc) {
-    if (dali_provision_busy_slave(slave_id)) {
-        LOG_DBG("light", "group %u.G%u bri skipped — slave provisioning", slave_id, group);
-        return false;
-    }
-    uint8_t addr_byte = (uint8_t)(0x80u | ((group & 0x0Fu) << 1));  /* DAPC, idempotent */
-    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, arc, 0, 0, true)) {
-        LOG_WARN("light", "group %u.G%u bri=%u dropped — queue full", slave_id, group, arc);
-        return false;
-    }
-    LOG_INFO("light", "group %u.G%u bri=%u", slave_id, group, arc);
-    dirty_poll_mark_active(slave_id);
-    dali_state_mark_dirty_group(slave_id, group);
-    return true;
+    return desired(slave_id, true, group, DP_LEVEL, arc, "group bri");
 }
 
 bool lighting_group_set_on_off(uint8_t slave_id, uint8_t group, bool on) {
-    if (dali_provision_busy_slave(slave_id)) {
-        LOG_DBG("light", "group %u.G%u %s skipped — slave provisioning",
-                slave_id, group, on ? "on" : "off");
-        return false;
-    }
-    uint8_t addr_byte = (uint8_t)(0x81u | ((group & 0x0Fu) << 1));  /* command, idempotent */
-    uint8_t opcode    = on ? 0x0Au /* GOTO_LAST_ACTIVE */ : 0x00u /* OFF */;
-    if (!raw_submit(slave_id, DQ_PRIO_USER, addr_byte, opcode, 0, 0, true)) {
-        LOG_WARN("light", "group %u.G%u %s dropped — queue full",
-                 slave_id, group, on ? "on" : "off");
-        return false;
-    }
-    LOG_INFO("light", "group %u.G%u %s",
-             slave_id, group, on ? "on" : "off");
-    dirty_poll_mark_active(slave_id);
-    dali_state_mark_dirty_group(slave_id, group);
-    return true;
+    return desired(slave_id, true, group, on ? DP_ON : DP_OFF, 0, on ? "group on" : "group off");
 }
 
 bool lighting_group_step(uint8_t slave_id, uint8_t group, bool up) {

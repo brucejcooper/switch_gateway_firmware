@@ -25,6 +25,7 @@
  */
 
 #include "dali_queue.h"
+#include "dali_pending.h"
 #include "mbq_client.h"
 #include "modbus.h"
 #include "config.h"
@@ -117,6 +118,16 @@
  * it; the steady-state sweep stays at 1, where dd83279's bound is what
  * matters. */
 #define DQ_DEPTH_BG_BURST 2u
+
+/* The pending desired-state table (task 14 — HA/web/CLI on/off/level, see
+ * dali_pending.h) drains at CMDQ_DEPTH: it may keep the gateway full but, like
+ * background, never takes the staging slot in front of it. A wall press arriving
+ * mid-drain is therefore staged next and waits only for the frames already at
+ * the gateway — buttons always win. A Siri "all off" is ~40 frames on the
+ * busier gateway, ~1.5 s of DALI, and none of it may sit ahead of a press. */
+#define DQ_DEPTH_PENDING  CMDQ_DEPTH
+_Static_assert(DQ_DEPTH_PENDING < DQ_PIPELINE_MAX,
+               "the pending table must not take the staging slot");
 _Static_assert(DQ_DEPTH_USER <= DQ_PIPELINE_MAX && DQ_DEPTH_CFG <= DQ_PIPELINE_MAX &&
                DQ_DEPTH_READ <= DQ_PIPELINE_MAX && DQ_DEPTH_BG < DQ_PIPELINE_MAX &&
                DQ_DEPTH_BG_BURST < DQ_PIPELINE_MAX,
@@ -208,6 +219,10 @@ typedef struct {
     uint8_t  delta_cursor;   /* rotating start point, so one ballast being dimmed
                               * cannot starve another's steps */
 
+    /* Latest-wins desired state for absolute commands — state, not queued
+     * commands, the same idea as the delta counters (see dali_pending.h). */
+    dp_table_t pending;
+
     /* One record per command handed to the client and not yet resolved — so
      * it must cover the client's whole capacity, queue and in-flight alike. */
     dq_pending_t pend[MBQ_CMD_SLOTS];
@@ -225,6 +240,7 @@ typedef struct {
 } dq_slave_t;
 
 static dq_slave_t s_dq[MAX_DALI_SLAVES];
+static dq_ship_hook_t s_ship_hook;
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -281,6 +297,7 @@ void dq_init(void) {
          * inversion a button press can suffer is bounded by .depth below, which
          * is unchanged. */
         s_dq[i].cl[DQ_CL_BG]   = (dq_class_t){ .cap = 4u,           .depth = DQ_DEPTH_BG   };
+        dp_init(&s_dq[i].pending);
         mbq_client_add_slave(s_dq[i].slave_id);
     }
 }
@@ -346,27 +363,48 @@ void dq_set_bg_burst(uint8_t slave_id, bool on) {
     s->cl[DQ_CL_BG].depth = on ? DQ_DEPTH_BG_BURST : DQ_DEPTH_BG;
 }
 
+void dq_set_ship_hook(dq_ship_hook_t hook) { s_ship_hook = hook; }
+
+bool dq_set_desired(uint8_t slave_id, bool is_group, uint8_t target,
+                    dp_op_t op, uint8_t arc) {
+    dq_slave_t *s = slave_for(slave_id);
+    if (!s) {
+        LOG_WARN("dq", "desired state for unknown DALI slave %u dropped", slave_id);
+        return false;
+    }
+    /* A person is waiting, exactly as for a USER submit: retry a gateway that
+     * was written off as absent now, not when its backoff next allows. */
+    modbus_backoff_kick(slave_id);
+    mbq_client_kick(slave_id);
+    dp_write(&s->pending, is_group, target, op, arc);
+    return true;
+}
+
+bool dq_button_settle(uint8_t slave_id, bool is_group, uint8_t target,
+                      dp_op_t op, uint8_t arc) {
+    dq_slave_t *s = slave_for(slave_id);
+    if (!s) return false;
+    return dp_button(&s->pending, is_group, target, op, arc);
+}
+
+uint32_t dq_pending_count(uint8_t slave_id) {
+    dq_slave_t *s = slave_for(slave_id);
+    return s ? s->pending.n_dirty : 0u;
+}
+
 bool dq_add_delta(uint8_t slave_id, bool is_group, uint8_t addr, int8_t steps) {
     dq_slave_t *s = slave_for(slave_id);
     if (!s) return false;
+    /* A dim step is a button acting on this target: anything still pending for
+     * it is older, and buttons win. (A pending GROUP covering a dimmed ballast
+     * still ships — a step is relative, so there is nothing to re-assert.) */
+    dp_clear(&s->pending, is_group, addr);
     int8_t *d = is_group ? &s->gdelta[addr & 0x0Fu] : &s->delta[addr & 0x3Fu];
     int v = *d + steps;
     if (v >  DQ_DELTA_MAX) { v =  DQ_DELTA_MAX; s->c_steps_clamp++; }
     if (v < -DQ_DELTA_MAX) { v = -DQ_DELTA_MAX; s->c_steps_clamp++; }
     *d = (int8_t)v;
     return true;
-}
-
-static bool any_delta(const dq_slave_t *s) {
-    for (uint8_t i = 0; i < 64; i++) if (s->delta[i]) return true;
-    for (uint8_t i = 0; i < 16; i++) if (s->gdelta[i]) return true;
-    return false;
-}
-
-static uint8_t pending_total(const dq_slave_t *s) {
-    uint8_t n = 0;
-    for (uint8_t i = 0; i < DQ_CL_COUNT; i++) n = (uint8_t)(n + s->cl[i].n);
-    return n;
 }
 
 /* ── driver internals ────────────────────────────────────────────────────── */
@@ -480,6 +518,30 @@ static bool ship_delta(dq_slave_t *s) {
     return false;
 }
 
+/* Ship the oldest-written pending desired state (see dali_pending.h for why
+ * oldest-first is the whole group-vs-member story). Idempotent: an absolute
+ * level re-sent after a gateway reboot lands at the same level. The verification
+ * read is marked HERE, when the frame actually leaves, not when HA asked — and
+ * since this rung outranks verification reads on the same gateway, which
+ * executes FIFO, the read can never run before the command it verifies. */
+static bool ship_pending(dq_slave_t *s) {
+    if (s->outstanding >= DQ_DEPTH_PENDING) return false;
+    uint8_t idx;
+    if (!dp_next(&s->pending, &idx)) return false;
+    uint8_t addr, data;
+    dp_frame(idx, &s->pending.slot[idx], &addr, &data);
+    dq_cmd_t e = { .addr = addr, .data = data, .flags = 0, .dtr0 = 0,
+                   .prio = (uint8_t)DQ_PRIO_USER, .idempotent = true,
+                   .cb = NULL, .ctx = NULL };
+    if (!ship(s, &e)) return false;
+    dp_take(&s->pending, idx);
+    if (s_ship_hook) {
+        bool grp = idx >= DP_BALLASTS;
+        s_ship_hook(s->slave_id, grp, grp ? (uint8_t)(idx - DP_BALLASTS) : idx);
+    }
+    return true;
+}
+
 /* Walk the priority ladder for one slave and ship at most one command.
  * Returns true if something went out. */
 static bool ship_ladder(dq_slave_t *s) {
@@ -497,6 +559,7 @@ static bool ship_ladder(dq_slave_t *s) {
     if (ship_class(s, DQ_CL_PROV)) return true;   /* commissioning steps */
     if (ship_class(s, DQ_CL_USER)) return true;   /* discrete presses / HA commands */
     if (ship_delta(s))             return true;   /* dim ramps, one step at a time */
+    if (ship_pending(s))           return true;   /* HA/web/CLI desired state, oldest first */
     if (ship_class(s, DQ_CL_CFG))  return true;   /* config writes */
     if (ship_class(s, DQ_CL_READ)) return true;   /* verification reads */
     return ship_class(s, DQ_CL_BG);               /* sweeps, rotation queries */
@@ -603,6 +666,13 @@ void dq_debug_print(int slave_id) {
                        s->cl[DQ_CL_BG].depth == DQ_DEPTH_BG_BURST ? " burst" : "");
         cdc_out_printf("  dim delta: %d target(s), net %d steps, cursor=%u\n",
                        dn, dsum, s->delta_cursor);
+        cdc_out_printf("  desired: %u pending (depth %u), written=%lu overwritten=%lu "
+                       "shipped=%lu button=%lu\n",
+                       s->pending.n_dirty, DQ_DEPTH_PENDING,
+                       (unsigned long)s->pending.c_written,
+                       (unsigned long)s->pending.c_overwritten,
+                       (unsigned long)s->pending.c_shipped,
+                       (unsigned long)s->pending.c_button);
         cdc_out_printf("  counters: submitted=%lu ok=%lu nak=%lu err=%lu dropped=%lu "
                        "refused=%lu coalesced=%lu steps=%lu clamped=%lu\n",
                        (unsigned long)s->c_submitted, (unsigned long)s->c_ok,

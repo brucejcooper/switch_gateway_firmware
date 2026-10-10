@@ -790,7 +790,7 @@ static void cmd_relay(char **saveptr) {
         }
         bool on = (strcasecmp(val, "toggle") == 0) ? !state_cache_get_relay_on((uint8_t)ch)
                 : (strcmp(val, "true") == 0 || strcmp(val, "1") == 0 || strcasecmp(val, "on") == 0);
-        /* No predictive write and no emit here. relay_write_cb caches and emits
+        /* No predictive write and no emit here. The relay write ACK caches and emits
          * when the Modbus write is ACKed — that ACK is the confirmation. The
          * predictive write was worse than redundant: on a FAILED write nothing
          * corrected it, so the cache (and HA) kept the requested state until the
@@ -1348,6 +1348,14 @@ static void cmd_busload(char **saveptr) {
     cdc_out_printf("  queue drops: %lu button event(s), %lu HA command(s)\n",
                    (unsigned long)button_raw_drop_count(),
                    (unsigned long)ha_bridge_cmd_drop_count());
+    /* Relay desired state (task 14): writes = bus transactions that carried the
+     * written commands; overwritten = superseded before they shipped. DALI's
+     * equivalent is the `desired:` line of `dq`. */
+    uint32_t rw, ro, rx;
+    lighting_relay_counters(&rw, &ro, &rx);
+    cdc_out_printf("  relay desired: %lu written, %lu overwritten, %lu bus writes, "
+                   "pending mask %08lx\n", (unsigned long)rw, (unsigned long)ro,
+                   (unsigned long)rx, (unsigned long)lighting_relay_pending());
 }
 
 /* `soak [<slave> <addr> [n=<pairs>] [depth=<1-8>]] | stop` — bench queue soak.

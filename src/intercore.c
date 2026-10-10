@@ -16,8 +16,12 @@
  * IC_CMD_RESYNC handler before core 1 next drains. 512 leaves margin
  * (~50 KB heap at this element size — plenty on the RP2040's 264 KB). */
 #define IC_EVENT_QUEUE_DEPTH 512
-/* Command queue (core1 -> core0). Commands are small and infrequent. */
-#define IC_CMD_QUEUE_DEPTH   16
+/* Command queue (core1 -> core0). Not a scheduler FIFO — core 0 empties it into
+ * the latest-wins desired-state tables every loop pass, so depth costs no
+ * latency. A 107-command HA burst in 11 ms measured 0 drops at 16 (2026-10-10);
+ * 64 is headroom for the times core 0 is briefly busy (a group-membership write
+ * spins up to 2 s per member). */
+#define IC_CMD_QUEUE_DEPTH   64
 
 static queue_t   s_event_q;
 static queue_t   s_cmd_q;

@@ -139,12 +139,12 @@ static void do_toggle(uint8_t fixture, uint8_t button) {
     for (int i = 0; i < rec->target_count; i++) {
         const mapping_target_t *t = &rec->targets[i];
         if (TARGET_IS_GROUP(*t)) {
-            lighting_group_set_on_off(t->slave, TARGET_GROUP_NUM(*t), !any_on);
+            lighting_button_group_on_off(t->slave, TARGET_GROUP_NUM(*t), !any_on);
         } else if (slave_kind(t->slave) == SLAVE_KIND_RELAY) {
             /* a relay target is a coil, not a DALI ballast — addr is the channel */
-            lighting_set_relay(TARGET_BALLAST_ADDR(*t), !any_on);
+            lighting_button_relay(TARGET_BALLAST_ADDR(*t), !any_on);
         } else {
-            lighting_set_on_off(t->slave, TARGET_BALLAST_ADDR(*t), !any_on);
+            lighting_button_on_off(t->slave, TARGET_BALLAST_ADDR(*t), !any_on);
         }
     }
 }
