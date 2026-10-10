@@ -69,7 +69,6 @@ typedef enum {
     ACTION_GET_INPUT_REGISTERS   = 0x04,   /* new: FC04 for TinyModbus */
     ACTION_SET_COIL              = 0x05,
     ACTION_SET_HOLDING_REGISTER  = 0x06,
-    ACTION_WRITE_MULTI_COILS     = 0x0F,   /* FC15 Write Multiple Coils (relay banks) */
     ACTION_WRITE_MULTI_REG       = 0x10,   /* new: FC16 Write Multiple Registers */
     /* The DALI command queue's one user-defined code. MODBUS Application
      * Protocol V1.1b reserves 65-72 and 100-110 for exactly this, so it is
@@ -373,10 +372,6 @@ static void log_action_intent(const modbus_action_t *a) {
         LOG_DBG("modbus", "write multi reg slave=%u addr=%u count=%u",
                 a->device, a->wr_address, a->wr_count);
         break;
-    case ACTION_WRITE_MULTI_COILS:
-        LOG_DBG("modbus", "write coils slave=%u addr=%u count=%u",
-                a->device, a->wr_address, a->wr_count);
-        break;
     default:
         LOG_DBG("modbus", "action 0x%02x slave=%u addr=%u arg=%u",
                 (unsigned)a->action, a->device, a->address, a->arg);
@@ -579,10 +574,8 @@ static void log_frame_hex(const char *dir, const uint8_t *b, size_t n) {
  * MODBUS_DEADTIME).  Leaves the bus in MODBUS_TRANSMITTING. */
 static void start_action_tx(void) {
     size_t sz;
-    if (currentAction.action == ACTION_WRITE_MULTI_REG ||
-        currentAction.action == ACTION_WRITE_MULTI_COILS) {
-        /* FC16 / FC15: dev, fc, start(2), count(2), bytecount, data[...] —
-         * the same frame; FC15's data is packed coil bits, LSB = first coil. */
+    if (currentAction.action == ACTION_WRITE_MULTI_REG) {
+        /* FC16: dev, fc, start(2), count(2), bytecount, data[...] */
         buf[0] = currentAction.device;
         buf[1] = currentAction.action;
         buf[2] = currentAction.wr_address >> 8;
@@ -971,19 +964,6 @@ bool modbus_set_coil(uint8_t dev, uint16_t addr, bool is_on,
                      modbus_action_cb_t cb, void *ctx) {
     modbus_action_t a = { .action = ACTION_SET_COIL, .device = dev, .address = addr,
                           .arg = is_on ? 0xFF00u : 0x0000u, .callback = cb, .ctx = ctx };
-    return enqueue(&a);
-}
-
-bool modbus_set_coils(uint8_t dev, uint16_t addr, uint16_t count,
-                      const uint8_t *bits, uint8_t nbytes,
-                      modbus_action_cb_t cb, void *ctx) {
-    if (count == 0u || nbytes != (uint8_t)((count + 7u) / 8u) ||
-        nbytes > MODBUS_WR_PAYLOAD_MAX) return false;
-    /* Idempotent (absolute coil values), so the transport's retries are safe. */
-    modbus_action_t a = { .action = ACTION_WRITE_MULTI_COILS, .device = dev,
-                          .wr_address = addr, .wr_count = count, .wr_len = nbytes,
-                          .callback = cb, .ctx = ctx };
-    memcpy(a.wr_payload, bits, nbytes);
     return enqueue(&a);
 }
 

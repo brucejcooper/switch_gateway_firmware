@@ -55,7 +55,7 @@ bool lighting_evt_try_pop(levt_t *out);
 void lighting_init(void);
 
 /* Relay: on/off as DESIRED STATE (HA, web, CLI) — latest wins per channel,
- * drained by lighting_relay_tick() one single-byte FC15 bank at a time, so a
+ * drained by lighting_relay_tick() one FC05 write in flight at a time, so a
  * burst is never dropped. The cache and HA update from the write ACK only. */
 bool lighting_set_relay(uint8_t channel, bool on);
 

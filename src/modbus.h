@@ -107,13 +107,6 @@ bool modbus_get_coils(uint8_t device_id, uint16_t addr, uint16_t count,
 bool modbus_set_coil(uint8_t device_id, uint16_t addr, bool is_on,
                      modbus_action_cb_t cb, void *ctx);
 
-/* FC15 Write Multiple Coils: `count` coils from `addr`, packed into `nbytes`
- * (= ceil(count/8)) data bytes, LSB of the first byte = coil `addr`. Returns
- * false on a malformed request or a full action queue. */
-bool modbus_set_coils(uint8_t device_id, uint16_t addr, uint16_t count,
-                      const uint8_t *bits, uint8_t nbytes,
-                      modbus_action_cb_t cb, void *ctx);
-
 /* Waveshare toggle coil (0x5500) */
 bool modbus_toggle(uint8_t device_id, uint16_t addr,
                    modbus_action_cb_t cb, void *ctx);

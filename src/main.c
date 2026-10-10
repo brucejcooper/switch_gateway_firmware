@@ -280,7 +280,7 @@ int main(void) {
         lighting_any_on_probe_tick();   /* submit probe queries into the gateway queue */
         lighting_cfg_query_tick();      /* submit config queries into the gateway queue */
         dq_tick();                      /* drive the gateway command queue (FC 0x41) */
-        lighting_relay_tick();          /* drain relay desired state (FC15 banks) */
+        lighting_relay_tick();          /* drain relay desired state, one write at a time */
         dq_soak_tick();                 /* bench: queue soak probe (idle unless started) */
         dali_state_tick();              /* controller-owned DALI world model */
         button_fsm_tick();

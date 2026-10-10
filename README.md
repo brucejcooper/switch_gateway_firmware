@@ -299,9 +299,9 @@ Physical `press`/`release` frame every interaction; the gesture events
 ### Relay channels
 
 A wall button sends its coil write (FC05) at once. HA, web and CLI commands set
-the channel's **desired state** instead; `lighting_relay_tick()` drains those with
-one write in flight at a time, each an FC15 over one byte-aligned bank of 8 coils
-(see [Bursts](#bursts-latest-wins-desired-state)). Either way the cache and HA are
+the channel's **desired state** instead; `lighting_relay_tick()` drains those
+with one FC05 write in flight at a time (see
+[Bursts](#bursts-latest-wins-desired-state)). Either way the cache and HA are
 updated from the write ACK, never from the request. Relay state is
 instantaneous — no polling needed after a command.
 
@@ -510,13 +510,13 @@ verification read is marked when a slot's frame actually ships, and since the
 table outranks verification reads on a gateway that executes FIFO, the read can
 never run before the command it verifies.
 
-**Relays** get the same rule per channel, drained with one write in flight at a
-time. Each write is **FC15 over one byte-aligned bank of 8 coils** — a single
-data byte. The Waveshare board returns FC01 reads byte-swapped (`relay_byteswap`)
-and its FC15 data order is undocumented; with one data byte there is no byte
-order to get wrong. Coils in the bank nobody asked for are written with their
-last commanded (else measured) value, and a bank with an unknown neighbour falls
-back to FC05 per channel. A 32-relay burst costs 4 transactions instead of 32.
+**Relays** get the same rule per channel, drained with one FC05 write in
+flight at a time, so a burst can no longer overflow the Modbus action queue
+(~8 ms per write: 32 relays drain in about a quarter of a second). **Not FC15:**
+the Waveshare 32CH does not answer an FC15 over one 8-coil bank at all — silent
+timeouts, then backoff — measured live 2026-10-10. A full 32-coil FC15 might
+work, but the board returns FC01 reads byte-swapped (`relay_byteswap`) and its
+FC15 data order is undocumented, so trying it risks switching the wrong relays.
 
 Duplicate idempotent submits that have not shipped are folded, so a repeated
 press or a re-published HA state costs nothing. A class-full refusal is
@@ -1406,7 +1406,7 @@ was *lost* from one that was merely *late*. Its last lines are the drop
 counters, printed even at zero: `queue drops: … button event(s), … HA
 command(s)` (the button PIO queue and the core-1 → core-0 queue) and `relay
 desired: … written, … overwritten, … bus writes, pending mask …` (the relay
-desired-state table — bus writes well below written is a burst being coalesced).
+desired-state table — overwritten is a burst being coalesced).
 The `action queue: … dropped N` header is the Modbus action queue; HA and
 button relay writes no longer feed it faster than it drains.
 

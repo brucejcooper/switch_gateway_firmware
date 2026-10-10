@@ -74,84 +74,50 @@ bool lighting_evt_try_pop(levt_t *out) {
  * Same latest-wins rule as DALI (task 14). A relay command from HA/web/CLI sets
  * the channel's desired state and a dirty bit; lighting_relay_tick() drains them
  * with ONE write in flight at a time, so a burst can never overflow the Modbus
- * action queue (measured: 7 of 32 relay writes lost to it) and whatever arrives
- * while a write is out simply folds into the next one.
+ * action queue (measured: 7 of 32 relay writes lost to it) and a channel
+ * re-commanded before its write goes out costs nothing extra.
  *
- * Each write is FC15 over ONE byte-aligned bank of 8 coils — a single data byte.
- * The Waveshare 32CH returns FC01 reads byte-swapped (relay_byteswap), and
- * whether its FC15 data is swapped the same way is undocumented; with one data
- * byte there is no byte order to get wrong, and bit order within a byte is the
- * standard one on this board. A 32-relay burst costs 4 transactions, not 32.
- * Channels in the bank that were not asked for are written with their last
- * commanded value (or the measured one if never commanded); if any is unknown
- * the bank falls back to one FC05 per dirty channel.
+ * One FC05 per channel. NOT FC15: the house's Waveshare 32CH does not answer an
+ * FC15 over one 8-coil bank at all — silent timeouts, then backoff — measured
+ * live 2026-10-10 on 2.0.1+0a895fa. (A full 32-coil FC15 might work, but the
+ * board returns FC01 reads byte-swapped and its FC15 data order is
+ * undocumented, so trying it means risking real relays.) At ~8 ms per write
+ * a 32-relay burst drains in about a quarter of a second.
  *
  * The cache and HA are still updated only from the write ACK — never from the
  * request. Wall buttons bypass the table (lighting_button_relay). */
-#define RELAY_BANKS (RELAY_COUNT / 8u)
-
 static uint32_t s_relay_dirty;          /* channels with a pending desired state */
 static uint32_t s_relay_want;           /* their desired state (bit = on)        */
-static uint32_t s_relay_cmd;            /* last value written or being written   */
-static uint32_t s_relay_cmd_known;      /* ...for these channels                 */
 static bool     s_relay_busy;           /* a table-driven write is in flight     */
+static uint8_t  s_relay_cursor;         /* round-robin start for the drain       */
 static uint32_t s_relay_c_written, s_relay_c_overwritten, s_relay_c_writes;
 
-typedef struct { uint32_t mask; uint32_t val; uint32_t asked; } relay_wr_t;
-static relay_wr_t s_relay_wr;           /* the in-flight table write             */
-
 typedef struct { uint8_t channel; bool on; } relay_ctx_t;
-static relay_ctx_t s_relay_ctx[RELAY_COUNT]; /* one per possible in-flight FC05 */
+static relay_ctx_t s_relay_ctx[RELAY_COUNT]; /* one per possible in-flight write */
 static uint8_t     s_relay_ctx_idx = 0;
-
-static void relay_ack(uint8_t ch, bool on) {
-    state_cache_set_relay(ch, on);
-    levt_t e = { .type = LEVT_RELAY, .relay = { ch, on } };
-    push_evt(&e);
-}
 
 static void relay_write_cb(int res, uint8_t *buf, void *ctx) {
     (void)buf;
     relay_ctx_t *c = (relay_ctx_t *)ctx;
-    if (res > 0) relay_ack(c->channel, c->on);
-    else LOG_ERR("light", "relay write failed ch=%u (%d)", c->channel, res);
+    if (res > 0) {
+        state_cache_set_relay(c->channel, c->on);
+        levt_t e = { .type = LEVT_RELAY, .relay = { c->channel, c->on } };
+        push_evt(&e);
+    } else {
+        LOG_ERR("light", "relay write failed ch=%u (%d)", c->channel, res);
+    }
 }
 
-/* One coil, FC05 — the button path and the unknown-neighbour fallback. */
-static bool relay_fc05(uint8_t channel, bool on, modbus_action_cb_t cb) {
-    relay_ctx_t *c = &s_relay_ctx[s_relay_ctx_idx++ % RELAY_COUNT];
-    c->channel = channel;
-    c->on      = on;
-    if (!modbus_set_coil(g_config.relay_slave_ids[0], channel, on, cb, c)) return false;
-    s_relay_cmd       = on ? (s_relay_cmd | (1u << channel)) : (s_relay_cmd & ~(1u << channel));
-    s_relay_cmd_known |= 1u << channel;
-    return true;
-}
-
-static void relay_table_fc05_cb(int res, uint8_t *buf, void *ctx) {
+static void relay_table_cb(int res, uint8_t *buf, void *ctx) {
     s_relay_busy = false;
     relay_write_cb(res, buf, ctx);
 }
 
-static void relay_bank_cb(int res, uint8_t *buf, void *ctx) {
-    (void)buf; (void)ctx;
-    s_relay_busy = false;
-    if (res <= 0) {
-        LOG_ERR("light", "relay bank write failed mask=%08lx (%d)",
-                (unsigned long)s_relay_wr.mask, res);
-        return;
-    }
-    for (uint8_t ch = 0; ch < RELAY_COUNT; ch++) {
-        uint32_t bit = 1u << ch;
-        if (!(s_relay_wr.mask & bit)) continue;
-        bool on = (s_relay_wr.val & bit) != 0;
-        /* Emit the channels that were asked for (HA expects a reply even when
-         * nothing changed), and any neighbour whose measured state this write
-         * changed; a neighbour re-written with the value it had is not news. */
-        if ((s_relay_wr.asked & bit) || !state_cache_relay_known(ch) ||
-            state_cache_get_relay_on(ch) != on)
-            relay_ack(ch, on);
-    }
+static bool relay_fc05(uint8_t channel, bool on, modbus_action_cb_t cb) {
+    relay_ctx_t *c = &s_relay_ctx[s_relay_ctx_idx++ % RELAY_COUNT];
+    c->channel = channel;
+    c->on      = on;
+    return modbus_set_coil(g_config.relay_slave_ids[0], channel, on, cb, c);
 }
 
 bool lighting_set_relay(uint8_t channel, bool on) {
@@ -177,7 +143,7 @@ bool lighting_button_relay(uint8_t channel, bool on) {
     if (channel >= RELAY_COUNT) return false;
     modbus_backoff_kick(g_config.relay_slave_ids[0]);   /* a person is waiting */
     /* Buttons win: anything pending for this channel is older. A table write
-     * already in flight was enqueued first, so this FC05 executes after it. */
+     * already in flight was enqueued first, so this one executes after it. */
     s_relay_dirty &= ~(1u << channel);
     if (!relay_fc05(channel, on, relay_write_cb)) {
         LOG_WARN("light", "button relay ch=%u: action queue full — queued as desired state",
@@ -190,45 +156,12 @@ bool lighting_button_relay(uint8_t channel, bool on) {
 
 void lighting_relay_tick(void) {
     if (s_relay_busy || !s_relay_dirty || g_config.relay_slave_count == 0) return;
-    uint8_t slave = g_config.relay_slave_ids[0];
-
-    uint8_t bank = 0;
-    while (bank < RELAY_BANKS && !((s_relay_dirty >> (bank * 8u)) & 0xFFu)) bank++;
-    uint32_t bank_mask = 0xFFu << (bank * 8u);
-    uint32_t dirty     = s_relay_dirty & bank_mask;
-
-    /* Fill the channels nobody asked for: last commanded, else measured. */
-    uint32_t val = s_relay_want & dirty;
-    bool complete = true;
-    for (uint8_t ch = (uint8_t)(bank * 8u); ch < bank * 8u + 8u; ch++) {
-        uint32_t bit = 1u << ch;
-        if (dirty & bit) continue;
-        if (s_relay_cmd_known & bit)        { if (s_relay_cmd & bit) val |= bit; }
-        else if (state_cache_relay_known(ch)) { if (state_cache_get_relay_on(ch)) val |= bit; }
-        else { complete = false; break; }
-    }
-
-    if (!complete) {
-        /* A neighbour's state is unknown — never guess a coil. One FC05. */
-        uint8_t ch = (uint8_t)(bank * 8u);
-        while (!(dirty & (1u << ch))) ch++;
-        bool on = (s_relay_want >> ch) & 1u;
-        if (!relay_fc05(ch, on, relay_table_fc05_cb)) return;   /* action queue full: next tick */
-        s_relay_dirty &= ~(1u << ch);
-        s_relay_busy = true;
-        s_relay_c_writes++;
-        return;
-    }
-
-    uint8_t byte = (uint8_t)(val >> (bank * 8u));
-    if (!modbus_set_coils(slave, (uint16_t)(bank * 8u), 8u, &byte, 1u, relay_bank_cb, NULL))
-        return;                                       /* action queue full: next tick */
-    s_relay_wr.mask = bank_mask;
-    s_relay_wr.val  = val;
-    s_relay_wr.asked = dirty;
-    s_relay_cmd       = (s_relay_cmd & ~bank_mask) | val;
-    s_relay_cmd_known |= bank_mask;
-    s_relay_dirty    &= ~dirty;
+    uint8_t ch = s_relay_cursor;
+    while (!(s_relay_dirty & (1u << ch))) ch = (uint8_t)((ch + 1u) % RELAY_COUNT);
+    bool on = (s_relay_want >> ch) & 1u;
+    if (!relay_fc05(ch, on, relay_table_cb)) return;   /* action queue full: next tick */
+    s_relay_dirty &= ~(1u << ch);
+    s_relay_cursor = (uint8_t)((ch + 1u) % RELAY_COUNT);
     s_relay_busy = true;
     s_relay_c_writes++;
 }
