@@ -485,7 +485,11 @@ as a rung of the ladder — below the user class and dim steps, above config
 writes, verification reads and background — at depth **2**: like background it
 may keep the gateway full but never takes the staging slot, so a wall press
 arriving mid-drain is staged next and waits only for the frames already at the
-gateway. **Buttons always win.**
+gateway. **Buttons always win.** Measured on the house (2.0.1+8bc2861) with a
+USER-class `dali_raw` fired 0–200 ms behind a 206-command burst: **94–157 ms**,
+never refused (idle: 40 ms) — against `backlog full` at +0/+100 ms and 276 ms at
++200 ms before. Same burst: 0 drops at every stage, 45 relay writes for 64
+commands, each DALI target shipped once.
 
 **Group vs member: oldest-written ships first, and that is all.** A ballast's
 final level is set by whichever of its own slot and its groups' slots executes
