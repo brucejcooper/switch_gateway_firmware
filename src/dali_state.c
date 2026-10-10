@@ -137,6 +137,7 @@ typedef struct {
     bool     got_level_ok;
     bool     got_level_mask; /* LEVEL answered MASK (0xFF): gear still starting */
     uint16_t got_groups;
+    uint8_t  got_groups_ok;   /* bit0 GROUPS 0-7 answered, bit1 GROUPS 8-15 */
 
     uint8_t  cursor;        /* rotating idle sweep position (present ballasts) */
     uint8_t  absent_cursor; /* rotating probe position across ALL addresses */
@@ -487,10 +488,12 @@ static void record(ds_slave_t *d, step_t s) {
             d->got_level      = d->got_level_ok ? answer : cached_arc(d, d->addr);
             break;
         case STEP_GROUPS_LO:
-            if (ok) d->got_groups = (uint16_t)((d->got_groups & 0xFF00u) | answer);
+            if (ok) { d->got_groups = (uint16_t)((d->got_groups & 0xFF00u) | answer);
+                      d->got_groups_ok |= 1u; }
             break;
         case STEP_GROUPS_HI:
-            if (ok) d->got_groups = (uint16_t)((d->got_groups & 0x00FFu) | ((uint16_t)answer << 8));
+            if (ok) { d->got_groups = (uint16_t)((d->got_groups & 0x00FFu) | ((uint16_t)answer << 8));
+                      d->got_groups_ok |= 2u; }
             break;
         default: break;
     }
@@ -550,11 +553,22 @@ static void advance(ds_slave_t *d) {
             d->step    = STEP_STATUS;
             return;
         }
-        d->got_groups = 0;   /* about to read them */
+        d->got_groups    = 0;   /* about to read them */
+        d->got_groups_ok = 0;
     }
 
     if (last == STEP_GROUPS_HI) {
-        commit_ballast(d, d->addr, d->got_level, d->got_status, true, d->got_groups);
+        /* Membership is committed only from TWO clean answers. A QUERY GROUPS
+         * that did not answer is bus evidence, not membership evidence: it
+         * used to commit as an empty byte, wiping the ballast out of up to
+         * eight groups in the cache (and HA) until the next full scan — seen
+         * 2026-10-10 when a scan read timed out behind a long desired-state
+         * drain. The cached membership stands instead. */
+        if (d->got_groups_ok != 3u)
+            LOG_WARN("dstate", "slave %u addr %u: QUERY GROUPS unanswered — membership "
+                     "left as cached", d->slave_id, d->addr);
+        commit_ballast(d, d->addr, d->got_level, d->got_status,
+                       d->got_groups_ok == 3u, d->got_groups);
         d->scan  &= ~bit;
         if (d->got_level_mask) {   /* still starting: follow it like a fade */
             if (!(d->fade_watch & bit)) {
@@ -617,6 +631,16 @@ void dali_state_tick(void) {
 
             if (all) {
                 advance(d);
+            } else if (time_reached(d->deadline) && dq_pending_count(d->slave_id) > 0u) {
+                /* Not lost — not even sent. The deadline is set when the window
+                 * is handed to the scheduler, and while this gateway's
+                 * desired-state table is draining (a Siri "all off", a big
+                 * membership edit) background reads wait below it for
+                 * seconds. Expiring here recorded real ballasts as unanswered.
+                 * Same rule as the queue client's blocked head: push the
+                 * deadline out while the wait is explained, and let it run
+                 * again once the drain is done. */
+                d->deadline = make_timeout_time_ms(QUERY_DEADLINE_MS);
             } else if (time_reached(d->deadline)) {
                 /* Abandon whatever is still missing: record() drops its token so
                  * a late answer is ignored, and the outcome is bus evidence (not
