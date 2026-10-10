@@ -430,8 +430,8 @@ partitioned by priority class, and each class carries **its own gateway depth**:
 | class | storage | in-flight depth | what uses it |
 |---|---|---|---|
 | provisioning | 2 | **1** | the commissioning sequence (each step depends on the previous answer) |
-| user | 8 | 3 | wall buttons, toggle probes, group-membership writes — sized to one button's full fan-out |
-| desired state | 80 slots, latest-wins | **2** | HA / web / HTTP API / CLI on-off-level — a table, not a FIFO; see [Bursts](#bursts-latest-wins-desired-state) |
+| user | 8 | 3 | wall buttons, toggle probes — sized to one button's full fan-out |
+| desired state | 80 slots + 16 membership lists, latest-wins | **2** | HA / web / HTTP API / CLI on-off-level and group-membership edits — a table, not a FIFO; see [Bursts](#bursts-latest-wins-desired-state) |
 | config | 3 | 3 | DTR0+SET config writes |
 | verification read | 4 | 3 | the re-read that carries a command's real outcome to HA |
 | background | 2 | **2** | the world-model sweep, config-query rotation |
@@ -509,6 +509,25 @@ costs one idempotent frame, only during a drain. A dim step drops its target's
 pending slot (a step is relative, so there is nothing to re-assert). If the user
 class ever refuses a press, the press goes into the table rather than being lost.
 
+**Group membership edits don't block either.** They used to submit each ADD/REMOVE
+TO GROUP frame into the user class and spin the bus (up to 2 s per frame) until
+there was room, so replacing a big group stalled core 0 for about a second. Now
+each group has a pending add list and remove list in the same table, latest wins
+per (ballast, group) pair, and the frames (send-twice, idempotent) drain in the
+same write order as everything else, so "set G5's members, then G5 on" changes
+the members first. An edit is diffed against the membership last *requested* as
+well as the measured cache, because the cache lags a frame that has shipped but
+not yet been read back; CLI `add=`/`remove=` start from the requested membership
+for the same reason. Each frame's ballast is re-interrogated as it ships, so
+`QUERY GROUPS` stays the only writer of the membership cache.
+
+**Blocking CLI commands keep absorbing bursts.** `dali_raw`, `read_mem` and the
+Modbus `get_*`/`set_*` verbs wait on the bus by design. While they do, the
+wait loop moves queued HA light commands (set_dali / set_group / set_relay —
+none of which can block) into the tables, stopping at the first command of any
+other kind so nothing is reordered. Before this a 214-command burst lost 41
+commands at the intercore queue behind one `dali_raw`.
+
 **State stays measured.** Nothing writes the cache from a request. The
 verification read is marked when a slot's frame actually ships, and since the
 table outranks verification reads on a gateway that executes FIFO, the read can
@@ -557,13 +576,12 @@ class's own depth (see [Scheduler model](#scheduler-model) above). A command
 carries an **idempotency** flag that decides what happens to it if a reboot or a
 never-landed frame catches it. The ladder, highest first: **provisioning**
 (bus-exclusive — while a slave is being commissioned the scheduler admits
-nothing else on it) → **user actions** (wall-button on/off, group-membership
-writes, the any-on probe) → **dim steps** → **desired state** (HA/web/CLI
-on/off/level, latest-wins — see [Bursts](#bursts-latest-wins-desired-state)) →
-**config writes** (DTR0+SET) →
+nothing else on it) → **user actions** (wall-button on/off, the any-on probe)
+→ **dim steps** → **desired state** (HA/web/CLI on/off/level and
+group-membership edits, latest-wins — see
+[Bursts](#bursts-latest-wins-desired-state)) → **config writes** (DTR0+SET) →
 **verification reads** → **background** (the world-model sweep, config
-rotation). Group-membership writes deliberately share the user class: a group
-command *is* a user action and wants exactly that storage and depth.
+rotation).
 
 **Sequences belong to the gateway.** Sequences run 1–31 (0 = "none") and are
 assigned **exclusively** by the gateway; the master never proposes one, it
@@ -687,8 +705,9 @@ them:
 **Observability.** **`dq [slave]`** dumps the per-class pending counts and
 depths, the pending dim deltas and cursor, the in-flight count, the
 desired-state table (`desired: N pending, written / overwritten / shipped /
-button` — overwritten is how much a burst coalesced, button how often a press
-cleared or re-asserted a slot), and its counters
+button / member_ops` — overwritten is how much a burst coalesced, button how
+often a press cleared or re-asserted a slot, member_ops the membership frames
+requested), and its counters
 (submitted / ok / nak / err / dropped / refused / coalesced / steps / clamped),
 then the client's own dump. **`mbq [slave]`** is that dump on its own: per-slave
 FSM state, the current ack/head/last-seq binding, estimated response-queue

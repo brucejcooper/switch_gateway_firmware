@@ -33,6 +33,17 @@
 #define DP_BALLASTS  64u
 #define DP_GROUPS    16u
 #define DP_SLOTS     (DP_BALLASTS + DP_GROUPS)   /* index: ballast a = a, group g = 64+g */
+/* Membership edits occupy a further 16 indices in the same stamp order:
+ * group g's pending ADD/REMOVE TO GROUP frames = DP_SLOTS + g. */
+#define DP_MEMBER_BASE DP_SLOTS
+#define DP_ALL       (DP_SLOTS + DP_GROUPS)
+
+/* What a shipped index addressed — for the verification hook. */
+typedef enum {
+    DP_K_BALLAST = 0,   /* target = short address                       */
+    DP_K_GROUP   = 1,   /* target = group number                        */
+    DP_K_MEMBER  = 2,   /* target = the short address whose groups changed */
+} dp_kind_t;
 
 typedef enum {
     DP_OFF   = 0,   /* ballast: DAPC 0;  group: OFF command          */
@@ -56,6 +67,26 @@ typedef struct {
     uint32_t  c_overwritten;  /* writes that replaced a not-yet-shipped one */
     uint32_t  c_shipped;      /* slots drained to the scheduler */
     uint32_t  c_button;       /* slots a button cleared or re-asserted */
+
+    /* Group membership edits (ADD / REMOVE TO GROUP), one pending list per
+     * group. Latest wins per (ballast, group) pair: an add cancels a pending
+     * remove of the same pair and vice versa. A group's list takes ONE stamp,
+     * when it goes from empty to non-empty, and keeps it while it drains — so
+     * every edit requested before a later command on the group (e.g. "set
+     * members, then group ON") has gone out before that command does. Edits
+     * added while it drains ride along early, which can only make such a
+     * command see membership NEWER than at its request, never older. */
+    uint64_t  m_add[DP_GROUPS];
+    uint64_t  m_rem[DP_GROUPS];
+    uint32_t  m_stamp[DP_GROUPS];
+    /* The membership last REQUESTED for each group, valid per bit of
+     * m_intent_valid. Edits are diffed against it as well as against the
+     * measured cache, because the cache lags: a frame can have shipped but not
+     * yet been read back, and a diff against the cache alone would miss
+     * undoing it. */
+    uint64_t  m_intent[DP_GROUPS];
+    uint16_t  m_intent_valid;
+    uint32_t  c_member_ops;   /* membership frames requested */
 } dp_table_t;
 
 static inline uint8_t dp_index(bool is_group, uint8_t target) {
@@ -81,11 +112,28 @@ void dp_clear(dp_table_t *t, bool is_group, uint8_t target);
  * only ever during a drain). */
 bool dp_button(dp_table_t *t, bool is_group, uint8_t target, dp_op_t op, uint8_t arc);
 
-/* The slot to ship next: the dirty one with the oldest stamp. False if none. */
+/* Queue membership changes for `group`: ballasts in `add` join it, ballasts in
+ * `remove` leave it (the masks must be disjoint). Never blocks, never fails. */
+void dp_members(dp_table_t *t, uint8_t group, uint64_t add, uint64_t remove);
+
+/* Record / fetch the membership last requested for `group` (see m_intent). */
+void dp_note_intent(dp_table_t *t, uint8_t group, uint64_t members);
+bool dp_intent(const dp_table_t *t, uint8_t group, uint64_t *members);
+
+/* The index to ship next: the dirty one with the oldest stamp, over level
+ * slots and membership lists alike. False if none. */
 bool dp_next(const dp_table_t *t, uint8_t *idx);
 
-/* Mark slot `idx` shipped (clean). */
+/* Mark index `idx` shipped. A level slot goes clean; a membership list loses
+ * the one frame dp_member_frame() built (its lowest pending ballast) and stays
+ * dirty, at its stamp, while any remain. */
 void dp_take(dp_table_t *t, uint8_t idx);
+
+/* The next frame of membership list `idx` (>= DP_MEMBER_BASE): ADD TO GROUP
+ * (0x60|g) or REMOVE FROM GROUP (0x70|g) to the lowest pending ballast, command
+ * form; these are SET-class, so the caller sends them twice. */
+void dp_member_frame(const dp_table_t *t, uint8_t idx, uint8_t *addr, uint8_t *data,
+                     uint8_t *ballast);
 
 /* The DALI forward frame for slot `idx` in state `s`: address byte + data byte,
  * using the same encodings the direct paths always have (ballast off = DAPC 0,

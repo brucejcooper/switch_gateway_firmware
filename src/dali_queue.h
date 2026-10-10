@@ -182,11 +182,28 @@ bool dq_set_desired(uint8_t slave_id, bool is_group, uint8_t target,
 bool dq_button_settle(uint8_t slave_id, bool is_group, uint8_t target,
                       dp_op_t op, uint8_t arc);
 
-/* Called once for each pending slot as its frame is handed to the client — the
+/* Group membership edits, same table: ballasts in `add` join `group`, those in
+ * `remove` leave it. Never blocks — the ADD/REMOVE TO GROUP frames drain in
+ * write order with everything else (dali_pending.h). False only for an unknown
+ * slave. */
+bool dq_set_members(uint8_t slave_id, uint8_t group, uint64_t add, uint64_t remove);
+
+/* The membership last requested for a group (dp_note_intent / dp_intent): edits
+ * diff against it as well as the measured cache, which lags the bus. */
+void dq_note_member_intent(uint8_t slave_id, uint8_t group, uint64_t members);
+bool dq_member_intent(uint8_t slave_id, uint8_t group, uint64_t *members);
+
+/* Called once for each pending entry as its frame is handed to the client — the
  * moment to mark the target for its verification read. (lighting_actions owns
- * the marking; this layer must not reach up into dali_state.) */
-typedef void (*dq_ship_hook_t)(uint8_t slave_id, bool is_group, uint8_t target);
+ * the marking; this layer must not reach up into dali_state.) `target` is a
+ * short address for DP_K_BALLAST / DP_K_MEMBER, a group for DP_K_GROUP. */
+typedef void (*dq_ship_hook_t)(uint8_t slave_id, dp_kind_t kind, uint8_t target);
 void dq_set_ship_hook(dq_ship_hook_t hook);
+
+/* Called on every spin of dq_submit_sync's blocking wait (the ic seam registers
+ * one that keeps absorbing HA light commands, so a burst cannot overflow the
+ * intercore queue while a CLI command blocks). */
+void dq_set_wait_hook(void (*hook)(void));
 
 /* Desired-state slots not yet shipped on `slave_id` (0 for an unknown slave). */
 uint32_t dq_pending_count(uint8_t slave_id);

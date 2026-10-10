@@ -192,6 +192,51 @@ static void test_button(void) {
     CHECK(order[2] == dp_index(true, 15) && st[2].op == DP_OFF);
 }
 
+/* Membership edits: latest wins per (ballast, group); the list keeps the stamp
+ * it got when it became non-empty, so it drains before a LATER group command. */
+static void test_members(void) {
+    dp_table_t t; dp_init(&t);
+    dp_members(&t, 5, (1ull << 2) | (1ull << 9), 1ull << 4);   /* +2 +9 -4 */
+    dp_members(&t, 5, 0, 1ull << 9);                          /* -9 cancels +9 */
+    CHECK(t.n_dirty == 1);
+    dp_write(&t, true, 5, DP_ON, 0);                           /* then group ON */
+    dp_members(&t, 5, 1ull << 7, 0);                           /* rides the early stamp */
+    CHECK(t.n_dirty == 2);
+
+    uint8_t idx, a, d, b, n = 0;
+    struct { uint8_t a, d; } out[8];
+    while (dp_next(&t, &idx)) {
+        if (idx >= DP_MEMBER_BASE) {
+            CHECK(idx == DP_MEMBER_BASE + 5);
+            dp_member_frame(&t, idx, &a, &d, &b);
+        } else {
+            dp_frame(idx, &t.slot[idx], &a, &d);
+        }
+        out[n].a = a; out[n].d = d; n++;
+        dp_take(&t, idx);
+    }
+    CHECK(n == 5);
+    CHECK(out[0].a == 0x05 && out[0].d == 0x65);   /* ADD 2 to G5      */
+    CHECK(out[1].a == 0x09 && out[1].d == 0x75);   /* REMOVE 4         */
+    CHECK(out[2].a == 0x0F && out[2].d == 0x65);   /* ADD 7 (rode along) */
+    CHECK(out[3].a == 0x13 && out[3].d == 0x75);   /* REMOVE 9 (latest) */
+    CHECK(out[4].a == 0x8B && out[4].d == 0x0A);   /* then G5 ON, last */
+    CHECK(t.n_dirty == 0);
+
+    /* Intent bookkeeping. */
+    uint64_t m;
+    CHECK(!dp_intent(&t, 3, &m));
+    dp_note_intent(&t, 3, 0x30u);
+    CHECK(dp_intent(&t, 3, &m) && m == 0x30u);
+    CHECK(!dp_intent(&t, 4, &m));
+
+    /* A button while a membership list drains counts it as "something older
+     * pending", so the press is re-asserted after it. */
+    dp_init(&t);
+    dp_members(&t, 1, 1ull << 3, 0);
+    CHECK(dp_button(&t, false, 3, DP_OFF, 0) == true);
+}
+
 static void test_frames(void) {
     uint8_t a, d;
     dp_slot_t off = { .op = DP_OFF }, on = { .op = DP_ON }, lvl = { .op = DP_LEVEL, .arc = 200 };
@@ -211,6 +256,7 @@ int main(void) {
     test_drain_order();
     test_group_vs_member();
     test_button();
+    test_members();
     test_frames();
     if (s_fail) { printf("dali_pending_test: %d FAILED\n", s_fail); return 1; }
     printf("dali_pending_test: all passed\n");

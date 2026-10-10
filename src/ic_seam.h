@@ -40,6 +40,13 @@ void emit_state_dali(uint8_t slave, uint8_t addr);
 void emit_state_group(uint8_t slave, uint8_t group);
 void emit_state_cfg(void);
 void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_mask);
+uint64_t dali_group_members_requested(uint8_t slave, uint8_t group);
+
+/* Register the blocking-wait hook (after dq_init). */
+void ic_seam_init(void);
+/* Move queued HA light commands into the desired-state tables now — for code
+ * that blocks core 0 (see ic_seam.c). Safe to call from any wait loop. */
+void ic_seam_absorb_light_cmds(void);
 int  dali_apply_kv(uint8_t slave, uint8_t addr, const char *key, const char *val);
 
 /* Emit a config_mapping line for one (fixture, button). Empty `targets`

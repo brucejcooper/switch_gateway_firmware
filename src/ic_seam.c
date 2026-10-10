@@ -133,54 +133,47 @@ void emit_state_group(uint8_t slave, uint8_t group) {
 
 /* Set a DALI group's membership.
  *
- * The controller diffs membership against its own cache and emits the
- * ADD/REMOVE FROM GROUP frames itself; the gateway holds no masks.
+ * The controller diffs membership and emits the ADD/REMOVE TO GROUP frames
+ * itself; the gateway holds no masks. ADD is 0x60|g and REMOVE 0x70|g, both
+ * SET-class (send-twice), addressed to each ballast whose membership changes.
  *
- * ADD TO GROUP is 0x60|g and REMOVE FROM GROUP is 0x70|g, both SET-class so
- * they go send-twice, addressed to each ballast whose membership changed. They
- * are idempotent (re-adding a member is a no-op), so a retry is safe.
+ * NON-BLOCKING (task 14 follow-up). This used to submit each frame straight
+ * into the 8-deep user class and spin the bus — up to 2 s per frame — until
+ * there was room, so replacing a big group's membership stalled core 0 for
+ * about a second: no HA commands absorbed, wall buttons waiting. Now the edit
+ * goes into the gateway's desired-state table (dq_set_members) and drains in
+ * write order with everything else, below buttons.
  *
- * The membership cache is NOT taken on trust afterwards: each touched ballast is
- * marked for a full re-interrogation, so QUERY GROUPS confirms what actually
- * stuck. Predicting it locally is what made the old bug invisible. */
+ * The diff is against BOTH the measured cache and the membership last
+ * requested: the cache lags (a frame can have shipped but not yet been read
+ * back), and diffing against it alone would miss undoing such a frame. A
+ * redundant frame costs nothing — ADD/REMOVE are idempotent.
+ *
+ * The membership cache is still NOT taken on trust: each frame's ballast is
+ * marked for a full re-interrogation as it ships (lighting_actions'
+ * pending_shipped), so QUERY GROUPS confirms what actually stuck, and
+ * lighting_emit_group_state_if_changed publishes the measured list. */
 void dali_group_set_members(uint8_t slave, uint8_t group, uint64_t new_mask) {
     int idx = state_cache_slave_idx(slave);
     if (idx < 0) return;
-    uint64_t old_mask = state_cache_get_dali_group((uint8_t)idx, group);
-    uint64_t diff = old_mask ^ new_mask;
-    if (!diff) return;
+    uint64_t cache = state_cache_get_dali_group((uint8_t)idx, group);
+    uint64_t asked;
+    uint64_t change = new_mask ^ cache;
+    if (dq_member_intent(slave, group, &asked)) change |= new_mask ^ asked;
+    dq_note_member_intent(slave, group, new_mask);
+    if (!change) return;
+    dq_set_members(slave, group, new_mask & change, ~new_mask & change);
+    dirty_poll_mark_active(slave);
+}
 
-    for (uint8_t a = 0; a < DALI_ADDR_COUNT; a++) {
-        uint64_t bit = (uint64_t)1 << a;
-        if (!(diff & bit)) continue;
-        bool add = (new_mask & bit) != 0;
-        uint8_t addr_byte = (uint8_t)(((a & 0x3Fu) << 1) | 0x01u);
-        uint8_t opcode    = (uint8_t)((add ? 0x60u : 0x70u) | (group & 0x0Fu));
-
-        /* The user class is bounded, so spin the bus until this one is accepted
-         * rather than dropping members of a membership change on the floor. */
-        absolute_time_t dl = make_timeout_time_ms(2000);
-        while (!dq_submit(slave, DQ_PRIO_GROUP_WRITE, addr_byte, opcode,
-                          DQ_TWICE, 0, true, NULL, NULL)) {
-            if (absolute_time_diff_us(get_absolute_time(), dl) <= 0) {
-                LOG_WARN("cli", "group %u.G%u %s addr %u dropped — queue busy",
-                         slave, group, add ? "add" : "remove", a);
-                break;
-            }
-            modbus_poll();
-            dq_tick();
-            wd_feed();
-        }
-        dali_state_mark_scan(slave, a);   /* confirm by reading it back */
-    }
-    /* NO optimistic cache write. dali_state_mark_scan above re-reads QUERY GROUPS
-     * for every touched ballast, and commit_ballast writes the measured mask —
-     * that is the only writer. Recording new_mask here would publish membership
-     * we had merely requested, and a write that silently failed would sit in the
-     * cache (and in HA) until something else happened to re-read it.
-     * lighting_emit_group_state_if_changed now compares members, so the read-back
-     * publishes the new list on its own. */
-    (void)idx;
+/* The membership a relative edit (`add=` / `remove=`) should start from: the
+ * last one requested if there is one — it may not be on the bus or read back
+ * yet — else the measured cache. */
+uint64_t dali_group_members_requested(uint8_t slave, uint8_t group) {
+    uint64_t m;
+    if (dq_member_intent(slave, group, &m)) return m;
+    int idx = state_cache_slave_idx(slave);
+    return idx >= 0 ? state_cache_get_dali_group((uint8_t)idx, group) : 0;
 }
 
 void emit_state_cfg(void) {
@@ -696,6 +689,37 @@ void serial_tx_config_full(void) {
  *     make it see last tick's state instead — a real, if small, timing
  *     regression, which is why it lives here and not in cli.c despite being
  *     a CLI-flavoured feature. */
+/* Absorb pending LIGHT commands from core 1 while core 0 is inside a blocking
+ * wait (a CLI dali_raw / read_mem / get_input). Without this the core-1 ->
+ * core-0 queue fills behind the wait and a burst past its depth is dropped —
+ * measured 41 of a 214-command burst behind one dali_raw.
+ *
+ * Only commands that cannot block or re-enter are taken: set_dali / set_group
+ * / set_relay all just write desired state (or start an async probe). The
+ * first command of any other kind stops the drain, so nothing is reordered —
+ * it and everything behind it wait for the main loop, as before. Guarded
+ * against re-entry (a hook inside a wait inside a hook). */
+static bool is_light_cmd(const ic_cmd_t *c) {
+    return c->type == IC_CMD_SET_DALI || c->type == IC_CMD_SET_GROUP ||
+           c->type == IC_CMD_SET_RELAY;
+}
+
+void ic_seam_absorb_light_cmds(void) {
+    static bool busy;
+    if (busy) return;
+    busy = true;
+    ic_cmd_t cmd;
+    while (intercore_peek_cmd(&cmd) && is_light_cmd(&cmd)) {
+        intercore_pop_cmd(&cmd);
+        ic_dispatch_cmd(&cmd);
+    }
+    busy = false;
+}
+
+void ic_seam_init(void) {
+    dq_set_wait_hook(ic_seam_absorb_light_cmds);
+}
+
 void ic_seam_pump(void) {
     /* Drain inbound commands from core 1 (the network bridge) and dispatch them
      * through the same domain entry points the CLI/JSON use. Empty until core 1

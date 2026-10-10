@@ -42,7 +42,7 @@ void modbus_poll(void) {}
 void modbus_backoff_kick(uint8_t slave) { (void)slave; }
 bool dali_provision_busy_slave(uint8_t slave_id) { (void)slave_id; return false; }
 
-typedef struct { uint8_t addr, data; mbq_cb_t cb; void *ctx; bool done; } wire_t;
+typedef struct { uint8_t addr, data, flags; mbq_cb_t cb; void *ctx; bool done; } wire_t;
 static wire_t s_wire[512];
 static int    s_nwire, s_ndone;
 
@@ -55,7 +55,8 @@ void mbq_client_debug_print(int slave_id) { (void)slave_id; }
 bool mbq_client_submit(uint8_t slave_id, const uint8_t cmd[MBQ_CMD_BYTES],
                        bool idempotent, mbq_cb_t cb, void *ctx) {
     (void)slave_id; (void)idempotent;
-    s_wire[s_nwire++] = (wire_t){ .addr = cmd[0], .data = cmd[1], .cb = cb, .ctx = ctx };
+    s_wire[s_nwire++] = (wire_t){ .addr = cmd[0], .data = cmd[1], .flags = cmd[2],
+                                  .cb = cb, .ctx = ctx };
     return true;
 }
 
@@ -66,9 +67,9 @@ static void complete_one(void) {
     w->cb(3, MBQ_R_COMPLETE, 0, w->ctx);
 }
 
-static int s_hooks; static uint8_t s_hook_tgt[256]; static bool s_hook_grp[256];
-static void hook(uint8_t slave, bool grp, uint8_t tgt) {
-    (void)slave; s_hook_grp[s_hooks] = grp; s_hook_tgt[s_hooks++] = tgt;
+static int s_hooks; static uint8_t s_hook_tgt[256]; static dp_kind_t s_hook_kind[256];
+static void hook(uint8_t slave, dp_kind_t kind, uint8_t tgt) {
+    (void)slave; s_hook_kind[s_hooks] = kind; s_hook_tgt[s_hooks++] = tgt;
 }
 
 static void setup(void) {
@@ -99,7 +100,7 @@ static void test_drain_all_in_order(void) {
     int k = 0;
     for (uint8_t a = 0; a < 40; a++) if (a != 10) { CHECK(s_wire[k].addr == DAPC(a) && s_wire[k].data == 0); k++; }
     CHECK(s_wire[39].addr == DAPC(10) && s_wire[39].data == 77);
-    CHECK(s_hooks == 40 && !s_hook_grp[0] && s_hook_tgt[39] == 10);
+    CHECK(s_hooks == 40 && s_hook_kind[0] == DP_K_BALLAST && s_hook_tgt[39] == 10);
 }
 
 static void test_button_jumps_the_drain(void) {
@@ -158,6 +159,57 @@ static void test_dim_clears_pending(void) {
     CHECK(dq_pending_count(3) == 0);
 }
 
+/* A big membership replace no longer blocks: it returns at once, ships send-
+ * twice frames in the table's order, below a button, and the hook asks for a
+ * re-interrogation of each touched ballast. */
+static void test_members_nonblocking(void) {
+    setup();
+    uint64_t add = 0;
+    for (int a = 0; a < 36; a++) add |= 1ull << a;
+    CHECK(dq_set_members(3, 15, add, 0));            /* returns immediately */
+    CHECK(dq_set_desired(3, true, 15, DP_ON, 0));    /* then "group 15 on" */
+    for (int i = 0; i < 5; i++) dq_tick();
+    CHECK(in_flight() == (int)CMDQ_DEPTH);
+    int before = s_nwire;
+    dq_submit(3, DQ_PRIO_USER, 0x7F, 0x00, 0, 0, true, NULL, NULL);   /* a press */
+    dq_tick();
+    CHECK(s_wire[before].addr == 0x7F);              /* the press went next */
+    for (int guard = 0; guard < 1000 && (dq_pending_count(3) || in_flight()); guard++) {
+        dq_tick(); if (in_flight()) complete_one();
+    }
+    CHECK(s_nwire == 36 + 1 + 1);
+    int adds = 0;
+    for (int i = 0; i < s_nwire; i++)
+        if (s_wire[i].data == 0x6F) { adds++; CHECK(s_wire[i].flags == DQ_TWICE); }
+    CHECK(adds == 36);
+    CHECK(s_wire[s_nwire - 1].addr == 0x9F && s_wire[s_nwire - 1].data == 0x0A);  /* ON last */
+    CHECK(s_hook_kind[0] == DP_K_MEMBER && s_hook_tgt[0] == 0);
+    CHECK(s_hook_kind[s_hooks - 1] == DP_K_GROUP && s_hook_tgt[s_hooks - 1] == 15);
+
+    uint64_t m;
+    CHECK(!dq_member_intent(3, 15, &m));
+    dq_note_member_intent(3, 15, add);
+    CHECK(dq_member_intent(3, 15, &m) && m == add);
+}
+
+/* dq_submit_sync's blocking wait runs the wait hook on every spin (the seam
+ * hangs the HA-command absorber on it). */
+static int s_wait_calls;
+static void wait_hook(void) {
+    s_wait_calls++;
+    if (s_wait_calls == 3) complete_one();   /* the gateway answers mid-wait */
+}
+
+static void test_wait_hook(void) {
+    setup();
+    s_wait_calls = 0;
+    dq_set_wait_hook(wait_hook);
+    dq_result_t r; uint8_t ans;
+    CHECK(dq_submit_sync(3, 0x01, 0x90, DQ_ANSWER, 0, true, 1000, &r, &ans));
+    CHECK(s_wait_calls >= 3 && r == DQ_RES_OK);
+    dq_set_wait_hook(NULL);
+}
+
 static void test_unknown_slave(void) {
     setup();
     CHECK(!dq_set_desired(9, false, 1, DP_ON, 0));
@@ -169,6 +221,8 @@ int main(void) {
     test_button_jumps_the_drain();
     test_button_settle_reasserts();
     test_dim_clears_pending();
+    test_members_nonblocking();
+    test_wait_hook();
     test_unknown_slave();
     if (s_fail) { printf("dali_queue_test: %d FAILED\n", s_fail); return 1; }
     printf("dali_queue_test: all passed\n");

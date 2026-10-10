@@ -831,9 +831,14 @@ static bool desired(uint8_t slave_id, bool is_group, uint8_t target,
 
 /* Ship hook: a pending slot's frame just left for the gateway — read back what
  * it actually did. */
-static void pending_shipped(uint8_t slave_id, bool is_group, uint8_t target) {
-    if (is_group) dali_state_mark_dirty_group(slave_id, target);
-    else          dali_state_mark_dirty(slave_id, target);
+static void pending_shipped(uint8_t slave_id, dp_kind_t kind, uint8_t target) {
+    switch (kind) {
+    case DP_K_GROUP:   dali_state_mark_dirty_group(slave_id, target); break;
+    case DP_K_BALLAST: dali_state_mark_dirty(slave_id, target);       break;
+    /* A membership frame: re-interrogate the ballast so QUERY GROUPS confirms
+     * what actually stuck — the only writer of the membership cache. */
+    case DP_K_MEMBER:  dali_state_mark_scan(slave_id, target);        break;
+    }
 }
 
 void lighting_init(void) {

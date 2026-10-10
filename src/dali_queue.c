@@ -241,6 +241,7 @@ typedef struct {
 
 static dq_slave_t s_dq[MAX_DALI_SLAVES];
 static dq_ship_hook_t s_ship_hook;
+static void (*s_wait_hook)(void);
 
 /* ── helpers ─────────────────────────────────────────────────────────────── */
 
@@ -364,6 +365,31 @@ void dq_set_bg_burst(uint8_t slave_id, bool on) {
 }
 
 void dq_set_ship_hook(dq_ship_hook_t hook) { s_ship_hook = hook; }
+void dq_set_wait_hook(void (*hook)(void)) { s_wait_hook = hook; }
+
+bool dq_set_members(uint8_t slave_id, uint8_t group, uint64_t add, uint64_t remove) {
+    dq_slave_t *s = slave_for(slave_id);
+    if (!s) {
+        LOG_WARN("dq", "membership edit for unknown DALI slave %u dropped", slave_id);
+        return false;
+    }
+    if (add | remove) {
+        modbus_backoff_kick(slave_id);
+        mbq_client_kick(slave_id);
+        dp_members(&s->pending, group, add, remove & ~add);
+    }
+    return true;
+}
+
+void dq_note_member_intent(uint8_t slave_id, uint8_t group, uint64_t members) {
+    dq_slave_t *s = slave_for(slave_id);
+    if (s) dp_note_intent(&s->pending, group, members);
+}
+
+bool dq_member_intent(uint8_t slave_id, uint8_t group, uint64_t *members) {
+    dq_slave_t *s = slave_for(slave_id);
+    return s && dp_intent(&s->pending, group, members);
+}
 
 bool dq_set_desired(uint8_t slave_id, bool is_group, uint8_t target,
                     dp_op_t op, uint8_t arc) {
@@ -528,17 +554,25 @@ static bool ship_pending(dq_slave_t *s) {
     if (s->outstanding >= DQ_DEPTH_PENDING) return false;
     uint8_t idx;
     if (!dp_next(&s->pending, &idx)) return false;
-    uint8_t addr, data;
-    dp_frame(idx, &s->pending.slot[idx], &addr, &data);
-    dq_cmd_t e = { .addr = addr, .data = data, .flags = 0, .dtr0 = 0,
+    uint8_t addr, data, flags = 0, target;
+    dp_kind_t kind;
+    if (idx >= DP_MEMBER_BASE) {
+        /* ADD/REMOVE TO GROUP: SET-class, so send-twice; idempotent (re-adding
+         * a member is a no-op), so a reboot resend is safe. */
+        dp_member_frame(&s->pending, idx, &addr, &data, &target);
+        flags = DQ_TWICE;
+        kind  = DP_K_MEMBER;
+    } else {
+        dp_frame(idx, &s->pending.slot[idx], &addr, &data);
+        kind   = idx >= DP_BALLASTS ? DP_K_GROUP : DP_K_BALLAST;
+        target = idx >= DP_BALLASTS ? (uint8_t)(idx - DP_BALLASTS) : idx;
+    }
+    dq_cmd_t e = { .addr = addr, .data = data, .flags = flags, .dtr0 = 0,
                    .prio = (uint8_t)DQ_PRIO_USER, .idempotent = true,
                    .cb = NULL, .ctx = NULL };
     if (!ship(s, &e)) return false;
     dp_take(&s->pending, idx);
-    if (s_ship_hook) {
-        bool grp = idx >= DP_BALLASTS;
-        s_ship_hook(s->slave_id, grp, grp ? (uint8_t)(idx - DP_BALLASTS) : idx);
-    }
+    if (s_ship_hook) s_ship_hook(s->slave_id, kind, target);
     return true;
 }
 
@@ -627,6 +661,10 @@ bool dq_submit_sync(uint8_t slave_id, uint8_t addr, uint8_t data, uint8_t flags,
     while (!s_sync_have && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         modbus_poll();
         dq_tick();
+        /* Keep absorbing HA light commands into the desired-state tables while
+         * this blocks — otherwise a burst arriving now overflows the intercore
+         * queue (measured: 41 of 214 dropped behind one dali_raw). */
+        if (s_wait_hook) s_wait_hook();
         /* Long CLI-driven chains (dali_read_mem, cmd_blink) call this up to
          * ~193 times; feed here or the 5 s watchdog fires mid-command
          * (core-1-gated, so a real core-1 wedge still reboots). */
@@ -667,12 +705,13 @@ void dq_debug_print(int slave_id) {
         cdc_out_printf("  dim delta: %d target(s), net %d steps, cursor=%u\n",
                        dn, dsum, s->delta_cursor);
         cdc_out_printf("  desired: %u pending (depth %u), written=%lu overwritten=%lu "
-                       "shipped=%lu button=%lu\n",
+                       "shipped=%lu button=%lu member_ops=%lu\n",
                        s->pending.n_dirty, DQ_DEPTH_PENDING,
                        (unsigned long)s->pending.c_written,
                        (unsigned long)s->pending.c_overwritten,
                        (unsigned long)s->pending.c_shipped,
-                       (unsigned long)s->pending.c_button);
+                       (unsigned long)s->pending.c_button,
+                       (unsigned long)s->pending.c_member_ops);
         cdc_out_printf("  counters: submitted=%lu ok=%lu nak=%lu err=%lu dropped=%lu "
                        "refused=%lu coalesced=%lu steps=%lu clamped=%lu\n",
                        (unsigned long)s->c_submitted, (unsigned long)s->c_ok,

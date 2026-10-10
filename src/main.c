@@ -192,6 +192,7 @@ int main(void) {
     dali_provision_init();
     dq_init();   /* per-slave gateway command-queue driver state */
     lighting_init();   /* verification reads ride the pending table's ships */
+    ic_seam_init();    /* blocking waits keep absorbing HA light commands */
 
     /* Arm a full DALI interrogation per slave and carry on — do NOT wait for
      * them. An interrogation is a multi-second bus operation and an absent

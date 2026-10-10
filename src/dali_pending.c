@@ -42,19 +42,77 @@ bool dp_button(dp_table_t *t, bool is_group, uint8_t target, dp_op_t op, uint8_t
     return true;
 }
 
+void dp_members(dp_table_t *t, uint8_t group, uint64_t add, uint64_t remove) {
+    uint8_t g = group & 0x0Fu;
+    bool was = (t->m_add[g] | t->m_rem[g]) != 0u;
+    t->m_add[g] = (t->m_add[g] & ~remove) | add;
+    t->m_rem[g] = (t->m_rem[g] & ~add) | remove;
+    bool now = (t->m_add[g] | t->m_rem[g]) != 0u;
+    if (!was && now) { t->n_dirty++; t->m_stamp[g] = t->next_stamp++; }
+    for (uint64_t m = add | remove; m; m &= m - 1u) t->c_member_ops++;
+}
+
+void dp_note_intent(dp_table_t *t, uint8_t group, uint64_t members) {
+    uint8_t g = group & 0x0Fu;
+    t->m_intent[g] = members;
+    t->m_intent_valid = (uint16_t)(t->m_intent_valid | (1u << g));
+}
+
+bool dp_intent(const dp_table_t *t, uint8_t group, uint64_t *members) {
+    uint8_t g = group & 0x0Fu;
+    if (!(t->m_intent_valid & (1u << g))) return false;
+    *members = t->m_intent[g];
+    return true;
+}
+
+static uint8_t lowest_bit(uint64_t m) {
+    uint8_t b = 0;
+    while (!(m & 1u)) { m >>= 1; b++; }
+    return b;
+}
+
 bool dp_next(const dp_table_t *t, uint8_t *idx) {
     if (t->n_dirty == 0u) return false;
     bool found = false;
     uint32_t best = 0;
-    for (uint8_t i = 0; i < DP_SLOTS; i++) {
-        const dp_slot_t *s = &t->slot[i];
-        if (!s->dirty) continue;
-        if (!found || s->stamp < best) { best = s->stamp; *idx = i; found = true; }
+    for (uint8_t i = 0; i < DP_ALL; i++) {
+        uint32_t stamp;
+        if (i < DP_SLOTS) {
+            if (!t->slot[i].dirty) continue;
+            stamp = t->slot[i].stamp;
+        } else {
+            uint8_t g = (uint8_t)(i - DP_MEMBER_BASE);
+            if (!(t->m_add[g] | t->m_rem[g])) continue;
+            stamp = t->m_stamp[g];
+        }
+        if (!found || stamp < best) { best = stamp; *idx = i; found = true; }
     }
     return found;
 }
 
+void dp_member_frame(const dp_table_t *t, uint8_t idx, uint8_t *addr, uint8_t *data,
+                     uint8_t *ballast) {
+    uint8_t g = (uint8_t)(idx - DP_MEMBER_BASE);
+    uint64_t pend = t->m_add[g] | t->m_rem[g];
+    uint8_t  b    = pend ? lowest_bit(pend) : 0u;
+    bool     add  = (t->m_add[g] >> b) & 1u;
+    *ballast = b;
+    *addr    = (uint8_t)(((b & 0x3Fu) << 1) | 0x01u);
+    *data    = (uint8_t)((add ? 0x60u : 0x70u) | g);
+}
+
 void dp_take(dp_table_t *t, uint8_t idx) {
+    if (idx >= DP_MEMBER_BASE) {
+        uint8_t g = (uint8_t)(idx - DP_MEMBER_BASE);
+        uint64_t pend = t->m_add[g] | t->m_rem[g];
+        if (!pend) return;
+        uint64_t bit = (uint64_t)1 << lowest_bit(pend);
+        t->m_add[g] &= ~bit;
+        t->m_rem[g] &= ~bit;
+        if (!(t->m_add[g] | t->m_rem[g])) t->n_dirty--;
+        t->c_shipped++;
+        return;
+    }
     dp_slot_t *s = &t->slot[idx];
     if (!s->dirty) return;
     s->dirty = false;

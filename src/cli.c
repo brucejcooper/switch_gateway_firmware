@@ -289,9 +289,10 @@ static void cli_mb_wait(cli_mb_ctx_t *c) {
     absolute_time_t deadline = make_timeout_time_ms(1500);
     while (!c->done && absolute_time_diff_us(get_absolute_time(), deadline) > 0) {
         modbus_poll();
+        ic_seam_absorb_light_cmds();   /* keep taking HA bursts while blocked */
         /* This blocks the core-0 main loop, which is the only watchdog feeder.
-         * A single transaction can stall 1.5 s, and dali_group_set_members chains
-         * up to four of these — past the 5 s watchdog against a dead gateway.
+         * A single transaction can stall 1.5 s, and a CLI verb can chain
+         * several of these — past the 5 s watchdog against a dead gateway.
          * Feed here (core-1-gated, so a real core-1 wedge still reboots). */
         wd_feed();
     }
@@ -876,8 +877,9 @@ static void cmd_dali(char **saveptr) {
                      strcasecmp(key, "remove") == 0) {
                 uint8_t arr[DALI_ADDR_COUNT];
                 int gn = parse_csv_u8(val, arr, DALI_ADDR_COUNT);
-                int gidx = state_cache_slave_idx((uint8_t)slave);
-                uint64_t mask = gidx >= 0 ? state_cache_get_dali_group((uint8_t)gidx, (uint8_t)group) : 0;
+                /* Relative edits start from the membership last asked for,
+                 * which may still be draining — not the lagging cache. */
+                uint64_t mask = dali_group_members_requested((uint8_t)slave, (uint8_t)group);
                 uint64_t bits = 0;
                 for (int i = 0; i < gn; i++) if (arr[i] < 64) bits |= (uint64_t)1 << arr[i];
                 if      (strcasecmp(key, "members") == 0) mask = bits;

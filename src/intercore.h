@@ -256,6 +256,8 @@ bool intercore_pop_event(ic_event_t *e);
 /* core1 producer / core0 consumer (command queue). Non-blocking. */
 bool intercore_push_cmd(const ic_cmd_t *c);
 bool intercore_pop_cmd(ic_cmd_t *c);
+/* Copy the next command without removing it (core 0 — the only consumer). */
+bool intercore_peek_cmd(ic_cmd_t *c);
 
 /* Total events dropped on a full event queue (diagnostics). */
 uint32_t intercore_event_drops(void);

@@ -50,6 +50,10 @@ bool intercore_pop_cmd(ic_cmd_t *c) {
     return queue_try_remove(&s_cmd_q, c);
 }
 
+bool intercore_peek_cmd(ic_cmd_t *c) {
+    return queue_try_peek(&s_cmd_q, c);
+}
+
 uint32_t intercore_event_drops(void) {
     return s_event_drops;
 }
